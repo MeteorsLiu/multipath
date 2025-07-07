@@ -23,7 +23,7 @@ type batchWriter struct {
 }
 
 func NewWriter(fd syscall.RawConn) conn.BatchWriter {
-	return &batchWriter{fd: fd, ioves: make([]unix.Iovec, 1024), metadata: make([]*iovesMetadata, 1024)}
+	return &batchWriter{fd: fd, ioves: make([]unix.Iovec, 0, 1024), metadata: make([]*iovesMetadata, 0, 1024)}
 }
 
 func (f *batchWriter) fillIov(b [][]byte) (int64, error) {
@@ -62,8 +62,12 @@ func calculateConsumed(metadata []*iovesMetadata, offset int, submitted int64) (
 	fullBytes := len(currentBuf)
 	availableBytes = int(metadata[offset].metadata - submitted)
 
-	consumedBytes := fullBytes - availableBytes
-	offsetPtr = &currentBuf[consumedBytes]
+	// bound edge: when we have no availableBytes, no need to resize because pos cursor has move to the end
+	// this is only for safety
+	if availableBytes > 0 {
+		consumedBytes := fullBytes - availableBytes
+		offsetPtr = &currentBuf[consumedBytes]
+	}
 	return
 }
 
@@ -77,15 +81,25 @@ func (f *batchWriter) resizeIov(submitted int64) {
 	// bound edge: when first buffer size is equal to submitted, we should move to next one
 	if metadata[0].metadata <= submitted {
 		i := sort.Search(len(metadata), func(i int) bool {
-			return metadata[i].metadata > submitted
+			// consider end bound edge (Test case 5th(Edge)), so we need to search the previous one
+			return metadata[i].metadata >= submitted
 		})
+		// we got a previous result, but we need a greater one, so move to next one
+		// be careful about the slice bound.
+		if metadata[i].metadata <= submitted {
+			i = min(i+1, len(metadata))
+		}
+
 		startIdx = i
 		pos += i
 	}
-	consumedBufPtr, availableBytes := calculateConsumed(metadata, startIdx, submitted)
 
-	f.ioves[pos].Base = consumedBufPtr
-	f.ioves[pos].SetLen(availableBytes)
+	if startIdx < len(metadata) {
+		consumedBufPtr, availableBytes := calculateConsumed(metadata, startIdx, submitted)
+
+		f.ioves[pos].Base = consumedBufPtr
+		f.ioves[pos].SetLen(availableBytes)
+	}
 
 	f.pos = pos
 }
@@ -110,7 +124,12 @@ func (f *batchWriter) WriteBatch(b [][]byte) (n int64, err error) {
 		var nw int
 
 		for maxSize > 0 {
-			nw, err = writev(int(fd), f.ioves[f.pos:])
+			offsetIoves := f.ioves[f.pos:]
+			// should not happen
+			if len(offsetIoves) == 0 {
+				panic("zero ioves")
+			}
+			nw, err = writev(int(fd), offsetIoves)
 
 			if nw > 0 {
 				n += int64(nw)

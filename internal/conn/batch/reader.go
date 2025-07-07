@@ -15,7 +15,7 @@ type batchReader struct {
 }
 
 func NewReader(fd syscall.RawConn) conn.BatchReader {
-	return &batchReader{fd: fd, ioves: make([]unix.Iovec, 1024)}
+	return &batchReader{fd: fd, ioves: make([]unix.Iovec, 0, 1024)}
 }
 
 func (f *batchReader) fillIov(b [][]byte) error {
