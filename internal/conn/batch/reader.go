@@ -20,7 +20,7 @@ func NewReader(fd syscall.RawConn) conn.BatchReader {
 
 func (f *batchReader) fillIov(b [][]byte) error {
 	if len(b) > 1024 {
-		return ErrTooManySegments
+		return conn.ErrTooManySegments
 	}
 	if len(f.ioves) > 0 {
 		panic("the cursor of ioves dones't reset.")
@@ -42,6 +42,9 @@ func (f *batchReader) resetCursor() {
 }
 
 func (f *batchReader) ReadBatch(b [][]byte) (n int64, err error) {
+	if len(b) == 0 {
+		return
+	}
 	if err = f.fillIov(b); err != nil {
 		return
 	}

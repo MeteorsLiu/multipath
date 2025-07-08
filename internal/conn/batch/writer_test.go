@@ -115,14 +115,14 @@ func TestWritevResize(t *testing.T) {
 		},
 	}
 
-	f2 := &batchWriter{}
-	f2.fillIov(bufs)
+	f2 := newResizableIov()
+	f2.fill(bufs)
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			f := &batchWriter{}
-			f.fillIov(bufs)
+			f := newResizableIov()
+			f.fill(bufs)
 
-			f.resizeIov(tc.consumed)
+			f.resize(tc.consumed)
 
 			if !reflect.DeepEqual(tc.expect, f.ioves[f.pos:]) {
 				t.Fatalf("unexpected resize result: want: %v got: %v", tc.expect, f.ioves[f.pos:])
@@ -130,7 +130,7 @@ func TestWritevResize(t *testing.T) {
 		})
 
 		t.Run(fmt.Sprintf("%s Continuously", tc.name), func(t *testing.T) {
-			f2.resizeIov(tc.consumed)
+			f2.resize(tc.consumed)
 
 			if !reflect.DeepEqual(tc.expect, f2.ioves[f2.pos:]) {
 				t.Fatalf("unexpected resize result: want: %v got: %v", tc.expect, f2.ioves[f2.pos:])
@@ -160,9 +160,9 @@ func TestWritevRandom(t *testing.T) {
 
 	consumed += int64(offset)
 
-	f := &batchWriter{}
-	f.fillIov(bufs)
-	f.resizeIov(consumed)
+	f := newResizableIov()
+	f.fill(bufs)
+	f.resize(consumed)
 
 	if f.pos != selectedIdx {
 		t.Errorf("unexpected pos: want: %d got: %d", f.pos, selectedIdx)
