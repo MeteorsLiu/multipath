@@ -13,7 +13,10 @@ import (
 	"github.com/MeteorsLiu/multipath/internal/vary"
 )
 
-const _defaultTimeout = 15 * time.Second
+const (
+	_defaultTimeout    = 15
+	_defaultTimeoutDur = _defaultTimeout * time.Second
+)
 
 var packetPool = sync.Pool{
 	New: func() any {
@@ -78,13 +81,14 @@ type Prober struct {
 
 func New(ctx context.Context, on func(Event)) *Prober {
 	p := &Prober{
-		on:         on,
-		avg:        vary.NewVary(),
-		in:         make(chan *Packet, 128),
-		out:        make(chan *Packet, 128),
-		minRtt:     math.MaxFloat64,
-		deadline:   &time.Timer{},
-		reschedule: &time.Timer{},
+		on:     on,
+		avg:    vary.NewVary(),
+		in:     make(chan *Packet, 128),
+		out:    make(chan *Packet, 128),
+		minRtt: math.MaxFloat64,
+
+		deadline:   new(time.Timer),
+		reschedule: new(time.Timer),
 		packetMap:  make(map[uint64]*packetInfo),
 	}
 	go p.run(ctx)
@@ -110,7 +114,7 @@ func (p *Prober) sendProbePacket() {
 	p.out <- packet
 
 	if p.avg.IsZero() {
-		p.deadline = time.NewTimer(_defaultTimeout)
+		p.deadline = time.NewTimer(_defaultTimeoutDur)
 		return
 	}
 
@@ -127,11 +131,11 @@ func (p *Prober) sendProbePacket() {
 func (p *Prober) markTimeout() (isTimeout bool) {
 	var timeHeap maxTimeHeap
 
-	if p.lastMaxStartTime > 0 && time.Now().Unix()-p.lastMaxStartTime >= 15 {
+	if p.lastMaxStartTime > 0 && time.Now().Unix()-p.lastMaxStartTime >= _defaultTimeout {
 		p.switchState(Disconnected)
 		isTimeout = true
+		p.lastMaxStartTime = 0
 	}
-	p.lastMaxStartTime = 0
 	// too many on flight
 	needGC := len(p.packetMap) > 100
 
@@ -141,7 +145,7 @@ func (p *Prober) markTimeout() (isTimeout bool) {
 		elapsed := time.Since(pkt.startTime)
 
 		// if one of packet has no reply over 15 seconds, mark it disconnected.
-		if elapsed >= 15*time.Second {
+		if elapsed >= _defaultTimeoutDur {
 			p.switchState(Disconnected)
 			// we need to send a probe packet right now if we confirm it's disconnected.
 			isTimeout = true

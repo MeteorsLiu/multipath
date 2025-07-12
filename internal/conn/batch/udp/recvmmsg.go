@@ -1,4 +1,4 @@
-package batch
+package udp
 
 import (
 	"net"
@@ -32,22 +32,22 @@ var (
 	}
 )
 
-type recvMmsg struct {
+type RecvMmsg struct {
 	conn *net.UDPConn
 
 	v4pc *ipv4.PacketConn
 	v6pc *ipv6.PacketConn
 }
 
-func NewReaderV4(conn net.PacketConn) conn.BatchReader {
-	return &recvMmsg{conn: conn.(*net.UDPConn), v4pc: ipv4.NewPacketConn(conn)}
+func NewReaderV4(conn net.PacketConn) *RecvMmsg {
+	return &RecvMmsg{conn: conn.(*net.UDPConn), v4pc: ipv4.NewPacketConn(conn)}
 }
 
-func NewReaderV6(conn net.PacketConn) conn.BatchReader {
-	return &recvMmsg{conn: conn.(*net.UDPConn), v6pc: ipv6.NewPacketConn(conn)}
+func NewReaderV6(conn net.PacketConn) *RecvMmsg {
+	return &RecvMmsg{conn: conn.(*net.UDPConn), v6pc: ipv6.NewPacketConn(conn)}
 }
 
-func (s *recvMmsg) ReadBatch(b [][]byte) (int64, error) {
+func (s *RecvMmsg) ReadBatch(b [][]byte) (int64, error) {
 	if s.v6pc != nil {
 		return s.readBatchV6(b)
 	}
@@ -80,7 +80,7 @@ func fillMsgsV6(bufs [][]byte) (*[]ipv4.Message, error) {
 	return msgs, nil
 }
 
-func (s *recvMmsg) readBatchV4(bufs [][]byte) (int64, error) {
+func (s *RecvMmsg) readBatchV4(bufs [][]byte) (int64, error) {
 	msgs, err := fillMsgsV4(bufs)
 	if err != nil {
 		return 0, err
@@ -110,7 +110,7 @@ func (s *recvMmsg) readBatchV4(bufs [][]byte) (int64, error) {
 	return sum, nil
 }
 
-func (s *recvMmsg) readBatchV6(bufs [][]byte) (int64, error) {
+func (s *RecvMmsg) readBatchV6(bufs [][]byte) (int64, error) {
 	msgs, err := fillMsgsV6(bufs)
 	if err != nil {
 		return 0, err
