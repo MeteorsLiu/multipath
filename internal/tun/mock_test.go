@@ -177,7 +177,7 @@ func TestMockTun(t *testing.T) {
 
 	execCommand("ping", "-c", "1", "10.168.168.1")
 	var ip4 layers.IPv4
-	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &ip4)
+	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeIPv4, &ip4)
 	decoded := []gopacket.LayerType{}
 	b.wg.Wait()
 
