@@ -2,8 +2,10 @@ package tun
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/MeteorsLiu/multipath/internal/conn"
+	"github.com/MeteorsLiu/multipath/internal/conn/udpmux/ip"
 	"github.com/MeteorsLiu/multipath/internal/mempool"
 )
 
@@ -87,8 +89,13 @@ func (u *TunHandler) readLoop() {
 		if err != nil {
 			break
 		}
-
 		for i := 0; i < numMsgs; i++ {
+			size, err := ip.Header(bufs[i].Bytes()).Size()
+			if err != nil {
+				fmt.Println(err)
+				continue
+			}
+			bufs[i].SetLen(int(size))
 			u.outWriter.Write(bufs[i])
 			bufs[i] = mempool.Get(1500)
 		}
