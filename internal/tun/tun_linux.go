@@ -156,6 +156,32 @@ func (tun *tunDevice) WriteBatch(bufs [][]byte) (int64, error) {
 	return tun.fallbackWriter.WriteBatch(bufs)
 }
 
+func (tun *tunDevice) Read(buf []byte) (int, error) {
+	n, err := tun.tunFile.Read(buf)
+	if err != nil {
+		return 0, err
+	}
+	if n < 20 {
+		_, err := io.ReadFull(tun.tunFile, buf[n:20])
+		if err != nil {
+			return 0, err
+		}
+		n = 20
+	}
+	fullSize, err := ip.Header(buf).Size()
+	if err != nil {
+		return 0, err
+	}
+	if n < int(fullSize) {
+		_, err := io.ReadFull(tun.tunFile, buf[n:fullSize])
+		if err != nil {
+			return 0, err
+		}
+		n = int(fullSize)
+	}
+	return n, err
+}
+
 // TODO: GRO Support
 func (tun *tunDevice) ReadBatch(bufs [][]byte) (int, int64, error) {
 	pos, n, err := tun.fallbackReader.ReadBatch(bufs)
@@ -249,7 +275,7 @@ func (tun *tunDevice) initFromFlags(name string) error {
 }
 
 // CreateTUN creates a Device with the provided name and MTU.
-func CreateTUN(name string, mtu int) (conn.BatchConn, error) {
+func CreateTUN(name string, mtu int) (OSTun, error) {
 	nfd, err := unix.Open(cloneDevicePath, unix.O_RDWR|unix.O_CLOEXEC, 0)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -282,7 +308,7 @@ func CreateTUN(name string, mtu int) (conn.BatchConn, error) {
 }
 
 // CreateTUNFromFile creates a Device from an os.File with the provided MTU.
-func CreateTUNFromFile(file *os.File, mtu int) (conn.BatchConn, error) {
+func CreateTUNFromFile(file *os.File, mtu int) (OSTun, error) {
 	sc, err := file.SyscallConn()
 	if err != nil {
 		return nil, err

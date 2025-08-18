@@ -6,10 +6,6 @@
 
 package tun
 
-import (
-	"github.com/MeteorsLiu/multipath/internal/conn"
-)
-
-func CreateTUN(name string, mtu int) (conn.BatchConn, error) {
+func CreateTUN(name string, mtu int) (OSTun, error) {
 	panic("todo")
 }

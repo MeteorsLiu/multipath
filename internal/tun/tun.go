@@ -3,20 +3,24 @@ package tun
 import (
 	"context"
 	"fmt"
+	"io"
 
 	"github.com/MeteorsLiu/multipath/internal/conn"
-	"github.com/MeteorsLiu/multipath/internal/conn/udpmux/ip"
 	"github.com/MeteorsLiu/multipath/internal/mempool"
 )
 
+type OSTun interface {
+	io.Reader
+	conn.BatchConn
+}
 type TunHandler struct {
 	ctx       context.Context
-	osTun     conn.BatchConn
+	osTun     OSTun
 	inCh      chan *mempool.Buffer
 	outWriter mempool.Writer
 }
 
-func NewHandler(ctx context.Context, tunInterface conn.BatchConn, outWriter mempool.Writer) *TunHandler {
+func NewHandler(ctx context.Context, tunInterface OSTun, outWriter mempool.Writer) *TunHandler {
 	t := &TunHandler{ctx: ctx, osTun: tunInterface, inCh: make(chan *mempool.Buffer, 1024), outWriter: outWriter}
 	go t.writeLoop()
 	go t.readLoop()
@@ -74,30 +78,17 @@ func (u *TunHandler) writeLoop() {
 }
 
 func (u *TunHandler) readLoop() {
-	bufs := make([]*mempool.Buffer, 1024)
-	for i := range bufs {
-		bufs[i] = mempool.Get(1500)
-	}
-	bufBytes := make([][]byte, 0, 1024)
-
-	for _, b := range bufs {
-		bufBytes = append(bufBytes, b.Bytes())
-	}
-
 	for {
-		numMsgs, _, err := u.osTun.ReadBatch(bufBytes)
+		buf := mempool.Get(1500)
+		n, err := u.osTun.Read(buf.Bytes())
 		if err != nil {
-			break
+			fmt.Println("readloop exits: ", err)
+			return
 		}
-		for i := 0; i < numMsgs; i++ {
-			size, err := ip.Header(bufs[i].Bytes()).Size()
-			if err != nil {
-				fmt.Println(err)
-				continue
-			}
-			bufs[i].SetLen(int(size))
-			u.outWriter.Write(bufs[i])
-			bufs[i] = mempool.Get(1500)
+		buf.SetLen(n)
+		if err := u.outWriter.Write(buf); err != nil {
+			fmt.Println("readloop exits: ", err)
+			return
 		}
 	}
 }
