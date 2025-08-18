@@ -164,16 +164,16 @@ func TestMockTun(t *testing.T) {
 	}
 	defer tunInt.Close()
 
-	exec.Command("ip", "link", "set", "multipath-veth0", "up").Run()
-	exec.Command("ip", "a", "add", "10.168.168.1", "peer", "10.168.168.2", "dev", "multipath-veth0").Run()
+	execCommand("ip", "link", "set", "multipath-veth0", "up")
+	execCommand("ip", "a", "add", "10.168.168.1", "peer", "10.168.168.2", "dev", "multipath-veth0")
 
-	defer exec.Command("ip", "link", "del", "multipath-veth0").Run()
+	defer execCommand("ip", "link", "del", "multipath-veth0")
 
 	var buf bytes.Buffer
 	b := newBufferWriter(buf)
 	NewHandler(context.Background(), tunInt, b)
 
-	exec.Command("ping", "-c", "1", "10.168.168.2").Run()
+	execCommand("ping", "-c", "1", "10.168.168.2")
 	var ip4 layers.IPv4
 	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &ip4)
 	decoded := []gopacket.LayerType{}
@@ -204,4 +204,11 @@ func (b *bufferWriter) Write(buf *mempool.Buffer) error {
 	defer mempool.Put(buf)
 	_, err := b.Buffer.Write(buf.Bytes())
 	return err
+}
+
+func execCommand(cmd string, args ...string) {
+	current := exec.Command(cmd, args...)
+	current.Stdout = os.Stdout
+	current.Stderr = os.Stderr
+	current.Run()
 }
