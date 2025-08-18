@@ -67,28 +67,33 @@ func (f *resizableIov) fill(b [][]byte) (int64, error) {
 	return sum, nil
 }
 
-func (f *resizableIov) resize(submitted int64) {
+func (f *resizableIov) find(size int64, next bool) int {
 	metadata := f.metadata[f.pos:]
 
-	pos := f.pos
 	startIdx := 0
 
-	// if the first metadata is greater than submitted, just consume the first buffer
-	// bound edge: when first buffer size is equal to submitted, we should move to next one
-	if metadata[0].metadata <= submitted {
+	if metadata[0].metadata <= size {
 		i := sort.Search(len(metadata), func(i int) bool {
 			// consider end bound edge (Test case 5th(Edge)), so we need to search the previous one
-			return metadata[i].metadata >= submitted
+			return metadata[i].metadata >= size
 		})
 		// we got a previous result, but we need a greater one, so move to next one
 		// be careful about the slice bound.
-		if metadata[i].metadata <= submitted {
+		if next && metadata[i].metadata <= size {
 			i = min(i+1, len(metadata))
 		}
 
 		startIdx = i
-		pos += i
 	}
+
+	return startIdx
+}
+
+func (f *resizableIov) resize(submitted int64) {
+	metadata := f.metadata[f.pos:]
+	startIdx := f.find(submitted, true)
+
+	pos := f.pos + startIdx
 
 	if startIdx < len(metadata) {
 		consumedBufPtr, availableBytes := calculateConsumed(metadata, startIdx, submitted)

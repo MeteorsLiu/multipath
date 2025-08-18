@@ -4,34 +4,105 @@ package mempool
 
 import (
 	"errors"
+	"io"
 	"math/bits"
 	"sync"
 )
+
+type Writer interface {
+	Write(*Buffer) error
+}
 
 var (
 	defaultAllocator = NewAllocator()
 )
 
+var _ io.ReaderFrom = (*Buffer)(nil)
+
 type Buffer struct {
-	B []byte
+	b   []byte
+	pos int
 }
 
-func ToBuffer(b []byte) *Buffer { return &Buffer{B: b} }
+func ToBuffer(b []byte) *Buffer { return &Buffer{b: b} }
+
+func (b *Buffer) Read(buf []byte) (n int, err error) {
+	n = copy(buf, b.b[b.pos:])
+	return
+}
+
+func (b *Buffer) Write(buf []byte) (n int, err error) {
+	n = copy(b.b[b.pos:], buf)
+	// move cursor by default
+	b.Consume(n)
+	return
+}
+
+func (b *Buffer) ReadFrom(r io.Reader) (n int64, err error) {
+	var nr int
+	nr, err = io.ReadFull(r, b.b[b.pos:])
+	n = int64(nr)
+	return
+}
+
+func (b *Buffer) Peek(n int) []byte {
+	pos := b.pos
+	b.Consume(n)
+	return b.b[pos : n+pos]
+}
 
 func (b *Buffer) Bytes() []byte {
-	return b.B
+	return b.b[b.pos:]
+}
+
+func (b *Buffer) OffsetTo(n int) {
+	b.pos = n
+}
+
+func (b *Buffer) resetCursor() {
+	b.pos = 0
+	// allow GC
+	b.SetLen(0)
 }
 
 func (b *Buffer) Reset() {
-	clear(b.B)
+	clear(b.b[b.pos:])
 }
 
 func (b *Buffer) SetLen(len int) {
-	b.B = b.B[:len]
+	b.b = b.b[:len]
 }
 
 func (b *Buffer) Cap() int {
-	return cap(b.B)
+	return cap(b.b)
+}
+
+func (b *Buffer) Len() int {
+	if b == nil {
+		return 0
+	}
+	return len(b.Bytes())
+}
+
+func (b *Buffer) Consume(n int) {
+	b.pos = min(b.pos+n, len(b.b))
+}
+
+func (b *Buffer) GrowTo(n int) {
+	if b.Len() >= n {
+		return
+	}
+	newBuf := Get(n)
+	copy(newBuf.b, b.b)
+
+	Put(ToBuffer(b.b))
+
+	b.b = newBuf.b
+	newBuf.b = nil
+}
+
+func (b *Buffer) ConsumedBytes() int {
+	return b.pos
 }
 
 func Get(size int) *Buffer {
@@ -62,7 +133,7 @@ func NewAllocator() *Allocator {
 	for k := range alloc.buffers {
 		i := k
 		alloc.buffers[k].New = func() any {
-			return &Buffer{B: make([]byte, 1<<uint32(i))}
+			return &Buffer{b: make([]byte, 1<<uint32(i))}
 		}
 	}
 	return alloc
@@ -93,6 +164,7 @@ func (alloc *Allocator) Put(b *Buffer) error {
 	if b.Cap() == 0 || b.Cap() > 65536 || b.Cap() != 1<<bits {
 		return errors.New("allocator Put() incorrect buffer size")
 	}
+	b.resetCursor()
 	alloc.buffers[bits].Put(b)
 	return nil
 }

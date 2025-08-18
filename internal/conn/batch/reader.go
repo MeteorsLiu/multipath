@@ -11,49 +11,27 @@ import (
 type batchReader struct {
 	fd syscall.RawConn
 
-	ioves []unix.Iovec
+	ioves *resizableIov
 }
 
 func NewReader(fd syscall.RawConn) conn.BatchReader {
-	return &batchReader{fd: fd, ioves: make([]unix.Iovec, 0, 1024)}
+	return &batchReader{fd: fd, ioves: newResizableIov()}
 }
 
-func (f *batchReader) fillIov(b [][]byte) error {
-	if len(b) > 1024 {
-		return conn.ErrTooManySegments
-	}
-	if len(f.ioves) > 0 {
-		panic("the cursor of ioves dones't reset.")
-	}
-
-	for _, buf := range b {
-		var vec unix.Iovec
-		vec.Base = &buf[0]
-		vec.SetLen(len(buf))
-
-		f.ioves = append(f.ioves, vec)
-	}
-
-	return nil
-}
-
-func (f *batchReader) resetCursor() {
-	f.ioves = f.ioves[:0]
-}
-
-func (f *batchReader) ReadBatch(b [][]byte) (n int64, err error) {
+func (f *batchReader) ReadBatch(b [][]byte) (nums int, n int64, err error) {
 	if len(b) == 0 {
 		return
 	}
-	if err = f.fillIov(b); err != nil {
+	_, err = f.ioves.fill(b)
+	if err != nil {
 		return
 	}
-	defer f.resetCursor()
+	defer f.ioves.resetCursor()
 
 	err2 := f.fd.Read(func(fd uintptr) (done bool) {
 		var nr int
 		for {
-			nr, err = readv(int(fd), f.ioves)
+			nr, err = readv(int(fd), f.ioves.iovec())
 
 			if nr > 0 {
 				n += int64(nr)
@@ -80,5 +58,10 @@ func (f *batchReader) ReadBatch(b [][]byte) (n int64, err error) {
 	if err == nil && err2 != nil {
 		err = err2
 	}
+
+	if n > 0 && err == nil {
+		nums = f.ioves.find(n, false)
+	}
+
 	return
 }

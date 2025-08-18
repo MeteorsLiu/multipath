@@ -5,24 +5,19 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
-	"io"
+	"fmt"
 	"math"
-	"sync"
 	"time"
 
+	"github.com/MeteorsLiu/multipath/internal/mempool"
 	"github.com/MeteorsLiu/multipath/internal/vary"
 )
 
 const (
+	NonceSize          = 8
 	_defaultTimeout    = 15
 	_defaultTimeoutDur = _defaultTimeout * time.Second
 )
-
-var packetPool = sync.Pool{
-	New: func() any {
-		return &Packet{Nonce: make([]byte, 8)}
-	},
-}
 
 type Event int
 
@@ -32,22 +27,16 @@ const (
 	Lost
 )
 
-type Packet struct {
-	Nonce []byte
-}
-
-func NewProbePacket(buf []byte) *Packet {
-	packet := packetPool.Get().(*Packet)
-
-	if buf != nil {
-		copy(packet.Nonce, buf)
+func (e Event) String() string {
+	switch e {
+	case Normal:
+		return "normal"
+	case Disconnected:
+		return "disconnected"
+	case Lost:
+		return "lost"
 	}
-
-	return packet
-}
-
-func (p *Packet) Release() {
-	packetPool.Put(p)
+	return "unknown"
 }
 
 type packetInfo struct {
@@ -64,9 +53,9 @@ type Prober struct {
 	on    func(Event)
 	state Event
 
-	in  chan *Packet
-	out chan *Packet
-
+	in             chan *mempool.Buffer
+	out            chan *mempool.Buffer
+	ctx            context.Context
 	avg            *vary.Vary
 	minRtt         float64
 	lost           float64
@@ -82,32 +71,32 @@ type Prober struct {
 func New(ctx context.Context, on func(Event)) *Prober {
 	p := &Prober{
 		on:     on,
+		ctx:    ctx,
 		avg:    vary.NewVary(),
-		in:     make(chan *Packet, 128),
-		out:    make(chan *Packet, 128),
+		in:     make(chan *mempool.Buffer, 128),
+		out:    make(chan *mempool.Buffer, 128),
 		minRtt: math.MaxFloat64,
 
 		deadline:   new(time.Timer),
 		reschedule: new(time.Timer),
 		packetMap:  make(map[uint64]*packetInfo),
 	}
-	go p.run(ctx)
 	return p
 }
 
-func (p *Prober) In() chan<- *Packet {
+func (p *Prober) In() chan<- *mempool.Buffer {
 	return p.in
 }
 
-func (p *Prober) Out() <-chan *Packet {
+func (p *Prober) Out() <-chan *mempool.Buffer {
 	return p.out
 }
 
 func (p *Prober) sendProbePacket() {
-	packet := NewProbePacket(nil)
-	io.ReadFull(rand.Reader, packet.Nonce)
+	packet := mempool.Get(NonceSize)
+	packet.ReadFrom(rand.Reader)
 
-	nonce := binary.LittleEndian.Uint64(packet.Nonce)
+	nonce := binary.LittleEndian.Uint64(packet.Bytes())
 
 	p.packetMap[nonce] = &packetInfo{startTime: time.Now()}
 
@@ -185,10 +174,10 @@ func (p *Prober) markTimeout() (isTimeout bool) {
 	return
 }
 
-func (p *Prober) recvProbePacket(packet *Packet) {
-	defer packet.Release()
+func (p *Prober) recvProbePacket(packet *mempool.Buffer) {
+	defer mempool.Put(packet)
 
-	nonce := binary.LittleEndian.Uint64(packet.Nonce)
+	nonce := binary.LittleEndian.Uint64(packet.Bytes())
 
 	info, ok := p.packetMap[nonce]
 	if !ok {
@@ -249,6 +238,7 @@ func (p *Prober) switchState(to Event) {
 		return
 	}
 
+	oldState := p.state
 	p.state = to
 
 	switch to {
@@ -258,6 +248,8 @@ func (p *Prober) switchState(to Event) {
 	case Disconnected:
 		p.debit = 1
 	}
+
+	fmt.Printf("Switch State: %s => %s Debit: %f\n", oldState, p.state, p.debit)
 
 	p.on(to)
 }
@@ -272,12 +264,12 @@ func (p *Prober) switchState(to Event) {
 // Lost -> Disconnect (When one packet reaches the maximum deadline, 15s)
 // Disconnect -> Lost (When 1 packets meets estimated RTT requirement)
 // Lost -> Normal: See Normal <-> Lost
-func (p *Prober) run(ctx context.Context) {
+func (p *Prober) Run() {
 	p.sendProbePacket()
 
 	for {
 		select {
-		case <-ctx.Done():
+		case <-p.ctx.Done():
 			return
 		case pkt := <-p.in:
 			p.recvProbePacket(pkt)

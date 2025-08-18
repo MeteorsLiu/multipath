@@ -9,6 +9,182 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+func TestWritevFind(t *testing.T) {
+	bufs := [][]byte{
+		{1, 2, 3, 4},
+		{5, 6, 7, 8, 9, 10, 11},
+		{12, 13},
+		{14, 15, 16, 17, 18, 19},
+		{20},
+	}
+
+	testCases := []struct {
+		name     string
+		consumed int64
+		expect   int
+	}{
+		{
+			name:     "Zero Consumed",
+			consumed: 0,
+			expect:   0,
+		},
+		{
+			name:     "Consumed First",
+			consumed: 2,
+			expect:   0,
+		},
+		{
+			name:     "Consumed First Edge",
+			consumed: 4,
+			expect:   0,
+		},
+		{
+			name:     "Consumed Second",
+			consumed: 7,
+			expect:   1,
+		},
+		{
+			name:     "Consumed Second Edge",
+			consumed: 11,
+			expect:   1,
+		},
+		{
+			name:     "Consumed Third",
+			consumed: 12,
+			expect:   2,
+		},
+		{
+			name:     "Consumed Third Edge",
+			consumed: 13,
+			expect:   2,
+		},
+
+		{
+			name:     "Consumed Fourth",
+			consumed: 17,
+			expect:   3,
+		},
+
+		{
+			name:     "Consumed Fourth Edge",
+			consumed: 19,
+			expect:   3,
+		},
+		{
+			name:     "Consumed Fifth Edge",
+			consumed: 20,
+			expect:   4,
+		},
+	}
+
+	f2 := newResizableIov()
+	f2.fill(bufs)
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newResizableIov()
+			f.fill(bufs)
+
+			if tc.expect != f.find(tc.consumed, false) {
+				t.Fatalf("unexpected resize result: want: %v got: %v", tc.expect, f.ioves[f.pos:])
+			}
+		})
+
+		t.Run(fmt.Sprintf("%s Continuously", tc.name), func(t *testing.T) {
+			if tc.expect != f2.find(tc.consumed, false) {
+				t.Fatalf("unexpected resize result: want: %v got: %v", tc.expect, f2.ioves[f2.pos:])
+			}
+		})
+	}
+}
+
+func TestWritevFindNext(t *testing.T) {
+	bufs := [][]byte{
+		{1, 2, 3, 4},
+		{5, 6, 7, 8, 9, 10, 11},
+		{12, 13},
+		{14, 15, 16, 17, 18, 19},
+		{20},
+	}
+
+	testCases := []struct {
+		name     string
+		consumed int64
+		expect   int
+	}{
+		{
+			name:     "Zero Consumed",
+			consumed: 0,
+			expect:   0,
+		},
+		{
+			name:     "Consumed First",
+			consumed: 2,
+			expect:   0,
+		},
+		{
+			name:     "Consumed First Edge",
+			consumed: 4,
+			expect:   1,
+		},
+		{
+			name:     "Consumed Second",
+			consumed: 7,
+			expect:   1,
+		},
+		{
+			name:     "Consumed Second Edge",
+			consumed: 11,
+			expect:   2,
+		},
+		{
+			name:     "Consumed Third",
+			consumed: 12,
+			expect:   2,
+		},
+		{
+			name:     "Consumed Third Edge",
+			consumed: 13,
+			expect:   3,
+		},
+
+		{
+			name:     "Consumed Fourth",
+			consumed: 17,
+			expect:   3,
+		},
+
+		{
+			name:     "Consumed Fourth Edge",
+			consumed: 19,
+			expect:   4,
+		},
+		{
+			name:     "Consumed Fifth Edge",
+			consumed: 20,
+			expect:   5,
+		},
+	}
+
+	f2 := newResizableIov()
+	f2.fill(bufs)
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newResizableIov()
+			f.fill(bufs)
+
+			if tc.expect != f.find(tc.consumed, true) {
+				t.Fatalf("unexpected resize result: want: %v got: %v", tc.expect, f.ioves[f.pos:])
+			}
+		})
+
+		t.Run(fmt.Sprintf("%s Continuously", tc.name), func(t *testing.T) {
+			if tc.expect != f2.find(tc.consumed, true) {
+				t.Fatalf("unexpected resize result: want: %v got: %v", tc.expect, f2.ioves[f2.pos:])
+			}
+		})
+	}
+}
+
 func TestWritevResize(t *testing.T) {
 	bufs := [][]byte{
 		{1, 2, 3, 4},
