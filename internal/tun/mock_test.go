@@ -207,6 +207,7 @@ func newBufferWriter(b bytes.Buffer) *bufferWriter {
 func (b *bufferWriter) Write(buf *mempool.Buffer) error {
 	defer mempool.Put(buf)
 	defer b.wg.Done()
+	fmt.Println(buf.Bytes())
 	_, err := b.Buffer.Write(buf.Bytes())
 	return err
 }
