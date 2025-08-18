@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"sync"
 	"testing"
 	"time"
 
@@ -171,12 +172,14 @@ func TestMockTun(t *testing.T) {
 
 	var buf bytes.Buffer
 	b := newBufferWriter(buf)
+	b.wg.Add(1)
 	NewHandler(context.Background(), tunInt, b)
 
-	execCommand("ping", "-c", "1", "10.168.168.2")
+	execCommand("ping", "-c", "1", "10.168.168.1")
 	var ip4 layers.IPv4
 	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &ip4)
 	decoded := []gopacket.LayerType{}
+	b.wg.Wait()
 
 	err = parser.DecodeLayers(buf.Bytes(), &decoded)
 	if err != nil {
@@ -193,6 +196,7 @@ func TestMockTun(t *testing.T) {
 }
 
 type bufferWriter struct {
+	wg sync.WaitGroup
 	bytes.Buffer
 }
 
@@ -202,6 +206,7 @@ func newBufferWriter(b bytes.Buffer) *bufferWriter {
 
 func (b *bufferWriter) Write(buf *mempool.Buffer) error {
 	defer mempool.Put(buf)
+	defer b.wg.Done()
 	_, err := b.Buffer.Write(buf.Bytes())
 	return err
 }
