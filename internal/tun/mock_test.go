@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -158,6 +157,41 @@ func TestComplete(t *testing.T) {
 }
 
 func TestMockTun(t *testing.T) {
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	b := newBufferWriter(func(buf *mempool.Buffer) {
+		var ip4 layers.IPv4
+		var icmp4 layers.ICMPv4
+		parser := gopacket.NewDecodingLayerParser(layers.LayerTypeIPv4, &ip4, &icmp4)
+		decoded := []gopacket.LayerType{}
+		parser.DecodeLayers(buf.Bytes(), &decoded)
+		handled := false
+
+		defer func() {
+			if handled {
+				wg.Done()
+			}
+		}()
+		for _, layerType := range decoded {
+			switch layerType {
+			case layers.LayerTypeICMPv4:
+				handled = true
+				if ip4.SrcIP.String() != "10.168.168.1" {
+					t.Errorf("unexpected src ip: want %s got %s", "10.168.168.1", ip4.SrcIP.String())
+					return
+				}
+				if ip4.DstIP.String() != "10.168.168.2" {
+					t.Errorf("unexpected src ip: want %s got %s", "10.168.168.2", ip4.DstIP.String())
+					return
+				}
+				if uint16(buf.Len()) != ip4.Length {
+					t.Errorf("unexpected buffer size: want %d got %d", buf.Len(), ip4.Length)
+				}
+			}
+		}
+	})
+
 	tunInt, err := CreateTUN("multipath-veth0", 1500)
 	if err != nil {
 		t.Error(err)
@@ -170,46 +204,26 @@ func TestMockTun(t *testing.T) {
 
 	defer execCommand("ip", "link", "del", "multipath-veth0")
 
-	var buf bytes.Buffer
-	b := newBufferWriter(&buf)
-	b.wg.Add(1)
 	NewHandler(context.Background(), tunInt, b)
 
-	execCommand("ping", "-c", "1", "10.168.168.1")
-	var ip4 layers.IPv4
-	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeIPv4, &ip4)
-	decoded := []gopacket.LayerType{}
-	b.wg.Wait()
+	execCommand("ping", "-W", "1", "-c", "1", "10.168.168.2")
+	execCommand("ping", "-W", "1", "-c", "1", "10.168.168.2")
 
-	err = parser.DecodeLayers(buf.Bytes(), &decoded)
-	if err != nil {
-		t.Error(err)
-		return
-	}
-
-	for _, layerType := range decoded {
-		switch layerType {
-		case layers.LayerTypeIPv4:
-			fmt.Println("    IP4 ", ip4.SrcIP, ip4.DstIP)
-		}
-	}
+	wg.Wait()
 }
 
 type bufferWriter struct {
-	wg sync.WaitGroup
-	*bytes.Buffer
+	onRecv func(*mempool.Buffer)
 }
 
-func newBufferWriter(b *bytes.Buffer) *bufferWriter {
-	return &bufferWriter{Buffer: b}
+func newBufferWriter(onRecv func(*mempool.Buffer)) *bufferWriter {
+	return &bufferWriter{onRecv: onRecv}
 }
 
 func (b *bufferWriter) Write(buf *mempool.Buffer) error {
-	defer mempool.Put(buf)
-	defer b.wg.Done()
-	fmt.Println(buf.Bytes())
-	_, err := b.Buffer.Write(buf.Bytes())
-	return err
+	b.onRecv(buf)
+	mempool.Put(buf)
+	return nil
 }
 
 func execCommand(cmd string, args ...string) {
