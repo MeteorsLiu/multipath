@@ -165,7 +165,7 @@ func TestMockTun(t *testing.T) {
 	defer tunInt.Close()
 
 	exec.Command("ip", "link", "set", "multipath-veth0", "up").Run()
-	exec.Command("ip", "a", "add", "10.168.168.1", "peer", "10.168.168.2").Run()
+	exec.Command("ip", "a", "add", "10.168.168.1", "peer", "10.168.168.2", "dev", "multipath-veth0").Run()
 
 	defer exec.Command("ip", "link", "del", "multipath-veth0").Run()
 
@@ -173,12 +173,16 @@ func TestMockTun(t *testing.T) {
 	b := newBufferWriter(buf)
 	NewHandler(context.Background(), tunInt, b)
 
-	exec.Command("ping", "-c", "1", "192.168.168.2").Run()
+	exec.Command("ping", "-c", "1", "10.168.168.2").Run()
 	var ip4 layers.IPv4
 	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &ip4)
 	decoded := []gopacket.LayerType{}
 
-	parser.DecodeLayers(buf.Bytes(), &decoded)
+	err = parser.DecodeLayers(buf.Bytes(), &decoded)
+	if err != nil {
+		t.Error(err)
+		return
+	}
 
 	for _, layerType := range decoded {
 		switch layerType {
