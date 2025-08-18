@@ -171,7 +171,7 @@ func TestMockTun(t *testing.T) {
 	defer execCommand("ip", "link", "del", "multipath-veth0")
 
 	var buf bytes.Buffer
-	b := newBufferWriter(buf)
+	b := newBufferWriter(&buf)
 	b.wg.Add(1)
 	NewHandler(context.Background(), tunInt, b)
 
@@ -197,10 +197,10 @@ func TestMockTun(t *testing.T) {
 
 type bufferWriter struct {
 	wg sync.WaitGroup
-	bytes.Buffer
+	*bytes.Buffer
 }
 
-func newBufferWriter(b bytes.Buffer) *bufferWriter {
+func newBufferWriter(b *bytes.Buffer) *bufferWriter {
 	return &bufferWriter{Buffer: b}
 }
 
