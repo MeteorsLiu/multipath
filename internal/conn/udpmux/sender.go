@@ -92,7 +92,7 @@ func (u *udpSender) writeLoop() {
 		bufs = bufs[:0]
 
 		if err != nil {
-			fmt.Println(err)
+			fmt.Println(u.remote.String(), err)
 			break
 		}
 	}

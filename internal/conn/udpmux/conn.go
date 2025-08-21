@@ -30,10 +30,6 @@ func DialConn(ctx context.Context, pm *conn.SenderManager, remoteAddr string, ou
 	if err != nil {
 		return nil, err
 	}
-	sendC, err := net.ListenPacket("udp", ":0")
-	if err != nil {
-		return nil, err
-	}
 
 	conn := &udpConn{manager: pm}
 	conn.ctx, conn.cancel = context.WithCancel(ctx)
@@ -43,7 +39,7 @@ func DialConn(ctx context.Context, pm *conn.SenderManager, remoteAddr string, ou
 	conn.sender = newUDPSender(conn.ctx, conn.prober.Out())
 
 	conn.receiver.Start()
-	conn.sender.Start(sendC, remoteUdpAddr)
+	conn.sender.Start(udpC, remoteUdpAddr)
 
 	pm.Add(conn.sender)
 
