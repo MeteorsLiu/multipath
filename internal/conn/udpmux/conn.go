@@ -31,20 +31,22 @@ func DialConn(ctx context.Context, pm *conn.SenderManager, remoteAddr string, ou
 		return nil, err
 	}
 
-	conn := &udpConn{manager: pm}
-	conn.ctx, conn.cancel = context.WithCancel(ctx)
-	conn.prober = prober.New(conn.ctx, conn.onProberEvent)
+	cn := &udpConn{manager: pm}
+	cn.ctx, cn.cancel = context.WithCancel(ctx)
+	cn.prober = prober.New(cn.ctx, cn.onProberEvent)
 
-	conn.receiver = newUDPReceiver(udpC, out, conn.prober.In(), conn.onRecvAddr)
-	conn.sender = newUDPSender(conn.ctx, conn.prober.Out())
+	cn.receiver = newUDPReceiver(udpC, out, cn.prober.In(), cn.onRecvAddr)
+	cn.sender = newUDPSender(cn.ctx, cn.prober.Out())
 
-	conn.receiver.Start()
-	conn.sender.Start(udpC, remoteUdpAddr)
-	conn.prober.Start()
+	cn.receiver.Start()
+	cn.sender.Start(udpC, remoteUdpAddr)
+	cn.prober.Start()
 
-	pm.Add(conn.sender)
+	pm.Add(remoteAddr, func() conn.ConnWriter {
+		return cn.sender
+	})
 
-	return conn, nil
+	return cn, nil
 }
 
 func ListenConn(ctx context.Context, pm *conn.SenderManager, local string, out chan<- *mempool.Buffer) (conn.MuxConn, error) {
@@ -69,7 +71,9 @@ func (c *udpConn) onProberEvent(event prober.Event) {
 	case prober.Disconnected:
 		c.manager.Remove(c.sender)
 	case prober.Normal:
-		c.manager.Add(c.sender)
+		c.manager.Add(c.sender.String(), func() conn.ConnWriter {
+			return c.sender
+		})
 	}
 }
 func (c *udpConn) onRecvAddr(addr string) {
