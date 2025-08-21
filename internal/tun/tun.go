@@ -2,11 +2,13 @@ package tun
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 
 	"github.com/MeteorsLiu/multipath/internal/conn"
 	"github.com/MeteorsLiu/multipath/internal/mempool"
+	"github.com/MeteorsLiu/multipath/internal/scheduler"
 )
 
 type OSTun interface {
@@ -86,7 +88,7 @@ func (u *TunHandler) readLoop() {
 			break
 		}
 		buf.SetLen(n)
-		if err := u.outWriter.Write(buf); err != nil {
+		if err := u.outWriter.Write(buf); err != nil && !errors.Is(err, scheduler.ErrNoPath) {
 			fmt.Println("readloop exit: ", err)
 			break
 		}
