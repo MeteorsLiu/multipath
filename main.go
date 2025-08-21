@@ -20,11 +20,16 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	var close func()
 	if cfg.IsServerSide {
-		NewServer(ctx, cfg)
+		close, err = NewServer(ctx, cfg)
 	} else {
-		NewClient(ctx, cfg)
+		close, err = NewClient(ctx, cfg)
 	}
+	if err != nil {
+		panic(err)
+	}
+	defer close()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)

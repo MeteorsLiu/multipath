@@ -82,13 +82,13 @@ func (u *TunHandler) readLoop() {
 		buf := mempool.Get(1500)
 		n, err := u.osTun.Read(buf.Bytes())
 		if err != nil {
-			fmt.Println("readloop exits: ", err)
-			return
+			fmt.Println("readloop exit: ", err)
+			break
 		}
 		buf.SetLen(n)
 		if err := u.outWriter.Write(buf); err != nil {
-			fmt.Println("readloop exits: ", err)
-			return
+			fmt.Println("readloop exit: ", err)
+			break
 		}
 	}
 }

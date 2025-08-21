@@ -44,7 +44,7 @@ func NewServer(ctx context.Context, cfg Config) (closeFn func(), err error) {
 
 	return func() {
 		tunInterface.Close()
-
 	}, nil
-
 }
+
+// 2018

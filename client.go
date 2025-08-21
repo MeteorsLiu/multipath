@@ -11,9 +11,9 @@ import (
 	"github.com/MeteorsLiu/multipath/internal/tun"
 )
 
-func NewClient(ctx context.Context, cfg Config) error {
+func NewClient(ctx context.Context, cfg Config) (func(), error) {
 	if len(cfg.Client.Remotes) == 0 {
-		return fmt.Errorf("failed to init client: no remote paths found")
+		return nil, fmt.Errorf("failed to init client: no remote paths found")
 	}
 
 	pathMap := newSchedulablePathManager()
@@ -35,9 +35,8 @@ func NewClient(ctx context.Context, cfg Config) error {
 
 	tunInterface, err := tun.CreateTUN(cfg.TunName, conn.MTUSize)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer tunInterface.Close()
 
 	tunModule := tun.NewHandler(ctx, tunInterface, sche)
 
@@ -45,6 +44,7 @@ func NewClient(ctx context.Context, cfg Config) error {
 		udpmux.DialConn(ctx, manager, path.RemoteAddr, tunModule.In())
 	}
 
-	return nil
-
+	return func() {
+		tunInterface.Close()
+	}, nil
 }

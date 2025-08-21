@@ -59,9 +59,5 @@ func (f *batchReader) ReadBatch(b [][]byte) (nums int, n int64, err error) {
 		err = err2
 	}
 
-	if n > 0 && err == nil {
-		nums = f.ioves.find(n, false)
-	}
-
 	return
 }

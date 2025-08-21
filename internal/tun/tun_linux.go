@@ -184,48 +184,7 @@ func (tun *tunDevice) Read(buf []byte) (int, error) {
 
 // TODO: GRO Support
 func (tun *tunDevice) ReadBatch(bufs [][]byte) (int, int64, error) {
-	pos, n, err := tun.fallbackReader.ReadBatch(bufs)
-	if err != nil {
-		return 0, 0, err
-	}
-
-	// check the last buffer is complete, this may happen when Go runtime preempts current Goroutine.
-	// if not, finish reading the left parts in tun device
-
-	bufLen := n
-	for i := 0; i < pos-1; i++ {
-		bufLen -= int64(len(bufs[i]))
-	}
-	// our minimum requirement is a ipv4 header
-	if bufLen < 20 {
-		var nr int
-
-		nr, err = io.ReadFull(tun.tunFile, bufs[pos][bufLen:20])
-		if err != nil {
-			return 0, 0, err
-		}
-
-		if nr > 0 {
-			n += int64(nr)
-			bufLen += int64(nr)
-		}
-	}
-
-	size, err := ip.Header(bufs[pos]).Size()
-	if err != nil {
-		return 0, 0, err
-	}
-
-	if size > uint16(bufLen) {
-		var nr int
-
-		nr, err = io.ReadFull(tun.tunFile, bufs[pos][bufLen:size])
-
-		if nr > 0 {
-			n += int64(nr)
-		}
-	}
-	return pos + 1, n, err
+	return tun.fallbackReader.ReadBatch(bufs)
 }
 
 func (tun *tunDevice) Close() error {
