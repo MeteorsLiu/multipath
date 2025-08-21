@@ -9,6 +9,16 @@ const (
 	TunEncap
 )
 
+func (p PacketType) String() string {
+	switch p {
+	case HeartBeat:
+		return "heartbeat"
+	case TunEncap:
+		return "tun"
+	}
+	return "unknown"
+}
+
 type Header []byte
 
 func MakeHeader(buf []byte, pktType PacketType) (headerSize int) {

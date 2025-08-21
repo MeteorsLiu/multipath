@@ -2,6 +2,7 @@ package udpmux
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"sync"
 
@@ -31,6 +32,8 @@ func (u *udpSender) waitInPacket(bufs *[][]byte, pendingBuf *[]*mempool.Buffer, 
 	appendPacket := func(pkt *mempool.Buffer, packetType protocol.PacketType) {
 
 		headerSize := protocol.MakeHeader(headerBuf, packetType)
+
+		fmt.Println("append: ", packetType.String())
 
 		header := headerBuf[0:headerSize]
 
@@ -89,6 +92,7 @@ func (u *udpSender) writeLoop() {
 		bufs = bufs[:0]
 
 		if err != nil {
+			fmt.Println(err)
 			break
 		}
 	}
