@@ -1,6 +1,7 @@
 package udpmux
 
 import (
+	"fmt"
 	"net"
 	"sync"
 
@@ -152,6 +153,7 @@ func (u *udpReader) readLoop() {
 
 func (u *udpReader) Start() {
 	u.startOnce.Do(func() {
+		fmt.Println("start listening at ", u.conn.LocalAddr())
 		go u.readLoop()
 	})
 }
