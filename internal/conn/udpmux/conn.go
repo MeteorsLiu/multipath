@@ -26,7 +26,7 @@ func DialConn(ctx context.Context, pm *conn.SenderManager, remoteAddr string, ou
 	if err != nil {
 		return nil, err
 	}
-	udpC, err := net.ListenPacket("udp", ":0")
+	udpC, err := net.DialUDP("udp", nil, remoteUdpAddr)
 	if err != nil {
 		return nil, err
 	}
