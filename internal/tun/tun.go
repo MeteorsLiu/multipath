@@ -24,9 +24,12 @@ type TunHandler struct {
 
 func NewHandler(ctx context.Context, tunInterface OSTun, outWriter mempool.Writer) *TunHandler {
 	t := &TunHandler{ctx: ctx, osTun: tunInterface, inCh: make(chan *mempool.Buffer, 1024), outWriter: outWriter}
+	return t
+}
+
+func (t *TunHandler) Start() {
 	go t.writeLoop()
 	go t.readLoop()
-	return t
 }
 
 func (t *TunHandler) In() chan<- *mempool.Buffer {
