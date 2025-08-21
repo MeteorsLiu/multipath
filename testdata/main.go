@@ -23,7 +23,7 @@ const (
 }`
 	cfgFileServer = `{
 	"server": {
-		listen: "0.0.0.0:29999"
+		"listen": "0.0.0.0:29999"
 	},
 	"isServer": true
 }`
