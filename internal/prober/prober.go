@@ -264,7 +264,7 @@ func (p *Prober) switchState(to Event) {
 // Lost -> Disconnect (When one packet reaches the maximum deadline, 15s)
 // Disconnect -> Lost (When 1 packets meets estimated RTT requirement)
 // Lost -> Normal: See Normal <-> Lost
-func (p *Prober) Run() {
+func (p *Prober) start() {
 	p.sendProbePacket()
 
 	for {
@@ -283,4 +283,8 @@ func (p *Prober) Run() {
 			}
 		}
 	}
+}
+
+func (p *Prober) Start() {
+	go p.start()
 }

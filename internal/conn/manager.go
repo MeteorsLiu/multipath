@@ -40,12 +40,13 @@ func (pm *SenderManager) onRemovePath(conn ConnWriter) {
 	}
 }
 
-func (pm *SenderManager) Add(conn ConnWriter) (succ bool) {
-	if conn == nil {
-		return false
-	}
+func (pm *SenderManager) Add(addr string, fn func() ConnWriter) (conn ConnWriter, succ bool) {
 	pm.mu.Lock()
-	if _, ok := pm.connMap[conn.String()]; !ok {
+	if _, ok := pm.connMap[addr]; ok {
+		pm.mu.Unlock()
+		return
+	}
+	if conn = fn(); conn != nil {
 		succ = true
 		pm.connMap[conn.String()] = conn
 	}

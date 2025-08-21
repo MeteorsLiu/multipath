@@ -40,6 +40,7 @@ func DialConn(ctx context.Context, pm *conn.SenderManager, remoteAddr string, ou
 
 	conn.receiver.Start()
 	conn.sender.Start(udpC, remoteUdpAddr)
+	conn.prober.Start()
 
 	pm.Add(conn.sender)
 
@@ -75,17 +76,18 @@ func (c *udpConn) onRecvAddr(addr string) {
 	if !c.isServerSide {
 		return
 	}
-	fmt.Println("recv", addr)
-	remoteAddr, err := net.ResolveUDPAddr("udp", addr)
-	if err != nil {
-		fmt.Println("failed to parse udp addr when onRecvAddr: ", err)
-		return
-	}
-	localC, err := net.ListenPacket("udp", ":0")
-	if err != nil {
-		fmt.Println("failed to listen udp when onRecvAddr: ", err)
-		return
-	}
-	c.sender.Start(localC, remoteAddr)
-	c.manager.Add(c.sender)
+	c.manager.Add(addr, func() conn.ConnWriter {
+		remoteAddr, err := net.ResolveUDPAddr("udp", addr)
+		if err != nil {
+			fmt.Println("failed to parse udp addr when onRecvAddr: ", err)
+			return nil
+		}
+		localC, err := net.ListenPacket("udp", ":0")
+		if err != nil {
+			fmt.Println("failed to listen udp when onRecvAddr: ", err)
+			return nil
+		}
+		c.sender.Start(localC, remoteAddr)
+		return c.sender
+	})
 }
