@@ -88,7 +88,13 @@ func (u *TunHandler) readLoop() {
 			break
 		}
 		buf.SetLen(n)
-		if err := u.outWriter.Write(buf); err != nil && !errors.Is(err, scheduler.ErrNoPath) {
+		err = u.outWriter.Write(buf)
+
+		if errors.Is(err, scheduler.ErrNoPath) {
+			mempool.Put(buf)
+			continue
+		}
+		if err != nil {
 			fmt.Println("readloop exit: ", err)
 			break
 		}
