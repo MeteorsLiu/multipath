@@ -131,6 +131,7 @@ func (u *udpReader) readLoop() {
 		}
 
 		numMsgs, _, err := batchReader.ReadBatch(bufBytes)
+		fmt.Println("recv", numMsgs, err)
 		if err != nil {
 			break
 		}
