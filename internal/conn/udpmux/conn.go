@@ -75,6 +75,7 @@ func (c *udpConn) onRecvAddr(addr string) {
 	if !c.isServerSide {
 		return
 	}
+	fmt.Println("recv", addr)
 	remoteAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
 		fmt.Println("failed to parse udp addr when onRecvAddr: ", err)
