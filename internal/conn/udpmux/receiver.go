@@ -92,7 +92,7 @@ func (u *udpReader) handlePacket(buf *mempool.Buffer) error {
 
 	payload := buf.Bytes()
 
-	fmt.Println(payload)
+	fmt.Println(header.Type(), payload)
 
 	switch header.Type() {
 	case protocol.HeartBeat:
