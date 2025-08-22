@@ -86,7 +86,7 @@ func (u *udpReader) handlePacket(buf *mempool.Buffer) error {
 			return nil
 		}
 	}
-	fmt.Println(buf.Bytes())
+	fmt.Println("headerbuf", buf.Bytes())
 
 	// TODO: allow different protocol
 	headerBuf := buf.Peek(protocol.HeaderSize)
