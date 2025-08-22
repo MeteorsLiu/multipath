@@ -18,7 +18,7 @@ const (
 	cfgFileClient = `{
 	"client": {
 		"remotePaths": [{
-			"remoteAddr": "192.168.167.55:29999",
+			"remoteAddr": "192.168.167.155:29999",
 			"weight": 1
 		}]
 	}
