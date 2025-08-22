@@ -92,6 +92,8 @@ func (u *udpReader) handlePacket(buf *mempool.Buffer) error {
 
 	payload := buf.Bytes()
 
+	fmt.Println(payload)
+
 	switch header.Type() {
 	case protocol.HeartBeat:
 		buf.SetLen(prober.NonceSize)
