@@ -45,8 +45,8 @@ func (u *udpSender) waitInPacket(bufs *[][]byte, pendingBuf *[]*mempool.Buffer, 
 	}
 
 	select {
-	case pkt := <-u.proberCh:
-		appendPacket(pkt, protocol.HeartBeat)
+	case <-u.proberCh:
+		// appendPacket(pkt, protocol.HeartBeat)
 	case pkt := <-u.queue:
 		appendPacket(pkt, protocol.TunEncap)
 	case <-u.ctx.Done():
