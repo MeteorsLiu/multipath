@@ -86,8 +86,6 @@ func (u *udpReader) handlePacket(buf *mempool.Buffer) error {
 			return nil
 		}
 	}
-	fmt.Println("headerbuf", buf.Bytes())
-
 	// TODO: allow different protocol
 	headerBuf := buf.Peek(protocol.HeaderSize)
 	header := protocol.Header(headerBuf)
@@ -146,12 +144,13 @@ func (u *udpReader) readLoop() {
 			msg := batchReader.MessageAt(i)
 
 			bufs[i].SetLen(msg.N)
-			u.handlePacket(bufs[i])
+			fmt.Println(bufs[i].Bytes())
+			// u.handlePacket(bufs[i])
 
 			u.onRecvAddr(msg.Addr.String())
 			// buffers in queue will be put back into the pool after consumed.
 			// so we can grab a new buffer here
-			bufs[i] = mempool.Get(1500)
+			// bufs[i] = mempool.Get(1500)
 		}
 		// avoid memory leak
 		bufBytes = bufBytes[:0]

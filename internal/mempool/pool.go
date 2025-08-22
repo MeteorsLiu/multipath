@@ -89,7 +89,8 @@ func (b *Buffer) Consume(n int) {
 }
 
 func (b *Buffer) GrowTo(n int) {
-	if b.Len() >= n {
+	if b.Cap() >= n {
+		b.SetLen(n)
 		return
 	}
 	newBuf := Get(n)
