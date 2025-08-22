@@ -86,13 +86,16 @@ func (u *udpReader) handlePacket(buf *mempool.Buffer) error {
 			return nil
 		}
 	}
+	fmt.Println(buf.Bytes())
+
 	// TODO: allow different protocol
 	headerBuf := buf.Peek(protocol.HeaderSize)
 	header := protocol.Header(headerBuf)
+	fmt.Println(header.Type())
 
 	payload := buf.Bytes()
 
-	fmt.Println(header.Type(), payload)
+	fmt.Println(payload)
 
 	switch header.Type() {
 	case protocol.HeartBeat:
@@ -111,6 +114,7 @@ func (u *udpReader) handlePacket(buf *mempool.Buffer) error {
 			u.pending.Set(buf, fullSize)
 			return nil
 		}
+
 	}
 
 	u.outCh <- buf
