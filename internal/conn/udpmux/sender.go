@@ -30,9 +30,6 @@ func newUDPSender(ctx context.Context, probeCh <-chan *mempool.Buffer) *udpSende
 
 func (u *udpSender) waitInPacket(bufs *[][]byte, pendingBuf *[]*mempool.Buffer, headerBuf []byte) error {
 	appendPacket := func(pkt *mempool.Buffer, packetType protocol.PacketType) {
-		if packetType == protocol.HeartBeat {
-			return
-		}
 		headerSize := protocol.MakeHeader(headerBuf, packetType)
 
 		fmt.Println("append: ", packetType.String())

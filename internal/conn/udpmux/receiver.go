@@ -14,6 +14,7 @@ import (
 
 type pending struct {
 	buf        *mempool.Buffer
+	pktType    protocol.PacketType
 	expectSize int
 }
 
@@ -21,8 +22,9 @@ func newPending() *pending {
 	return &pending{}
 }
 
-func (p *pending) Set(buf *mempool.Buffer, expect int) {
+func (p *pending) Set(buf *mempool.Buffer, expect int, pktType protocol.PacketType) {
 	p.buf = buf
+	p.pktType = pktType
 	p.expectSize = expect
 }
 
@@ -43,10 +45,10 @@ func (p *pending) Write(buf *mempool.Buffer) bool {
 	return p.buf.ConsumedBytes() >= p.expectSize
 }
 
-func (p *pending) Buffer() *mempool.Buffer {
+func (p *pending) Buffer() (buf *mempool.Buffer, pktType protocol.PacketType) {
 	// skip header
 	p.buf.OffsetTo(protocol.HeaderSize)
-	return p.buf
+	return p.buf, pktType
 }
 
 type udpReader struct {
@@ -77,27 +79,39 @@ func newUDPReceiver(
 
 func (u *udpReader) handlePacket(buf *mempool.Buffer) error {
 	if u.pending.HasData() {
-		if u.pending.Write(buf) {
-			u.outCh <- u.pending.Buffer()
-			u.pending.Reset()
+		done := u.pending.Write(buf)
+
+		if done {
+			buf, pktType := u.pending.Buffer()
+
+			switch pktType {
+			case protocol.HeartBeat:
+				u.proberIn <- buf
+			case protocol.TunEncap:
+				u.outCh <- buf
+			}
 		}
 		if buf.Len() == 0 {
 			mempool.Put(buf)
 			return nil
 		}
+		panic("invalid buffer")
 	}
 	// TODO: allow different protocol
 	headerBuf := buf.Peek(protocol.HeaderSize)
 	header := protocol.Header(headerBuf)
-	fmt.Println(header.Type())
 
 	payload := buf.Bytes()
 
-	fmt.Println(payload)
-
 	switch header.Type() {
 	case protocol.HeartBeat:
+		if len(payload) < prober.NonceSize {
+			buf.GrowTo(prober.NonceSize + protocol.HeaderSize)
+			u.pending.Set(buf, prober.NonceSize, protocol.HeartBeat)
+			return nil
+		}
 		buf.SetLen(prober.NonceSize)
+		u.proberIn <- buf
 	case protocol.TunEncap:
 		payloadSize, err := ip.Header(payload).Size()
 		if err != nil {
@@ -109,14 +123,11 @@ func (u *udpReader) handlePacket(buf *mempool.Buffer) error {
 		if size < fullSize {
 			buf.GrowTo(fullSize + protocol.HeaderSize)
 			buf.Consume(size)
-			u.pending.Set(buf, fullSize)
+			u.pending.Set(buf, fullSize, protocol.TunEncap)
 			return nil
 		}
-
+		u.outCh <- buf
 	}
-
-	u.outCh <- buf
-
 	return nil
 }
 
