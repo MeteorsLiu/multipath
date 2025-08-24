@@ -1,5 +1,7 @@
 package protocol
 
+import "io"
+
 const HeaderSize = 1
 
 type PacketType byte
@@ -21,9 +23,11 @@ func (p PacketType) String() string {
 
 type Header []byte
 
-func MakeHeader(buf []byte, pktType PacketType) (headerSize int) {
-	buf[0] = byte(pktType)
-	return 1
+func MakeHeader(writer io.WriterAt, pktType PacketType) (headerSize int) {
+	var header [1]byte
+	header[0] = byte(pktType)
+	headerSize, _ = writer.WriteAt(header[:], 0)
+	return
 }
 
 func (h Header) Type() PacketType {

@@ -84,7 +84,7 @@ func (u *TunHandler) writeLoop() {
 
 func (u *TunHandler) readLoop() {
 	for {
-		buf := mempool.Get(1500)
+		buf := mempool.GetWithHeader(1500)
 		n, err := u.osTun.Read(buf.Bytes())
 		if err != nil {
 			fmt.Println("readloop exit: ", err)

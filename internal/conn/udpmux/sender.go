@@ -28,19 +28,14 @@ func newUDPSender(ctx context.Context, probeCh <-chan *mempool.Buffer) *udpSende
 	return &udpSender{ctx: ctx, queue: make(chan *mempool.Buffer, 1024), proberCh: probeCh}
 }
 
-func (u *udpSender) waitInPacket(bufs *[][]byte, pendingBuf *[]*mempool.Buffer, headerBuf []byte) error {
+func (u *udpSender) waitInPacket(bufs *[][]byte, pendingBuf *[]*mempool.Buffer) error {
 	appendPacket := func(pkt *mempool.Buffer, packetType protocol.PacketType) {
-		headerSize := protocol.MakeHeader(headerBuf, packetType)
+		protocol.MakeHeader(pkt, packetType)
 
 		fmt.Println("append: ", packetType.String())
 
-		header := headerBuf[0:headerSize]
-
-		*bufs = append(*bufs, header)
 		*bufs = append(*bufs, pkt.Bytes())
 		*pendingBuf = append(*pendingBuf, pkt)
-
-		headerBuf = headerBuf[headerSize:]
 	}
 
 	select {
@@ -71,14 +66,11 @@ func (u *udpSender) waitInPacket(bufs *[][]byte, pendingBuf *[]*mempool.Buffer, 
 func (u *udpSender) writeLoop() {
 	bufs := make([][]byte, 0, 1024)
 	pb := make([]*mempool.Buffer, 0, 1024)
-	const headerSize = 1024 * protocol.HeaderSize
-
-	headerBuf := make([]byte, headerSize)
 
 	batchWriter := udp.NewWriterV4(u.conn, u.remote)
 
 	for {
-		err := u.waitInPacket(&bufs, &pb, headerBuf)
+		err := u.waitInPacket(&bufs, &pb)
 		if err != nil {
 			break
 		}

@@ -7,6 +7,8 @@ import (
 	"io"
 	"math/bits"
 	"sync"
+
+	"github.com/MeteorsLiu/multipath/internal/conn/udpmux/protocol"
 )
 
 type Writer interface {
@@ -24,7 +26,14 @@ type Buffer struct {
 	pos int
 }
 
+var _ io.WriterAt = (*Buffer)(nil)
+
 func ToBuffer(b []byte) *Buffer { return &Buffer{b: b} }
+
+func (b *Buffer) WriteAt(p []byte, off int64) (n int, err error) {
+	n = copy(b.b[off:], p)
+	return
+}
 
 func (b *Buffer) Read(buf []byte) (n int, err error) {
 	n = copy(buf, b.b[b.pos:])
@@ -104,6 +113,15 @@ func (b *Buffer) GrowTo(n int) {
 
 func (b *Buffer) ConsumedBytes() int {
 	return b.pos
+}
+
+func GetWithHeader(size int) *Buffer {
+	if defaultAllocator == nil {
+		return nil
+	}
+	buf := defaultAllocator.Get(size + protocol.HeaderSize)
+	buf.OffsetTo(protocol.HeaderSize)
+	return buf
 }
 
 func Get(size int) *Buffer {
