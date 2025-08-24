@@ -119,15 +119,13 @@ func (u *udpReader) handlePacket(buf *mempool.Buffer) error {
 		if err != nil {
 			return nil
 		}
-		size := buf.Len()
+		size := len(payload)
 		fullSize := int(payloadSize)
 
 		if size < fullSize {
 			buf.GrowTo(fullSize + protocol.HeaderSize)
 			buf.Consume(size)
 			u.pending.Set(buf, fullSize, protocol.TunEncap)
-
-			fmt.Println("small", fullSize, size)
 			return nil
 		}
 		u.outCh <- buf
