@@ -32,8 +32,11 @@ func (u *udpSender) waitInPacket(bufs *[][]byte, pendingBuf *[]*mempool.Buffer) 
 	appendPacket := func(pkt *mempool.Buffer, packetType protocol.PacketType) {
 		protocol.MakeHeader(pkt, packetType)
 
+		size := pkt.Len()
 		pkt.OffsetTo(0)
+		pkt.SetLen(size + 1)
 
+		fmt.Println(pkt.Bytes())
 		*bufs = append(*bufs, pkt.Bytes())
 		*pendingBuf = append(*pendingBuf, pkt)
 	}
