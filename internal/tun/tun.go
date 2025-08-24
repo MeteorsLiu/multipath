@@ -7,6 +7,7 @@ import (
 	"io"
 
 	"github.com/MeteorsLiu/multipath/internal/conn"
+	"github.com/MeteorsLiu/multipath/internal/conn/udpmux/protocol"
 	"github.com/MeteorsLiu/multipath/internal/mempool"
 	"github.com/MeteorsLiu/multipath/internal/scheduler"
 )
@@ -90,7 +91,7 @@ func (u *TunHandler) readLoop() {
 			fmt.Println("readloop exit: ", err)
 			break
 		}
-		buf.SetLen(n)
+		buf.SetLen(n + protocol.HeaderSize)
 		err = u.outWriter.Write(buf)
 
 		if errors.Is(err, scheduler.ErrNoPath) {
