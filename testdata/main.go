@@ -17,6 +17,12 @@ const (
 	cfgFileClient = `{
 	"client": {
 		"remotePaths": [{
+			"remoteAddr": "192.168.167.155:29997",
+			"weight": 1
+		},{
+			"remoteAddr": "192.168.167.155:29998",
+			"weight": 1
+		},{
 			"remoteAddr": "192.168.167.155:29999",
 			"weight": 1
 		}]
@@ -62,10 +68,60 @@ func mockServer(l net.Listener) {
 }
 
 func mockClient(c net.Conn) {
-	_, err := c.Write(buf)
+	const bufSizeHalf = 1024 * 1024 / 2
+	_, err := c.Write(buf[0:bufSizeHalf])
 	if err != nil {
 		printInfoAndExit("%v", err)
 	}
+	_, err = c.Write(buf[bufSizeHalf : bufSizeHalf+bufSizeHalf])
+	if err != nil {
+		printInfoAndExit("%v", err)
+	}
+	_, err = c.Write(buf[bufSizeHalf+bufSizeHalf:])
+	if err != nil {
+		printInfoAndExit("%v", err)
+	}
+
+}
+
+func setupForwarder() {
+	execCommand("iptables",
+		"-t", "nat",
+		"-A", "PREROUTING",
+		"-p", "udp",
+		"--dport", "29997",
+		"-j", "DNAT",
+		"--to-destination", "127.0.0.1:29999")
+
+	execCommand("iptables",
+		"-t", "nat",
+		"-A", "PREROUTING",
+		"-p", "udp",
+		"--dport", "29998",
+		"-j", "DNAT",
+		"--to-destination", "127.0.0.1:29999")
+
+	execCommand("iptables", "-t", "nat", "-A", "POSTROUTING", "-j", "MASQUERADE")
+}
+
+func delForwarder() {
+	execCommand("iptables",
+		"-t", "nat",
+		"-D", "PREROUTING",
+		"-p", "udp",
+		"--dport", "29997",
+		"-j", "DNAT",
+		"--to-destination", "127.0.0.1:29999")
+
+	execCommand("iptables",
+		"-t", "nat",
+		"-D", "PREROUTING",
+		"-p", "udp",
+		"--dport", "29998",
+		"-j", "DNAT",
+		"--to-destination", "127.0.0.1:29999")
+
+	execCommand("iptables", "-t", "nat", "-D", "POSTROUTING", "-j", "MASQUERADE")
 }
 
 func main() {
@@ -99,7 +155,9 @@ func main() {
 
 	execCommand("ip", "link", "set", "multipath-veth0", "up")
 	if testServer {
+		setupForwarder()
 		execCommand("ip", "a", "add", "10.168.168.1", "peer", "10.168.168.2", "dev", "multipath-veth0")
+		defer delForwarder()
 	} else {
 		execCommand("ip", "a", "add", "10.168.168.2", "peer", "10.168.168.1", "dev", "multipath-veth0")
 	}
