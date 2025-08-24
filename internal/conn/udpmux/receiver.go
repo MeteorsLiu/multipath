@@ -103,8 +103,6 @@ func (u *udpReader) handlePacket(buf *mempool.Buffer) error {
 
 	payload := buf.Bytes()
 
-	fmt.Println(header.Type(), payload)
-
 	switch header.Type() {
 	case protocol.HeartBeat:
 		if len(payload) < prober.NonceSize {
@@ -149,7 +147,6 @@ func (u *udpReader) readLoop() {
 		}
 
 		numMsgs, _, err := batchReader.ReadBatch(bufBytes)
-		fmt.Println("recv", numMsgs, err)
 		if err != nil {
 			break
 		}
