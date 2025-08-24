@@ -165,7 +165,7 @@ func (u *udpReader) readLoop() {
 			u.onRecvAddr(msg.Addr.String())
 			// buffers in queue will be put back into the pool after consumed.
 			// so we can grab a new buffer here
-			// bufs[i] = mempool.Get(1500)
+			bufs[i] = mempool.Get(1500)
 		}
 		// avoid memory leak
 		bufBytes = bufBytes[:0]
