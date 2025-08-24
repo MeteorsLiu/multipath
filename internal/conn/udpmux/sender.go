@@ -34,7 +34,6 @@ func (u *udpSender) waitInPacket(bufs *[][]byte, pendingBuf *[]*mempool.Buffer) 
 
 		pkt.OffsetTo(0)
 
-		fmt.Println("sent", pkt.Bytes())
 		*bufs = append(*bufs, pkt.Bytes())
 		*pendingBuf = append(*pendingBuf, pkt)
 	}
