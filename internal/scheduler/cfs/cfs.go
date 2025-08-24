@@ -24,8 +24,6 @@ func (h *pathHeap) Push(x any) {
 	item := x.(*cfsPath)
 	item.heapIdx = n
 	*h = append(*h, item)
-
-	fmt.Println(item.heapIdx)
 }
 
 func (h *pathHeap) Pop() any {
@@ -75,7 +73,7 @@ func (s *schedulerImpl) findBestPath(size int) (*cfsPath, error) {
 	if s.heap.Len() == 0 {
 		return nil, scheduler.ErrNoPath
 	}
-	bestPath := s.heap[len(s.heap)-1]
+	bestPath := s.heap[0]
 	bestPath.beforeWrite(size)
 	heap.Fix(&s.heap, bestPath.heapIdx)
 	return bestPath, nil
