@@ -159,7 +159,7 @@ func (u *udpReader) readLoop() {
 			msg := batchReader.MessageAt(i)
 
 			bufs[i].SetLen(msg.N)
-			// fmt.Println(bufs[i].Bytes())
+			fmt.Println(bufs[i].Bytes())
 			u.handlePacket(bufs[i])
 
 			u.onRecvAddr(msg.Addr.String())
