@@ -103,6 +103,8 @@ func (u *udpReader) handlePacket(buf *mempool.Buffer) error {
 
 	payload := buf.Bytes()
 
+	fmt.Println(header.Type(), payload)
+
 	switch header.Type() {
 	case protocol.HeartBeat:
 		if len(payload) < prober.NonceSize {
@@ -124,6 +126,8 @@ func (u *udpReader) handlePacket(buf *mempool.Buffer) error {
 			buf.GrowTo(fullSize + protocol.HeaderSize)
 			buf.Consume(size)
 			u.pending.Set(buf, fullSize, protocol.TunEncap)
+
+			fmt.Println("small", fullSize, size)
 			return nil
 		}
 		u.outCh <- buf
