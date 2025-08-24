@@ -95,7 +95,7 @@ func (u *udpReader) handlePacket(buf *mempool.Buffer) error {
 			mempool.Put(buf)
 			return nil
 		}
-		fmt.Println(buf.Bytes())
+		fmt.Println("left", buf.Bytes())
 	}
 	// TODO: allow different protocol
 	headerBuf := buf.Peek(protocol.HeaderSize)
@@ -126,7 +126,7 @@ func (u *udpReader) handlePacket(buf *mempool.Buffer) error {
 			buf.GrowTo(fullSize + protocol.HeaderSize)
 			buf.Consume(size)
 			u.pending.Set(buf, fullSize, protocol.TunEncap)
-			fmt.Println("small")
+			fmt.Println("small", size, fullSize)
 			return nil
 		}
 		u.outCh <- buf
