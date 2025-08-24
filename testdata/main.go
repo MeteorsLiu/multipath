@@ -35,7 +35,7 @@ var buf = make([]byte, 16384)
 var sigCh = make(chan os.Signal, 1)
 
 func printInfoAndExit(f string, err ...any) {
-	log.Printf(f, err)
+	log.Printf(f, err...)
 	sigCh <- os.Kill
 }
 
