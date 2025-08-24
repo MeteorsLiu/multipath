@@ -105,6 +105,7 @@ func setupForwarder() {
 }
 
 func delForwarder() {
+	execCommand("iptables", "-t", "nat", "-nvL")
 	execCommand("iptables",
 		"-t", "nat",
 		"-D", "PREROUTING",
