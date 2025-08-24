@@ -34,8 +34,6 @@ func (u *udpSender) waitInPacket(bufs *[][]byte, pendingBuf *[]*mempool.Buffer) 
 
 		pkt.OffsetTo(0)
 
-		fmt.Println("append: ", packetType.String())
-
 		*bufs = append(*bufs, pkt.Bytes())
 		*pendingBuf = append(*pendingBuf, pkt)
 	}
@@ -49,7 +47,7 @@ func (u *udpSender) waitInPacket(bufs *[][]byte, pendingBuf *[]*mempool.Buffer) 
 		return u.ctx.Err()
 	}
 
-	for len(*bufs) < 1024-2 {
+	for len(*bufs) < 1024 {
 		select {
 		case pkt := <-u.proberCh:
 			appendPacket(pkt, protocol.HeartBeat)

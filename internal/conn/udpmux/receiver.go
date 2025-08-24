@@ -155,8 +155,8 @@ func (u *udpReader) readLoop() {
 			msg := batchReader.MessageAt(i)
 
 			bufs[i].SetLen(msg.N)
-			fmt.Println(bufs[i].Bytes())
-			// u.handlePacket(bufs[i])
+			// fmt.Println(bufs[i].Bytes())
+			u.handlePacket(bufs[i])
 
 			u.onRecvAddr(msg.Addr.String())
 			// buffers in queue will be put back into the pool after consumed.
