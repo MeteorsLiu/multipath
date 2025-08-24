@@ -141,6 +141,8 @@ func (u *udpReader) readLoop() {
 
 	batchReader := udp.NewReaderV4(u.conn)
 
+	trafficMap := make(map[string]int64)
+
 	for {
 		for _, b := range bufs {
 			bufBytes = append(bufBytes, b.Bytes())
@@ -156,6 +158,9 @@ func (u *udpReader) readLoop() {
 
 			bufs[i].SetLen(msg.N)
 			u.handlePacket(bufs[i])
+
+			trafficMap[msg.Addr.String()] += int64(msg.N)
+			fmt.Println(trafficMap[msg.Addr.String()])
 
 			u.onRecvAddr(msg.Addr.String())
 			// buffers in queue will be put back into the pool after consumed.
