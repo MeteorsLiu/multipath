@@ -47,7 +47,7 @@ func mockServer(l net.Listener) {
 		go func(conn net.Conn) {
 			defer conn.Close()
 
-			tBuf := make([]byte, 16384)
+			tBuf := make([]byte, 1024*1024)
 			_, err := io.ReadFull(conn, tBuf)
 			if err != nil {
 				printInfoAndExit("%v", err)
