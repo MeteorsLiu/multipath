@@ -24,6 +24,8 @@ func (h *pathHeap) Push(x any) {
 	item := x.(*cfsPath)
 	item.heapIdx = n
 	*h = append(*h, item)
+
+	fmt.Println(item.heapIdx)
 }
 
 func (h *pathHeap) Pop() any {
