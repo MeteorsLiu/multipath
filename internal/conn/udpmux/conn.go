@@ -67,14 +67,14 @@ func ListenConn(ctx context.Context, pm *conn.SenderManager, local string, out c
 }
 
 func (c *udpConn) onProberEvent(event prober.Event) {
-	switch event {
-	case prober.Disconnected:
-		c.manager.Remove(c.sender)
-	case prober.Normal:
-		c.manager.Add(c.sender.String(), func() conn.ConnWriter {
-			return c.sender
-		})
-	}
+	// switch event {
+	// case prober.Disconnected:
+	// 	c.manager.Remove(c.sender)
+	// case prober.Normal:
+	// 	c.manager.Add(c.sender.String(), func() conn.ConnWriter {
+	// 		return c.sender
+	// 	})
+	// }
 }
 func (c *udpConn) onRecvAddr(addr string) {
 	if !c.isServerSide {
