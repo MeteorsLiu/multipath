@@ -1,26 +1,31 @@
 package path
 
 import (
+	"github.com/MeteorsLiu/multipath/internal/conn"
 	"github.com/MeteorsLiu/multipath/internal/mempool"
 	"github.com/google/uuid"
 )
 
 type Path interface {
-	mempool.Writer
+	conn.ConnWriter
 	PathID() string
 }
 
 type pathImpl struct {
 	id         string
-	connSender mempool.Writer
+	connSender conn.ConnWriter
 }
 
-func NewPath(conn mempool.Writer) Path {
+func NewPath(conn conn.ConnWriter) Path {
 	return &pathImpl{id: uuid.NewString(), connSender: conn}
 }
 
 func (p *pathImpl) PathID() string {
 	return p.id
+}
+
+func (p *pathImpl) String() string {
+	return p.connSender.String()
 }
 
 func (p *pathImpl) Write(b *mempool.Buffer) (err error) {
