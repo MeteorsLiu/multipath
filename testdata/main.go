@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"crypto/rand"
 	"flag"
 	"io"
 	"log"
@@ -31,7 +30,7 @@ const (
 }`
 )
 
-var buf = make([]byte, 16384)
+var buf []byte
 var sigCh = make(chan os.Signal, 1)
 
 func printInfoAndExit(f string, err ...any) {
@@ -74,7 +73,7 @@ func main() {
 	flag.BoolVar(&testServer, "server", false, "Test server")
 	flag.Parse()
 
-	io.ReadFull(rand.Reader, buf)
+	buf, _ = os.ReadFile("mockdata.bin")
 
 	tempConfig, err := os.CreateTemp("", "mock-test*.cfg")
 	if err != nil {
