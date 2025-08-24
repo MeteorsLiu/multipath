@@ -95,7 +95,6 @@ func (u *udpReader) handlePacket(buf *mempool.Buffer) error {
 			mempool.Put(buf)
 			return nil
 		}
-		panic("invalid buffer")
 	}
 	// TODO: allow different protocol
 	headerBuf := buf.Peek(protocol.HeaderSize)
