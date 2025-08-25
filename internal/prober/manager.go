@@ -47,5 +47,5 @@ func (i *Manager) PacketIn(remoteAddr string, pkt *mempool.Buffer) {
 	if prober := i.Get(remoteAddr); prober != nil {
 		prober.In() <- pkt
 	}
-	fmt.Println("packet in", remoteAddr)
+	fmt.Println("packet in", i.inMap, remoteAddr)
 }
