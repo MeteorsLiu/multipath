@@ -1,6 +1,7 @@
 package conn
 
 import (
+	"fmt"
 	"sync"
 )
 
@@ -51,6 +52,8 @@ func (pm *SenderManager) Add(addr string, fn func() ConnWriter) (conn ConnWriter
 		pm.connMap[addr] = conn
 	}
 	pm.mu.Unlock()
+
+	fmt.Println(addr, conn.String())
 
 	if succ {
 		pm.onNewPath(conn)
