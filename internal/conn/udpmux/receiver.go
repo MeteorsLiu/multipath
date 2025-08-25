@@ -157,12 +157,13 @@ func (u *udpReader) readLoop() {
 
 			bufs[i].SetLen(msg.N)
 			remoteAddr := msg.Addr.String()
+			u.onRecvAddr(remoteAddr)
+
 			u.handlePacket(remoteAddr, bufs[i])
 
 			trafficMap[msg.Addr.String()] += int64(msg.N)
 			fmt.Println(msg.Addr.String(), trafficMap[msg.Addr.String()])
 
-			u.onRecvAddr(remoteAddr)
 			// buffers in queue will be put back into the pool after consumed.
 			// so we can grab a new buffer here
 			bufs[i] = mempool.Get(1500)
