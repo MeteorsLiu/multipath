@@ -2,6 +2,7 @@ package prober
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	"github.com/MeteorsLiu/multipath/internal/mempool"
@@ -46,4 +47,5 @@ func (i *Manager) PacketIn(remoteAddr string, pkt *mempool.Buffer) {
 	if prober := i.Get(remoteAddr); prober != nil {
 		prober.In() <- pkt
 	}
+	fmt.Println("packet in", remoteAddr)
 }
