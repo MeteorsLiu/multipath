@@ -14,7 +14,6 @@ type udpConn struct {
 	ctx          context.Context
 	cancel       context.CancelFunc
 	receiver     *udpReader
-	sender       *udpSender
 	prober       *prober.Prober
 	isServerSide bool
 
@@ -36,14 +35,14 @@ func DialConn(ctx context.Context, pm *conn.SenderManager, remoteAddr string, ou
 	cn.prober = prober.New(cn.ctx, cn.onProberEvent)
 
 	cn.receiver = newUDPReceiver(udpC, out, cn.prober.In(), cn.onRecvAddr)
-	cn.sender = newUDPSender(cn.ctx, cn.prober.Out())
+	sender := newUDPSender(cn.ctx, cn.prober.Out())
 
 	cn.receiver.Start()
-	cn.sender.Start(udpC, remoteUdpAddr)
+	sender.Start(udpC, remoteUdpAddr)
 	cn.prober.Start()
 
 	pm.Add(remoteAddr, func() conn.ConnWriter {
-		return cn.sender
+		return sender
 	})
 
 	return cn, nil
@@ -59,8 +58,6 @@ func ListenConn(ctx context.Context, pm *conn.SenderManager, local string, out c
 	conn.prober = prober.New(conn.ctx, conn.onProberEvent)
 
 	conn.receiver = newUDPReceiver(localConn, out, conn.prober.In(), conn.onRecvAddr)
-	conn.sender = newUDPSender(conn.ctx, conn.prober.Out())
-
 	conn.receiver.Start()
 
 	return conn, nil
@@ -91,9 +88,10 @@ func (c *udpConn) onRecvAddr(addr string) {
 			fmt.Println("failed to listen udp when onRecvAddr: ", err)
 			return nil
 		}
-		c.sender.Start(localC, remoteAddr)
-		fmt.Println("on addr :", addr, c.sender.String())
+		sender := newUDPSender(c.ctx, c.prober.Out())
 
-		return c.sender
+		sender.Start(localC, remoteAddr)
+
+		return sender
 	})
 }
