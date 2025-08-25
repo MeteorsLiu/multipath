@@ -33,7 +33,7 @@ func DialConn(ctx context.Context, pm *conn.SenderManager, remoteAddr string, ou
 	cn := &udpConn{manager: pm, proberManager: prober.NewManager()}
 	cn.ctx, cn.cancel = context.WithCancel(ctx)
 
-	prober, _ := cn.proberManager.Register(remoteAddr, ctx, cn.onProberEvent)
+	prober, _ := cn.proberManager.Register(udpC.LocalAddr().String(), ctx, cn.onProberEvent)
 
 	cn.receiver = newUDPReceiver(udpC, out, cn.proberManager, cn.onRecvAddr)
 	sender := newUDPSender(cn.ctx, prober.Out())
