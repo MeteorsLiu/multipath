@@ -11,11 +11,11 @@ import (
 )
 
 type udpConn struct {
-	ctx          context.Context
-	cancel       context.CancelFunc
-	receiver     *udpReader
-	prober       *prober.Prober
-	isServerSide bool
+	ctx           context.Context
+	cancel        context.CancelFunc
+	receiver      *udpReader
+	isServerSide  bool
+	proberManager *prober.Manager
 
 	manager *conn.SenderManager
 }
@@ -30,16 +30,18 @@ func DialConn(ctx context.Context, pm *conn.SenderManager, remoteAddr string, ou
 		return nil, err
 	}
 
-	cn := &udpConn{manager: pm}
+	cn := &udpConn{manager: pm, proberManager: prober.NewManager()}
 	cn.ctx, cn.cancel = context.WithCancel(ctx)
-	cn.prober = prober.New(cn.ctx, cn.onProberEvent)
 
-	cn.receiver = newUDPReceiver(udpC, out, cn.prober.In(), cn.onRecvAddr)
-	sender := newUDPSender(cn.ctx, cn.prober.Out())
+	prober, _ := cn.proberManager.Register(remoteAddr, ctx, cn.onProberEvent)
+
+	cn.receiver = newUDPReceiver(udpC, out, cn.proberManager, cn.onRecvAddr)
+	sender := newUDPSender(cn.ctx, prober.Out())
 
 	cn.receiver.Start()
+
 	sender.Start(udpC, remoteUdpAddr)
-	cn.prober.Start()
+	prober.Start()
 
 	pm.Add(remoteAddr, func() conn.ConnWriter {
 		return sender
@@ -53,11 +55,10 @@ func ListenConn(ctx context.Context, pm *conn.SenderManager, local string, out c
 	if err != nil {
 		return nil, err
 	}
-	conn := &udpConn{manager: pm, isServerSide: true}
+	conn := &udpConn{manager: pm, isServerSide: true, proberManager: prober.NewManager()}
 	conn.ctx, conn.cancel = context.WithCancel(ctx)
-	conn.prober = prober.New(conn.ctx, conn.onProberEvent)
 
-	conn.receiver = newUDPReceiver(localConn, out, conn.prober.In(), conn.onRecvAddr)
+	conn.receiver = newUDPReceiver(localConn, out, conn.proberManager, conn.onRecvAddr)
 	conn.receiver.Start()
 
 	return conn, nil
@@ -88,9 +89,11 @@ func (c *udpConn) onRecvAddr(addr string) {
 			fmt.Println("failed to listen udp when onRecvAddr: ", err)
 			return nil
 		}
-		sender := newUDPSender(c.ctx, c.prober.Out())
+		prober, _ := c.proberManager.Register(addr, c.ctx, c.onProberEvent)
+		sender := newUDPSender(c.ctx, prober.Out())
 
 		sender.Start(localC, remoteAddr)
+		prober.Start()
 
 		fmt.Println(addr, sender.String())
 

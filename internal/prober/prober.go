@@ -52,6 +52,7 @@ type gcPacket struct {
 type Prober struct {
 	on    func(Event)
 	state Event
+	addr  string
 
 	in             chan *mempool.Buffer
 	out            chan *mempool.Buffer
@@ -68,10 +69,11 @@ type Prober struct {
 	lastMaxStartTime int64
 }
 
-func New(ctx context.Context, on func(Event)) *Prober {
+func New(ctx context.Context, addr string, on func(Event)) *Prober {
 	p := &Prober{
 		on:     on,
 		ctx:    ctx,
+		addr:   addr,
 		avg:    vary.NewVary(),
 		in:     make(chan *mempool.Buffer, 128),
 		out:    make(chan *mempool.Buffer, 128),
@@ -186,7 +188,11 @@ func (p *Prober) recvProbePacket(packet *mempool.Buffer) {
 	}
 	defer delete(p.packetMap, nonce)
 
-	elapsedTimeUs := time.Since(info.startTime).Microseconds()
+	elapsedTimeDur := time.Since(info.startTime)
+
+	elapsedTimeUs := elapsedTimeDur.Microseconds()
+
+	fmt.Println("recv probe", p.addr, elapsedTimeDur)
 
 	// check twice, this aims to avoid the case receiving probe packet and reaching deadline concurrently.
 	isTimeout := info.isTimeout ||

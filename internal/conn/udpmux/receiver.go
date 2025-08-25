@@ -52,10 +52,10 @@ func (p *pending) Buffer() (buf *mempool.Buffer, pktType protocol.PacketType) {
 }
 
 type udpReader struct {
-	conn       net.PacketConn
-	outCh      chan<- *mempool.Buffer
-	proberIn   chan<- *mempool.Buffer
-	onRecvAddr func(string)
+	conn          net.PacketConn
+	outCh         chan<- *mempool.Buffer
+	proberManager *prober.Manager
+	onRecvAddr    func(string)
 
 	pending *pending
 
@@ -65,30 +65,30 @@ type udpReader struct {
 func newUDPReceiver(
 	conn net.PacketConn,
 	outCh chan<- *mempool.Buffer,
-	proberIn chan<- *mempool.Buffer,
+	proberManager *prober.Manager,
 	onRecvAddr func(string),
 ) *udpReader {
 	return &udpReader{
-		conn:       conn,
-		proberIn:   proberIn,
-		onRecvAddr: onRecvAddr,
-		outCh:      outCh,
-		pending:    newPending(),
+		conn:          conn,
+		proberManager: proberManager,
+		onRecvAddr:    onRecvAddr,
+		outCh:         outCh,
+		pending:       newPending(),
 	}
 }
 
-func (u *udpReader) handlePacket(buf *mempool.Buffer) error {
+func (u *udpReader) handlePacket(addr string, buf *mempool.Buffer) error {
 	if u.pending.HasData() {
 		done := u.pending.Write(buf)
 
 		if done {
-			buf, pktType := u.pending.Buffer()
+			pendingBuf, pktType := u.pending.Buffer()
 
 			switch pktType {
 			case protocol.HeartBeat:
-				u.proberIn <- buf
+				u.proberManager.PacketIn(addr, pendingBuf)
 			case protocol.TunEncap:
-				u.outCh <- buf
+				u.outCh <- pendingBuf
 			}
 		}
 		if buf.Len() == 0 {
@@ -110,8 +110,7 @@ func (u *udpReader) handlePacket(buf *mempool.Buffer) error {
 			u.pending.Set(buf, prober.NonceSize, protocol.HeartBeat)
 			return nil
 		}
-		buf.SetLen(prober.NonceSize)
-		u.proberIn <- buf
+		u.proberManager.PacketIn(addr, buf)
 	case protocol.TunEncap:
 		payloadSize, err := ip.Header(payload).Size()
 		if err != nil {
@@ -157,12 +156,13 @@ func (u *udpReader) readLoop() {
 			msg := batchReader.MessageAt(i)
 
 			bufs[i].SetLen(msg.N)
-			u.handlePacket(bufs[i])
+			remoteAddr := msg.Addr.String()
+			u.handlePacket(remoteAddr, bufs[i])
 
 			trafficMap[msg.Addr.String()] += int64(msg.N)
 			fmt.Println(msg.Addr.String(), trafficMap[msg.Addr.String()])
 
-			u.onRecvAddr(msg.Addr.String())
+			u.onRecvAddr(remoteAddr)
 			// buffers in queue will be put back into the pool after consumed.
 			// so we can grab a new buffer here
 			bufs[i] = mempool.Get(1500)
