@@ -182,6 +182,9 @@ func (p *Prober) recvProbePacket(packet *mempool.Buffer) {
 	nonce := binary.LittleEndian.Uint64(packet.Bytes())
 
 	info, ok := p.packetMap[nonce]
+
+	fmt.Println("recv probe", p.addr, info)
+
 	if !ok {
 		// has been GC or unknown
 		return
@@ -191,8 +194,6 @@ func (p *Prober) recvProbePacket(packet *mempool.Buffer) {
 	elapsedTimeDur := time.Since(info.startTime)
 
 	elapsedTimeUs := elapsedTimeDur.Microseconds()
-
-	fmt.Println("recv probe", p.addr, elapsedTimeDur)
 
 	// check twice, this aims to avoid the case receiving probe packet and reaching deadline concurrently.
 	isTimeout := info.isTimeout ||
