@@ -92,7 +92,7 @@ func (c *udpConn) onRecvAddr(addr string) {
 			return nil
 		}
 		c.sender.Start(localC, remoteAddr)
-		fmt.Println("on addr :", addr)
+		fmt.Println("on addr :", addr, c.sender.String())
 
 		return c.sender
 	})
