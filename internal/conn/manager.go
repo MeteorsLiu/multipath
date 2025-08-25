@@ -48,7 +48,7 @@ func (pm *SenderManager) Add(addr string, fn func() ConnWriter) (conn ConnWriter
 	}
 	if conn = fn(); conn != nil {
 		succ = true
-		pm.connMap[conn.String()] = conn
+		pm.connMap[addr] = conn
 	}
 	pm.mu.Unlock()
 
