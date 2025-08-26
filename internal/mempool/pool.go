@@ -7,8 +7,6 @@ import (
 	"io"
 	"math/bits"
 	"sync"
-
-	"github.com/MeteorsLiu/multipath/internal/conn/udpmux/protocol"
 )
 
 type Writer interface {
@@ -22,13 +20,22 @@ var (
 var _ io.ReaderFrom = (*Buffer)(nil)
 
 type Buffer struct {
-	b   []byte
-	pos int
+	b            []byte
+	pos          int
+	reservedSize int
 }
 
 var _ io.WriterAt = (*Buffer)(nil)
 
 func ToBuffer(b []byte) *Buffer { return &Buffer{b: b} }
+
+func (b *Buffer) offset() int {
+	return b.pos + b.reservedSize
+}
+
+func (b *Buffer) Reserve(n int) {
+	b.reservedSize = n
+}
 
 func (b *Buffer) WriteAt(p []byte, off int64) (n int, err error) {
 	n = copy(b.b[off:], p)
@@ -36,12 +43,12 @@ func (b *Buffer) WriteAt(p []byte, off int64) (n int, err error) {
 }
 
 func (b *Buffer) Read(buf []byte) (n int, err error) {
-	n = copy(buf, b.b[b.pos:])
+	n = copy(buf, b.b[b.offset():])
 	return
 }
 
 func (b *Buffer) Write(buf []byte) (n int, err error) {
-	n = copy(b.b[b.pos:], buf)
+	n = copy(b.b[b.offset():], buf)
 	// move cursor by default
 	b.Consume(n)
 	return
@@ -49,19 +56,23 @@ func (b *Buffer) Write(buf []byte) (n int, err error) {
 
 func (b *Buffer) ReadFrom(r io.Reader) (n int64, err error) {
 	var nr int
-	nr, err = io.ReadFull(r, b.b[b.pos:])
+	nr, err = io.ReadFull(r, b.b[b.offset():])
 	n = int64(nr)
 	return
 }
 
 func (b *Buffer) Peek(n int) []byte {
-	pos := b.pos
+	pos := b.offset()
 	b.Consume(n)
 	return b.b[pos : n+pos]
 }
 
+func (b *Buffer) FullBytes() []byte {
+	return b.b
+}
+
 func (b *Buffer) Bytes() []byte {
-	return b.b[b.pos:]
+	return b.b[b.offset():]
 }
 
 func (b *Buffer) OffsetTo(n int) {
@@ -70,16 +81,21 @@ func (b *Buffer) OffsetTo(n int) {
 
 func (b *Buffer) resetCursor() {
 	b.pos = 0
+	b.reservedSize = 0
 	// allow GC
 	b.SetLen(0)
 }
 
 func (b *Buffer) Reset() {
-	clear(b.b[b.pos:])
+	clear(b.b[b.offset():])
+}
+
+func (b *Buffer) ResetFull() {
+	clear(b.b)
 }
 
 func (b *Buffer) SetLen(len int) {
-	b.b = b.b[:len]
+	b.b = b.b[:len+b.reservedSize]
 }
 
 func (b *Buffer) Cap() int {
@@ -115,12 +131,12 @@ func (b *Buffer) ConsumedBytes() int {
 	return b.pos
 }
 
-func GetWithHeader(size int) *Buffer {
+func GetWithHeader(size, headerSize int) *Buffer {
 	if defaultAllocator == nil {
 		return nil
 	}
-	buf := defaultAllocator.Get(size + protocol.HeaderSize)
-	buf.OffsetTo(protocol.HeaderSize)
+	buf := defaultAllocator.Get(size)
+	buf.Reserve(headerSize)
 	return buf
 }
 
