@@ -135,7 +135,7 @@ func GetWithHeader(size, headerSize int) *Buffer {
 	if defaultAllocator == nil {
 		return nil
 	}
-	buf := defaultAllocator.Get(size)
+	buf := defaultAllocator.Get(size + headerSize)
 	buf.Reserve(headerSize)
 	return buf
 }
