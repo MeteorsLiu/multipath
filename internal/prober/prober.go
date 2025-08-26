@@ -9,6 +9,7 @@ import (
 	"math"
 	"time"
 
+	"github.com/MeteorsLiu/multipath/internal/conn/udpmux/protocol"
 	"github.com/MeteorsLiu/multipath/internal/mempool"
 	"github.com/MeteorsLiu/multipath/internal/vary"
 )
@@ -95,7 +96,7 @@ func (p *Prober) Out() <-chan *mempool.Buffer {
 }
 
 func (p *Prober) sendProbePacket() {
-	packet := mempool.GetWithHeader(NonceSize)
+	packet := mempool.GetWithHeader(NonceSize, protocol.HeaderSize)
 	packet.ReadFrom(rand.Reader)
 
 	nonce := binary.LittleEndian.Uint64(packet.Bytes())
