@@ -159,8 +159,6 @@ func (u *udpReader) readLoop() {
 			remoteAddr := msg.Addr.String()
 			u.onRecvAddr(remoteAddr)
 
-			fmt.Println(bufs[i].Bytes())
-
 			u.handlePacket(remoteAddr, bufs[i])
 
 			trafficMap[msg.Addr.String()] += int64(msg.N)
