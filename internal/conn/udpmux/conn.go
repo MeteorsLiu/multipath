@@ -91,7 +91,6 @@ func (c *udpConn) onRecvAddr(addr string) {
 			return nil
 		}
 		id, prober := c.proberManager.Register(c.ctx, c.onProberEvent)
-		// make a dummy prober here
 		sender := newUDPSender(c.ctx, prober)
 
 		sender.Start(localC, remoteAddr)
