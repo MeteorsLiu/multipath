@@ -10,12 +10,11 @@ import (
 )
 
 type Manager struct {
-	mu           sync.Mutex
-	isServerSide bool
-	inMap        map[string]*Prober
+	mu    sync.Mutex
+	inMap map[string]*Prober
 }
 
-func NewManager(isServerSide bool) *Manager {
+func NewManager() *Manager {
 	return &Manager{inMap: make(map[string]*Prober)}
 }
 

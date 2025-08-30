@@ -31,7 +31,7 @@ func DialConn(ctx context.Context, pm *conn.SenderManager, remoteAddr string, ou
 		return nil, err
 	}
 
-	cn := &udpConn{manager: pm, proberManager: prober.NewManager(false)}
+	cn := &udpConn{manager: pm, proberManager: prober.NewManager()}
 	cn.ctx, cn.cancel = context.WithCancel(ctx)
 
 	id, prober := cn.proberManager.Register(ctx, cn.onProberEvent)
@@ -56,7 +56,7 @@ func ListenConn(ctx context.Context, pm *conn.SenderManager, local string, out c
 	if err != nil {
 		return nil, err
 	}
-	conn := &udpConn{manager: pm, isServerSide: true, proberManager: prober.NewManager(true)}
+	conn := &udpConn{manager: pm, isServerSide: true, proberManager: prober.NewManager()}
 	conn.ctx, conn.cancel = context.WithCancel(ctx)
 
 	conn.receiver = newUDPReceiver(localConn, out, conn.manager, conn.proberManager, conn.onRecvAddr)
