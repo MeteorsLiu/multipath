@@ -2,7 +2,6 @@ package cfs
 
 import (
 	"container/heap"
-	"fmt"
 	"sync"
 
 	"github.com/MeteorsLiu/multipath/internal/mempool"
@@ -84,6 +83,5 @@ func (s *schedulerImpl) Write(b *mempool.Buffer) (err error) {
 	if err != nil {
 		return
 	}
-	fmt.Println("select", path)
 	return path.Write(b)
 }
