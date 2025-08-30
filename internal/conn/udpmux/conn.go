@@ -33,7 +33,7 @@ func DialConn(ctx context.Context, pm *conn.SenderManager, remoteAddr string, ou
 	cn := &udpConn{manager: pm, proberManager: prober.NewManager()}
 	cn.ctx, cn.cancel = context.WithCancel(ctx)
 
-	prober, _ := cn.proberManager.Register(udpC.LocalAddr().String(), ctx, cn.onProberEvent)
+	id, prober := cn.proberManager.Register(ctx, cn.onProberEvent)
 
 	cn.receiver = newUDPReceiver(udpC, out, cn.proberManager, cn.onRecvAddr)
 	sender := newUDPSender(cn.ctx, prober.Out())
@@ -41,7 +41,7 @@ func DialConn(ctx context.Context, pm *conn.SenderManager, remoteAddr string, ou
 	cn.receiver.Start()
 
 	sender.Start(udpC, remoteUdpAddr)
-	prober.Start()
+	prober.Start(id)
 
 	pm.Add(remoteAddr, func() conn.ConnWriter {
 		return sender
@@ -89,11 +89,11 @@ func (c *udpConn) onRecvAddr(addr string) {
 			fmt.Println("failed to listen udp when onRecvAddr: ", err)
 			return nil
 		}
-		prober, _ := c.proberManager.Register(addr, c.ctx, c.onProberEvent)
+		// make a dummy prober here
+		prober := prober.New(c.ctx, c.onProberEvent)
 		sender := newUDPSender(c.ctx, prober.Out())
 
 		sender.Start(localC, remoteAddr)
-		prober.Start()
 
 		fmt.Println(addr, sender.String())
 

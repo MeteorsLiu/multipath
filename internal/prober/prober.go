@@ -7,11 +7,13 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"sync"
 	"time"
 
 	"github.com/MeteorsLiu/multipath/internal/conn/udpmux/protocol"
 	"github.com/MeteorsLiu/multipath/internal/mempool"
 	"github.com/MeteorsLiu/multipath/internal/vary"
+	"github.com/google/uuid"
 )
 
 const (
@@ -51,9 +53,10 @@ type gcPacket struct {
 }
 
 type Prober struct {
-	on    func(Event)
-	state Event
-	addr  string
+	on        func(Event)
+	state     Event
+	proberId  uuid.UUID
+	startOnce sync.Once
 
 	in             chan *mempool.Buffer
 	out            chan *mempool.Buffer
@@ -70,11 +73,10 @@ type Prober struct {
 	lastMaxStartTime int64
 }
 
-func New(ctx context.Context, addr string, on func(Event)) *Prober {
+func New(ctx context.Context, on func(Event)) *Prober {
 	p := &Prober{
 		on:     on,
 		ctx:    ctx,
-		addr:   addr,
 		avg:    vary.NewVary(),
 		in:     make(chan *mempool.Buffer, 128),
 		out:    make(chan *mempool.Buffer, 128),
@@ -96,8 +98,10 @@ func (p *Prober) Out() <-chan *mempool.Buffer {
 }
 
 func (p *Prober) sendProbePacket() {
-	packet := mempool.GetWithHeader(NonceSize, protocol.HeaderSize)
+	packet := mempool.GetWithHeader(NonceSize, protocol.HeaderSize+len(p.proberId))
 	packet.ReadFrom(rand.Reader)
+
+	packet.WriteAt(p.proberId[:], protocol.HeaderSize)
 
 	nonce := binary.LittleEndian.Uint64(packet.Bytes())
 
@@ -184,7 +188,7 @@ func (p *Prober) recvProbePacket(packet *mempool.Buffer) {
 
 	info, ok := p.packetMap[nonce]
 
-	fmt.Println("recv probe", p.addr, info)
+	fmt.Println("recv probe", p.proberId.String(), info)
 
 	if !ok {
 		// has been GC or unknown
@@ -293,6 +297,9 @@ func (p *Prober) start() {
 	}
 }
 
-func (p *Prober) Start() {
-	go p.start()
+func (p *Prober) Start(proberId uuid.UUID) {
+	p.startOnce.Do(func() {
+		p.proberId = proberId
+		go p.start()
+	})
 }

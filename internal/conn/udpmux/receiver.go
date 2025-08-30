@@ -86,7 +86,7 @@ func (u *udpReader) handlePacket(addr string, buf *mempool.Buffer) error {
 
 			switch pktType {
 			case protocol.HeartBeat:
-				u.proberManager.PacketIn(addr, pendingBuf)
+				u.proberManager.PacketIn(pendingBuf)
 			case protocol.TunEncap:
 				u.outCh <- pendingBuf
 			}
@@ -110,7 +110,7 @@ func (u *udpReader) handlePacket(addr string, buf *mempool.Buffer) error {
 			u.pending.Set(buf, prober.NonceSize, protocol.HeartBeat)
 			return nil
 		}
-		u.proberManager.PacketIn(addr, buf)
+		u.proberManager.PacketIn(buf)
 	case protocol.TunEncap:
 		payloadSize, err := ip.Header(payload).Size()
 		if err != nil {
