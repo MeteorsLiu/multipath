@@ -18,7 +18,7 @@ func ProberIDFromBuffer(buf *mempool.Buffer) (uuid.UUID, error) {
 	epoch[0]++
 	buf.WriteAt(epoch, protocol.HeaderSize)
 
-	id := buf.Peek(ProbeHeaderSize)
+	id := buf.Peek(16)
 	proberId, err := uuid.FromBytes(id)
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("failed to parse probe packet header")
