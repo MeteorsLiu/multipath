@@ -205,7 +205,7 @@ func (p *Prober) recvProbePacket(packet *mempool.Buffer) {
 
 	// check twice, this aims to avoid the case receiving probe packet and reaching deadline concurrently.
 	isTimeout := info.isTimeout ||
-		elapsedTimeUs >= p.currentTimeout.Microseconds()
+		(p.currentTimeout > 0 && elapsedTimeUs >= p.currentTimeout.Microseconds())
 
 	if isTimeout {
 		if p.debit > 0 {
