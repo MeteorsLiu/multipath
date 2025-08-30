@@ -38,7 +38,7 @@ func (i *Manager) Remove(proberId string) {
 }
 
 func (i *Manager) PacketIn(pkt *mempool.Buffer) error {
-	id, err := ProberIDFromBuffer(pkt)
+	epoch, id, err := ProberIDFromBuffer(pkt)
 	if err != nil {
 		return err
 	}
@@ -49,6 +49,8 @@ func (i *Manager) PacketIn(pkt *mempool.Buffer) error {
 	i.mu.RUnlock()
 
 	if !ok {
+		// incr epoch
+		IncrEpoch(epoch, pkt)
 		return ErrProberIDNotFound
 	}
 	prober.In() <- pkt

@@ -10,18 +10,21 @@ import (
 
 const ProbeHeaderSize = 17
 
-func ProberIDFromBuffer(buf *mempool.Buffer) (uuid.UUID, error) {
+func ProberIDFromBuffer(buf *mempool.Buffer) ([]byte, uuid.UUID, error) {
 	epoch := buf.Peek(1)
 	if epoch[0] > 0 {
-		return uuid.Nil, fmt.Errorf("probe packet has been replied")
+		return nil, uuid.Nil, fmt.Errorf("probe packet has been replied")
 	}
-	epoch[0]++
-	buf.WriteAt(epoch, protocol.HeaderSize)
 
 	id := buf.Peek(16)
 	proberId, err := uuid.FromBytes(id)
 	if err != nil {
-		return uuid.Nil, fmt.Errorf("failed to parse probe packet header")
+		return nil, uuid.Nil, fmt.Errorf("failed to parse probe packet header")
 	}
-	return proberId, nil
+	return epoch, proberId, nil
+}
+
+func IncrEpoch(epoch []byte, pkt *mempool.Buffer) {
+	epoch[0]++
+	pkt.WriteAt(epoch, protocol.HeaderSize)
 }
