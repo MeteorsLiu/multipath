@@ -60,8 +60,6 @@ func mockServer(l net.Listener) {
 			}
 			if !bytes.Equal(tBuf, buf) {
 				printInfoAndExit("unexpected buf: want %v got %v", buf, tBuf)
-			} else {
-				printInfoAndExit("verify done")
 			}
 		}(c)
 	}
