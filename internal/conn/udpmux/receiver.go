@@ -201,7 +201,6 @@ func (u *udpReader) readLoop() {
 			u.handlePacket(remoteAddr, bufs[i])
 
 			trafficMap[msg.Addr.String()] += int64(msg.N)
-			fmt.Println(msg.Addr.String(), trafficMap[msg.Addr.String()])
 
 			// buffers in queue will be put back into the pool after consumed.
 			// so we can grab a new buffer here
