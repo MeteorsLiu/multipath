@@ -39,14 +39,14 @@ func DialConn(ctx context.Context, pm *conn.SenderManager, remoteAddr string, ou
 	cn.receiver = newUDPReceiver(udpC, out, cn.manager, cn.proberManager, cn.onRecvAddr)
 	sender := newUDPSender(cn.ctx, prober)
 
+	pm.Add(remoteAddr, func() conn.ConnWriter {
+		return sender
+	})
+
 	cn.receiver.Start()
 
 	sender.Start(udpC, remoteUdpAddr)
 	prober.Start(id)
-
-	pm.Add(remoteAddr, func() conn.ConnWriter {
-		return sender
-	})
 
 	return cn, nil
 }
