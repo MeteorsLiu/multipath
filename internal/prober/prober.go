@@ -234,7 +234,7 @@ func (p *Prober) recvProbePacket(packet *mempool.Buffer) {
 
 	uclRtt := math.Pow(math.E, p.avg.UCL(3)) + p.minRtt
 
-	fmt.Println("recv probe", p.proberId.String(), info, time.Duration(uclRtt)*time.Microsecond)
+	fmt.Println("recv probe", p.proberId.String(), info, elapsedTimeDur, time.Duration(uclRtt)*time.Microsecond)
 
 	if p.reschedule.C == nil {
 		p.reschedule = time.NewTimer(time.Duration(uclRtt) * time.Microsecond)
