@@ -186,8 +186,6 @@ func (p *Prober) recvProbePacket(packet *mempool.Buffer) {
 
 	info, ok := p.packetMap[nonce]
 
-	fmt.Println("recv probe", p.proberId.String(), info)
-
 	if !ok {
 		// has been GC or unknown
 		return
@@ -235,6 +233,8 @@ func (p *Prober) recvProbePacket(packet *mempool.Buffer) {
 	p.avg.Calculate(compressedRtt)
 
 	uclRtt := math.Pow(math.E, p.avg.UCL(3)) + p.minRtt
+
+	fmt.Println("recv probe", p.proberId.String(), info, time.Duration(uclRtt)*time.Microsecond)
 
 	if p.reschedule.C == nil {
 		p.reschedule = time.NewTimer(time.Duration(uclRtt) * time.Microsecond)
