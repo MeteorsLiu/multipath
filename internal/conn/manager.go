@@ -5,7 +5,7 @@ import (
 )
 
 type SenderManager struct {
-	mu          sync.Mutex
+	mu          sync.RWMutex
 	connMap     map[string]ConnWriter
 	onConnEvent func(ManagerEvent, ConnWriter)
 }
@@ -38,6 +38,14 @@ func (pm *SenderManager) onRemovePath(conn ConnWriter) {
 	if pm.onConnEvent != nil {
 		pm.onConnEvent(ConnRemove, conn)
 	}
+}
+
+func (pm *SenderManager) Get(addr string) ConnWriter {
+	pm.mu.RLock()
+	sender := pm.connMap[addr]
+	pm.mu.RUnlock()
+
+	return sender
 }
 
 func (pm *SenderManager) Add(addr string, fn func() ConnWriter) (conn ConnWriter, succ bool) {

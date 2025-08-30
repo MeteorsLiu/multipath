@@ -11,10 +11,11 @@ import (
 )
 
 type udpConn struct {
-	ctx           context.Context
-	cancel        context.CancelFunc
-	receiver      *udpReader
-	isServerSide  bool
+	ctx          context.Context
+	cancel       context.CancelFunc
+	receiver     *udpReader
+	isServerSide bool
+
 	proberManager *prober.Manager
 
 	manager *conn.SenderManager
@@ -30,13 +31,13 @@ func DialConn(ctx context.Context, pm *conn.SenderManager, remoteAddr string, ou
 		return nil, err
 	}
 
-	cn := &udpConn{manager: pm, proberManager: prober.NewManager()}
+	cn := &udpConn{manager: pm, proberManager: prober.NewManager(false)}
 	cn.ctx, cn.cancel = context.WithCancel(ctx)
 
 	id, prober := cn.proberManager.Register(ctx, cn.onProberEvent)
 
-	cn.receiver = newUDPReceiver(udpC, out, cn.proberManager, cn.onRecvAddr)
-	sender := newUDPSender(cn.ctx, prober.Out())
+	cn.receiver = newUDPReceiver(udpC, out, cn.manager, cn.proberManager, cn.onRecvAddr)
+	sender := newUDPSender(cn.ctx, prober)
 
 	cn.receiver.Start()
 
@@ -55,10 +56,10 @@ func ListenConn(ctx context.Context, pm *conn.SenderManager, local string, out c
 	if err != nil {
 		return nil, err
 	}
-	conn := &udpConn{manager: pm, isServerSide: true, proberManager: prober.NewManager()}
+	conn := &udpConn{manager: pm, isServerSide: true, proberManager: prober.NewManager(true)}
 	conn.ctx, conn.cancel = context.WithCancel(ctx)
 
-	conn.receiver = newUDPReceiver(localConn, out, conn.proberManager, conn.onRecvAddr)
+	conn.receiver = newUDPReceiver(localConn, out, conn.manager, conn.proberManager, conn.onRecvAddr)
 	conn.receiver.Start()
 
 	return conn, nil
@@ -91,7 +92,7 @@ func (c *udpConn) onRecvAddr(addr string) {
 		}
 		// make a dummy prober here
 		prober := prober.New(c.ctx, c.onProberEvent)
-		sender := newUDPSender(c.ctx, prober.Out())
+		sender := newUDPSender(c.ctx, prober)
 
 		sender.Start(localC, remoteAddr)
 

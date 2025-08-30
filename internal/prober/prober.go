@@ -7,7 +7,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
-	"sync"
 	"time"
 
 	"github.com/MeteorsLiu/multipath/internal/conn/udpmux/protocol"
@@ -53,10 +52,9 @@ type gcPacket struct {
 }
 
 type Prober struct {
-	on        func(Event)
-	state     Event
-	proberId  uuid.UUID
-	startOnce sync.Once
+	on       func(Event)
+	state    Event
+	proberId uuid.UUID
 
 	in             chan *mempool.Buffer
 	out            chan *mempool.Buffer
@@ -98,7 +96,7 @@ func (p *Prober) Out() <-chan *mempool.Buffer {
 }
 
 func (p *Prober) sendProbePacket() {
-	packet := mempool.GetWithHeader(NonceSize, protocol.HeaderSize+len(p.proberId))
+	packet := mempool.GetWithHeader(NonceSize, protocol.HeaderSize+ProbeHeaderSize)
 	packet.ReadFrom(rand.Reader)
 
 	packet.WriteAt(p.proberId[:], protocol.HeaderSize)
@@ -298,8 +296,6 @@ func (p *Prober) start() {
 }
 
 func (p *Prober) Start(proberId uuid.UUID) {
-	p.startOnce.Do(func() {
-		p.proberId = proberId
-		go p.start()
-	})
+	p.proberId = proberId
+	go p.start()
 }

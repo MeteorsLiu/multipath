@@ -10,11 +10,12 @@ import (
 )
 
 type Manager struct {
-	mu    sync.RWMutex
-	inMap map[string]*Prober
+	mu           sync.Mutex
+	isServerSide bool
+	inMap        map[string]*Prober
 }
 
-func NewManager() *Manager {
+func NewManager(isServerSide bool) *Manager {
 	return &Manager{inMap: make(map[string]*Prober)}
 }
 
@@ -29,30 +30,33 @@ func (i *Manager) Register(ctx context.Context, on func(Event)) (id uuid.UUID, p
 	return
 }
 
-func (i *Manager) Get(proberId string) *Prober {
-	i.mu.RLock()
-	prober := i.inMap[proberId]
-	i.mu.RUnlock()
-
-	return prober
-}
-
 func (i *Manager) Remove(proberId string) {
 	i.mu.Lock()
 	delete(i.inMap, proberId)
 	i.mu.Unlock()
 }
 
-func (i *Manager) PacketIn(pkt *mempool.Buffer) {
-	id := pkt.Peek(16)
-	proberId, err := uuid.FromBytes(id)
+func (i *Manager) PacketIn(pkt *mempool.Buffer, proberElem *Prober) error {
+	id, err := ProberIDFromBuffer(pkt)
 	if err != nil {
-		return
+		return err
 	}
-	proberIdString := proberId.String()
-	if prober := i.Get(proberIdString); prober != nil {
-		prober.In() <- pkt
-		prober.Start(proberId)
+	proberId := id.String()
+
+	var prober *Prober
+
+	i.mu.Lock()
+	prober, ok := i.inMap[proberId]
+	if !ok {
+		prober = proberElem
+		i.inMap[proberId] = prober
+		prober.Start(id)
 	}
-	fmt.Println("packet in", i.inMap, proberIdString)
+	i.mu.Unlock()
+
+	prober.In() <- pkt
+
+	fmt.Println("packet in", i.inMap, proberId)
+
+	return nil
 }

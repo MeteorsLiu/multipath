@@ -5,6 +5,7 @@ import (
 	"net"
 	"sync"
 
+	"github.com/MeteorsLiu/multipath/internal/conn"
 	"github.com/MeteorsLiu/multipath/internal/conn/batch/udp"
 	"github.com/MeteorsLiu/multipath/internal/conn/udpmux/ip"
 	"github.com/MeteorsLiu/multipath/internal/conn/udpmux/protocol"
@@ -54,6 +55,7 @@ func (p *pending) Buffer() (buf *mempool.Buffer, pktType protocol.PacketType) {
 type udpReader struct {
 	conn          net.PacketConn
 	outCh         chan<- *mempool.Buffer
+	senderManager *conn.SenderManager
 	proberManager *prober.Manager
 	onRecvAddr    func(string)
 
@@ -65,16 +67,26 @@ type udpReader struct {
 func newUDPReceiver(
 	conn net.PacketConn,
 	outCh chan<- *mempool.Buffer,
+	senderManager *conn.SenderManager,
 	proberManager *prober.Manager,
 	onRecvAddr func(string),
 ) *udpReader {
 	return &udpReader{
 		conn:          conn,
+		senderManager: senderManager,
 		proberManager: proberManager,
 		onRecvAddr:    onRecvAddr,
 		outCh:         outCh,
 		pending:       newPending(),
 	}
+}
+
+func (u *udpReader) getProberFromSender(addr string) *prober.Prober {
+	sender := u.senderManager.Get(addr)
+	if sender == nil {
+		panic("sender not found")
+	}
+	return sender.Prober()
 }
 
 func (u *udpReader) handlePacket(addr string, buf *mempool.Buffer) error {
@@ -86,7 +98,7 @@ func (u *udpReader) handlePacket(addr string, buf *mempool.Buffer) error {
 
 			switch pktType {
 			case protocol.HeartBeat:
-				u.proberManager.PacketIn(pendingBuf)
+				u.proberManager.PacketIn(pendingBuf, u.getProberFromSender(addr))
 			case protocol.TunEncap:
 				u.outCh <- pendingBuf
 			}
@@ -110,7 +122,7 @@ func (u *udpReader) handlePacket(addr string, buf *mempool.Buffer) error {
 			u.pending.Set(buf, prober.NonceSize, protocol.HeartBeat)
 			return nil
 		}
-		u.proberManager.PacketIn(buf)
+		u.proberManager.PacketIn(buf, u.getProberFromSender(addr))
 	case protocol.TunEncap:
 		payloadSize, err := ip.Header(payload).Size()
 		if err != nil {

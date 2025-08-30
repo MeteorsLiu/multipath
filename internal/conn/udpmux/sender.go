@@ -10,22 +10,23 @@ import (
 	"github.com/MeteorsLiu/multipath/internal/conn/batch/udp"
 	"github.com/MeteorsLiu/multipath/internal/conn/udpmux/protocol"
 	"github.com/MeteorsLiu/multipath/internal/mempool"
+	"github.com/MeteorsLiu/multipath/internal/prober"
 )
 
 type udpSender struct {
-	ctx      context.Context
-	remote   *net.UDPAddr
-	queue    chan *mempool.Buffer
-	conn     net.PacketConn
-	proberCh <-chan *mempool.Buffer
+	ctx    context.Context
+	remote *net.UDPAddr
+	queue  chan *mempool.Buffer
+	conn   net.PacketConn
+	prober *prober.Prober
 
 	startOnce sync.Once
 }
 
 var _ conn.ConnWriter = (*udpSender)(nil)
 
-func newUDPSender(ctx context.Context, probeCh <-chan *mempool.Buffer) *udpSender {
-	return &udpSender{ctx: ctx, queue: make(chan *mempool.Buffer, 1024), proberCh: probeCh}
+func newUDPSender(ctx context.Context, prober *prober.Prober) *udpSender {
+	return &udpSender{ctx: ctx, queue: make(chan *mempool.Buffer, 1024), prober: prober}
 }
 
 func (u *udpSender) waitInPacket(bufs *[][]byte, pendingBuf *[]*mempool.Buffer) error {
@@ -37,7 +38,7 @@ func (u *udpSender) waitInPacket(bufs *[][]byte, pendingBuf *[]*mempool.Buffer) 
 	}
 
 	select {
-	case pkt := <-u.proberCh:
+	case pkt := <-u.prober.Out():
 		appendPacket(pkt, protocol.HeartBeat)
 	case pkt := <-u.queue:
 		appendPacket(pkt, protocol.TunEncap)
@@ -47,7 +48,7 @@ func (u *udpSender) waitInPacket(bufs *[][]byte, pendingBuf *[]*mempool.Buffer) 
 
 	for len(*bufs) < 1024 {
 		select {
-		case pkt := <-u.proberCh:
+		case pkt := <-u.prober.Out():
 			appendPacket(pkt, protocol.HeartBeat)
 		case pkt := <-u.queue:
 			appendPacket(pkt, protocol.TunEncap)
@@ -107,4 +108,8 @@ func (u *udpSender) Write(b *mempool.Buffer) error {
 		u.queue <- b
 		return nil
 	}
+}
+
+func (u *udpSender) Prober() *prober.Prober {
+	return u.prober
 }
