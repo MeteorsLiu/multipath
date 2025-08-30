@@ -97,7 +97,7 @@ func (u *udpReader) sendPacketToRemote(addr string, pkt *mempool.Buffer) {
 	if sender == nil {
 		panic("sender is nil")
 	}
-	sender.Write(pkt)
+	err := sender.Write(pkt)
 }
 
 func (u *udpReader) recvProbe(addr string, pkt *mempool.Buffer) {
