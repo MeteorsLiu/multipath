@@ -194,6 +194,7 @@ func (p *Prober) recvProbePacket(packet *mempool.Buffer) {
 
 	if !ok {
 		// has been GC or unknown
+		fmt.Println(nonce, p.packetMap)
 		return
 	}
 	defer delete(p.packetMap, nonce)
