@@ -12,7 +12,7 @@ const ProbeHeaderSize = 17
 
 func ProberIDFromBuffer(buf *mempool.Buffer) (byte, uuid.UUID, error) {
 	epoch := buf.Peek(1)
-	if epoch[0] > 0 {
+	if epoch[0] > 1 {
 		return 0, uuid.Nil, fmt.Errorf("probe packet has been replied")
 	}
 	id := buf.Peek(16)
