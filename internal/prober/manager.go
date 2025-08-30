@@ -9,8 +9,10 @@ import (
 	"github.com/google/uuid"
 )
 
+var ErrProberIDNotFound = fmt.Errorf("proberid not found")
+
 type Manager struct {
-	mu    sync.Mutex
+	mu    sync.RWMutex
 	inMap map[string]*Prober
 }
 
@@ -35,24 +37,20 @@ func (i *Manager) Remove(proberId string) {
 	i.mu.Unlock()
 }
 
-func (i *Manager) PacketIn(pkt *mempool.Buffer, proberElem *Prober) error {
+func (i *Manager) PacketIn(pkt *mempool.Buffer) error {
 	id, err := ProberIDFromBuffer(pkt)
 	if err != nil {
 		return err
 	}
 	proberId := id.String()
 
-	var prober *Prober
-
-	i.mu.Lock()
+	i.mu.RLock()
 	prober, ok := i.inMap[proberId]
-	if !ok {
-		prober = proberElem
-		i.inMap[proberId] = prober
-		prober.Start(id)
-	}
-	i.mu.Unlock()
+	i.mu.RUnlock()
 
+	if !ok {
+		return ErrProberIDNotFound
+	}
 	prober.In() <- pkt
 
 	fmt.Println("packet in", i.inMap, proberId)

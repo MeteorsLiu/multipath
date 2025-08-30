@@ -53,8 +53,10 @@ func (p *pending) Buffer() (buf *mempool.Buffer, pktType protocol.PacketType) {
 }
 
 type udpReader struct {
-	conn          net.PacketConn
-	outCh         chan<- *mempool.Buffer
+	conn  net.PacketConn
+	outCh chan<- *mempool.Buffer
+
+	clientSender  chan<- *mempool.Buffer
 	senderManager *conn.SenderManager
 	proberManager *prober.Manager
 	onRecvAddr    func(string)
@@ -68,6 +70,7 @@ type udpReader struct {
 func newUDPReceiver(
 	conn net.PacketConn,
 	outCh chan<- *mempool.Buffer,
+	clientSender chan<- *mempool.Buffer,
 	senderManager *conn.SenderManager,
 	proberManager *prober.Manager,
 	onRecvAddr func(string),
@@ -80,19 +83,34 @@ func newUDPReceiver(
 		onRecvAddr:    onRecvAddr,
 		isServerSide:  isServerSide,
 		outCh:         outCh,
+		clientSender:  clientSender,
 		pending:       newPending(),
 	}
 }
 
-func (u *udpReader) getProberFromSender(addr string) *prober.Prober {
+func (u *udpReader) sendPacketToRemote(addr string, pkt *mempool.Buffer) {
 	if !u.isServerSide {
-		return nil
+		u.clientSender <- pkt
+		return
 	}
 	sender := u.senderManager.Get(addr)
 	if sender == nil {
-		panic("sender not found")
+		panic("sender is nil")
 	}
-	return sender.Prober()
+	sender.Write(pkt)
+}
+
+func (u *udpReader) recvProbe(addr string, pkt *mempool.Buffer) {
+	err := u.proberManager.PacketIn(pkt)
+	if err == prober.ErrProberIDNotFound {
+		u.sendPacketToRemote(addr, pkt)
+		return
+	}
+	if err != nil {
+		fmt.Println(err)
+		mempool.Put(pkt)
+		return
+	}
 }
 
 func (u *udpReader) handlePacket(addr string, buf *mempool.Buffer) error {
@@ -104,7 +122,7 @@ func (u *udpReader) handlePacket(addr string, buf *mempool.Buffer) error {
 
 			switch pktType {
 			case protocol.HeartBeat:
-				u.proberManager.PacketIn(pendingBuf, u.getProberFromSender(addr))
+				u.recvProbe(addr, pendingBuf)
 			case protocol.TunEncap:
 				u.outCh <- pendingBuf
 			}
@@ -128,7 +146,7 @@ func (u *udpReader) handlePacket(addr string, buf *mempool.Buffer) error {
 			u.pending.Set(buf, prober.NonceSize, protocol.HeartBeat)
 			return nil
 		}
-		u.proberManager.PacketIn(buf, u.getProberFromSender(addr))
+		u.recvProbe(addr, buf)
 	case protocol.TunEncap:
 		payloadSize, err := ip.Header(payload).Size()
 		if err != nil {

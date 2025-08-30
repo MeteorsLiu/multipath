@@ -137,6 +137,8 @@ func GetWithHeader(size, headerSize int) *Buffer {
 	}
 	buf := defaultAllocator.Get(size + headerSize)
 	buf.Reserve(headerSize)
+	// tell sender we have no header, need make one.
+	clear(buf.b[0:headerSize])
 	return buf
 }
 

@@ -35,9 +35,9 @@ func DialConn(ctx context.Context, pm *conn.SenderManager, remoteAddr string, ou
 	cn.ctx, cn.cancel = context.WithCancel(ctx)
 
 	id, prober := cn.proberManager.Register(ctx, cn.onProberEvent)
-
-	cn.receiver = newUDPReceiver(udpC, out, cn.manager, cn.proberManager, cn.onRecvAddr, false)
 	sender := newUDPSender(cn.ctx, prober)
+
+	cn.receiver = newUDPReceiver(udpC, out, sender.queue, cn.manager, cn.proberManager, cn.onRecvAddr, false)
 
 	pm.Add(remoteAddr, func() conn.ConnWriter {
 		return sender
@@ -59,7 +59,7 @@ func ListenConn(ctx context.Context, pm *conn.SenderManager, local string, out c
 	conn := &udpConn{manager: pm, isServerSide: true, proberManager: prober.NewManager()}
 	conn.ctx, conn.cancel = context.WithCancel(ctx)
 
-	conn.receiver = newUDPReceiver(localConn, out, conn.manager, conn.proberManager, conn.onRecvAddr, true)
+	conn.receiver = newUDPReceiver(localConn, out, nil, conn.manager, conn.proberManager, conn.onRecvAddr, true)
 	conn.receiver.Start()
 
 	return conn, nil
@@ -90,11 +90,12 @@ func (c *udpConn) onRecvAddr(addr string) {
 			fmt.Println("failed to listen udp when onRecvAddr: ", err)
 			return nil
 		}
+		id, prober := c.proberManager.Register(c.ctx, c.onProberEvent)
 		// make a dummy prober here
-		prober := prober.New(c.ctx, c.onProberEvent)
 		sender := newUDPSender(c.ctx, prober)
 
 		sender.Start(localC, remoteAddr)
+		prober.Start(id)
 
 		fmt.Println(addr, sender.String())
 

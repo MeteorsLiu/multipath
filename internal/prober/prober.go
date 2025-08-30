@@ -96,10 +96,16 @@ func (p *Prober) Out() <-chan *mempool.Buffer {
 }
 
 func (p *Prober) sendProbePacket() {
+	// Header:
+	// Byte 1: OpCode
+	// Byte 2: Reply Epoch
+	// Byte 3-19: Prober ID (16B)
+	// Byte 20-28: Nonce (8B)
 	packet := mempool.GetWithHeader(NonceSize, protocol.HeaderSize+ProbeHeaderSize)
 	packet.ReadFrom(rand.Reader)
 
-	packet.WriteAt(p.proberId[:], protocol.HeaderSize)
+	// skip epoch id, it's reset to zero by GetWithHeader
+	packet.WriteAt(p.proberId[:], protocol.HeaderSize+1)
 
 	nonce := binary.LittleEndian.Uint64(packet.Bytes())
 

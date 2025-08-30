@@ -31,7 +31,11 @@ func newUDPSender(ctx context.Context, prober *prober.Prober) *udpSender {
 
 func (u *udpSender) waitInPacket(bufs *[][]byte, pendingBuf *[]*mempool.Buffer) error {
 	appendPacket := func(pkt *mempool.Buffer, packetType protocol.PacketType) {
-		protocol.MakeHeader(pkt, packetType)
+		pktBuf := pkt.FullBytes()
+
+		if pktBuf[0] == 0 {
+			protocol.MakeHeader(pkt, packetType)
+		}
 
 		*bufs = append(*bufs, pkt.FullBytes())
 		*pendingBuf = append(*pendingBuf, pkt)
