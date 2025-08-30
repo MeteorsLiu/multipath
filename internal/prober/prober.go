@@ -289,6 +289,7 @@ func (p *Prober) start() {
 		case <-p.ctx.Done():
 			return
 		case pkt := <-p.in:
+			fmt.Println("recv loop pkt: ", pkt.Bytes())
 			p.recvProbePacket(pkt)
 		case <-p.reschedule.C:
 			p.sendProbePacket()
