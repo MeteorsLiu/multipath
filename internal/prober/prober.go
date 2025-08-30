@@ -211,7 +211,7 @@ func (p *Prober) recvProbePacket(packet *mempool.Buffer) {
 		if p.debit > 0 {
 			p.debit = 10
 		}
-		fmt.Println("timeout!", elapsedTimeDur)
+		fmt.Println("timeout!", elapsedTimeDur, p.currentTimeout)
 
 		return
 	}
