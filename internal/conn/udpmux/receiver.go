@@ -61,7 +61,8 @@ type udpReader struct {
 
 	pending *pending
 
-	startOnce sync.Once
+	startOnce    sync.Once
+	isServerSide bool
 }
 
 func newUDPReceiver(
@@ -70,18 +71,23 @@ func newUDPReceiver(
 	senderManager *conn.SenderManager,
 	proberManager *prober.Manager,
 	onRecvAddr func(string),
+	isServerSide bool,
 ) *udpReader {
 	return &udpReader{
 		conn:          conn,
 		senderManager: senderManager,
 		proberManager: proberManager,
 		onRecvAddr:    onRecvAddr,
+		isServerSide:  isServerSide,
 		outCh:         outCh,
 		pending:       newPending(),
 	}
 }
 
 func (u *udpReader) getProberFromSender(addr string) *prober.Prober {
+	if !u.isServerSide {
+		return nil
+	}
 	sender := u.senderManager.Get(addr)
 	if sender == nil {
 		panic("sender not found")
