@@ -281,7 +281,7 @@ func main() {
 	defer execCommand("ip", "link", "del", "multipath-veth0")
 
 	if testServer {
-		l, err := net.Listen("tcp", "0.0.0.0:9999")
+		l, err := net.Listen("tcp", "10.168.168.1:9999")
 		if err != nil {
 			panic(err)
 		}
