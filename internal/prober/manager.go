@@ -52,6 +52,7 @@ func (i *Manager) PacketIn(pkt *mempool.Buffer) error {
 
 	if !ok {
 		// incr epoch
+		fmt.Println(pkt.FullBytes(), proberId)
 		return ErrProberIDNotFound
 	}
 	prober.In() <- pkt
