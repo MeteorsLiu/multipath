@@ -218,6 +218,34 @@ func setupForwarder() {
 	execCommand("iptables", "-t", "nat", "-A", "POSTROUTING", "-j", "MASQUERADE")
 }
 
+// setupNetworkDisorder 使用Linux tc工具在指定接口上设置网络乱序
+func setupNetworkDisorder(interfaceName string) {
+	fmt.Printf("Setting up network disorder on interface %s\n", interfaceName)
+
+	// 清除现有的qdisc规则
+	execCommand("tc", "qdisc", "del", "dev", interfaceName, "root")
+
+	// 添加netem规则来制造UDP包乱序
+	// delay 10ms: 基础延迟10毫秒
+	// reorder 25% 5: 25%的概率乱序，每5个包检查一次
+	execCommand("tc", "qdisc", "add", "dev", interfaceName, "root", "handle", "1:", "netem",
+		"delay", "10ms",
+		"reorder", "25%", "5")
+
+	fmt.Printf("Network disorder rules applied to %s\n", interfaceName)
+
+	// 显示当前规则
+	fmt.Println("Current tc rules:")
+	execCommand("tc", "qdisc", "show", "dev", interfaceName)
+}
+
+// cleanupNetworkDisorder 清除网络乱序设置
+func cleanupNetworkDisorder(interfaceName string) {
+	fmt.Printf("Cleaning up network disorder on interface %s\n", interfaceName)
+	execCommand("tc", "qdisc", "del", "dev", interfaceName, "root")
+	fmt.Printf("Network disorder rules removed from %s\n", interfaceName)
+}
+
 func delForwarder() {
 	execCommand("iptables", "-t", "nat", "-nvL")
 	execCommand("iptables",
@@ -242,8 +270,10 @@ func delForwarder() {
 func main() {
 	var testServer bool
 	var outOfOrder bool
+	var networkDisorder bool
 	flag.BoolVar(&testServer, "server", false, "Test server")
 	flag.BoolVar(&outOfOrder, "out-of-order", false, "Test out of order sending")
+	flag.BoolVar(&networkDisorder, "network-disorder", false, "Enable network-level packet disorder using Linux tc")
 	flag.Parse()
 
 	buf, _ = os.ReadFile("mockdata.bin")
@@ -279,6 +309,15 @@ func main() {
 		execCommand("ip", "a", "add", "10.168.168.2", "peer", "10.168.168.1", "dev", "multipath-veth0")
 	}
 	defer execCommand("ip", "link", "del", "multipath-veth0")
+
+	// 如果启用了网络乱序，设置tc规则
+	if networkDisorder {
+		setupNetworkDisorder("multipath-veth0")
+		defer cleanupNetworkDisorder("multipath-veth0")
+
+		fmt.Println("Network disorder enabled - UDP packets will be reordered at network level")
+		fmt.Println("TCP layer should handle reordering and ensure data integrity")
+	}
 
 	if testServer {
 		l, err := net.Listen("tcp", "10.168.168.1:9999")
