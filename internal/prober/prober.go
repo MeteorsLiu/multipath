@@ -194,7 +194,6 @@ func (p *Prober) recvProbePacket(packet *mempool.Buffer) {
 
 	if !ok {
 		// has been GC or unknown
-		fmt.Println("GCC", nonce, p.packetMap)
 		return
 	}
 	defer delete(p.packetMap, nonce)
@@ -211,8 +210,6 @@ func (p *Prober) recvProbePacket(packet *mempool.Buffer) {
 		if p.debit > 0 {
 			p.debit = 10
 		}
-		fmt.Println("timeout!", elapsedTimeDur, p.currentTimeout)
-
 		return
 	}
 	p.lastMaxStartTime = 0
@@ -242,8 +239,6 @@ func (p *Prober) recvProbePacket(packet *mempool.Buffer) {
 	p.avg.Calculate(compressedRtt)
 
 	uclRtt := math.Pow(math.E, p.avg.UCL(3)) + p.minRtt
-
-	fmt.Println("recv probe", p.proberId.String(), info, elapsedTimeDur, time.Duration(uclRtt)*time.Microsecond)
 
 	nextTimeout := time.Duration(uclRtt)*time.Microsecond + 200*time.Millisecond
 	if p.reschedule.C == nil {
@@ -292,7 +287,6 @@ func (p *Prober) start() {
 		case <-p.ctx.Done():
 			return
 		case pkt := <-p.in:
-			fmt.Println("recv loop pkt: ", pkt.Bytes())
 			p.recvProbePacket(pkt)
 		case <-p.reschedule.C:
 			p.sendProbePacket()

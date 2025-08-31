@@ -55,7 +55,5 @@ func (i *Manager) PacketIn(pkt *mempool.Buffer) error {
 	}
 	prober.In() <- pkt
 
-	fmt.Println("packet in", i.inMap, proberId)
-
 	return nil
 }
