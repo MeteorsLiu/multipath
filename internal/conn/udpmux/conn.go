@@ -96,6 +96,7 @@ func (c *udpConn) onRecvAddr(addr string) {
 		sender.Start(localC, remoteAddr)
 		prober.Start(id)
 
+		fmt.Println("recv addr:", addr)
 		return sender
 	})
 }
