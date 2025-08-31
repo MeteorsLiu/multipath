@@ -97,7 +97,105 @@ func mockClient(c net.Conn) {
 		printInfoAndExit("unexpected buf: want %v got %v", buf, rBuf)
 	}
 	fmt.Println("client done")
+}
 
+// mockClientOutOfOrder 模拟乱序发送数据包
+// 这个函数模拟在多路径传输中数据包到达顺序混乱的情况
+func mockClientOutOfOrder(c net.Conn) {
+	fmt.Println("start sending segments out of order")
+
+	// 分成3个大段，每段再分成小片段，模拟多路径传输中的乱序
+	const bufSizeThird = 1024 * 1024 / 3
+
+	// 第一段：正常发送
+	segment1 := buf[0:bufSizeThird]
+
+	// 第二段：分片乱序发送
+	segment2Start := bufSizeThird
+	segment2End := bufSizeThird * 2
+	segment2 := buf[segment2Start:segment2End]
+
+	// 第三段：正常发送
+	segment3 := buf[bufSizeThird*2:]
+
+	fmt.Println("Sending segment 1 (normal order)")
+	_, err := c.Write(segment1)
+	if err != nil {
+		printInfoAndExit("%v", err)
+	}
+
+	fmt.Println("Sending segment 2 in fragments with delays (simulating out-of-order)")
+
+	// 将第二段分成4个小片段，乱序发送
+	fragmentSize := len(segment2) / 4
+	fragments := make([][]byte, 4)
+
+	for i := 0; i < 4; i++ {
+		start := i * fragmentSize
+		end := start + fragmentSize
+		if i == 3 { // 最后一个片段包含剩余的所有数据
+			end = len(segment2)
+		}
+		fragments[i] = segment2[start:end]
+	}
+
+	// 乱序发送：3, 1, 4, 2 的顺序
+	sendOrder := []int{2, 0, 3, 1} // 对应fragments的索引
+	delays := []time.Duration{0, 50 * time.Millisecond, 100 * time.Millisecond, 150 * time.Millisecond}
+
+	type fragmentTask struct {
+		index int
+		data  []byte
+		delay time.Duration
+	}
+
+	tasks := make([]fragmentTask, 4)
+	for i, fragIndex := range sendOrder {
+		tasks[i] = fragmentTask{
+			index: fragIndex,
+			data:  fragments[fragIndex],
+			delay: delays[i],
+		}
+	}
+
+	// 并发发送片段，模拟网络延迟导致的乱序
+	done := make(chan error, 4)
+
+	for _, task := range tasks {
+		go func(t fragmentTask) {
+			time.Sleep(t.delay)
+			fmt.Printf("Sending fragment %d (size: %d bytes) after %v delay\n",
+				t.index+1, len(t.data), t.delay)
+			_, err := c.Write(t.data)
+			done <- err
+		}(task)
+	}
+
+	// 等待所有片段发送完成
+	for i := 0; i < 4; i++ {
+		if err := <-done; err != nil {
+			printInfoAndExit("fragment send error: %v", err)
+		}
+	}
+
+	fmt.Println("Sending segment 3 (normal order)")
+	_, err = c.Write(segment3)
+	if err != nil {
+		printInfoAndExit("%v", err)
+	}
+
+	fmt.Println("All segments sent, waiting for response")
+
+	// 接收响应
+	rBuf := make([]byte, 1024*1024)
+	_, err = io.ReadFull(c, rBuf)
+	if err != nil {
+		printInfoAndExit("%v", err)
+	}
+	if !bytes.Equal(rBuf, buf) {
+		printInfoAndExit("unexpected buf: want %v got %v", buf, rBuf)
+	}
+	fmt.Println("client done (out of order test)")
 }
 
 func setupForwarder() {
@@ -143,7 +241,9 @@ func delForwarder() {
 
 func main() {
 	var testServer bool
+	var outOfOrder bool
 	flag.BoolVar(&testServer, "server", false, "Test server")
+	flag.BoolVar(&outOfOrder, "out-of-order", false, "Test out of order sending")
 	flag.Parse()
 
 	buf, _ = os.ReadFile("mockdata.bin")
@@ -197,7 +297,11 @@ func main() {
 		}
 		defer c.Close()
 
-		go mockClient(c)
+		if outOfOrder {
+			go mockClientOutOfOrder(c)
+		} else {
+			go mockClient(c)
+		}
 	}
 
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
