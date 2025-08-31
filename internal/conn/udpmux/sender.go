@@ -34,9 +34,6 @@ func (u *udpSender) waitInPacket(bufs *[][]byte, pendingBuf *[]*mempool.Buffer) 
 		pktBuf := pkt.FullBytes()
 
 		if pktBuf[0] == 0 {
-			if packetType == protocol.HeartBeat {
-				fmt.Println("make packet", pktBuf, packetType)
-			}
 			protocol.MakeHeader(pkt, packetType)
 		}
 

@@ -40,3 +40,7 @@ type ConnWriter interface {
 	Prober() *prober.Prober
 	String() string
 }
+
+type ByteWriterAt interface {
+	WriteByteAt(c byte, off int) error
+}

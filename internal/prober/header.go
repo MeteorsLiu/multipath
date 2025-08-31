@@ -23,8 +23,6 @@ func ProberIDFromBuffer(buf *mempool.Buffer) (byte, uuid.UUID, error) {
 	return epoch[0], proberId, nil
 }
 
-func IncrEpoch(epoch byte, pkt *mempool.Buffer) {
-	var buf [1]byte
-	buf[0] = epoch
-	pkt.WriteAt(buf[:], protocol.HeaderSize)
+func incrEpoch(epoch byte, pkt *mempool.Buffer) {
+	pkt.WriteByteAt(epoch+1, protocol.HeaderSize)
 }

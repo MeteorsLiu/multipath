@@ -42,6 +42,11 @@ func (b *Buffer) WriteAt(p []byte, off int64) (n int, err error) {
 	return
 }
 
+func (b *Buffer) WriteByteAt(p byte, off int64) (err error) {
+	b.b[off] = p
+	return
+}
+
 func (b *Buffer) Read(buf []byte) (n int, err error) {
 	n = copy(buf, b.b[b.offset():])
 	return
@@ -73,6 +78,10 @@ func (b *Buffer) FullBytes() []byte {
 
 func (b *Buffer) Bytes() []byte {
 	return b.b[b.offset():]
+}
+
+func (b *Buffer) ShallowCopy(pos, headerSize int) *Buffer {
+	return &Buffer{pos: pos, reservedSize: headerSize, b: b.b}
 }
 
 func (b *Buffer) OffsetTo(n int) {

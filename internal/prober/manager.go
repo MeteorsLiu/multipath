@@ -44,7 +44,7 @@ func (i *Manager) PacketIn(pkt *mempool.Buffer) error {
 	}
 	proberId := id.String()
 
-	IncrEpoch(epoch, pkt)
+	incrEpoch(epoch, pkt)
 
 	i.mu.RLock()
 	prober, ok := i.inMap[proberId]

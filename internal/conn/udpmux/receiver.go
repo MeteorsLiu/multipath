@@ -105,7 +105,7 @@ func (u *udpReader) sendPacketToRemote(addr string, pkt *mempool.Buffer) {
 func (u *udpReader) recvProbe(addr string, pkt *mempool.Buffer) {
 	err := u.proberManager.PacketIn(pkt)
 	if err == prober.ErrProberIDNotFound {
-		fmt.Println("send to remote")
+		fmt.Println("send to remote", pkt.FullBytes())
 		u.sendPacketToRemote(addr, pkt)
 		return
 	}
