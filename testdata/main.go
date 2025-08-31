@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -61,11 +62,18 @@ func mockServer(l net.Listener) {
 			if !bytes.Equal(tBuf, buf) {
 				printInfoAndExit("unexpected buf: want %v got %v", buf, tBuf)
 			}
+			fmt.Println("done, sending it back")
+			// sent it back
+			if n, err := conn.Write(tBuf); err != nil || n != 1024*1024 {
+				printInfoAndExit("unexpected sending: %v", err)
+			}
 		}(c)
 	}
 }
 
 func mockClient(c net.Conn) {
+	fmt.Println("start sending segments")
+
 	const bufSizeHalf = 1024 * 1024 / 2
 	_, err := c.Write(buf[0:bufSizeHalf])
 	if err != nil {
@@ -79,6 +87,16 @@ func mockClient(c net.Conn) {
 	if err != nil {
 		printInfoAndExit("%v", err)
 	}
+
+	rBuf := make([]byte, 1024*1024)
+	_, err = io.ReadFull(c, rBuf)
+	if err != nil {
+		printInfoAndExit("%v", err)
+	}
+	if !bytes.Equal(rBuf, buf) {
+		printInfoAndExit("unexpected buf: want %v got %v", buf, rBuf)
+	}
+	fmt.Println("client done")
 
 }
 
