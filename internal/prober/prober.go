@@ -60,6 +60,7 @@ type Prober struct {
 	out            chan *mempool.Buffer
 	ctx            context.Context
 	avg            *vary.Vary
+	addr           string
 	minRtt         float64
 	lost           float64
 	debit          float64
@@ -71,10 +72,11 @@ type Prober struct {
 	lastMaxStartTime int64
 }
 
-func New(ctx context.Context, on func(Event)) *Prober {
+func New(ctx context.Context, addr string, on func(Event)) *Prober {
 	p := &Prober{
 		on:     on,
 		ctx:    ctx,
+		addr:   addr,
 		avg:    vary.NewVary(),
 		in:     make(chan *mempool.Buffer, 128),
 		out:    make(chan *mempool.Buffer, 128),
@@ -264,7 +266,7 @@ func (p *Prober) switchState(to Event) {
 		p.debit = 1
 	}
 
-	fmt.Printf("Switch State: %s => %s Debit: %f\n", oldState, p.state, p.debit)
+	fmt.Printf("Switch State %s: %s => %s Debit: %f\n", p.addr, oldState, p.state, p.debit)
 
 	p.on(to)
 }
