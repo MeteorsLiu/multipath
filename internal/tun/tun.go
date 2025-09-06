@@ -71,6 +71,7 @@ func (u *TunHandler) writeLoop() {
 	for {
 		err := u.waitInPacket()
 		if err != nil {
+			fmt.Println("write loop exits", err)
 			return
 		}
 	}
