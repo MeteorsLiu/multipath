@@ -123,11 +123,11 @@ func (p *Prober) sendProbePacket() {
 	uclRtt := math.Pow(math.E, p.avg.UCL(3)) + p.minRtt
 	p.currentTimeout = time.Duration(uclRtt)*time.Microsecond + 500*time.Millisecond
 
-	if p.deadline.C == nil {
-		p.deadline = time.NewTimer(p.currentTimeout)
-		return
-	}
-	p.deadline.Reset(p.currentTimeout)
+	// if p.deadline.C == nil {
+	// 	p.deadline = time.NewTimer(p.currentTimeout)
+	// 	return
+	// }
+	// p.deadline.Reset(p.currentTimeout)
 }
 
 func (p *Prober) markTimeout() (isTimeout bool) {
@@ -284,20 +284,21 @@ func (p *Prober) switchState(to Event) {
 func (p *Prober) start() {
 	p.sendProbePacket()
 
+	ticker := time.NewTicker(100 * time.Millisecond)
 	for {
 		select {
 		case <-p.ctx.Done():
 			return
 		case pkt := <-p.in:
 			p.recvProbePacket(pkt)
-		case <-p.reschedule.C:
+		case <-ticker.C:
 			p.sendProbePacket()
-		case <-p.deadline.C:
-			// make sure we're really in timeout
-			if p.markTimeout() {
-				p.switchState(Lost)
-				p.sendProbePacket()
-			}
+			// case <-p.deadline.C:
+			// 	// make sure we're really in timeout
+			// 	if p.markTimeout() {
+			// 		p.switchState(Lost)
+			// 		p.sendProbePacket()
+			// 	}
 		}
 	}
 }
