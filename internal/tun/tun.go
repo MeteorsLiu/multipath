@@ -14,7 +14,7 @@ import (
 )
 
 type OSTun interface {
-	io.Reader
+	io.ReadWriter
 	conn.BatchConn
 }
 type TunHandler struct {
@@ -38,20 +38,28 @@ func (t *TunHandler) In() chan<- *mempool.Buffer {
 	return t.inCh
 }
 
-func (u *TunHandler) waitInPacket(bufs *[][]byte, pendingBuf *[]*mempool.Buffer) error {
+func (u *TunHandler) write(buf *mempool.Buffer) error {
+	_, err := u.osTun.Write(buf.Bytes())
+	mempool.Put(buf)
+	return err
+}
+
+func (u *TunHandler) waitInPacket() error {
 	select {
 	case pkt := <-u.inCh:
-		*bufs = append(*bufs, pkt.Bytes())
-		*pendingBuf = append(*pendingBuf, pkt)
+		if err := u.write(pkt); err != nil {
+			return err
+		}
 	case <-u.ctx.Done():
 		return u.ctx.Err()
 	}
 
-	for len(*bufs) < 1024 {
+	for {
 		select {
 		case pkt := <-u.inCh:
-			*bufs = append(*bufs, pkt.Bytes())
-			*pendingBuf = append(*pendingBuf, pkt)
+			if err := u.write(pkt); err != nil {
+				return err
+			}
 		case <-u.ctx.Done():
 			return u.ctx.Err()
 		default:
@@ -63,24 +71,10 @@ func (u *TunHandler) waitInPacket(bufs *[][]byte, pendingBuf *[]*mempool.Buffer)
 }
 
 func (u *TunHandler) writeLoop() {
-	bufs := make([][]byte, 0, 1024)
-	pb := make([]*mempool.Buffer, 0, 1024)
 	for {
-		err := u.waitInPacket(&bufs, &pb)
-		if err != nil {
-			return
-		}
-		_, err = u.osTun.WriteBatch(bufs)
-
-		for _, b := range pb {
-			mempool.Put(b)
-		}
-		pb = pb[:0]
-		bufs = bufs[:0]
-
+		err := u.waitInPacket()
 		if err != nil && err != syscall.EIO {
-			fmt.Println("write exit", err)
-			break
+			return
 		}
 	}
 }
