@@ -156,6 +156,10 @@ func (tun *tunDevice) WriteBatch(bufs [][]byte) (int64, error) {
 	return tun.fallbackWriter.WriteBatch(bufs)
 }
 
+func (tun *tunDevice) Write(buf []byte) (int, error) {
+	return tun.tunFile.Write(buf)
+}
+
 func (tun *tunDevice) Read(buf []byte) (int, error) {
 	n, err := tun.tunFile.Read(buf)
 	if err != nil {
@@ -173,6 +177,7 @@ func (tun *tunDevice) Read(buf []byte) (int, error) {
 		return 0, err
 	}
 	if n < int(fullSize) {
+		fmt.Println("small")
 		_, err := io.ReadFull(tun.tunFile, buf[n:fullSize])
 		if err != nil {
 			return 0, err
