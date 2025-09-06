@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"syscall"
 
 	"github.com/MeteorsLiu/multipath/internal/conn"
 	"github.com/MeteorsLiu/multipath/internal/conn/udpmux/protocol"
@@ -70,7 +71,7 @@ func (u *TunHandler) waitInPacket() error {
 func (u *TunHandler) writeLoop() {
 	for {
 		err := u.waitInPacket()
-		if err != nil {
+		if err != nil && !errors.Is(err, syscall.EIO) {
 			fmt.Println("write loop exits", err)
 			return
 		}
