@@ -75,8 +75,10 @@ func (s *SendMmsg) resetCursor() {
 
 func (s *SendMmsg) Write(b *mempool.Buffer) error {
 	if s.v6pc != nil {
+		s.lazyInitMsgsV6()
 		s.v6msgs[s.cursor].Buffers[0] = b.FullBytes()
 	} else {
+		s.lazyInitMsgsV4()
 		s.v4msgs[s.cursor].Buffers[0] = b.FullBytes()
 	}
 	s.cursor++
