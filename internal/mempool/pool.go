@@ -76,6 +76,18 @@ func (b *Buffer) FullBytes() []byte {
 	return b.b
 }
 
+func (b *Buffer) Header() []byte {
+	if b.reservedSize > 0 {
+		return b.b[0:b.reservedSize]
+	}
+	return nil
+}
+
+func (b *Buffer) IsHeaderInitialized() bool {
+	header := b.Header()
+	return header != nil && header[0] != 0
+}
+
 func (b *Buffer) Bytes() []byte {
 	return b.b[b.offset():]
 }

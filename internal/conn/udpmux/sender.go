@@ -14,12 +14,12 @@ import (
 )
 
 type udpSender struct {
-	ctx    context.Context
-	remote *net.UDPAddr
-	queue  chan *mempool.Buffer
-	conn   net.PacketConn
-	prober *prober.Prober
-
+	ctx       context.Context
+	remote    *net.UDPAddr
+	queue     chan *mempool.Buffer
+	conn      net.PacketConn
+	prober    *prober.Prober
+	writer    *udp.SendMmsg
 	startOnce sync.Once
 }
 
@@ -29,15 +29,12 @@ func newUDPSender(ctx context.Context, prober *prober.Prober) *udpSender {
 	return &udpSender{ctx: ctx, queue: make(chan *mempool.Buffer, 1024), prober: prober}
 }
 
-func (u *udpSender) waitInPacket(bufs *[][]byte, pendingBuf *[]*mempool.Buffer) error {
+func (u *udpSender) waitInPacket(udpWriter *udp.SendMmsg, pendingBuf *[]*mempool.Buffer) error {
 	appendPacket := func(pkt *mempool.Buffer, packetType protocol.PacketType) {
-		pktBuf := pkt.FullBytes()
-
-		if pktBuf[0] == 0 {
+		if !pkt.IsHeaderInitialized() {
 			protocol.MakeHeader(pkt, packetType)
 		}
-
-		*bufs = append(*bufs, pktBuf)
+		udpWriter.Write(pkt)
 		*pendingBuf = append(*pendingBuf, pkt)
 	}
 
@@ -50,7 +47,7 @@ func (u *udpSender) waitInPacket(bufs *[][]byte, pendingBuf *[]*mempool.Buffer) 
 		return u.ctx.Err()
 	}
 
-	for len(*bufs) < 1024 {
+	for len(*pendingBuf) < 1024 {
 		select {
 		case pkt := <-u.prober.Out():
 			appendPacket(pkt, protocol.HeartBeat)
@@ -67,23 +64,21 @@ func (u *udpSender) waitInPacket(bufs *[][]byte, pendingBuf *[]*mempool.Buffer) 
 }
 
 func (u *udpSender) writeLoop() {
-	bufs := make([][]byte, 0, 1024)
 	pb := make([]*mempool.Buffer, 0, 1024)
 
 	batchWriter := udp.NewWriterV4(u.conn, u.remote)
 
 	for {
-		err := u.waitInPacket(&bufs, &pb)
+		err := u.waitInPacket(batchWriter, &pb)
 		if err != nil {
 			break
 		}
-		_, err = batchWriter.WriteBatch(bufs)
+		_, err = batchWriter.Submit()
 
 		for _, b := range pb {
 			mempool.Put(b)
 		}
 		pb = pb[:0]
-		bufs = bufs[:0]
 
 		if err != nil {
 			fmt.Println(u.remote.String(), err)

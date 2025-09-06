@@ -168,20 +168,18 @@ func (u *udpReader) handlePacket(addr string, buf *mempool.Buffer) error {
 }
 
 func (u *udpReader) readLoop() {
-	bufBytes := make([][]byte, 0, 1024)
-
+	batchReader := udp.NewReaderV4(u.conn)
 	bufs := make([]*mempool.Buffer, 1024)
 	for i := range bufs {
 		bufs[i] = mempool.Get(1500)
-		bufBytes = append(bufBytes, bufs[i].Bytes())
+		msg := batchReader.MessageAt(i)
+		msg.Buffers[0] = bufs[i].FullBytes()
 	}
-
-	batchReader := udp.NewReaderV4(u.conn)
 
 	trafficMap := make(map[string]int64)
 
 	for {
-		numMsgs, _, err := batchReader.ReadBatch(bufBytes)
+		numMsgs, _, err := batchReader.ReadMessage()
 		if err != nil {
 			break
 		}
@@ -200,6 +198,8 @@ func (u *udpReader) readLoop() {
 			// buffers in queue will be put back into the pool after consumed.
 			// so we can grab a new buffer here
 			bufs[i] = mempool.Get(1500)
+			// update receive queue
+			msg.Buffers[0] = bufs[i].FullBytes()
 		}
 	}
 }

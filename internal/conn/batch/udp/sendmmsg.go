@@ -2,14 +2,16 @@ package udp
 
 import (
 	"net"
-	"runtime"
 
-	"github.com/MeteorsLiu/multipath/internal/conn"
+	"github.com/MeteorsLiu/multipath/internal/mempool"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 )
 
+var _ mempool.Writer = (*SendMmsg)(nil)
+
 type SendMmsg struct {
+	cursor int
 	conn   *net.UDPConn
 	remote *net.UDPAddr
 
@@ -17,7 +19,7 @@ type SendMmsg struct {
 	v6pc *ipv6.PacketConn
 
 	v4msgs []ipv4.Message
-	v6msgs []ipv4.Message
+	v6msgs []ipv6.Message
 }
 
 func NewWriterV4(conn net.PacketConn, remoteAddr *net.UDPAddr) *SendMmsg {
@@ -28,116 +30,115 @@ func NewWriterV6(conn net.PacketConn, remoteAddr *net.UDPAddr) *SendMmsg {
 	return &SendMmsg{conn: conn.(*net.UDPConn), v6pc: ipv6.NewPacketConn(conn), remote: remoteAddr}
 }
 
-func (s *SendMmsg) fillMsgsV4(bufs [][]byte) error {
-	if len(bufs) > 1024 {
-		return conn.ErrTooManySegments
-	}
+func (s *SendMmsg) lazyInitMsgsV4() error {
 	if s.v4msgs == nil {
 		s.v4msgs = make([]ipv4.Message, 1024)
 		for i := range s.v4msgs {
 			s.v4msgs[i].Buffers = make(net.Buffers, 1)
+			s.v4msgs[i].Addr = s.remote
 		}
-	}
-	for i := range bufs {
-		s.v4msgs[i].Buffers[0] = bufs[i]
-		s.v4msgs[i].Addr = s.remote
 	}
 
 	return nil
 }
 
-func (s *SendMmsg) fillMsgsV6(bufs [][]byte) error {
-	if len(bufs) > 1024 {
-		return conn.ErrTooManySegments
-	}
+func (s *SendMmsg) lazyInitMsgsV6() error {
 	if s.v6msgs == nil {
 		s.v6msgs = make([]ipv6.Message, 1024)
 		for i := range s.v6msgs {
 			s.v6msgs[i].Buffers = make(net.Buffers, 1)
+			s.v6msgs[i].Addr = s.remote
 		}
-	}
-	for i := range bufs {
-		s.v6msgs[i].Buffers[0] = bufs[i]
-		s.v6msgs[i].Addr = s.remote
 	}
 
 	return nil
 }
 
-func (s *SendMmsg) WriteBatch(bufs [][]byte) (int64, error) {
+func (s *SendMmsg) resetCursor() {
+	for i := range s.v4msgs {
+		// ranging over slices is nil safety, while resizing slices is not.
+		// s.v4msgs[:s.cursor] will panic when s.v4msgs is nil
+		if i >= s.cursor {
+			break
+		}
+		// cut off GC tracking to avoid memory leak.
+		s.v4msgs[i].Buffers[0] = nil
+	}
+	for i := range s.v6msgs {
+		if i >= s.cursor {
+			break
+		}
+		s.v6msgs[i].Buffers[0] = nil
+	}
+	s.cursor = 0
+}
+
+func (s *SendMmsg) Write(b *mempool.Buffer) error {
 	if s.v6pc != nil {
-		return s.send6(bufs)
+		s.v6msgs[s.cursor].Buffers[0] = b.FullBytes()
+	} else {
+		s.v4msgs[s.cursor].Buffers[0] = b.FullBytes()
 	}
-	return s.send4(bufs)
+	s.cursor++
+	return nil
 }
 
-func (s *SendMmsg) send4(bufs [][]byte) (int64, error) {
-	err := s.fillMsgsV4(bufs)
-	if err != nil {
-		return 0, err
+func (s *SendMmsg) Submit() (int64, error) {
+	defer s.resetCursor()
+	if s.v6pc != nil {
+		return s.send6()
 	}
+	return s.send4()
+}
+
+func (s *SendMmsg) send4() (int64, error) {
 	var (
 		n     int
 		start int
 		sent  int64
+		err   error
 	)
-	if runtime.GOOS == "linux" {
-		for {
-			n, err = s.v4pc.WriteBatch(s.v4msgs[start:len(bufs)], 0)
-			if n > 0 {
-				sent += int64(n)
-			}
-			if err != nil || n == len(s.v4msgs[start:len(bufs)]) {
-				break
-			}
-			start += n
+	for {
+		n, err = s.v4pc.WriteBatch(s.v4msgs[start:s.cursor], 0)
+		if n > 0 {
+			sent += int64(n)
 		}
-	} else {
-		for i, buf := range bufs {
-			n, _, err = s.conn.WriteMsgUDP(buf, s.v4msgs[i].OOB, s.remote)
-			if n > 0 {
-				sent += int64(n)
-			}
-			if err != nil {
-				break
-			}
+		if err != nil || n == len(s.v4msgs[start:s.cursor]) {
+			break
 		}
+		start += n
 	}
 	return sent, err
 }
 
-func (s *SendMmsg) send6(bufs [][]byte) (int64, error) {
-	err := s.fillMsgsV6(bufs)
-	if err != nil {
-		return 0, err
-	}
-
+func (s *SendMmsg) send6() (int64, error) {
 	var (
 		n     int
 		start int
 		sent  int64
+		err   error
 	)
-	if runtime.GOOS == "linux" {
-		for {
-			n, err = s.v6pc.WriteBatch(s.v6msgs[start:len(bufs)], 0)
-			if n > 0 {
-				sent += int64(n)
-			}
-			if err != nil || n == len(s.v6msgs[start:len(bufs)]) {
-				break
-			}
-			start += n
+	for {
+		n, err = s.v6pc.WriteBatch(s.v6msgs[start:s.cursor], 0)
+		if n > 0 {
+			sent += int64(n)
 		}
-	} else {
-		for i, buf := range bufs {
-			n, _, err = s.conn.WriteMsgUDP(buf, s.v6msgs[i].OOB, s.remote)
-			if n > 0 {
-				sent += int64(n)
-			}
-			if err != nil {
-				break
-			}
+		if err != nil || n == len(s.v6msgs[start:s.cursor]) {
+			break
 		}
+		start += n
 	}
 	return sent, err
+}
+
+func (s *SendMmsg) MessageAt(n int) *ipv4.Message {
+	s.lazyInitMsgsV4()
+	msg := s.v4msgs[n]
+	return &msg
+}
+
+func (s *SendMmsg) MessageV6At(n int) *ipv6.Message {
+	s.lazyInitMsgsV6()
+	msg := s.v6msgs[n]
+	return &msg
 }
