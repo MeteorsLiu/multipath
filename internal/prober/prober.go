@@ -121,7 +121,7 @@ func (p *Prober) sendProbePacket() {
 	}
 
 	uclRtt := math.Pow(math.E, p.avg.UCL(3)) + p.minRtt
-	p.currentTimeout = time.Duration(uclRtt)*time.Microsecond + 200*time.Millisecond
+	p.currentTimeout = time.Duration(uclRtt)*time.Microsecond + 500*time.Millisecond
 
 	if p.deadline.C == nil {
 		p.deadline = time.NewTimer(p.currentTimeout)
@@ -242,7 +242,7 @@ func (p *Prober) recvProbePacket(packet *mempool.Buffer) {
 
 	uclRtt := math.Pow(math.E, p.avg.UCL(3)) + p.minRtt
 
-	nextTimeout := time.Duration(uclRtt)*time.Microsecond + 200*time.Millisecond
+	nextTimeout := time.Duration(uclRtt)*time.Microsecond + 500*time.Millisecond
 	if p.reschedule.C == nil {
 		p.reschedule = time.NewTimer(nextTimeout)
 		return
