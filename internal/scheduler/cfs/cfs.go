@@ -2,6 +2,7 @@ package cfs
 
 import (
 	"container/heap"
+	"fmt"
 	"sync"
 
 	"github.com/MeteorsLiu/multipath/internal/mempool"
@@ -46,12 +47,15 @@ func NewCFSScheduler(isServerSide bool) scheduler.Scheduler {
 }
 
 func (s *schedulerImpl) AddPath(path scheduler.SchedulablePath) {
+	fmt.Println("push", path.String())
 	s.mu.Lock()
 	heap.Push(&s.heap, path)
 	s.mu.Unlock()
 }
 
 func (s *schedulerImpl) RemovePath(path scheduler.SchedulablePath) {
+	fmt.Println("remove", path.String())
+
 	cPath, ok := path.(*cfsPath)
 	if !ok {
 		panic("invalid path underlying type")
