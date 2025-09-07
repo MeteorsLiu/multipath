@@ -26,7 +26,10 @@ func NewClient(ctx context.Context, cfg Config) (func(), error) {
 	tunModule := tun.NewHandler(ctx, tunInterface, sche)
 
 	for _, p := range cfg.Client.Remotes {
-		c, _ := tcp.DialConn(ctx, p.RemoteAddr, tunModule.In())
+		c, err := tcp.DialConn(ctx, p.RemoteAddr, tunModule.In())
+		if err != nil {
+			panic(err)
+		}
 		sche.AddPath(cfs.NewPath(path.NewPath(c)))
 	}
 
