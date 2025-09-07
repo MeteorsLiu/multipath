@@ -90,28 +90,29 @@ func (t *tcpConn) Start() {
 }
 
 func (u *tcpConn) readLoop() {
-	buf := make([]byte, protocol.HeaderSize)
+	b := make([]byte, protocol.HeaderSize)
 	reader := bufio.NewReader(u.conn)
 	var err error
 	const proberPacketSize = prober.NonceSize + prober.ProbeHeaderSize
 loop:
 	for {
-		_, err = reader.Read(buf)
+		_, err = reader.Read(b)
 		if err != nil {
 			break
 		}
-		header := protocol.Header(buf)
+		header := protocol.Header(b)
 
 		switch header.Type() {
 		case protocol.HeartBeat:
 			// we can't read packets like UDP, because TCP is stream-origent
-			buf := mempool.Get(proberPacketSize)
+			buf := mempool.GetWithHeader(proberPacketSize, protocol.HeaderSize)
 			if _, err = io.ReadFull(reader, buf.Bytes()); err != nil {
 				break loop
 			}
 			err = u.proberManager.PacketIn(buf)
 			if err == prober.ErrProberIDNotFound {
 				// sent back
+				buf.WriteAt(b, 0)
 				u.queue <- buf
 				continue
 			}
