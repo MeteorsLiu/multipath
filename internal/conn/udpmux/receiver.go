@@ -176,7 +176,6 @@ func (u *udpReader) readLoop() {
 			bufs[i].SetLen(msg.N)
 			remoteAddr := msg.Addr.String()
 			u.onRecvAddr(remoteAddr)
-			fmt.Println("recv", bufs[i].Bytes(), remoteAddr)
 
 			u.handlePacket(remoteAddr, bufs[i])
 
