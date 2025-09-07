@@ -66,6 +66,7 @@ func (u *udpSender) waitInPacket(udpWriter *udp.SendMmsg, pendingBuf *[]*mempool
 func (u *udpSender) writeLoop() {
 	pb := make([]*mempool.Buffer, 0, 1024)
 
+	fmt.Println("start sender to ", u.remote)
 	batchWriter := udp.NewWriterV4(u.conn, u.remote)
 
 	for {
