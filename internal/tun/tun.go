@@ -13,7 +13,7 @@ import (
 )
 
 type OSTun interface {
-	io.ReadWriter
+	io.ReadWriteCloser
 }
 type TunHandler struct {
 	ctx       context.Context
