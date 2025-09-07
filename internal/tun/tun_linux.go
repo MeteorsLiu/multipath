@@ -151,11 +151,6 @@ func (tun *tunDevice) nameSlow() (string, error) {
 	return unix.ByteSliceToString(ifr[:]), nil
 }
 
-// TODO: GRO Support
-func (tun *tunDevice) WriteBatch(bufs [][]byte) (int64, error) {
-	return tun.fallbackWriter.WriteBatch(bufs)
-}
-
 func (tun *tunDevice) Write(buf []byte) (int, error) {
 	return tun.tunFile.Write(buf)
 }

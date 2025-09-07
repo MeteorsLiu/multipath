@@ -7,7 +7,6 @@ import (
 	"io"
 	"syscall"
 
-	"github.com/MeteorsLiu/multipath/internal/conn"
 	"github.com/MeteorsLiu/multipath/internal/conn/protocol"
 	"github.com/MeteorsLiu/multipath/internal/mempool"
 	"github.com/MeteorsLiu/multipath/internal/scheduler"
@@ -15,7 +14,6 @@ import (
 
 type OSTun interface {
 	io.ReadWriter
-	conn.BatchConn
 }
 type TunHandler struct {
 	ctx       context.Context
