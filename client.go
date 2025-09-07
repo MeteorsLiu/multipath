@@ -6,6 +6,7 @@ import (
 
 	"github.com/MeteorsLiu/multipath/internal/conn"
 	"github.com/MeteorsLiu/multipath/internal/conn/tcp"
+	"github.com/MeteorsLiu/multipath/internal/path"
 	"github.com/MeteorsLiu/multipath/internal/scheduler/cfs"
 	"github.com/MeteorsLiu/multipath/internal/tun"
 )
@@ -24,8 +25,9 @@ func NewClient(ctx context.Context, cfg Config) (func(), error) {
 
 	tunModule := tun.NewHandler(ctx, tunInterface, sche)
 
-	for _, path := range cfg.Client.Remotes {
-		tcp.DialConn(ctx, path.RemoteAddr, tunModule.In())
+	for _, p := range cfg.Client.Remotes {
+		c, _ := tcp.DialConn(ctx, p.RemoteAddr, tunModule.In())
+		sche.AddPath(cfs.NewPath(path.NewPath(c)))
 	}
 
 	tunModule.Start()

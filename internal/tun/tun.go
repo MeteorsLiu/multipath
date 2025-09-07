@@ -64,8 +64,6 @@ func (u *TunHandler) waitInPacket() error {
 			return nil
 		}
 	}
-
-	return nil
 }
 
 func (u *TunHandler) writeLoop() {

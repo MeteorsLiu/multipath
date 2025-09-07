@@ -53,7 +53,6 @@ func (i *Manager) PacketIn(pkt *mempool.Buffer) error {
 	if !ok {
 		return ErrProberIDNotFound
 	}
-	fmt.Println(proberId)
 
 	prober.In() <- pkt
 

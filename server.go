@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
 
 	"github.com/MeteorsLiu/multipath/internal/conn"
 	"github.com/MeteorsLiu/multipath/internal/conn/tcp"
+	"github.com/MeteorsLiu/multipath/internal/path"
 	"github.com/MeteorsLiu/multipath/internal/scheduler/cfs"
 	"github.com/MeteorsLiu/multipath/internal/tun"
 )
@@ -24,11 +26,24 @@ func NewServer(ctx context.Context, cfg Config) (closeFn func(), err error) {
 
 	tunModule := tun.NewHandler(ctx, tunInterface, sche)
 
-	tcp.ListenConn(ctx, nil, cfg.ListenAddr, tunModule.In())
+	l, err := net.Listen("tcp", cfg.ListenAddr)
+
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				fmt.Println("listen exits: ", err)
+				break
+			}
+			tc := tcp.NewConn(ctx, c, tunModule.In())
+			sche.AddPath(cfs.NewPath(path.NewPath(tc)))
+		}
+	}()
 
 	tunModule.Start()
 
 	return func() {
+		l.Close()
 		tunInterface.Close()
 	}, nil
 }

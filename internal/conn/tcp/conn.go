@@ -41,7 +41,7 @@ func (c *tcpConn) onProberEvent(event prober.Event) {
 	// }
 }
 
-func newConn(ctx context.Context, cn net.Conn, out chan<- *mempool.Buffer) conn.MuxConn {
+func NewConn(ctx context.Context, cn net.Conn, out chan<- *mempool.Buffer) *tcpConn {
 	tc := &tcpConn{ctx: ctx, conn: cn, queue: make(chan *mempool.Buffer, queueSize), out: out, proberManager: prober.NewManager()}
 	tc.Start()
 	id, prober := tc.proberManager.Register(ctx, fmt.Sprintf("%s => %s", cn.LocalAddr(), cn.RemoteAddr()), tc.onProberEvent)
@@ -50,7 +50,7 @@ func newConn(ctx context.Context, cn net.Conn, out chan<- *mempool.Buffer) conn.
 	return tc
 }
 
-func DialConn(ctx context.Context, remoteAddr string, out chan<- *mempool.Buffer) (conn.MuxConn, error) {
+func DialConn(ctx context.Context, remoteAddr string, out chan<- *mempool.Buffer) (conn.ConnWriter, error) {
 	dialer := &net.Dialer{
 		Timeout: 15 * time.Second,
 	}
@@ -58,31 +58,7 @@ func DialConn(ctx context.Context, remoteAddr string, out chan<- *mempool.Buffer
 	if err != nil {
 		return nil, err
 	}
-	return newConn(ctx, cn, out), nil
-}
-
-func ListenConn(ctx context.Context, pm *conn.SenderManager, local string, out chan<- *mempool.Buffer) error {
-	l, err := net.Listen("tcp", local)
-	if err != nil {
-		return err
-	}
-	fmt.Println("start listening at", l.Addr())
-	go func() {
-		<-ctx.Done()
-		l.Close()
-	}()
-	go func() {
-		for {
-			cn, err := l.Accept()
-			if err != nil {
-				fmt.Println("listen exits: ", err)
-				break
-			}
-			newConn(ctx, cn, out)
-		}
-	}()
-
-	return nil
+	return NewConn(ctx, cn, out), nil
 }
 
 func (t *tcpConn) Start() {
@@ -142,6 +118,7 @@ loop:
 			if _, err = io.ReadFull(reader, buf.Bytes()[20:packetSize]); err != nil {
 				break loop
 			}
+			fmt.Println(packetSize, buf)
 			u.out <- buf
 		}
 	}
@@ -212,5 +189,22 @@ func (t *tcpConn) writeLoop() {
 	}
 	if err != nil {
 		fmt.Println("writeloop exits", err)
+	}
+}
+
+func (t *tcpConn) String() string {
+	return fmt.Sprintf("%s => %s", t.conn.LocalAddr(), t.conn.RemoteAddr())
+}
+
+func (t *tcpConn) Prober() *prober.Prober {
+	return t.prober
+}
+
+func (t *tcpConn) Write(b *mempool.Buffer) error {
+	select {
+	case <-t.ctx.Done():
+		return t.ctx.Err()
+	case t.queue <- b:
+		return nil
 	}
 }
