@@ -118,7 +118,6 @@ loop:
 			if _, err = io.ReadFull(reader, buf.Bytes()[20:packetSize]); err != nil {
 				break loop
 			}
-			fmt.Println(packetSize, buf)
 			u.out <- buf
 		}
 	}
@@ -145,7 +144,7 @@ func (u *tcpConn) waitInPacket(tcpWriter conn.BatchWriter, pendingBuf *[]*mempoo
 		return u.ctx.Err()
 	}
 
-	for len(*pendingBuf) < queueSize {
+	for len(*pendingBuf) < 1024 {
 		select {
 		case pkt := <-u.prober.Out():
 			appendPacket(pkt, protocol.HeartBeat)
