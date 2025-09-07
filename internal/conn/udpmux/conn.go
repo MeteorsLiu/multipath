@@ -11,58 +11,42 @@ import (
 )
 
 type udpConn struct {
-	ctx          context.Context
-	cancel       context.CancelFunc
-	receiver     *udpReader
-	isServerSide bool
+	*udpSender
+
+	ctx      context.Context
+	cancel   context.CancelFunc
+	receiver *udpReader
 
 	proberManager *prober.Manager
-
-	manager *conn.SenderManager
 }
 
-func DialConn(ctx context.Context, pm *conn.SenderManager, remoteAddr string, out chan<- *mempool.Buffer) (conn.MuxConn, error) {
+func DialConn(ctx context.Context, listenAddr, remoteAddr string, out chan<- *mempool.Buffer) (conn.ConnWriter, error) {
 	remoteUdpAddr, err := net.ResolveUDPAddr("udp", remoteAddr)
 	if err != nil {
 		return nil, err
 	}
-	udpC, err := net.ListenPacket("udp", ":0")
+	listenConn, err := net.ListenPacket("udp", listenAddr)
+	if err != nil {
+		return nil, err
+	}
+	remoteConn, err := net.ListenPacket("udp", ":0")
 	if err != nil {
 		return nil, err
 	}
 
-	cn := &udpConn{manager: pm, proberManager: prober.NewManager()}
+	cn := &udpConn{proberManager: prober.NewManager()}
 	cn.ctx, cn.cancel = context.WithCancel(ctx)
 
-	id, prober := cn.proberManager.Register(ctx, fmt.Sprintf("%s => %s", udpC.LocalAddr(), remoteAddr), cn.onProberEvent)
+	id, prober := cn.proberManager.Register(ctx, fmt.Sprintf("%s => %s", remoteConn.LocalAddr(), remoteAddr), cn.onProberEvent)
 
-	sender := newUDPSender(cn.ctx, prober)
-	cn.receiver = newUDPReceiver(udpC, out, sender.queue, cn.manager, cn.proberManager, cn.onRecvAddr, false)
-
-	pm.Add(remoteAddr, func() conn.ConnWriter {
-		return sender
-	})
+	cn.udpSender = newUDPSender(cn.ctx, prober)
+	cn.receiver = newUDPReceiver(listenConn, out, cn.udpSender.queue, cn.proberManager, cn.onRecvAddr, false)
 
 	cn.receiver.Start()
-
-	sender.Start(udpC, remoteUdpAddr)
+	cn.udpSender.Start(remoteConn, remoteUdpAddr)
 	prober.Start(id)
 
 	return cn, nil
-}
-
-func ListenConn(ctx context.Context, pm *conn.SenderManager, local string, out chan<- *mempool.Buffer) (conn.MuxConn, error) {
-	localConn, err := net.ListenPacket("udp", local)
-	if err != nil {
-		return nil, err
-	}
-	conn := &udpConn{manager: pm, isServerSide: true, proberManager: prober.NewManager()}
-	conn.ctx, conn.cancel = context.WithCancel(ctx)
-
-	conn.receiver = newUDPReceiver(localConn, out, nil, conn.manager, conn.proberManager, conn.onRecvAddr, true)
-	conn.receiver.Start()
-
-	return conn, nil
 }
 
 func (c *udpConn) onProberEvent(event prober.Event) {
@@ -76,27 +60,4 @@ func (c *udpConn) onProberEvent(event prober.Event) {
 	// }
 }
 func (c *udpConn) onRecvAddr(addr string) {
-	if !c.isServerSide {
-		return
-	}
-	c.manager.Add(addr, func() conn.ConnWriter {
-		remoteAddr, err := net.ResolveUDPAddr("udp", addr)
-		if err != nil {
-			fmt.Println("failed to parse udp addr when onRecvAddr: ", err)
-			return nil
-		}
-		localC, err := net.ListenPacket("udp", ":0")
-		if err != nil {
-			fmt.Println("failed to listen udp when onRecvAddr: ", err)
-			return nil
-		}
-		id, prober := c.proberManager.Register(c.ctx, fmt.Sprintf("%s => %s", localC.LocalAddr(), addr), c.onProberEvent)
-		sender := newUDPSender(c.ctx, prober)
-
-		sender.Start(localC, remoteAddr)
-		prober.Start(id)
-
-		fmt.Println("recv addr:", addr)
-		return sender
-	})
 }

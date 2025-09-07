@@ -282,8 +282,6 @@ func (p *Prober) switchState(to Event) {
 // Disconnect -> Lost (When 1 packets meets estimated RTT requirement)
 // Lost -> Normal: See Normal <-> Lost
 func (p *Prober) start() {
-	p.sendProbePacket()
-
 	ticker := time.NewTicker(100 * time.Millisecond)
 	for {
 		select {

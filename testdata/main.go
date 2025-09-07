@@ -16,7 +16,7 @@ import (
 
 const (
 	cfgFileClient = `{
-	"client": {
+	 	"listen": "0.0.0.0:26666",
 		"remotePaths": [{
 			"remoteAddr": "192.168.167.155:29997",
 			"weight": 1
@@ -27,7 +27,6 @@ const (
 			"remoteAddr": "192.168.167.155:29999",
 			"weight": 1
 		}]
-	}
 }`
 	cfgFileServer = `{
 	"server": {

@@ -5,7 +5,6 @@ import (
 	"net"
 	"sync"
 
-	"github.com/MeteorsLiu/multipath/internal/conn"
 	"github.com/MeteorsLiu/multipath/internal/conn/batch/udp"
 	"github.com/MeteorsLiu/multipath/internal/conn/udpmux/ip"
 	"github.com/MeteorsLiu/multipath/internal/conn/udpmux/protocol"
@@ -57,7 +56,6 @@ type udpReader struct {
 	outCh chan<- *mempool.Buffer
 
 	clientSender  chan<- *mempool.Buffer
-	senderManager *conn.SenderManager
 	proberManager *prober.Manager
 	onRecvAddr    func(string)
 
@@ -71,14 +69,12 @@ func newUDPReceiver(
 	conn net.PacketConn,
 	outCh chan<- *mempool.Buffer,
 	clientSender chan<- *mempool.Buffer,
-	senderManager *conn.SenderManager,
 	proberManager *prober.Manager,
 	onRecvAddr func(string),
 	isServerSide bool,
 ) *udpReader {
 	return &udpReader{
 		conn:          conn,
-		senderManager: senderManager,
 		proberManager: proberManager,
 		onRecvAddr:    onRecvAddr,
 		isServerSide:  isServerSide,
@@ -89,17 +85,7 @@ func newUDPReceiver(
 }
 
 func (u *udpReader) sendPacketToRemote(addr string, pkt *mempool.Buffer) {
-	if !u.isServerSide {
-		u.clientSender <- pkt
-		return
-	}
-	sender := u.senderManager.Get(addr)
-	if sender == nil {
-		panic("sender is nil")
-	}
-	if err := sender.Write(pkt); err != nil {
-		fmt.Println(err)
-	}
+	u.clientSender <- pkt
 }
 
 func (u *udpReader) recvProbe(addr string, pkt *mempool.Buffer) {

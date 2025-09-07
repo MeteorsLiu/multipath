@@ -20,12 +20,8 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var close func()
-	if cfg.IsServerSide {
-		close, err = NewServer(ctx, cfg)
-	} else {
-		close, err = NewClient(ctx, cfg)
-	}
+	close, err := NewClient(ctx, cfg)
+
 	if err != nil {
 		panic(err)
 	}

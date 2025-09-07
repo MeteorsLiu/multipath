@@ -10,19 +10,12 @@ type Path struct {
 	Weight     int    `json:"weight"`
 }
 
-type Client struct {
-	Remotes []Path `json:"remotePaths"`
-}
-
-type Server struct {
-	ListenAddr string `json:"listen"`
-}
-
 type Config struct {
-	Client       `json:"client,omitempty"`
-	Server       `json:"server,omitempty"`
-	TunName      string `json:"tun,omitempty"`
-	IsServerSide bool   `json:"isServer"`
+	ListenAddr string `json:"listen"`
+
+	Remotes []Path `json:"remotePaths"`
+
+	TunName string `json:"tun,omitempty"`
 }
 
 func ParseConfig(configFile string) (cfg Config, err error) {
