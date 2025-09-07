@@ -27,6 +27,9 @@ func NewServer(ctx context.Context, cfg Config) (closeFn func(), err error) {
 	tunModule := tun.NewHandler(ctx, tunInterface, sche)
 
 	l, err := net.Listen("tcp", cfg.ListenAddr)
+	if err != nil {
+		fmt.Println(err)
+	}
 
 	go func() {
 		for {
