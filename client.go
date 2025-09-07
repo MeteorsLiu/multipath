@@ -43,9 +43,9 @@ func NewClient(ctx context.Context, cfg Config) (func(), error) {
 
 	sema := make(chan struct{}, 1)
 
-	for _, pathConfig := range cfg.Remotes {
+	for i, pathConfig := range cfg.Remotes {
 		dial := func() (conn.ConnWriter, error) {
-			return udpmux.DialConn(ctx, cfg.ListenAddr, pathConfig.RemoteAddr, tunModule.In())
+			return udpmux.DialConn(ctx, cfg.ListenAddr[i], pathConfig.RemoteAddr, tunModule.In())
 		}
 		go func() {
 			asyncDial(sche, dial)

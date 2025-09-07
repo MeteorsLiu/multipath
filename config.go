@@ -11,7 +11,7 @@ type Path struct {
 }
 
 type Config struct {
-	ListenAddr string `json:"listen"`
+	ListenAddr []string `json:"listen"`
 
 	Remotes []Path `json:"remotePaths"`
 
