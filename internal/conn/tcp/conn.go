@@ -66,6 +66,7 @@ func ListenConn(ctx context.Context, pm *conn.SenderManager, local string, out c
 	if err != nil {
 		return err
 	}
+	fmt.Println("start listening at", l.Addr())
 	go func() {
 		<-ctx.Done()
 		l.Close()
@@ -94,6 +95,7 @@ func (u *tcpConn) readLoop() {
 	reader := bufio.NewReader(u.conn)
 	var err error
 	const proberPacketSize = prober.NonceSize + prober.ProbeHeaderSize
+	fmt.Printf("read tcp at: %s => %s\n", u.conn.LocalAddr(), u.conn.RemoteAddr())
 loop:
 	for {
 		_, err = reader.Read(b)
@@ -190,6 +192,7 @@ func (t *tcpConn) writeLoop() {
 	}
 	batchWriter := batch.NewWriter(rw)
 	pb := make([]*mempool.Buffer, 0, queueSize)
+	fmt.Printf("write tcp at: %s => %s\n", t.conn.LocalAddr(), t.conn.RemoteAddr())
 
 	for {
 		err = t.waitInPacket(batchWriter, &pb)
