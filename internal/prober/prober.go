@@ -9,7 +9,7 @@ import (
 	"math"
 	"time"
 
-	"github.com/MeteorsLiu/multipath/internal/conn/udpmux/protocol"
+	"github.com/MeteorsLiu/multipath/internal/conn/protocol"
 	"github.com/MeteorsLiu/multipath/internal/mempool"
 	"github.com/MeteorsLiu/multipath/internal/vary"
 	"github.com/google/uuid"

@@ -19,7 +19,7 @@ import (
 
 	"github.com/MeteorsLiu/multipath/internal/conn"
 	"github.com/MeteorsLiu/multipath/internal/conn/batch"
-	"github.com/MeteorsLiu/multipath/internal/conn/udpmux/ip"
+	"github.com/MeteorsLiu/multipath/internal/conn/ip"
 	"golang.org/x/sys/unix"
 )
 

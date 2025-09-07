@@ -3,12 +3,13 @@ package prober
 import (
 	"fmt"
 
-	"github.com/MeteorsLiu/multipath/internal/conn/udpmux/protocol"
+	"github.com/MeteorsLiu/multipath/internal/conn/protocol"
 	"github.com/MeteorsLiu/multipath/internal/mempool"
 	"github.com/google/uuid"
 )
 
-const ProbeHeaderSize = 17
+// epoch + prober id
+const ProbeHeaderSize = 1 + 16
 
 func ProberIDFromBuffer(buf *mempool.Buffer) (byte, uuid.UUID, error) {
 	epoch := buf.Peek(1)

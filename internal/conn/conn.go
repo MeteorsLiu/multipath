@@ -23,7 +23,8 @@ type BatchReader interface {
 }
 
 type BatchWriter interface {
-	WriteBatch(b [][]byte) (n int64, err error)
+	mempool.Writer
+	Submit() (n int64, err error)
 }
 
 type BatchConn interface {

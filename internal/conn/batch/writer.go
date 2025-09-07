@@ -5,6 +5,7 @@ import (
 	"syscall"
 
 	"github.com/MeteorsLiu/multipath/internal/conn"
+	"github.com/MeteorsLiu/multipath/internal/mempool"
 	"golang.org/x/sys/unix"
 )
 
@@ -18,16 +19,18 @@ func NewWriter(fd syscall.RawConn) conn.BatchWriter {
 	return &batchWriter{fd: fd, iov: newResizableIov()}
 }
 
+func (f *batchWriter) Write(b *mempool.Buffer) error {
+	f.iov.append(b.FullBytes())
+	return nil
+}
+
 // WriteBatch acts like writeBuffers for net.Buffers
 // However, tun device is underlying by *os.File, which dones't implement writeBuffers(), so we cannot use net.Buffers
-func (f *batchWriter) WriteBatch(b [][]byte) (n int64, err error) {
-	if len(b) == 0 {
+func (f *batchWriter) Submit() (n int64, err error) {
+	if len(f.iov.ioves) == 0 {
 		return
 	}
-	maxSize, err := f.iov.fill(b)
-	if err != nil {
-		return
-	}
+	maxSize := f.iov.sum
 	// reset cursor to avoid buffers leaky
 	defer f.iov.resetCursor()
 

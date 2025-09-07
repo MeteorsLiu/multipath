@@ -7,8 +7,8 @@ import (
 
 	"github.com/MeteorsLiu/multipath/internal/conn"
 	"github.com/MeteorsLiu/multipath/internal/conn/batch/udp"
-	"github.com/MeteorsLiu/multipath/internal/conn/udpmux/ip"
-	"github.com/MeteorsLiu/multipath/internal/conn/udpmux/protocol"
+	"github.com/MeteorsLiu/multipath/internal/conn/ip"
+	"github.com/MeteorsLiu/multipath/internal/conn/protocol"
 	"github.com/MeteorsLiu/multipath/internal/mempool"
 	"github.com/MeteorsLiu/multipath/internal/prober"
 )
