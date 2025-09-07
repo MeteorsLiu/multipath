@@ -123,11 +123,11 @@ func (p *Prober) sendProbePacket() {
 	uclRtt := math.Pow(math.E, p.avg.UCL(3)) + p.minRtt
 	p.currentTimeout = time.Duration(uclRtt)*time.Microsecond + 500*time.Millisecond
 
-	// if p.deadline.C == nil {
-	// 	p.deadline = time.NewTimer(p.currentTimeout)
-	// 	return
-	// }
-	// p.deadline.Reset(p.currentTimeout)
+	if p.deadline.C == nil {
+		p.deadline = time.NewTimer(p.currentTimeout)
+		return
+	}
+	p.deadline.Reset(p.currentTimeout)
 }
 
 func (p *Prober) markTimeout() (isTimeout bool) {
@@ -212,7 +212,6 @@ func (p *Prober) recvProbePacket(packet *mempool.Buffer) {
 		if p.debit > 0 {
 			p.debit = 10
 		}
-		fmt.Println("timeout!", elapsedTimeDur)
 		return
 	}
 	p.lastMaxStartTime = 0
@@ -283,21 +282,22 @@ func (p *Prober) switchState(to Event) {
 // Disconnect -> Lost (When 1 packets meets estimated RTT requirement)
 // Lost -> Normal: See Normal <-> Lost
 func (p *Prober) start() {
-	ticker := time.NewTicker(100 * time.Millisecond)
+	p.sendProbePacket()
+
 	for {
 		select {
 		case <-p.ctx.Done():
 			return
 		case pkt := <-p.in:
 			p.recvProbePacket(pkt)
-		case <-ticker.C:
+		case <-p.reschedule.C:
 			p.sendProbePacket()
-			// case <-p.deadline.C:
-			// 	// make sure we're really in timeout
-			// 	if p.markTimeout() {
-			// 		p.switchState(Lost)
-			// 		p.sendProbePacket()
-			// 	}
+		case <-p.deadline.C:
+			// make sure we're really in timeout
+			if p.markTimeout() {
+				p.switchState(Lost)
+				p.sendProbePacket()
+			}
 		}
 	}
 }
