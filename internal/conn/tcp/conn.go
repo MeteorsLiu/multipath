@@ -111,7 +111,7 @@ loop:
 				continue loop
 			}
 			// it looks like an jumbo frame, drop it
-			if packetSize > 1500 {
+			if packetSize > 1500 || packetSize <= 20 {
 				mempool.Put(buf)
 				continue loop
 			}
