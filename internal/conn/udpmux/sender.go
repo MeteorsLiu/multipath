@@ -74,6 +74,7 @@ func (u *udpSender) writeLoop() {
 		if err != nil {
 			break
 		}
+		fmt.Println("submit", u.remote)
 		_, err = batchWriter.Submit()
 
 		for _, b := range pb {
