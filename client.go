@@ -33,10 +33,8 @@ func NewClient(ctx context.Context, cfg Config) (func(), error) {
 	for _, p := range cfg.Client.Remotes {
 		var dial func()
 		dial = func() {
-			var c conn.ConnWriter
-			var err error
 			for i := 0; ; i++ {
-				c, err = tcp.DialConn(ctx, p.RemoteAddr, tunModule.In())
+				c, err := tcp.DialConn(ctx, p.RemoteAddr, tunModule.In())
 				if err == nil {
 					c.(*tcp.TcpConn).Start(dial)
 					sche.AddPath(cfs.NewPath(path.NewPath(c)))
