@@ -54,6 +54,7 @@ func NewClient(ctx context.Context, cfg Config) (func(), error) {
 	}
 
 	sema <- struct{}{}
+	fmt.Println("start tun")
 	tunModule.Start()
 
 	return func() {
