@@ -20,6 +20,7 @@ import (
 	"github.com/MeteorsLiu/multipath/internal/conn"
 	"github.com/MeteorsLiu/multipath/internal/conn/batch"
 	"github.com/MeteorsLiu/multipath/internal/conn/ip"
+	"github.com/MeteorsLiu/multipath/internal/mempool"
 	"golang.org/x/sys/unix"
 )
 
@@ -151,8 +152,16 @@ func (tun *tunDevice) nameSlow() (string, error) {
 	return unix.ByteSliceToString(ifr[:]), nil
 }
 
-func (tun *tunDevice) Write(buf []byte) (int, error) {
-	return tun.tunFile.Write(buf)
+// func (tun *tunDevice) Write(buf []byte) (int, error) {
+// 	return tun.tunFile.Write(buf)
+// }
+
+func (tun *tunDevice) Write(b *mempool.Buffer) error {
+	return tun.fallbackWriter.Write(b)
+}
+
+func (tun *tunDevice) Submit() (int64, error) {
+	return tun.fallbackWriter.Submit()
 }
 
 func (tun *tunDevice) Read(buf []byte) (int, error) {

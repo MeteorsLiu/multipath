@@ -5,15 +5,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"syscall"
 
+	"github.com/MeteorsLiu/multipath/internal/conn"
 	"github.com/MeteorsLiu/multipath/internal/conn/protocol"
 	"github.com/MeteorsLiu/multipath/internal/mempool"
 	"github.com/MeteorsLiu/multipath/internal/scheduler"
 )
 
 type OSTun interface {
-	io.ReadWriteCloser
+	io.Reader
+	conn.BatchConn
 }
 type TunHandler struct {
 	ctx       context.Context
@@ -36,41 +37,46 @@ func (t *TunHandler) In() chan<- *mempool.Buffer {
 	return t.inCh
 }
 
-func (u *TunHandler) write(buf *mempool.Buffer) error {
-	_, err := u.osTun.Write(buf.Bytes())
-	mempool.Put(buf)
-	return err
-}
-
-func (u *TunHandler) waitInPacket() error {
+func (u *TunHandler) waitInPacket(pendingBuf *[]*mempool.Buffer) error {
 	select {
 	case pkt := <-u.inCh:
-		if err := u.write(pkt); err != nil {
-			return err
-		}
+		u.osTun.Write(pkt)
+		*pendingBuf = append(*pendingBuf, pkt)
 	case <-u.ctx.Done():
 		return u.ctx.Err()
 	}
 
-	for {
+	for len(*pendingBuf) < 1024 {
 		select {
 		case pkt := <-u.inCh:
-			if err := u.write(pkt); err != nil {
-				return err
-			}
+			u.osTun.Write(pkt)
+			*pendingBuf = append(*pendingBuf, pkt)
 		case <-u.ctx.Done():
 			return u.ctx.Err()
 		default:
 			return nil
 		}
 	}
+
+	return nil
 }
 
 func (u *TunHandler) writeLoop() {
+	pb := make([]*mempool.Buffer, 0, 1024)
 	for {
-		err := u.waitInPacket()
-		if err != nil && err != syscall.EIO {
+		err := u.waitInPacket(&pb)
+		if err != nil {
 			return
+		}
+		_, err = u.osTun.Submit()
+
+		for _, b := range pb {
+			mempool.Put(b)
+		}
+		pb = pb[:0]
+
+		if err != nil {
+			break
 		}
 	}
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/MeteorsLiu/multipath/internal/conn"
 	"github.com/MeteorsLiu/multipath/internal/conn/tcp"
@@ -10,6 +11,8 @@ import (
 	"github.com/MeteorsLiu/multipath/internal/scheduler/cfs"
 	"github.com/MeteorsLiu/multipath/internal/tun"
 )
+
+func asyncDial()
 
 func NewClient(ctx context.Context, cfg Config) (func(), error) {
 	if len(cfg.Client.Remotes) == 0 {
@@ -25,14 +28,34 @@ func NewClient(ctx context.Context, cfg Config) (func(), error) {
 
 	tunModule := tun.NewHandler(ctx, tunInterface, sche)
 
+	sema := make(chan struct{}, 1)
+
 	for _, p := range cfg.Client.Remotes {
-		c, err := tcp.DialConn(ctx, p.RemoteAddr, tunModule.In())
-		if err != nil {
-			panic(err)
+		var dial func()
+		dial = func() {
+			var c conn.ConnWriter
+			var err error
+			for i := 0; ; i++ {
+				c, err = tcp.DialConn(ctx, p.RemoteAddr, tunModule.In())
+				if err == nil {
+					c.(*tcp.TcpConn).Start(dial)
+					sche.AddPath(cfs.NewPath(path.NewPath(c)))
+					return
+				}
+				sec := min(1<<i, 600)
+				time.Sleep(time.Duration(sec) * time.Second)
+			}
 		}
-		sche.AddPath(cfs.NewPath(path.NewPath(c)))
+		go func() {
+			dial()
+			select {
+			case sema <- struct{}{}:
+			default:
+			}
+		}()
 	}
 
+	<-sema
 	tunModule.Start()
 
 	return func() {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"syscall"
 	"time"
 
@@ -20,17 +21,19 @@ import (
 // max tcp mem: 64MB
 const queueSize = 64*1024*1024/1500 + 1
 
-type tcpConn struct {
+type TcpConn struct {
 	ctx           context.Context
 	prober        *prober.Prober
 	out           chan<- *mempool.Buffer
 	queue         chan *mempool.Buffer
 	proberManager *prober.Manager
 
-	conn net.Conn
+	conn      net.Conn
+	onClose   func()
+	closeOnce sync.Once
 }
 
-func (c *tcpConn) onProberEvent(event prober.Event) {
+func (c *TcpConn) onProberEvent(event prober.Event) {
 	// switch event {
 	// case prober.Disconnected:
 	// 	c.manager.Remove(c.sender)
@@ -41,12 +44,8 @@ func (c *tcpConn) onProberEvent(event prober.Event) {
 	// }
 }
 
-func NewConn(ctx context.Context, cn net.Conn, out chan<- *mempool.Buffer) *tcpConn {
-	tc := &tcpConn{ctx: ctx, conn: cn, queue: make(chan *mempool.Buffer, queueSize), out: out, proberManager: prober.NewManager()}
-	tc.Start()
-	id, prober := tc.proberManager.Register(ctx, fmt.Sprintf("%s => %s", cn.LocalAddr(), cn.RemoteAddr()), tc.onProberEvent)
-	tc.prober = prober
-	tc.prober.Start(id)
+func NewConn(ctx context.Context, cn net.Conn, out chan<- *mempool.Buffer) *TcpConn {
+	tc := &TcpConn{ctx: ctx, conn: cn, queue: make(chan *mempool.Buffer, queueSize), out: out, proberManager: prober.NewManager()}
 	return tc
 }
 
@@ -61,14 +60,27 @@ func DialConn(ctx context.Context, remoteAddr string, out chan<- *mempool.Buffer
 	return NewConn(ctx, cn, out), nil
 }
 
-func (t *tcpConn) Start() {
+func (t *TcpConn) Start(onClose func()) {
+	id, prober := t.proberManager.Register(t.ctx, fmt.Sprintf("%s => %s", t.conn.LocalAddr(), t.conn.RemoteAddr()), t.onProberEvent)
+	t.prober = prober
 	go t.readLoop()
 	go t.writeLoop()
+	t.prober.Start(id)
+	t.onClose = onClose
 }
 
-func (u *tcpConn) readLoop() {
+func (t *TcpConn) Close() error {
+	t.closeOnce.Do(func() {
+		t.conn.Close()
+		go t.onClose()
+	})
+	return nil
+}
+
+func (u *TcpConn) readLoop() {
 	b := make([]byte, protocol.HeaderSize)
 	reader := bufio.NewReader(u.conn)
+	defer u.Close()
 	var err error
 	const proberPacketSize = prober.NonceSize + prober.ProbeHeaderSize
 	fmt.Printf("read tcp at: %s => %s\n", u.conn.LocalAddr(), u.conn.RemoteAddr())
@@ -92,7 +104,7 @@ loop:
 				// sent back
 				buf.WriteAt(b, 0)
 				u.queue <- buf
-				continue
+				continue loop
 			}
 			if err != nil {
 				mempool.Put(buf)
@@ -126,7 +138,7 @@ loop:
 	}
 }
 
-func (u *tcpConn) waitInPacket(tcpWriter conn.BatchWriter, pendingBuf *[]*mempool.Buffer) error {
+func (u *TcpConn) waitInPacket(tcpWriter conn.BatchWriter, pendingBuf *[]*mempool.Buffer) error {
 	appendPacket := func(pkt *mempool.Buffer, packetType protocol.PacketType) {
 		if !pkt.IsHeaderInitialized() {
 			protocol.MakeHeader(pkt, packetType)
@@ -160,12 +172,14 @@ func (u *tcpConn) waitInPacket(tcpWriter conn.BatchWriter, pendingBuf *[]*mempoo
 	return nil
 }
 
-func (t *tcpConn) writeLoop() {
+func (t *TcpConn) writeLoop() {
 	cn := t.conn.(syscall.Conn)
 	rw, err := cn.SyscallConn()
 	if err != nil {
 		panic(err)
 	}
+	defer t.Close()
+
 	batchWriter := batch.NewWriter(rw)
 	pb := make([]*mempool.Buffer, 0, queueSize)
 	fmt.Printf("write tcp at: %s => %s\n", t.conn.LocalAddr(), t.conn.RemoteAddr())
@@ -191,15 +205,15 @@ func (t *tcpConn) writeLoop() {
 	}
 }
 
-func (t *tcpConn) String() string {
+func (t *TcpConn) String() string {
 	return fmt.Sprintf("%s => %s", t.conn.LocalAddr(), t.conn.RemoteAddr())
 }
 
-func (t *tcpConn) Prober() *prober.Prober {
+func (t *TcpConn) Prober() *prober.Prober {
 	return t.prober
 }
 
-func (t *tcpConn) Write(b *mempool.Buffer) error {
+func (t *TcpConn) Write(b *mempool.Buffer) error {
 	select {
 	case <-t.ctx.Done():
 		return t.ctx.Err()
