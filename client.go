@@ -28,6 +28,8 @@ func NewClient(ctx context.Context, cfg Config) (func(), error) {
 
 	sema := make(chan struct{}, 1)
 
+	sema <- struct{}{}
+
 	for _, p := range cfg.Client.Remotes {
 		var dial func()
 		dial = func() {
@@ -47,13 +49,13 @@ func NewClient(ctx context.Context, cfg Config) (func(), error) {
 		go func() {
 			dial()
 			select {
-			case sema <- struct{}{}:
+			case <-sema:
 			default:
 			}
 		}()
 	}
 
-	<-sema
+	sema <- struct{}{}
 	tunModule.Start()
 
 	return func() {
