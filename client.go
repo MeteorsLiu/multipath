@@ -12,8 +12,6 @@ import (
 	"github.com/MeteorsLiu/multipath/internal/tun"
 )
 
-func asyncDial()
-
 func NewClient(ctx context.Context, cfg Config) (func(), error) {
 	if len(cfg.Client.Remotes) == 0 {
 		return nil, fmt.Errorf("failed to init client: no remote paths found")
