@@ -69,7 +69,9 @@ func (u *TunHandler) writeLoop() {
 		if err != nil {
 			return
 		}
+		fmt.Println("submit ")
 		_, err = u.osTun.Submit()
+		fmt.Println("submit end")
 
 		for _, b := range pb {
 			mempool.Put(b)
