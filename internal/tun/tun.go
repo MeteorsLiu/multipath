@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"syscall"
 
 	"github.com/MeteorsLiu/multipath/internal/conn"
 	"github.com/MeteorsLiu/multipath/internal/conn/protocol"
@@ -75,7 +76,8 @@ func (u *TunHandler) writeLoop() {
 		}
 		pb = pb[:0]
 
-		if err != nil {
+		if err != nil && err != syscall.EIO {
+			fmt.Println("writeloop exits: ", err)
 			break
 		}
 	}
