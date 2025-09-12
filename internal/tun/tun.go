@@ -66,14 +66,13 @@ func (u *TunHandler) waitInPacket() error {
 			return nil
 		}
 	}
-
-	return nil
 }
 
 func (u *TunHandler) writeLoop() {
 	for {
 		err := u.waitInPacket()
 		if err != nil && err != syscall.EIO {
+			fmt.Println("write exits: ", err)
 			return
 		}
 	}

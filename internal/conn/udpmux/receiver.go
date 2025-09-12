@@ -109,7 +109,7 @@ func (u *udpReader) recvProbe(addr string, pkt *mempool.Buffer) {
 		return
 	}
 	if err != nil {
-		fmt.Println(err)
+		fmt.Println("probe err: ", err)
 		mempool.Put(pkt)
 		return
 	}
@@ -181,6 +181,7 @@ func (u *udpReader) readLoop() {
 	for {
 		numMsgs, _, err := batchReader.ReadMessage()
 		if err != nil {
+			fmt.Println("udp read error: ", err)
 			break
 		}
 

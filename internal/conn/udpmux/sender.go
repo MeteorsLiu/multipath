@@ -81,7 +81,7 @@ func (u *udpSender) writeLoop() {
 		pb = pb[:0]
 
 		if err != nil {
-			fmt.Println(u.remote.String(), err)
+			fmt.Println("udp error: ", u.remote.String(), err)
 			break
 		}
 	}
