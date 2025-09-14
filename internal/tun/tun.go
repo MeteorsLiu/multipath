@@ -39,7 +39,6 @@ func (t *TunHandler) In() chan<- *mempool.Buffer {
 }
 
 func (u *TunHandler) write(buf *mempool.Buffer) error {
-	fmt.Println("write tun package: ", buf.Len())
 	_, err := u.osTun.Write(buf.Bytes())
 	mempool.Put(buf)
 	return err
@@ -93,8 +92,6 @@ func (u *TunHandler) readLoop() {
 		}
 		buf.SetLen(n)
 		err = u.outWriter.Write(buf)
-
-		fmt.Println("read tun package: ", n)
 
 		if errors.Is(err, scheduler.ErrNoPath) {
 			mempool.Put(buf)
