@@ -140,8 +140,6 @@ func (u *udpReader) handlePacket(addr string, buf *mempool.Buffer) error {
 
 	payload := buf.Bytes()
 
-	fmt.Println("recv: ", len(payload), header.Type())
-
 	switch header.Type() {
 	case protocol.HeartBeat:
 		if len(payload) < prober.NonceSize {
@@ -153,11 +151,14 @@ func (u *udpReader) handlePacket(addr string, buf *mempool.Buffer) error {
 	case protocol.TunEncap:
 		size := len(payload)
 		if size > 1500 || size <= 20 {
+			fmt.Println("small size: drop ", size)
 			mempool.Put(buf)
 			return nil
 		}
 		payloadSize, err := ip.Header(payload).Size()
 		if err != nil {
+			fmt.Println("small size: ", err)
+
 			return nil
 		}
 		fullSize := int(payloadSize)

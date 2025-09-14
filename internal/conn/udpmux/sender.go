@@ -33,7 +33,6 @@ func (u *udpSender) waitInPacket(udpWriter *udp.SendMmsg, pendingBuf *[]*mempool
 		if !pkt.IsHeaderInitialized() {
 			protocol.MakeHeader(pkt, packetType)
 		}
-		fmt.Println("send: ", pkt.Len())
 		udpWriter.Write(pkt)
 		*pendingBuf = append(*pendingBuf, pkt)
 	}
