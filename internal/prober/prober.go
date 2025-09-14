@@ -305,5 +305,5 @@ func (p *Prober) start() {
 
 func (p *Prober) Start(proberId uuid.UUID) {
 	p.proberId = proberId
-	go p.start()
+	// go p.start()
 }

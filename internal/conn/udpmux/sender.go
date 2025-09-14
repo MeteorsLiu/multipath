@@ -19,7 +19,6 @@ type udpSender struct {
 	queue     chan *mempool.Buffer
 	conn      net.PacketConn
 	prober    *prober.Prober
-	writer    *udp.SendMmsg
 	startOnce sync.Once
 }
 
@@ -34,6 +33,7 @@ func (u *udpSender) waitInPacket(udpWriter *udp.SendMmsg, pendingBuf *[]*mempool
 		if !pkt.IsHeaderInitialized() {
 			protocol.MakeHeader(pkt, packetType)
 		}
+		fmt.Println("send: ", pkt.Len())
 		udpWriter.Write(pkt)
 		*pendingBuf = append(*pendingBuf, pkt)
 	}
@@ -81,7 +81,7 @@ func (u *udpSender) writeLoop() {
 		pb = pb[:0]
 
 		if err != nil {
-			fmt.Println(u.remote.String(), err)
+			fmt.Println("udp error: ", u.remote.String(), err)
 			break
 		}
 	}

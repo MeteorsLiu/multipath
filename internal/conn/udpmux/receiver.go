@@ -109,7 +109,7 @@ func (u *udpReader) recvProbe(addr string, pkt *mempool.Buffer) {
 		return
 	}
 	if err != nil {
-		fmt.Println(err)
+		fmt.Println("probe err: ", err)
 		mempool.Put(pkt)
 		return
 	}
@@ -139,6 +139,8 @@ func (u *udpReader) handlePacket(addr string, buf *mempool.Buffer) error {
 	header := protocol.Header(headerBuf)
 
 	payload := buf.Bytes()
+
+	fmt.Println("recv: ", len(payload), header.Type())
 
 	switch header.Type() {
 	case protocol.HeartBeat:
@@ -181,6 +183,7 @@ func (u *udpReader) readLoop() {
 	for {
 		numMsgs, _, err := batchReader.ReadMessage()
 		if err != nil {
+			fmt.Println("udp read error: ", err)
 			break
 		}
 
@@ -188,6 +191,7 @@ func (u *udpReader) readLoop() {
 			msg := batchReader.MessageAt(i)
 
 			bufs[i].SetLen(msg.N)
+
 			remoteAddr := msg.Addr.String()
 			u.onRecvAddr(remoteAddr)
 
