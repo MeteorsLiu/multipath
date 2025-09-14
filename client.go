@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/exec"
 	"runtime/debug"
 
 	"github.com/MeteorsLiu/multipath/internal/conn"
@@ -37,10 +39,12 @@ func NewClient(ctx context.Context, cfg Config) (func(), error) {
 		}
 	}))
 
-	tunInterface, err := tun.CreateTUN(cfg.TunName, conn.MTUSize)
+	tunInterface, err := tun.CreateTUN(cfg.Tun.Name, conn.MTUSize)
 	if err != nil {
 		return nil, err
 	}
+	execCommand("ip", "a", "add", cfg.LocalAddr, "peer", cfg.RemoteAddr, "dev", cfg.Tun.Name)
+	execCommand("ip", "l", "set", cfg.Tun.Name, "up")
 
 	tunModule := tun.NewHandler(ctx, tunInterface, sche)
 
@@ -53,4 +57,11 @@ func NewClient(ctx context.Context, cfg Config) (func(), error) {
 	return func() {
 		tunInterface.Close()
 	}, nil
+}
+
+func execCommand(cmd string, args ...string) {
+	current := exec.Command(cmd, args...)
+	current.Stdout = os.Stdout
+	current.Stderr = os.Stderr
+	current.Run()
 }

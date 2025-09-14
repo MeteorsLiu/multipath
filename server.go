@@ -33,10 +33,12 @@ func NewServer(ctx context.Context, cfg Config) (closeFn func(), err error) {
 		}
 	}))
 
-	tunInterface, err := tun.CreateTUN(cfg.TunName, conn.MTUSize)
+	tunInterface, err := tun.CreateTUN(cfg.Tun.Name, conn.MTUSize)
 	if err != nil {
 		return nil, err
 	}
+	execCommand("ip", "a", "add", cfg.LocalAddr, "peer", cfg.RemoteAddr, "dev", cfg.Tun.Name)
+	execCommand("ip", "l", "set", cfg.Tun.Name, "up")
 
 	tunModule := tun.NewHandler(ctx, tunInterface, sche)
 
