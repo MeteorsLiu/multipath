@@ -58,6 +58,8 @@ func (u *TunHandler) waitInPacket(pendingBuf *[]*mempool.Buffer) error {
 			return nil
 		}
 	}
+
+	return nil
 }
 
 func (u *TunHandler) writeLoop() {
