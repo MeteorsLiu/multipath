@@ -84,6 +84,10 @@ func (u *TunHandler) readLoop() {
 		buf := mempool.GetWithHeader(1500, protocol.HeaderSize)
 		n, err := u.osTun.Read(buf.Bytes())
 		if err != nil {
+			if err == syscall.EIO {
+				mempool.Put(buf)
+				continue
+			}
 			fmt.Println("readloop exit: ", err)
 			break
 		}

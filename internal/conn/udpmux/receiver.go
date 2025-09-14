@@ -151,11 +151,15 @@ func (u *udpReader) handlePacket(addr string, buf *mempool.Buffer) error {
 		}
 		u.recvProbe(addr, buf)
 	case protocol.TunEncap:
+		size := len(payload)
+		if size > 1500 || size <= 20 {
+			mempool.Put(buf)
+			return nil
+		}
 		payloadSize, err := ip.Header(payload).Size()
 		if err != nil {
 			return nil
 		}
-		size := len(payload)
 		fullSize := int(payloadSize)
 
 		if size < fullSize {
