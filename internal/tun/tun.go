@@ -96,6 +96,7 @@ func (u *TunHandler) readLoop() {
 		buf.SetLen(n)
 		err = u.outWriter.Write(buf)
 
+		fmt.Println("recv: ", n)
 		if errors.Is(err, scheduler.ErrNoPath) {
 			mempool.Put(buf)
 			continue

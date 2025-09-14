@@ -127,6 +127,8 @@ loop:
 				mempool.Put(buf)
 				continue loop
 			}
+			buf.SetLen(int(packetSize))
+
 			if _, err = io.ReadFull(reader, buf.Bytes()[20:packetSize]); err != nil {
 				break loop
 			}
