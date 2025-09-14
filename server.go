@@ -41,6 +41,7 @@ func NewServer(ctx context.Context, cfg Config) (closeFn func(), err error) {
 				break
 			}
 			tc := tcp.NewConn(ctx, c, tunModule.In())
+			tc.Start(func() {})
 			sche.AddPath(cfs.NewPath(path.NewPath(tc)))
 		}
 	}()

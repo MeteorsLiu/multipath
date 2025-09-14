@@ -1,6 +1,7 @@
 package batch
 
 import (
+	"fmt"
 	"io"
 	"syscall"
 
@@ -28,6 +29,7 @@ func (f *batchWriter) Write(b *mempool.Buffer) error {
 // However, tun device is underlying by *os.File, which dones't implement writeBuffers(), so we cannot use net.Buffers
 func (f *batchWriter) Submit() (n int64, err error) {
 	if len(f.iov.ioves) == 0 {
+		err = fmt.Errorf("no buffer ")
 		return
 	}
 	maxSize := f.iov.sum
