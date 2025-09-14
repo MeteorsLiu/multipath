@@ -140,6 +140,8 @@ func (u *udpReader) handlePacket(addr string, buf *mempool.Buffer) error {
 
 	payload := buf.Bytes()
 
+	fmt.Println("recv: ", len(payload), header.Type())
+
 	switch header.Type() {
 	case protocol.HeartBeat:
 		if len(payload) < prober.NonceSize {
@@ -189,6 +191,7 @@ func (u *udpReader) readLoop() {
 			msg := batchReader.MessageAt(i)
 
 			bufs[i].SetLen(msg.N)
+
 			remoteAddr := msg.Addr.String()
 			u.onRecvAddr(remoteAddr)
 
