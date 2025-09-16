@@ -11,7 +11,6 @@ import (
 
 	"github.com/MeteorsLiu/multipath/internal/conn/udpmux/protocol"
 	"github.com/MeteorsLiu/multipath/internal/mempool"
-	"github.com/MeteorsLiu/multipath/internal/vary"
 	"github.com/google/uuid"
 )
 
@@ -19,6 +18,7 @@ const (
 	NonceSize          = 8
 	_defaultTimeout    = 15
 	_defaultTimeoutDur = _defaultTimeout * time.Second
+	_probeInterval     = 300 * time.Millisecond
 )
 
 type Event int
@@ -59,14 +59,17 @@ type Prober struct {
 	in             chan *mempool.Buffer
 	out            chan *mempool.Buffer
 	ctx            context.Context
-	avg            *vary.Vary
 	addr           string
-	minRtt         float64
 	lost           float64
 	debit          float64
 	deadline       *time.Timer
-	reschedule     *time.Timer
+	ticker         *time.Ticker // 固定间隔发送器
 	currentTimeout time.Duration
+
+	// RTT估计
+	srtt   time.Duration
+	rttvar time.Duration
+	minRtt time.Duration // 最小RTT
 
 	packetMap        map[uint64]*packetInfo
 	lastMaxStartTime int64
@@ -74,17 +77,14 @@ type Prober struct {
 
 func New(ctx context.Context, addr string, on func(Event)) *Prober {
 	p := &Prober{
-		on:     on,
-		ctx:    ctx,
-		addr:   addr,
-		avg:    vary.NewVary(),
-		in:     make(chan *mempool.Buffer, 128),
-		out:    make(chan *mempool.Buffer, 128),
-		minRtt: math.MaxFloat64,
-
-		deadline:   new(time.Timer),
-		reschedule: new(time.Timer),
-		packetMap:  make(map[uint64]*packetInfo),
+		on:             on,
+		ctx:            ctx,
+		addr:           addr,
+		in:             make(chan *mempool.Buffer, 128),
+		out:            make(chan *mempool.Buffer, 128),
+		currentTimeout: _defaultTimeoutDur, // 初始超时时间15秒
+		deadline:       new(time.Timer),
+		packetMap:      make(map[uint64]*packetInfo),
 	}
 	return p
 }
@@ -98,11 +98,6 @@ func (p *Prober) Out() <-chan *mempool.Buffer {
 }
 
 func (p *Prober) sendProbePacket() {
-	// Header:
-	// Byte 1: OpCode
-	// Byte 2: Reply Epoch
-	// Byte 3-19: Prober ID (16B)
-	// Byte 20-28: Nonce (8B)
 	packet := mempool.GetWithHeader(NonceSize, protocol.HeaderSize+ProbeHeaderSize)
 	packet.ReadFrom(rand.Reader)
 
@@ -115,19 +110,12 @@ func (p *Prober) sendProbePacket() {
 
 	p.out <- packet
 
-	if p.avg.IsZero() {
-		p.deadline = time.NewTimer(_defaultTimeoutDur)
-		return
+	// 设置超时定时器
+	if p.deadline.C == nil {
+		p.deadline = time.NewTimer(p.currentTimeout)
+	} else {
+		p.deadline.Reset(p.currentTimeout)
 	}
-
-	uclRtt := math.Pow(math.E, p.avg.UCL(3)) + p.minRtt
-	p.currentTimeout = time.Duration(uclRtt)*time.Microsecond + 500*time.Millisecond
-
-	// if p.deadline.C == nil {
-	// 	p.deadline = time.NewTimer(p.currentTimeout)
-	// 	return
-	// }
-	// p.deadline.Reset(p.currentTimeout)
 }
 
 func (p *Prober) markTimeout() (isTimeout bool) {
@@ -141,33 +129,25 @@ func (p *Prober) markTimeout() (isTimeout bool) {
 	// too many on flight
 	needGC := len(p.packetMap) > 100
 
-	for nonce := range p.packetMap {
-		pkt := p.packetMap[nonce]
-
+	for nonce, pkt := range p.packetMap {
 		elapsed := time.Since(pkt.startTime)
 
 		// if one of packet has no reply over 15 seconds, mark it disconnected.
 		if elapsed >= _defaultTimeoutDur {
 			p.switchState(Disconnected)
-			// we need to send a probe packet right now if we confirm it's disconnected.
 			isTimeout = true
 		}
 
-		if !pkt.isTimeout && elapsed.Microseconds() >= p.currentTimeout.Microseconds() {
+		if !pkt.isTimeout && elapsed >= p.currentTimeout {
 			pkt.isTimeout = true
 			isTimeout = true
 		}
 
 		if needGC {
-			// only GC old packets best-effort.
 			heap.Push(&timeHeap, &gcPacket{
 				nonce:   nonce,
 				elasped: elapsed,
 			})
-			// if we GC the maxmium timestamp, it may not trigger the 15s alive check
-			// need to record it, reset it when normal packet arrived
-			//
-			// unit: second, which is enough
 			p.lastMaxStartTime = max(p.lastMaxStartTime, pkt.startTime.Unix())
 		}
 	}
@@ -180,7 +160,6 @@ func (p *Prober) markTimeout() (isTimeout bool) {
 
 	for len(p.packetMap) > exceedSize {
 		pkt := heap.Pop(&timeHeap).(*gcPacket)
-
 		delete(p.packetMap, pkt.nonce)
 	}
 
@@ -193,7 +172,6 @@ func (p *Prober) recvProbePacket(packet *mempool.Buffer) {
 	nonce := binary.LittleEndian.Uint64(packet.Bytes())
 
 	info, ok := p.packetMap[nonce]
-
 	if !ok {
 		// has been GC or unknown
 		return
@@ -202,11 +180,8 @@ func (p *Prober) recvProbePacket(packet *mempool.Buffer) {
 
 	elapsedTimeDur := time.Since(info.startTime)
 
-	elapsedTimeUs := elapsedTimeDur.Microseconds()
-
 	// check twice, this aims to avoid the case receiving probe packet and reaching deadline concurrently.
-	isTimeout := info.isTimeout ||
-		(p.currentTimeout > 0 && elapsedTimeUs >= p.currentTimeout.Microseconds())
+	isTimeout := info.isTimeout || elapsedTimeDur >= p.currentTimeout
 
 	if isTimeout {
 		if p.debit > 0 {
@@ -217,6 +192,26 @@ func (p *Prober) recvProbePacket(packet *mempool.Buffer) {
 	p.lastMaxStartTime = 0
 	// clear timeout
 	p.deadline.Stop()
+
+	// 更新RTT估计
+	rtt := elapsedTimeDur
+	if p.srtt == 0 {
+		p.srtt = rtt
+		p.rttvar = rtt / 2
+	} else {
+		err := time.Duration(math.Abs(float64(rtt - p.srtt)))
+		p.rttvar = time.Duration(0.75*float64(p.rttvar) + 0.25*float64(err))
+		p.srtt = time.Duration(0.875*float64(p.srtt) + 0.125*float64(rtt))
+	}
+	p.currentTimeout = p.srtt + 4*p.rttvar
+	// 确保超时时间不小于1秒
+	if p.currentTimeout < time.Second {
+		p.currentTimeout = time.Second
+	}
+	// 更新minRtt
+	if p.minRtt == 0 || rtt < p.minRtt {
+		p.minRtt = rtt
+	}
 
 	if p.debit > 0 {
 		p.debit--
@@ -230,24 +225,6 @@ func (p *Prober) recvProbePacket(packet *mempool.Buffer) {
 			}
 		}
 	}
-
-	elapsedTime := float64(elapsedTimeUs)
-
-	p.minRtt = min(elapsedTime, p.minRtt)
-
-	// compress rtt
-	compressedRtt := math.Log(elapsedTime)
-
-	p.avg.Calculate(compressedRtt)
-
-	uclRtt := math.Pow(math.E, p.avg.UCL(3)) + p.minRtt
-
-	nextTimeout := time.Duration(uclRtt)*time.Microsecond + 500*time.Millisecond
-	if p.reschedule.C == nil {
-		p.reschedule = time.NewTimer(nextTimeout)
-		return
-	}
-	p.reschedule.Reset(nextTimeout)
 }
 
 func (p *Prober) switchState(to Event) {
@@ -271,39 +248,29 @@ func (p *Prober) switchState(to Event) {
 	p.on(to)
 }
 
-// State:
-// Normal <-> Lost:
-// Normal -> Lost (When one packet reaches the deadline)
-// Lost -> Normal (When 10 packets meets estimated RTT requirement)
-//
-// Normal <-> Lost <-> Disconnect <- Normal
-// Normal -> Disconnect (When one packet reaches the maximum deadline, 15s)
-// Lost -> Disconnect (When one packet reaches the maximum deadline, 15s)
-// Disconnect -> Lost (When 1 packets meets estimated RTT requirement)
-// Lost -> Normal: See Normal <-> Lost
 func (p *Prober) start() {
+	p.ticker = time.NewTicker(_probeInterval)
+	defer p.ticker.Stop()
+
 	p.sendProbePacket()
 
-	ticker := time.NewTicker(100 * time.Millisecond)
 	for {
 		select {
 		case <-p.ctx.Done():
 			return
 		case pkt := <-p.in:
 			p.recvProbePacket(pkt)
-		case <-ticker.C:
+		case <-p.ticker.C:
 			p.sendProbePacket()
-			// case <-p.deadline.C:
-			// 	// make sure we're really in timeout
-			// 	if p.markTimeout() {
-			// 		p.switchState(Lost)
-			// 		p.sendProbePacket()
-			// 	}
+		case <-p.deadline.C:
+			if p.markTimeout() {
+				p.switchState(Lost)
+			}
 		}
 	}
 }
 
 func (p *Prober) Start(proberId uuid.UUID) {
 	p.proberId = proberId
-	// go p.start()
+	go p.start()
 }
