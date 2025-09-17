@@ -21,6 +21,11 @@ type udpConn struct {
 	manager *conn.SenderManager
 }
 
+type proberContext struct {
+	addr   string
+	sender *udpSender
+}
+
 func mustListenUDP(addr string) net.PacketConn {
 	for i := 0; i < 100; i++ {
 		udpC, err := net.ListenPacket("udp", addr)
@@ -48,19 +53,13 @@ func DialConn(ctx context.Context, pm *conn.SenderManager, remoteAddr string, ou
 	sender := newUDPSender(ctx)
 	cn.receiver = newUDPReceiver(ctx, udpC, out, sender.queue, cn.manager, cn.proberManager, cn.onRecvAddr, false)
 
-	pm.Add(remoteAddr, func() (w conn.ConnWriter, onRemove func()) {
-		return sender, func() {
-			sender.Close()
-			cn.receiver.Close()
-			// start to dial a new one
-			DialConn(ctx, pm, remoteAddr, out)
-		}
-	})
-
 	cn.receiver.Start()
 
 	sender.Start(udpC, remoteUdpAddr, prober.Out())
-	prober.Start(sender, id)
+	prober.Start(&proberContext{
+		addr:   remoteAddr,
+		sender: sender,
+	}, id)
 }
 
 func ListenConn(ctx context.Context, pm *conn.SenderManager, local string, out chan<- *mempool.Buffer) {
@@ -71,10 +70,23 @@ func ListenConn(ctx context.Context, pm *conn.SenderManager, local string, out c
 	conn.receiver.Start()
 }
 
-func (c *udpConn) onProberEvent(sender conn.ConnWriter, event prober.Event) {
+func (c *udpConn) onProberEvent(context any, event prober.Event) {
+	proberContext := context.(*proberContext)
 	switch event {
 	case prober.Lost:
-		c.manager.Remove(sender)
+		c.manager.Remove(proberContext.sender)
+	case prober.Normal:
+		if c.isServerSide {
+			return
+		}
+		c.manager.Add(proberContext.addr, func() (w conn.ConnWriter, onRemove func()) {
+			return proberContext.sender, func() {
+				proberContext.sender.Close()
+				c.receiver.Close()
+				// start to dial a new one
+				DialConn(c.ctx, c.manager, proberContext.addr, c.receiver.outCh)
+			}
+		})
 	}
 }
 func (c *udpConn) onRecvAddr(addr string) {
@@ -93,7 +105,10 @@ func (c *udpConn) onRecvAddr(addr string) {
 		id, prober := c.proberManager.Register(c.ctx, fmt.Sprintf("%s => %s", localC.LocalAddr(), addr), c.onProberEvent)
 
 		sender.Start(localC, remoteAddr, prober.Out())
-		prober.Start(sender, id)
+		prober.Start(&proberContext{
+			addr:   addr,
+			sender: sender,
+		}, id)
 
 		fmt.Println("recv addr:", addr)
 		return sender, func() {

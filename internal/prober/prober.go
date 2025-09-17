@@ -9,7 +9,6 @@ import (
 	"math"
 	"time"
 
-	"github.com/MeteorsLiu/multipath/internal/conn"
 	"github.com/MeteorsLiu/multipath/internal/conn/protocol"
 	"github.com/MeteorsLiu/multipath/internal/mempool"
 	"github.com/google/uuid"
@@ -28,13 +27,16 @@ const (
 type Event int
 
 const (
-	Normal Event = iota
+	Initializing Event = iota
+	Normal
 	Unstable
 	Lost
 )
 
 func (e Event) String() string {
 	switch e {
+	case Initializing:
+		return "initializing"
 	case Normal:
 		return "normal"
 	case Unstable:
@@ -108,27 +110,29 @@ type gcPacket struct {
 	elasped time.Duration
 }
 
-type ProberCallback func(conn.ConnWriter, Event)
+type ProberCallback func(any, Event)
 
 type Prober struct {
 	on       ProberCallback
 	state    Event
 	proberId uuid.UUID
 
-	in             chan *mempool.Buffer
-	out            chan *mempool.Buffer
-	ctx            context.Context
-	rttEstimator   *HoltSmoothing
-	addr           string
-	minRtt         float64
-	lost           float64
-	debit          float64
-	writer         conn.ConnWriter
+	in           chan *mempool.Buffer
+	out          chan *mempool.Buffer
+	ctx          context.Context
+	rttEstimator *HoltSmoothing
+	addr         string
+	minRtt       float64
+	lost         float64
+	debit        float64
+
 	deadline       *time.Timer
 	reschedule     *time.Timer
 	currentTimeout time.Duration
 
-	packetMap        map[uint64]*packetInfo
+	packetMap map[uint64]*packetInfo
+
+	eventContext     any
 	lastMaxStartTime int64
 	consecutiveLoss  int
 	lastSuccessTime  time.Time
@@ -251,6 +255,8 @@ func (p *Prober) markTimeout() (hasTimeouts bool) {
 
 		// State transitions based on consecutive timeouts
 		switch p.state {
+		case Initializing:
+			// Stay in initializing state until first packet arrives
 		case Normal:
 			if p.consecutiveLoss >= 2 {
 				p.switchState(Unstable)
@@ -311,7 +317,10 @@ func (p *Prober) recvProbePacket(packet *mempool.Buffer) {
 	p.deadline.Stop()
 
 	// Handle state recovery
-	if p.debit > 0 {
+	if p.state == Initializing {
+		// First packet received successfully, transition to Normal
+		p.switchState(Normal)
+	} else if p.debit > 0 {
 		p.debit--
 
 		if p.debit == 0 {
@@ -387,6 +396,9 @@ func (p *Prober) switchState(to Event) {
 	p.state = to
 
 	switch to {
+	case Initializing:
+		p.debit = 0
+		p.consecutiveLoss = 0
 	case Normal:
 		p.debit = 0
 		p.consecutiveLoss = 0
@@ -401,10 +413,11 @@ func (p *Prober) switchState(to Event) {
 		p.addr, oldState, p.state, p.debit, p.consecutiveLoss,
 		p.rttEstimator.GetCurrent()/1000, p.rttEstimator.GetTrend())
 
-	p.on(p.writer, to)
+	p.on(p.eventContext, to)
 }
 
 // Enhanced State Machine:
+// Initializing -> Normal (first successful packet)
 // Normal -> Unstable (2 consecutive timeouts)
 // Unstable -> Normal (1 successful packet)
 // Unstable -> Lost (5 consecutive timeouts)
@@ -430,8 +443,8 @@ func (p *Prober) start() {
 	}
 }
 
-func (p *Prober) Start(writer conn.ConnWriter, proberId uuid.UUID) {
-	p.writer = writer
+func (p *Prober) Start(context any, proberId uuid.UUID) {
+	p.eventContext = context
 	p.proberId = proberId
 	go p.start()
 }

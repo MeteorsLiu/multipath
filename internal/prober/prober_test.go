@@ -135,6 +135,71 @@ func TestProbePacketHeaderStructure(t *testing.T) {
 	}
 }
 
+// TestInitializingStateTransition tests the Initializing -> Normal state transition
+func TestInitializingStateTransition(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	events := make(chan Event, 10)
+	prober := New(ctx, "test-addr", func(_ conn.ConnWriter, event Event) {
+		events <- event
+	})
+
+	proberId := uuid.New()
+	prober.proberId = proberId
+
+	// Verify initial state is Initializing
+	if prober.state != Initializing {
+		t.Errorf("Expected initial state to be Initializing, got %v", prober.state)
+	}
+	t.Logf("Initial state: %v", prober.state)
+
+	// Send a probe packet
+	prober.sendProbePacket()
+
+	var sentNonce uint64
+	select {
+	case packet := <-prober.Out():
+		sentNonce = binary.LittleEndian.Uint64(packet.Bytes())
+		mempool.Put(packet)
+		t.Logf("Sent first probe packet with nonce: %d", sentNonce)
+	case <-time.After(1 * time.Second):
+		t.Fatal("No packet sent")
+	}
+
+	// Verify still in Initializing state after sending
+	if prober.state != Initializing {
+		t.Errorf("Expected state to remain Initializing after sending, got %v", prober.state)
+	}
+
+	// Create and process successful reply (simulating first packet arrival)
+	replyPacket := mempool.Get(NonceSize)
+	binary.LittleEndian.PutUint64(replyPacket.Bytes(), sentNonce)
+	prober.recvProbePacket(replyPacket)
+
+	// Verify transition to Normal state
+	if prober.state != Normal {
+		t.Errorf("Expected state to transition to Normal after first packet, got %v", prober.state)
+	}
+	t.Logf("Successfully transitioned to Normal state after first packet reply")
+
+	// Check that Normal event was fired
+	select {
+	case event := <-events:
+		if event != Normal {
+			t.Errorf("Expected Normal event, got %v", event)
+		}
+		t.Logf("Received expected Normal event: %v", event)
+	case <-time.After(100 * time.Millisecond):
+		t.Error("No Normal event received")
+	}
+
+	// Verify packet was removed from map
+	if _, exists := prober.packetMap[sentNonce]; exists {
+		t.Error("Packet should be removed from map after successful reply")
+	}
+}
+
 // TestProbePacketReply tests packet reply handling through in channel
 func TestProbePacketReply(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -220,7 +285,12 @@ func TestProbePacketTimeout(t *testing.T) {
 		t.Error("markTimeout should return true when packet times out")
 	}
 
-	// Manually trigger state change
+	// Initially prober should be in Initializing state (default zero value)
+	if prober.state != Initializing {
+		t.Errorf("Expected initial state to be Initializing, got %v", prober.state)
+	}
+
+	// Manually trigger state change to Lost (skipping Normal state for this test)
 	prober.switchState(Lost)
 
 	// Check that Lost event was fired
@@ -739,8 +809,13 @@ func TestProber_StateTransitionsWithHolt(t *testing.T) {
 		prober.rttEstimator.Update(stableRTT + float64(i%3)*1000) // minor jitter
 	}
 
-	t.Logf("Initial state: Level=%.2fms, Trend=%.2f",
-		prober.rttEstimator.GetCurrent()/1000, prober.rttEstimator.GetTrend())
+	// Initially prober should be in Initializing state
+	if prober.state != Initializing {
+		t.Errorf("Expected initial state to be Initializing, got %v", prober.state)
+	}
+
+	t.Logf("Initial state: %v, Level=%.2fms, Trend=%.2f",
+		prober.state, prober.rttEstimator.GetCurrent()/1000, prober.rttEstimator.GetTrend())
 
 	// Test timeout detection
 	prober.sendProbePacket()
