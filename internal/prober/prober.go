@@ -217,7 +217,6 @@ func (p *Prober) markTimeout() (hasTimeouts bool) {
 	var timeHeap maxTimeHeap
 	var timeoutCount int
 
-
 	// too many on flight packets, need garbage collection
 	needGC := len(p.packetMap) > 100
 
@@ -342,8 +341,8 @@ func (p *Prober) recvProbePacket(packet *mempool.Buffer) {
 	trend := p.rttEstimator.GetTrend()
 
 	// Stats output for probe packet reception
-	fmt.Printf("Recv Probe %s: RTT=%.2fms MinRTT=%.2fms Trend=%.2f PredictedRTT=%.2fms State=%s InFlight=%d\n",
-		p.addr, elapsedTime/1000, p.minRtt/1000, trend, predictedRtt/1000, p.state, len(p.packetMap))
+	// fmt.Printf("Recv Probe %s: RTT=%.2fms MinRTT=%.2fms Trend=%.2f PredictedRTT=%.2fms State=%s InFlight=%d\n",
+	// 	p.addr, elapsedTime/1000, p.minRtt/1000, trend, predictedRtt/1000, p.state, len(p.packetMap))
 
 	// Calculate adaptive safety margin based on trend
 	safetyMultiplier := 2.0
