@@ -32,7 +32,7 @@ func newUDPSender(ctx context.Context) *udpSender {
 
 func (u *udpSender) waitInPacket(udpWriter *udp.SendMmsg, pendingBuf *[]*mempool.Buffer) error {
 	appendPacket := func(pkt *mempool.Buffer, packetType protocol.PacketType) {
-		if !pkt.IsHeaderInitialized() {
+		if pkt.FullBytes()[0] == 0 {
 			protocol.MakeHeader(pkt, packetType)
 		}
 		udpWriter.Write(pkt)

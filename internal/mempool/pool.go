@@ -4,7 +4,6 @@ package mempool
 
 import (
 	"errors"
-	"fmt"
 	"io"
 	"math/bits"
 	"sync"
@@ -82,12 +81,6 @@ func (b *Buffer) Header() []byte {
 		return b.b[0:b.reservedSize]
 	}
 	return nil
-}
-
-func (b *Buffer) IsHeaderInitialized() bool {
-	header := b.Header()
-	fmt.Println(header, b.b[0])
-	return header != nil && header[0] != 0
 }
 
 func (b *Buffer) Bytes() []byte {
