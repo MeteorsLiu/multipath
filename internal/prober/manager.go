@@ -50,7 +50,7 @@ func (i *Manager) PacketIn(ctx context.Context, pkt *mempool.Buffer) error {
 	prober, ok := i.inMap[proberId]
 	i.mu.RUnlock()
 
-	fmt.Println(ok, proberId)
+	fmt.Println(ok, proberId, i.inMap)
 	if !ok {
 		return ErrProberIDNotFound
 	}
