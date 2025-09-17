@@ -20,7 +20,7 @@ func NewManager() *Manager {
 	return &Manager{inMap: make(map[string]*Prober)}
 }
 
-func (i *Manager) Register(ctx context.Context, addr string, on func(Event)) (id uuid.UUID, prober *Prober) {
+func (i *Manager) Register(ctx context.Context, addr string, on ProberCallback) (id uuid.UUID, prober *Prober) {
 	id = uuid.New()
 	prober = New(ctx, addr, on)
 
@@ -37,7 +37,7 @@ func (i *Manager) Remove(proberId string) {
 	i.mu.Unlock()
 }
 
-func (i *Manager) PacketIn(pkt *mempool.Buffer) error {
+func (i *Manager) PacketIn(ctx context.Context, pkt *mempool.Buffer) error {
 	epoch, id, err := ProberIDFromBuffer(pkt)
 	if err != nil {
 		return err
@@ -53,7 +53,11 @@ func (i *Manager) PacketIn(pkt *mempool.Buffer) error {
 	if !ok {
 		return ErrProberIDNotFound
 	}
-	prober.In() <- pkt
+	select {
+	case prober.In() <- pkt:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 
 	return nil
 }

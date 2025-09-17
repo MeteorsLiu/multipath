@@ -8,38 +8,39 @@ import (
 
 	"github.com/MeteorsLiu/multipath/internal/conn"
 	"github.com/MeteorsLiu/multipath/internal/conn/batch/udp"
-	"github.com/MeteorsLiu/multipath/internal/conn/udpmux/protocol"
+	"github.com/MeteorsLiu/multipath/internal/conn/protocol"
 	"github.com/MeteorsLiu/multipath/internal/mempool"
-	"github.com/MeteorsLiu/multipath/internal/prober"
 )
 
 type udpSender struct {
 	ctx       context.Context
+	cancel    context.CancelFunc
 	remote    *net.UDPAddr
 	queue     chan *mempool.Buffer
 	conn      net.PacketConn
-	prober    *prober.Prober
+	proberOut <-chan *mempool.Buffer
 	startOnce sync.Once
 }
 
 var _ conn.ConnWriter = (*udpSender)(nil)
 
-func newUDPSender(ctx context.Context, prober *prober.Prober) *udpSender {
-	return &udpSender{ctx: ctx, queue: make(chan *mempool.Buffer, 1024), prober: prober}
+func newUDPSender(ctx context.Context) *udpSender {
+	sender := &udpSender{queue: make(chan *mempool.Buffer, 1024)}
+	sender.ctx, sender.cancel = context.WithCancel(ctx)
+	return sender
 }
 
 func (u *udpSender) waitInPacket(udpWriter *udp.SendMmsg, pendingBuf *[]*mempool.Buffer) error {
 	appendPacket := func(pkt *mempool.Buffer, packetType protocol.PacketType) {
 		if !pkt.IsHeaderInitialized() {
 			protocol.MakeHeader(pkt, packetType)
-			fmt.Println("make: ", pkt.FullBytes(), packetType)
 		}
 		udpWriter.Write(pkt)
 		*pendingBuf = append(*pendingBuf, pkt)
 	}
 
 	select {
-	case pkt := <-u.prober.Out():
+	case pkt := <-u.proberOut:
 		appendPacket(pkt, protocol.HeartBeat)
 	case pkt := <-u.queue:
 		appendPacket(pkt, protocol.TunEncap)
@@ -49,7 +50,7 @@ func (u *udpSender) waitInPacket(udpWriter *udp.SendMmsg, pendingBuf *[]*mempool
 
 	for len(*pendingBuf) < 1024 {
 		select {
-		case pkt := <-u.prober.Out():
+		case pkt := <-u.proberOut:
 			appendPacket(pkt, protocol.HeartBeat)
 		case pkt := <-u.queue:
 			appendPacket(pkt, protocol.TunEncap)
@@ -87,10 +88,11 @@ func (u *udpSender) writeLoop() {
 	}
 }
 
-func (u *udpSender) Start(conn net.PacketConn, remote *net.UDPAddr) {
+func (u *udpSender) Start(conn net.PacketConn, remote *net.UDPAddr, proberOut <-chan *mempool.Buffer) {
 	u.startOnce.Do(func() {
 		u.conn = conn
 		u.remote = remote
+		u.proberOut = proberOut
 		go u.writeLoop()
 	})
 }
@@ -109,6 +111,7 @@ func (u *udpSender) Write(b *mempool.Buffer) error {
 	}
 }
 
-func (u *udpSender) Prober() *prober.Prober {
-	return u.prober
+func (u *udpSender) Close() error {
+	u.cancel()
+	return u.conn.Close()
 }

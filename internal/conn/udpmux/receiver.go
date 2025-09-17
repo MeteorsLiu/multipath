@@ -1,17 +1,20 @@
 package udpmux
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"sync"
 
 	"github.com/MeteorsLiu/multipath/internal/conn"
 	"github.com/MeteorsLiu/multipath/internal/conn/batch/udp"
-	"github.com/MeteorsLiu/multipath/internal/conn/udpmux/ip"
-	"github.com/MeteorsLiu/multipath/internal/conn/udpmux/protocol"
+	"github.com/MeteorsLiu/multipath/internal/conn/ip"
+	"github.com/MeteorsLiu/multipath/internal/conn/protocol"
 	"github.com/MeteorsLiu/multipath/internal/mempool"
 	"github.com/MeteorsLiu/multipath/internal/prober"
 )
+
+var errPacketConsumed = fmt.Errorf("packet need consumed")
 
 type pending struct {
 	buf        *mempool.Buffer
@@ -53,8 +56,10 @@ func (p *pending) Buffer() (buf *mempool.Buffer, pktType protocol.PacketType) {
 }
 
 type udpReader struct {
-	conn  net.PacketConn
-	outCh chan<- *mempool.Buffer
+	ctx    context.Context
+	cancel context.CancelFunc
+	conn   net.PacketConn
+	outCh  chan<- *mempool.Buffer
 
 	clientSender  chan<- *mempool.Buffer
 	senderManager *conn.SenderManager
@@ -68,6 +73,7 @@ type udpReader struct {
 }
 
 func newUDPReceiver(
+	ctx context.Context,
 	conn net.PacketConn,
 	outCh chan<- *mempool.Buffer,
 	clientSender chan<- *mempool.Buffer,
@@ -76,7 +82,7 @@ func newUDPReceiver(
 	onRecvAddr func(string),
 	isServerSide bool,
 ) *udpReader {
-	return &udpReader{
+	reader := &udpReader{
 		conn:          conn,
 		senderManager: senderManager,
 		proberManager: proberManager,
@@ -86,6 +92,8 @@ func newUDPReceiver(
 		clientSender:  clientSender,
 		pending:       newPending(),
 	}
+	reader.ctx, reader.cancel = context.WithCancel(ctx)
+	return reader
 }
 
 func (u *udpReader) sendPacketToRemote(addr string, pkt *mempool.Buffer) {
@@ -102,17 +110,21 @@ func (u *udpReader) sendPacketToRemote(addr string, pkt *mempool.Buffer) {
 	}
 }
 
-func (u *udpReader) recvProbe(addr string, pkt *mempool.Buffer) {
-	err := u.proberManager.PacketIn(pkt)
+func (u *udpReader) recvProbe(addr string, pkt *mempool.Buffer) error {
+	err := u.proberManager.PacketIn(u.ctx, pkt)
 	if err == prober.ErrProberIDNotFound {
 		u.sendPacketToRemote(addr, pkt)
-		return
+		return nil
 	}
 	if err != nil {
-		fmt.Println("probe err: ", err)
-		mempool.Put(pkt)
-		return
+		select {
+		case <-u.ctx.Done():
+			return u.ctx.Err()
+		default:
+			return errPacketConsumed
+		}
 	}
+	return nil
 }
 
 func (u *udpReader) handlePacket(addr string, buf *mempool.Buffer) error {
@@ -124,14 +136,19 @@ func (u *udpReader) handlePacket(addr string, buf *mempool.Buffer) error {
 
 			switch pktType {
 			case protocol.HeartBeat:
-				u.recvProbe(addr, pendingBuf)
+				if err := u.recvProbe(addr, pendingBuf); err != nil {
+					return err
+				}
 			case protocol.TunEncap:
-				u.outCh <- pendingBuf
+				select {
+				case u.outCh <- buf:
+				case <-u.ctx.Done():
+					return u.ctx.Err()
+				}
 			}
 		}
 		if buf.Len() == 0 {
-			mempool.Put(buf)
-			return nil
+			return errPacketConsumed
 		}
 	}
 	// TODO: allow different protocol
@@ -147,19 +164,17 @@ func (u *udpReader) handlePacket(addr string, buf *mempool.Buffer) error {
 			u.pending.Set(buf, prober.NonceSize, protocol.HeartBeat)
 			return nil
 		}
-		u.recvProbe(addr, buf)
+		if err := u.recvProbe(addr, buf); err != nil {
+			return err
+		}
 	case protocol.TunEncap:
 		size := len(payload)
 		if size > 1500 || size <= 20 {
-			fmt.Println("small size: drop ", size)
-			mempool.Put(buf)
-			return nil
+			return errPacketConsumed
 		}
 		payloadSize, err := ip.Header(payload).Size()
 		if err != nil {
-			fmt.Println("small size: ", err, buf.FullBytes())
-
-			return nil
+			return errPacketConsumed
 		}
 		fullSize := int(payloadSize)
 
@@ -169,7 +184,11 @@ func (u *udpReader) handlePacket(addr string, buf *mempool.Buffer) error {
 			u.pending.Set(buf, fullSize, protocol.TunEncap)
 			return nil
 		}
-		u.outCh <- buf
+		select {
+		case u.outCh <- buf:
+		case <-u.ctx.Done():
+			return u.ctx.Err()
+		}
 	}
 	return nil
 }
@@ -184,6 +203,13 @@ func (u *udpReader) readLoop() {
 	}
 
 	trafficMap := make(map[string]int64)
+
+	defer func() {
+		// if someone closes us, we have to recycle our buffers
+		for _, b := range bufs {
+			mempool.Put(b)
+		}
+	}()
 
 	for {
 		numMsgs, _, err := batchReader.ReadMessage()
@@ -200,7 +226,15 @@ func (u *udpReader) readLoop() {
 			remoteAddr := msg.Addr.String()
 			u.onRecvAddr(remoteAddr)
 
-			u.handlePacket(remoteAddr, bufs[i])
+			err := u.handlePacket(remoteAddr, bufs[i])
+
+			switch err {
+			case nil:
+			case errPacketConsumed:
+				mempool.Put(bufs[i])
+			default:
+				return
+			}
 
 			trafficMap[msg.Addr.String()] += int64(msg.N)
 
@@ -218,4 +252,9 @@ func (u *udpReader) Start() {
 		fmt.Println("start listening at ", u.conn.LocalAddr())
 		go u.readLoop()
 	})
+}
+
+func (u *udpReader) Close() error {
+	u.cancel()
+	return u.conn.Close()
 }

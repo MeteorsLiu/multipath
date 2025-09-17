@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"runtime/debug"
 
 	"github.com/MeteorsLiu/multipath/internal/conn"
 	"github.com/MeteorsLiu/multipath/internal/conn/udpmux"
@@ -25,14 +24,11 @@ func NewClient(ctx context.Context, cfg Config) (func(), error) {
 	manager := conn.NewManager(conn.WithOnNewPath(func(event conn.ManagerEvent, cw conn.ConnWriter) {
 		switch event {
 		case conn.ConnAppend:
-			debug.PrintStack()
-			fmt.Println("new path", cw.String())
 			path := cfs.NewPath(path.NewPath(cw))
 			pathMap.add(cw.String(), path)
 			sche.AddPath(path)
 		case conn.ConnRemove:
 			if path := pathMap.get(cw.String()); path != nil {
-				fmt.Println("remove path", cw.String())
 				sche.RemovePath(path)
 				pathMap.remove(cw.String())
 			}

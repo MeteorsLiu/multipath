@@ -9,14 +9,15 @@ import (
 	"math"
 	"time"
 
-	"github.com/MeteorsLiu/multipath/internal/conn/udpmux/protocol"
+	"github.com/MeteorsLiu/multipath/internal/conn"
+	"github.com/MeteorsLiu/multipath/internal/conn/protocol"
 	"github.com/MeteorsLiu/multipath/internal/mempool"
 	"github.com/google/uuid"
 )
 
 const (
 	NonceSize           = 8
-	_defaultTimeout     = 15
+	_defaultTimeout     = 5
 	_defaultTimeoutDur  = _defaultTimeout * time.Second
 	_minTimeout         = 500 * time.Millisecond
 	_baselineBuffer     = 200 * time.Millisecond
@@ -110,8 +111,10 @@ type gcPacket struct {
 	elasped time.Duration
 }
 
+type ProberCallback func(conn.ConnWriter, Event)
+
 type Prober struct {
-	on       func(Event)
+	on       ProberCallback
 	state    Event
 	proberId uuid.UUID
 
@@ -123,6 +126,7 @@ type Prober struct {
 	minRtt         float64
 	lost           float64
 	debit          float64
+	writer         conn.ConnWriter
 	deadline       *time.Timer
 	reschedule     *time.Timer
 	currentTimeout time.Duration
@@ -134,7 +138,7 @@ type Prober struct {
 	lastSuccessTime  time.Time
 }
 
-func New(ctx context.Context, addr string, on func(Event)) *Prober {
+func New(ctx context.Context, addr string, on ProberCallback) *Prober {
 	p := &Prober{
 		on:           on,
 		ctx:          ctx,
@@ -422,7 +426,7 @@ func (p *Prober) switchState(to Event) {
 		p.addr, oldState, p.state, p.debit, p.consecutiveLoss,
 		p.rttEstimator.GetCurrent()/1000, p.rttEstimator.GetTrend())
 
-	p.on(to)
+	p.on(p.writer, to)
 }
 
 // Enhanced State Machine:
@@ -430,7 +434,7 @@ func (p *Prober) switchState(to Event) {
 // Unstable -> Normal (1 successful packet)
 // Unstable -> Lost (5 consecutive timeouts)
 // Lost -> Normal (10 successful packets)
-// Lost -> Disconnected (15s without successful response)
+// Lost -> Disconnected (5s without successful response)
 // Disconnected -> Lost (1 successful packet)
 func (p *Prober) start() {
 	p.sendProbePacket()
@@ -459,7 +463,8 @@ func (p *Prober) start() {
 	}
 }
 
-func (p *Prober) Start(proberId uuid.UUID) {
+func (p *Prober) Start(writer conn.ConnWriter, proberId uuid.UUID) {
+	p.writer = writer
 	p.proberId = proberId
 	go p.start()
 }

@@ -5,7 +5,6 @@ import (
 	"io"
 
 	"github.com/MeteorsLiu/multipath/internal/mempool"
-	"github.com/MeteorsLiu/multipath/internal/prober"
 )
 
 type ManagerEvent int
@@ -37,7 +36,6 @@ type MuxConn interface {
 
 type ConnWriter interface {
 	mempool.Writer
-	Prober() *prober.Prober
 	String() string
 }
 

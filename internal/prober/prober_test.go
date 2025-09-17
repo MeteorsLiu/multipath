@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MeteorsLiu/multipath/internal/conn/udpmux/protocol"
+	"github.com/MeteorsLiu/multipath/internal/conn/protocol"
 	"github.com/MeteorsLiu/multipath/internal/mempool"
 	"github.com/google/uuid"
 )
@@ -661,23 +661,23 @@ func TestProber_AdaptiveTimeoutCalculation(t *testing.T) {
 
 	// Test scenarios
 	scenarios := []struct {
-		name        string
-		rttPattern  []float64 // in microseconds
+		name              string
+		rttPattern        []float64 // in microseconds
 		expectHighTimeout bool
 	}{
 		{
-			name:       "Stable RTT",
-			rttPattern: []float64{50000, 52000, 48000, 51000, 49000},
+			name:              "Stable RTT",
+			rttPattern:        []float64{50000, 52000, 48000, 51000, 49000},
 			expectHighTimeout: false,
 		},
 		{
-			name:       "Increasing RTT (congestion)",
-			rttPattern: []float64{50000, 70000, 90000, 110000, 130000},
+			name:              "Increasing RTT (congestion)",
+			rttPattern:        []float64{50000, 70000, 90000, 110000, 130000},
 			expectHighTimeout: true,
 		},
 		{
-			name:       "Decreasing RTT (recovery)",
-			rttPattern: []float64{130000, 110000, 90000, 70000, 50000},
+			name:              "Decreasing RTT (recovery)",
+			rttPattern:        []float64{130000, 110000, 90000, 70000, 50000},
 			expectHighTimeout: false,
 		},
 	}
