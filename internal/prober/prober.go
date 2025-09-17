@@ -355,6 +355,10 @@ func (p *Prober) recvProbePacket(packet *mempool.Buffer) {
 	predictedRtt := p.rttEstimator.Predict(1)
 	trend := p.rttEstimator.GetTrend()
 
+	// Stats output for probe packet reception
+	fmt.Printf("Recv Probe %s: RTT=%.2fms MinRTT=%.2fms Trend=%.2f PredictedRTT=%.2fms State=%s InFlight=%d\n",
+		p.addr, elapsedTime/1000, p.minRtt/1000, trend, predictedRtt/1000, p.state, len(p.packetMap))
+
 	// Calculate adaptive safety margin based on trend
 	safetyMultiplier := 2.0
 	if trend > 0 {
