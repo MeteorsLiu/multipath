@@ -1,7 +1,6 @@
 package conn
 
 import (
-	"fmt"
 	"sync"
 )
 
@@ -50,8 +49,6 @@ func (pm *SenderManager) Get(addr string) ConnWriter {
 	pm.mu.RLock()
 	sender := pm.connMap[addr]
 	pm.mu.RUnlock()
-
-	fmt.Println(addr, pm.connMap)
 
 	return sender.writer
 }
