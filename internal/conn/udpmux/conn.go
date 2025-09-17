@@ -73,7 +73,7 @@ func ListenConn(ctx context.Context, pm *conn.SenderManager, local string, out c
 
 func (c *udpConn) onProberEvent(sender conn.ConnWriter, event prober.Event) {
 	switch event {
-	case prober.Disconnected:
+	case prober.Lost:
 		c.manager.Remove(sender)
 	}
 }

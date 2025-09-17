@@ -31,7 +31,6 @@ const (
 	Normal Event = iota
 	Unstable
 	Lost
-	Disconnected
 )
 
 func (e Event) String() string {
@@ -42,8 +41,6 @@ func (e Event) String() string {
 		return "unstable"
 	case Lost:
 		return "lost"
-	case Disconnected:
-		return "disconnected"
 	}
 	return "unknown"
 }
@@ -134,7 +131,6 @@ type Prober struct {
 	packetMap        map[uint64]*packetInfo
 	lastMaxStartTime int64
 	consecutiveLoss  int
-	reconnectTimer   *time.Timer
 	lastSuccessTime  time.Time
 }
 
@@ -150,7 +146,6 @@ func New(ctx context.Context, addr string, on ProberCallback) *Prober {
 
 		deadline:        time.NewTimer(time.Hour), // Initialize with long duration and stop immediately
 		reschedule:      time.NewTimer(time.Hour),
-		reconnectTimer:  time.NewTimer(time.Hour),
 		packetMap:       make(map[uint64]*packetInfo),
 		lastSuccessTime: time.Now(),
 	}
@@ -158,7 +153,6 @@ func New(ctx context.Context, addr string, on ProberCallback) *Prober {
 	// Stop all timers immediately after creation
 	p.deadline.Stop()
 	p.reschedule.Stop()
-	p.reconnectTimer.Stop()
 
 	return p
 }
@@ -223,12 +217,6 @@ func (p *Prober) markTimeout() (hasTimeouts bool) {
 	var timeHeap maxTimeHeap
 	var timeoutCount int
 
-	// Check if we should transition to disconnected state
-	// Only after being in Lost state for extended period
-	if p.state == Lost && time.Since(p.lastSuccessTime) >= _defaultTimeoutDur {
-		p.switchState(Disconnected)
-		hasTimeouts = true
-	}
 
 	// too many on flight packets, need garbage collection
 	needGC := len(p.packetMap) > 100
@@ -273,7 +261,7 @@ func (p *Prober) markTimeout() (hasTimeouts bool) {
 				p.switchState(Lost)
 			}
 		case Lost:
-			// Already in Lost state, will transition to Disconnected by time check above
+			// Already in Lost state, connection is considered terminated
 		}
 	}
 
@@ -333,8 +321,6 @@ func (p *Prober) recvProbePacket(packet *mempool.Buffer) {
 				p.switchState(Normal)
 			case Lost:
 				p.switchState(Normal)
-			case Disconnected:
-				p.switchState(Lost)
 			}
 		}
 	} else {
@@ -383,9 +369,6 @@ func (p *Prober) recvProbePacket(packet *mempool.Buffer) {
 	case Lost:
 		// Reduce probe frequency for lost connections
 		probeInterval = nextTimeout * 2
-	case Disconnected:
-		// Low frequency probing for disconnected state
-		probeInterval = _reconnectInterval
 	}
 
 	if p.reschedule.C == nil {
@@ -408,22 +391,11 @@ func (p *Prober) switchState(to Event) {
 	case Normal:
 		p.debit = 0
 		p.consecutiveLoss = 0
-		p.reconnectTimer.Stop()
 	case Unstable:
 		p.debit = 3 // Require fewer successful packets to recover
-		p.reconnectTimer.Stop()
 	case Lost:
 		p.lost++
 		p.debit = 10
-		p.reconnectTimer.Stop()
-	case Disconnected:
-		p.debit = 1
-		// Start reconnection timer for periodic probing
-		if p.reconnectTimer.C == nil {
-			p.reconnectTimer = time.NewTimer(_reconnectInterval)
-		} else {
-			p.reconnectTimer.Reset(_reconnectInterval)
-		}
 	}
 
 	fmt.Printf("Switch State %s: %s => %s Debit: %f ConsecutiveLoss: %d RTT: %.2fms Trend: %.2f\n",
@@ -438,8 +410,6 @@ func (p *Prober) switchState(to Event) {
 // Unstable -> Normal (1 successful packet)
 // Unstable -> Lost (5 consecutive timeouts)
 // Lost -> Normal (10 successful packets)
-// Lost -> Disconnected (5s without successful response)
-// Disconnected -> Lost (1 successful packet)
 func (p *Prober) start() {
 	p.sendProbePacket()
 
@@ -456,12 +426,6 @@ func (p *Prober) start() {
 			if p.markTimeout() {
 				// Continue probing even in bad states for potential recovery
 				p.sendProbePacket()
-			}
-		case <-p.reconnectTimer.C:
-			// Periodic reconnection attempts for disconnected state
-			if p.state == Disconnected {
-				p.sendProbePacket()
-				p.reconnectTimer.Reset(_reconnectInterval)
 			}
 		}
 	}
