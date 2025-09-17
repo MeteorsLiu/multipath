@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"runtime/debug"
 	"sync"
 
 	"github.com/MeteorsLiu/multipath/internal/conn"
@@ -103,7 +102,6 @@ func (u *udpSender) String() string {
 }
 
 func (u *udpSender) Write(b *mempool.Buffer) error {
-	debug.PrintStack()
 	select {
 	case <-u.ctx.Done():
 		return u.ctx.Err()
