@@ -157,7 +157,7 @@ func (u *udpReader) handlePacket(addr string, buf *mempool.Buffer) error {
 		}
 		payloadSize, err := ip.Header(payload).Size()
 		if err != nil {
-			fmt.Println("small size: ", err)
+			fmt.Println("small size: ", err, buf.FullBytes())
 
 			return nil
 		}
