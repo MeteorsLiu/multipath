@@ -42,10 +42,7 @@ func NewServer(ctx context.Context, cfg Config) (closeFn func(), err error) {
 
 	tunModule := tun.NewHandler(ctx, tunInterface, sche)
 
-	_, err = udpmux.ListenConn(ctx, manager, cfg.ListenAddr, tunModule.In())
-	if err != nil {
-		return nil, err
-	}
+	udpmux.ListenConn(ctx, manager, cfg.ListenAddr, tunModule.In())
 
 	tunModule.Start()
 
