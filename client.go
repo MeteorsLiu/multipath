@@ -36,7 +36,12 @@ func NewClient(ctx context.Context, cfg Config) (func(), error) {
 		}
 	}))
 
-	tunInterface, err := tun.CreateTUN(cfg.Tun.Name, conn.MTUSize)
+	mtuSize := udpmux.MTUSize
+	if cfg.IsTCP {
+		mtuSize = tcp.MTUSize
+	}
+
+	tunInterface, err := tun.CreateTUN(cfg.Tun.Name, mtuSize)
 	if err != nil {
 		return nil, err
 	}
