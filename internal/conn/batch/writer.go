@@ -1,6 +1,7 @@
 package batch
 
 import (
+	"fmt"
 	"io"
 	"syscall"
 
@@ -18,16 +19,19 @@ func NewWriter(fd syscall.RawConn) conn.BatchWriter {
 	return &batchWriter{fd: fd, iov: newResizableIov()}
 }
 
+func (f *batchWriter) Write(b []byte) (int, error) {
+	f.iov.append(b)
+	return len(b), nil
+}
+
 // WriteBatch acts like writeBuffers for net.Buffers
 // However, tun device is underlying by *os.File, which dones't implement writeBuffers(), so we cannot use net.Buffers
-func (f *batchWriter) WriteBatch(b [][]byte) (n int64, err error) {
-	if len(b) == 0 {
+func (f *batchWriter) Submit() (n int64, err error) {
+	if len(f.iov.ioves) == 0 {
+		err = fmt.Errorf("no buffer ")
 		return
 	}
-	maxSize, err := f.iov.fill(b)
-	if err != nil {
-		return
-	}
+	maxSize := f.iov.sum
 	// reset cursor to avoid buffers leaky
 	defer f.iov.resetCursor()
 

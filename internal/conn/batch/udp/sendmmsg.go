@@ -3,12 +3,12 @@ package udp
 import (
 	"net"
 
-	"github.com/MeteorsLiu/multipath/internal/mempool"
+	"github.com/MeteorsLiu/multipath/internal/conn"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 )
 
-var _ mempool.Writer = (*SendMmsg)(nil)
+var _ conn.BatchWriter = (*SendMmsg)(nil)
 
 type SendMmsg struct {
 	cursor int
@@ -73,16 +73,16 @@ func (s *SendMmsg) resetCursor() {
 	s.cursor = 0
 }
 
-func (s *SendMmsg) Write(b *mempool.Buffer) error {
+func (s *SendMmsg) Write(b []byte) (int, error) {
 	if s.v6pc != nil {
 		s.lazyInitMsgsV6()
-		s.v6msgs[s.cursor].Buffers[0] = b.FullBytes()
+		s.v6msgs[s.cursor].Buffers[0] = b
 	} else {
 		s.lazyInitMsgsV4()
-		s.v4msgs[s.cursor].Buffers[0] = b.FullBytes()
+		s.v4msgs[s.cursor].Buffers[0] = b
 	}
 	s.cursor++
-	return nil
+	return len(b), nil
 }
 
 func (s *SendMmsg) Submit() (int64, error) {

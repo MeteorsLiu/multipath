@@ -14,6 +14,7 @@ type iovesMetadata struct {
 
 type resizableIov struct {
 	pos      int
+	sum      int64
 	ioves    []unix.Iovec
 	metadata []*iovesMetadata
 }
@@ -38,6 +39,17 @@ func calculateConsumed(metadata []*iovesMetadata, offset int, submitted int64) (
 
 func newResizableIov() *resizableIov {
 	return &resizableIov{ioves: make([]unix.Iovec, 0, 1024), metadata: make([]*iovesMetadata, 0, 1024)}
+}
+
+func (f *resizableIov) append(b []byte) {
+	f.sum += int64(len(b))
+	f.metadata = append(f.metadata, &iovesMetadata{
+		buf:      b,
+		metadata: f.sum,
+	})
+	f.ioves = f.ioves[:len(f.metadata)]
+	f.ioves[len(f.metadata)-1].Base = &b[0]
+	f.ioves[len(f.metadata)-1].SetLen(len(b))
 }
 
 func (f *resizableIov) fill(b [][]byte) (int64, error) {
@@ -111,6 +123,7 @@ func (f *resizableIov) iovec() []unix.Iovec {
 
 func (f *resizableIov) resetCursor() {
 	f.pos = 0
+	f.sum = 0
 	f.ioves = f.ioves[:0]
 	f.metadata = f.metadata[:0]
 }

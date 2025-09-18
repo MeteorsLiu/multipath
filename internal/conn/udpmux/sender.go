@@ -35,7 +35,7 @@ func (u *udpSender) waitInPacket(udpWriter *udp.SendMmsg, pendingBuf *[]*mempool
 		if pkt.FullBytes()[0] == 0 {
 			protocol.MakeHeader(pkt, packetType)
 		}
-		udpWriter.Write(pkt)
+		udpWriter.Write(pkt.FullBytes())
 		*pendingBuf = append(*pendingBuf, pkt)
 	}
 

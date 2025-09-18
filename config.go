@@ -28,6 +28,7 @@ type Config struct {
 	Client       `json:"client,omitempty"`
 	Server       `json:"server,omitempty"`
 	Tun          `json:"tun"`
+	IsTCP        bool `json:"tcp"`
 	IsServerSide bool `json:"isServer"`
 }
 

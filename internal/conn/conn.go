@@ -22,7 +22,8 @@ type BatchReader interface {
 }
 
 type BatchWriter interface {
-	WriteBatch(b [][]byte) (n int64, err error)
+	io.Writer
+	Submit() (n int64, err error)
 }
 
 type BatchConn interface {

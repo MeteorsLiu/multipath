@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/MeteorsLiu/multipath/internal/conn"
+	"github.com/MeteorsLiu/multipath/internal/conn/tcp"
 	"github.com/MeteorsLiu/multipath/internal/conn/udpmux"
 	"github.com/MeteorsLiu/multipath/internal/path"
 	"github.com/MeteorsLiu/multipath/internal/scheduler/cfs"
@@ -42,7 +43,11 @@ func NewServer(ctx context.Context, cfg Config) (closeFn func(), err error) {
 
 	tunModule := tun.NewHandler(ctx, tunInterface, sche)
 
-	udpmux.ListenConn(ctx, manager, cfg.ListenAddr, tunModule.In())
+	if cfg.IsTCP {
+		tcp.ListenConn(ctx, manager, cfg.ListenAddr, tunModule.In())
+	} else {
+		udpmux.ListenConn(ctx, manager, cfg.ListenAddr, tunModule.In())
+	}
 
 	tunModule.Start()
 
