@@ -80,6 +80,8 @@ func NewConn(ctx context.Context, pm *conn.SenderManager, cn net.Conn, out chan<
 	}
 	tc.ctx, tc.cancel = context.WithCancel(ctx)
 
+	tc.Start()
+
 	pm.Add(tc.String(), func() (w conn.ConnWriter, onRemove func()) {
 		return tc, func() {
 			if isServerSide {
