@@ -12,10 +12,12 @@ import (
 
 	"github.com/MeteorsLiu/multipath/internal/conn"
 	"github.com/MeteorsLiu/multipath/internal/conn/batch"
-	"github.com/MeteorsLiu/multipath/internal/conn/ip"
 	"github.com/MeteorsLiu/multipath/internal/conn/protocol"
+	"github.com/MeteorsLiu/multipath/internal/conn/protocol/ip"
 	"github.com/MeteorsLiu/multipath/internal/mempool"
 	"github.com/MeteorsLiu/multipath/internal/prober"
+	"github.com/MeteorsLiu/multipath/internal/prom"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // max tcp mem: 64MB
@@ -142,6 +144,9 @@ func (u *TcpConn) readLoop() {
 	var err error
 	const proberPacketSize = prober.NonceSize + prober.ProbeHeaderSize
 	fmt.Printf("read tcp at: %s => %s\n", u.conn.LocalAddr(), u.conn.RemoteAddr())
+	var n int64
+	host, _, _ := net.SplitHostPort(u.conn.RemoteAddr().String())
+
 loop:
 	for {
 		_, err = reader.Read(b)
@@ -184,6 +189,9 @@ loop:
 			if packetSize > 1500 || packetSize <= 20 {
 				mempool.Put(buf)
 				continue loop
+			}
+			if n > 0 {
+				prom.TCPTraffic.With(prometheus.Labels{"addr": host}).Add(float64(packetSize))
 			}
 			buf.SetLen(int(packetSize))
 
@@ -243,13 +251,18 @@ func (t *TcpConn) writeLoop() {
 	batchWriter := batch.NewWriter(rw)
 	pb := make([]*mempool.Buffer, 0, queueSize)
 	fmt.Printf("write tcp at: %s => %s\n", t.conn.LocalAddr(), t.conn.RemoteAddr())
+	var n int64
+	host, _, _ := net.SplitHostPort(t.conn.RemoteAddr().String())
 
 	for {
 		err = t.waitInPacket(batchWriter, &pb)
 		if err != nil {
 			break
 		}
-		_, err = batchWriter.Submit()
+		n, err = batchWriter.Submit()
+		if n > 0 {
+			prom.TCPTraffic.With(prometheus.Labels{"addr": host}).Add(float64(n))
+		}
 
 		for _, b := range pb {
 			mempool.Put(b)

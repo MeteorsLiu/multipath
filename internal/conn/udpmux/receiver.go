@@ -8,10 +8,12 @@ import (
 
 	"github.com/MeteorsLiu/multipath/internal/conn"
 	"github.com/MeteorsLiu/multipath/internal/conn/batch/udp"
-	"github.com/MeteorsLiu/multipath/internal/conn/ip"
 	"github.com/MeteorsLiu/multipath/internal/conn/protocol"
+	"github.com/MeteorsLiu/multipath/internal/conn/protocol/ip"
 	"github.com/MeteorsLiu/multipath/internal/mempool"
 	"github.com/MeteorsLiu/multipath/internal/prober"
+	"github.com/MeteorsLiu/multipath/internal/prom"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 var errPacketConsumed = fmt.Errorf("packet need consumed")
@@ -202,8 +204,6 @@ func (u *udpReader) readLoop() {
 		msg.Buffers[0] = bufs[i].FullBytes()
 	}
 
-	trafficMap := make(map[string]int64)
-
 	defer func() {
 		// if someone closes us, we have to recycle our buffers
 		for _, b := range bufs {
@@ -236,7 +236,8 @@ func (u *udpReader) readLoop() {
 				return
 			}
 
-			trafficMap[msg.Addr.String()] += int64(msg.N)
+			host, _, _ := net.SplitHostPort(remoteAddr)
+			prom.UDPTraffic.With(prometheus.Labels{"addr": host}).Add(float64(msg.N))
 
 			// buffers in queue will be put back into the pool after consumed.
 			// so we can grab a new buffer here

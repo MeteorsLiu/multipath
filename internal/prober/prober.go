@@ -11,7 +11,9 @@ import (
 
 	"github.com/MeteorsLiu/multipath/internal/conn/protocol"
 	"github.com/MeteorsLiu/multipath/internal/mempool"
+	"github.com/MeteorsLiu/multipath/internal/prom"
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 const (
@@ -188,6 +190,8 @@ func (p *Prober) sendProbePacket() {
 
 	p.out <- packet
 
+	prom.ProbeInflight.With(prometheus.Labels{"addr": p.addr}).Add(1)
+
 	if !p.rttEstimator.IsInitialized() {
 		p.currentTimeout = _defaultTimeoutDur
 		p.deadline = time.NewTimer(p.currentTimeout)
@@ -295,8 +299,11 @@ func (p *Prober) recvProbePacket(packet *mempool.Buffer) {
 		return
 	}
 	defer delete(p.packetMap, nonce)
+	prom.ProbeInflight.With(prometheus.Labels{"addr": p.addr}).Add(-1)
 
 	elapsedTimeDur := time.Since(info.startTime)
+
+	prom.ProbeRtt.With(prometheus.Labels{"addr": p.addr}).Set(float64(elapsedTimeDur.Milliseconds()))
 
 	elapsedTimeUs := elapsedTimeDur.Microseconds()
 
@@ -364,6 +371,9 @@ func (p *Prober) recvProbePacket(packet *mempool.Buffer) {
 
 	nextTimeout := time.Duration(predictedRtt*safetyMultiplier)*time.Microsecond + _baselineBuffer
 
+	prom.ProbeRttPredict.With(prometheus.Labels{"addr": p.addr}).Set(predictedRtt)
+	prom.ProbeNextTimout.With(prometheus.Labels{"addr": p.addr}).Set(float64(p.currentTimeout.Milliseconds()))
+
 	// Schedule next probe with adaptive interval based on state
 	var probeInterval time.Duration
 	switch p.state {
@@ -395,6 +405,8 @@ func (p *Prober) switchState(to Event) {
 	// Allow recovery from any state
 	oldState := p.state
 	p.state = to
+
+	prom.ProbeState.With(prometheus.Labels{"addr": p.addr}).Set(float64(p.state))
 
 	switch to {
 	case Initializing:

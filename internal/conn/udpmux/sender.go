@@ -10,6 +10,8 @@ import (
 	"github.com/MeteorsLiu/multipath/internal/conn/batch/udp"
 	"github.com/MeteorsLiu/multipath/internal/conn/protocol"
 	"github.com/MeteorsLiu/multipath/internal/mempool"
+	"github.com/MeteorsLiu/multipath/internal/prom"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 type udpSender struct {
@@ -67,14 +69,19 @@ func (u *udpSender) waitInPacket(udpWriter *udp.SendMmsg, pendingBuf *[]*mempool
 func (u *udpSender) writeLoop() {
 	pb := make([]*mempool.Buffer, 0, 1024)
 
+	var n int64
 	batchWriter := udp.NewWriterV4(u.conn, u.remote)
+	host, _, _ := net.SplitHostPort(u.remote.String())
 
 	for {
 		err := u.waitInPacket(batchWriter, &pb)
 		if err != nil {
 			break
 		}
-		_, err = batchWriter.Submit()
+		n, err = batchWriter.Submit()
+		if n > 0 {
+			prom.UDPTraffic.With(prometheus.Labels{"addr": host}).Add(float64(n))
+		}
 
 		for _, b := range pb {
 			mempool.Put(b)

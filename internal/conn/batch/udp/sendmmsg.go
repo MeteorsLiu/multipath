@@ -102,13 +102,14 @@ func (s *SendMmsg) send4() (int64, error) {
 	)
 	for {
 		n, err = s.v4pc.WriteBatch(s.v4msgs[start:s.cursor], 0)
-		if n > 0 {
-			sent += int64(n)
-		}
 		if err != nil || n == len(s.v4msgs[start:s.cursor]) {
 			break
 		}
 		start += n
+	}
+
+	for i := 0; i < start; i++ {
+		sent += int64(s.v4msgs[i].N)
 	}
 	return sent, err
 }
@@ -129,6 +130,9 @@ func (s *SendMmsg) send6() (int64, error) {
 			break
 		}
 		start += n
+	}
+	for i := 0; i < start; i++ {
+		sent += int64(s.v4msgs[i].N)
 	}
 	return sent, err
 }

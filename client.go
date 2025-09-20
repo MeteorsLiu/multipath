@@ -10,6 +10,7 @@ import (
 	"github.com/MeteorsLiu/multipath/internal/conn/tcp"
 	"github.com/MeteorsLiu/multipath/internal/conn/udpmux"
 	"github.com/MeteorsLiu/multipath/internal/path"
+	"github.com/MeteorsLiu/multipath/internal/prom"
 	"github.com/MeteorsLiu/multipath/internal/scheduler/cfs"
 	"github.com/MeteorsLiu/multipath/internal/tun"
 )
@@ -18,6 +19,7 @@ func NewClient(ctx context.Context, cfg Config) (func(), error) {
 	if len(cfg.Client.Remotes) == 0 {
 		return nil, fmt.Errorf("failed to init client: no remote paths found")
 	}
+	prom.SetupServer(cfg.PromListenAddr)
 
 	pathMap := newSchedulablePathManager()
 	sche := cfs.NewCFSScheduler(false)

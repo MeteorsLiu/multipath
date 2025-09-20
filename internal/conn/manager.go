@@ -2,6 +2,9 @@ package conn
 
 import (
 	"sync"
+
+	"github.com/MeteorsLiu/multipath/internal/prom"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 type connElem struct {
@@ -85,7 +88,11 @@ func (pm *SenderManager) Remove(conn ConnWriter) bool {
 	if ok {
 		pm.onRemovePath(conn)
 		if elem.onRemove != nil {
-			go elem.onRemove()
+			go func() {
+				prom.NodeReconnectNum.With(prometheus.Labels{"addr": conn.String()}).Inc()
+				elem.onRemove()
+				prom.NodeReconnectNum.With(prometheus.Labels{"addr": conn.String()}).Dec()
+			}()
 		}
 	}
 	return ok

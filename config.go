@@ -25,11 +25,12 @@ type Tun struct {
 }
 
 type Config struct {
-	Client       `json:"client,omitempty"`
-	Server       `json:"server,omitempty"`
-	Tun          `json:"tun"`
-	IsTCP        bool `json:"tcp"`
-	IsServerSide bool `json:"isServer"`
+	Client         `json:"client,omitempty"`
+	Server         `json:"server,omitempty"`
+	Tun            `json:"tun"`
+	PromListenAddr string `json:"promListenAddr"`
+	IsTCP          bool   `json:"tcp"`
+	IsServerSide   bool   `json:"isServer"`
 }
 
 func ParseConfig(configFile string) (cfg Config, err error) {
@@ -42,6 +43,9 @@ func ParseConfig(configFile string) (cfg Config, err error) {
 	err = json.NewDecoder(file).Decode(&cfg)
 	if err != nil {
 		return
+	}
+	if cfg.PromListenAddr == "" {
+		cfg.PromListenAddr = "0.0.0.0:2131"
 	}
 	if cfg.Tun.Name == "" {
 		cfg.Tun.Name = "multipath-veth0"

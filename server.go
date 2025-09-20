@@ -8,6 +8,7 @@ import (
 	"github.com/MeteorsLiu/multipath/internal/conn/tcp"
 	"github.com/MeteorsLiu/multipath/internal/conn/udpmux"
 	"github.com/MeteorsLiu/multipath/internal/path"
+	"github.com/MeteorsLiu/multipath/internal/prom"
 	"github.com/MeteorsLiu/multipath/internal/scheduler/cfs"
 	"github.com/MeteorsLiu/multipath/internal/tun"
 )
@@ -16,6 +17,7 @@ func NewServer(ctx context.Context, cfg Config) (closeFn func(), err error) {
 	if cfg.ListenAddr == "" {
 		return nil, fmt.Errorf("failed to init server: no listen addr")
 	}
+	prom.SetupServer(cfg.PromListenAddr)
 
 	pathMap := newSchedulablePathManager()
 	sche := cfs.NewCFSScheduler(true)
