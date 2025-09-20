@@ -429,6 +429,7 @@ func (p *Prober) start() {
 	for {
 		select {
 		case <-p.ctx.Done():
+			p.switchState(Lost)
 			return
 		case pkt := <-p.in:
 			p.recvProbePacket(pkt)
