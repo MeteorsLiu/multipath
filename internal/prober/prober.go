@@ -215,6 +215,9 @@ func (p *Prober) sendProbePacket() {
 
 	p.currentTimeout = time.Duration(predictedRtt*safetyMultiplier)*time.Microsecond + _baselineBuffer
 
+	prom.ProbeRttPredict.With(prometheus.Labels{"addr": p.addr}).Set(predictedRtt)
+	prom.ProbeNextTimout.With(prometheus.Labels{"addr": p.addr}).Set(float64(p.currentTimeout.Milliseconds()))
+
 	if p.deadline.C == nil {
 		p.deadline = time.NewTimer(p.currentTimeout)
 		return
@@ -370,9 +373,6 @@ func (p *Prober) recvProbePacket(packet *mempool.Buffer) {
 	}
 
 	nextTimeout := time.Duration(predictedRtt*safetyMultiplier)*time.Microsecond + _baselineBuffer
-
-	prom.ProbeRttPredict.With(prometheus.Labels{"addr": p.addr}).Set(predictedRtt)
-	prom.ProbeNextTimout.With(prometheus.Labels{"addr": p.addr}).Set(float64(p.currentTimeout.Milliseconds()))
 
 	// Schedule next probe with adaptive interval based on state
 	var probeInterval time.Duration
