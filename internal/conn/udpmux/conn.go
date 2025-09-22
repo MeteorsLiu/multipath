@@ -13,6 +13,7 @@ import (
 
 type udpConn struct {
 	ctx          context.Context
+	cancel       context.CancelFunc
 	receiver     *udpReader
 	isServerSide bool
 
@@ -46,12 +47,13 @@ func DialConn(ctx context.Context, pm *conn.SenderManager, remoteAddr string, ou
 	}
 	udpC := mustListenUDP(":0")
 
-	cn := &udpConn{ctx: ctx, manager: pm, proberManager: prober.NewManager()}
+	cn := &udpConn{manager: pm, proberManager: prober.NewManager()}
+	cn.ctx, cn.cancel = context.WithCancel(ctx)
 
-	id, prober := cn.proberManager.Register(ctx, fmt.Sprintf("%s => %s", udpC.LocalAddr(), remoteAddr), cn.onProberEvent)
+	id, prober := cn.proberManager.Register(cn.ctx, fmt.Sprintf("%s => %s", udpC.LocalAddr(), remoteAddr), cn.onProberEvent)
 
-	sender := newUDPSender(ctx)
-	cn.receiver = newUDPReceiver(ctx, udpC, out, sender.queue, cn.manager, cn.proberManager, cn.onRecvAddr, false)
+	sender := newUDPSender(cn.ctx, cn.cancel)
+	cn.receiver = newUDPReceiver(cn.ctx, cn.cancel, udpC, out, sender.queue, cn.manager, cn.proberManager, cn.onRecvAddr, false)
 
 	cn.receiver.Start()
 
@@ -64,9 +66,10 @@ func DialConn(ctx context.Context, pm *conn.SenderManager, remoteAddr string, ou
 
 func ListenConn(ctx context.Context, pm *conn.SenderManager, local string, out chan<- *mempool.Buffer) {
 	localConn := mustListenUDP(local)
-	conn := &udpConn{ctx: ctx, manager: pm, isServerSide: true, proberManager: prober.NewManager()}
+	conn := &udpConn{manager: pm, isServerSide: true, proberManager: prober.NewManager()}
+	conn.ctx, conn.cancel = context.WithCancel(ctx)
 
-	conn.receiver = newUDPReceiver(ctx, localConn, out, nil, conn.manager, conn.proberManager, conn.onRecvAddr, true)
+	conn.receiver = newUDPReceiver(conn.ctx, conn.cancel, localConn, out, nil, conn.manager, conn.proberManager, conn.onRecvAddr, true)
 	conn.receiver.Start()
 }
 
@@ -100,9 +103,11 @@ func (c *udpConn) onRecvAddr(addr string) {
 		}
 		localC := mustListenUDP(":0")
 
-		sender := newUDPSender(c.ctx)
+		ctx, cancel := context.WithCancel(c.ctx)
 
-		id, prober := c.proberManager.Register(c.ctx, fmt.Sprintf("%s => %s", localC.LocalAddr(), addr), c.onProberEvent)
+		sender := newUDPSender(ctx, cancel)
+
+		id, prober := c.proberManager.Register(ctx, fmt.Sprintf("%s => %s", localC.LocalAddr(), addr), c.onProberEvent)
 
 		sender.Start(localC, remoteAddr, prober.Out())
 		prober.Start(&proberContext{

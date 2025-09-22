@@ -26,9 +26,8 @@ type udpSender struct {
 
 var _ conn.ConnWriter = (*udpSender)(nil)
 
-func newUDPSender(ctx context.Context) *udpSender {
-	sender := &udpSender{queue: make(chan *mempool.Buffer, 1024)}
-	sender.ctx, sender.cancel = context.WithCancel(ctx)
+func newUDPSender(ctx context.Context, cancel context.CancelFunc) *udpSender {
+	sender := &udpSender{ctx: ctx, cancel: cancel, queue: make(chan *mempool.Buffer, 1024)}
 	return sender
 }
 
@@ -72,6 +71,8 @@ func (u *udpSender) writeLoop() {
 	var n int64
 	batchWriter := udp.NewWriterV4(u.conn, u.remote)
 	host, _, _ := net.SplitHostPort(u.remote.String())
+
+	defer u.Close()
 
 	for {
 		err := u.waitInPacket(batchWriter, &pb)

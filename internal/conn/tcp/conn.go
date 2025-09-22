@@ -249,7 +249,7 @@ func (t *TcpConn) writeLoop() {
 	defer t.Close()
 
 	batchWriter := batch.NewWriter(rw)
-	pb := make([]*mempool.Buffer, 0, queueSize)
+	pb := make([]*mempool.Buffer, 0, 1024)
 	fmt.Printf("write tcp at: %s => %s\n", t.conn.LocalAddr(), t.conn.RemoteAddr())
 	var n int64
 	host, _, _ := net.SplitHostPort(t.conn.RemoteAddr().String())

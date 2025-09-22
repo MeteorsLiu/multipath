@@ -76,6 +76,7 @@ type udpReader struct {
 
 func newUDPReceiver(
 	ctx context.Context,
+	cancel context.CancelFunc,
 	conn net.PacketConn,
 	outCh chan<- *mempool.Buffer,
 	clientSender chan<- *mempool.Buffer,
@@ -85,6 +86,8 @@ func newUDPReceiver(
 	isServerSide bool,
 ) *udpReader {
 	reader := &udpReader{
+		ctx:           ctx,
+		cancel:        cancel,
 		conn:          conn,
 		senderManager: senderManager,
 		proberManager: proberManager,
@@ -94,7 +97,6 @@ func newUDPReceiver(
 		clientSender:  clientSender,
 		pending:       newPending(),
 	}
-	reader.ctx, reader.cancel = context.WithCancel(ctx)
 	return reader
 }
 
@@ -209,6 +211,7 @@ func (u *udpReader) readLoop() {
 		for _, b := range bufs {
 			mempool.Put(b)
 		}
+		u.Close()
 	}()
 
 	for {

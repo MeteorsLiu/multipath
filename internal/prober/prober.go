@@ -284,6 +284,7 @@ func (p *Prober) markTimeout() (hasTimeouts bool) {
 		for len(p.packetMap) > exceedSize {
 			pkt := heap.Pop(&timeHeap).(*gcPacket)
 			delete(p.packetMap, pkt.nonce)
+			prom.ProbeInflight.With(prometheus.Labels{"addr": p.addr}).Add(-1)
 		}
 	}
 
