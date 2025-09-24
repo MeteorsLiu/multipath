@@ -40,6 +40,8 @@ type schedulerImpl struct {
 	mu           sync.Mutex
 	heap         pathHeap
 	isServerSide bool
+
+	minVirtualSent uint64
 }
 
 func NewCFSScheduler(isServerSide bool) scheduler.Scheduler {
@@ -48,7 +50,16 @@ func NewCFSScheduler(isServerSide bool) scheduler.Scheduler {
 
 func (s *schedulerImpl) AddPath(path scheduler.SchedulablePath) {
 	fmt.Println("push", path.String())
+	cPath, ok := path.(*cfsPath)
+	if !ok {
+		panic("invalid path underlying type")
+	}
 	s.mu.Lock()
+	minVirtualSent := s.minVirtualSent
+	if minVirtualSent > 1500 {
+		minVirtualSent -= 1500 // max allow 1 packet
+	}
+	cPath.virtualSent = minVirtualSent
 	heap.Push(&s.heap, path)
 	s.mu.Unlock()
 }
@@ -79,6 +90,12 @@ func (s *schedulerImpl) findBestPath(size int) (*cfsPath, error) {
 	bestPath := s.heap[0]
 	bestPath.beforeWrite(size)
 	heap.Fix(&s.heap, bestPath.heapIdx)
+
+	if s.minVirtualSent == 0 {
+		s.minVirtualSent = s.heap[0].virtualSent
+	} else {
+		s.minVirtualSent = min(s.minVirtualSent, s.heap[0].virtualSent)
+	}
 	return bestPath, nil
 }
 
