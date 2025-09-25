@@ -41,10 +41,6 @@ func mustListenUDP(addr string) net.PacketConn {
 }
 
 func DialConn(ctx context.Context, pm *conn.SenderManager, remoteAddr string, out chan<- *mempool.Buffer) {
-	remoteUdpAddr, err := net.ResolveUDPAddr("udp", remoteAddr)
-	if err != nil {
-		panic(err)
-	}
 	udpC := mustListenUDP(":0")
 
 	cn := &udpConn{manager: pm, proberManager: prober.NewManager()}
@@ -57,7 +53,7 @@ func DialConn(ctx context.Context, pm *conn.SenderManager, remoteAddr string, ou
 
 	cn.receiver.Start()
 
-	sender.Start(udpC, remoteUdpAddr, prober.Out())
+	sender.Start(udpC, remoteAddr, prober.Out())
 	prober.Start(&proberContext{
 		addr:   remoteAddr,
 		sender: sender,
@@ -97,10 +93,6 @@ func (c *udpConn) onRecvAddr(addr string) {
 		return
 	}
 	c.manager.Add(addr, func() (w conn.ConnWriter, onRemove func()) {
-		remoteAddr, err := net.ResolveUDPAddr("udp", addr)
-		if err != nil {
-			panic(err)
-		}
 		localC := mustListenUDP(":0")
 
 		ctx, cancel := context.WithCancel(c.ctx)
@@ -109,7 +101,7 @@ func (c *udpConn) onRecvAddr(addr string) {
 
 		id, prober := c.proberManager.Register(ctx, fmt.Sprintf("%s => %s", localC.LocalAddr(), addr), c.onProberEvent)
 
-		sender.Start(localC, remoteAddr, prober.Out())
+		sender.Start(localC, addr, prober.Out())
 		prober.Start(&proberContext{
 			addr:   addr,
 			sender: sender,

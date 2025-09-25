@@ -15,13 +15,13 @@ import (
 )
 
 type udpSender struct {
-	ctx       context.Context
-	cancel    context.CancelFunc
-	remote    *net.UDPAddr
-	queue     chan *mempool.Buffer
-	conn      net.PacketConn
-	proberOut <-chan *mempool.Buffer
-	startOnce sync.Once
+	ctx        context.Context
+	cancel     context.CancelFunc
+	remoteAddr string
+	queue      chan *mempool.Buffer
+	conn       net.PacketConn
+	proberOut  <-chan *mempool.Buffer
+	startOnce  sync.Once
 }
 
 var _ conn.ConnWriter = (*udpSender)(nil)
@@ -69,8 +69,12 @@ func (u *udpSender) writeLoop() {
 	pb := make([]*mempool.Buffer, 0, 1024)
 
 	var n int64
-	batchWriter := udp.NewWriterV4(u.conn, u.remote)
-	host, _, _ := net.SplitHostPort(u.remote.String())
+	remote, err := net.ResolveUDPAddr("udp", u.remoteAddr)
+	if err != nil {
+		panic(err)
+	}
+	batchWriter := udp.NewWriterV4(u.conn, remote)
+	host, _, _ := net.SplitHostPort(u.remoteAddr)
 
 	defer u.Close()
 
@@ -90,23 +94,23 @@ func (u *udpSender) writeLoop() {
 		pb = pb[:0]
 
 		if err != nil {
-			fmt.Println("udp error: ", u.remote.String(), err)
+			fmt.Println("udp error: ", u.remoteAddr, err)
 			break
 		}
 	}
 }
 
-func (u *udpSender) Start(conn net.PacketConn, remote *net.UDPAddr, proberOut <-chan *mempool.Buffer) {
+func (u *udpSender) Start(conn net.PacketConn, remoteAddr string, proberOut <-chan *mempool.Buffer) {
 	u.startOnce.Do(func() {
 		u.conn = conn
-		u.remote = remote
+		u.remoteAddr = remoteAddr
 		u.proberOut = proberOut
 		go u.writeLoop()
 	})
 }
 
 func (u *udpSender) String() string {
-	return u.remote.String()
+	return u.remoteAddr
 }
 
 func (u *udpSender) Write(b *mempool.Buffer) error {
