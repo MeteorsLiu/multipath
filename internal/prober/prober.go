@@ -443,6 +443,11 @@ func (p *Prober) start() {
 		select {
 		case <-p.ctx.Done():
 			p.switchState(Lost)
+			prom.ProbeInflight.Delete(prometheus.Labels{"addr": p.addr})
+			prom.ProbeState.Delete(prometheus.Labels{"addr": p.addr})
+			prom.ProbeRtt.Delete(prometheus.Labels{"addr": p.addr})
+			prom.ProbeRttPredict.Delete(prometheus.Labels{"addr": p.addr})
+			prom.ProbeNextTimout.Delete(prometheus.Labels{"addr": p.addr})
 			return
 		case pkt := <-p.in:
 			p.recvProbePacket(pkt)

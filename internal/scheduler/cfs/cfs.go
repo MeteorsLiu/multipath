@@ -6,7 +6,9 @@ import (
 	"sync"
 
 	"github.com/MeteorsLiu/multipath/internal/mempool"
+	"github.com/MeteorsLiu/multipath/internal/prom"
 	"github.com/MeteorsLiu/multipath/internal/scheduler"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 type pathHeap []*cfsPath
@@ -54,6 +56,7 @@ func (s *schedulerImpl) AddPath(path scheduler.SchedulablePath) {
 	if !ok {
 		panic("invalid path underlying type")
 	}
+	prom.NodeConnInPool.With(prometheus.Labels{"addr": path.String()}).Inc()
 	s.mu.Lock()
 	minVirtualSent := s.minVirtualSent
 	if minVirtualSent > 1500 {
@@ -71,6 +74,8 @@ func (s *schedulerImpl) RemovePath(path scheduler.SchedulablePath) {
 	if !ok {
 		panic("invalid path underlying type")
 	}
+	prom.NodeConnInPool.Delete(prometheus.Labels{"addr": path.String()})
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

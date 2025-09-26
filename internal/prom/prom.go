@@ -61,6 +61,13 @@ var (
 		Name:      "node_reconnect_total",
 		Help:      "The total number of node reconnections",
 	}, []string{"addr"})
+
+	NodeConnInPool = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "multipath",
+		Subsystem: "node",
+		Name:      "node_conn_in_pool_total",
+		Help:      "The total number of node reconnections",
+	}, []string{"addr"})
 )
 
 func Register() {
@@ -72,6 +79,7 @@ func Register() {
 	prometheus.MustRegister(ProbeState)
 	prometheus.MustRegister(ProbeNextTimout)
 	prometheus.MustRegister(NodeReconnectNum)
+	prometheus.MustRegister(NodeConnInPool)
 }
 
 func SetupServer(listenAddr string) {
