@@ -13,7 +13,6 @@ import (
 
 type udpConn struct {
 	ctx          context.Context
-	cancel       context.CancelFunc
 	receiver     *udpReader
 	isServerSide bool
 
@@ -43,13 +42,19 @@ func mustListenUDP(addr string) net.PacketConn {
 func DialConn(ctx context.Context, pm *conn.SenderManager, remoteAddr string, out chan<- *mempool.Buffer) {
 	udpC := mustListenUDP(":0")
 
-	cn := &udpConn{manager: pm, proberManager: prober.NewManager()}
-	cn.ctx, cn.cancel = context.WithCancel(ctx)
+	select {
+	case <-ctx.Done():
+		panic("context has been cancel")
+	default:
+	}
 
-	id, prober := cn.proberManager.Register(cn.ctx, fmt.Sprintf("%s => %s", udpC.LocalAddr(), remoteAddr), cn.onProberEvent)
+	cn := &udpConn{ctx: ctx, manager: pm, proberManager: prober.NewManager()}
+	connCtx, connCancel := context.WithCancel(ctx)
 
-	sender := newUDPSender(cn.ctx, cn.cancel)
-	cn.receiver = newUDPReceiver(cn.ctx, cn.cancel, udpC, out, sender.queue, cn.manager, cn.proberManager, cn.onRecvAddr, false)
+	id, prober := cn.proberManager.Register(connCtx, fmt.Sprintf("%s => %s", udpC.LocalAddr(), remoteAddr), cn.onProberEvent)
+
+	sender := newUDPSender(connCtx, connCancel)
+	cn.receiver = newUDPReceiver(connCtx, connCancel, udpC, out, sender.queue, cn.manager, cn.proberManager, cn.onRecvAddr, false)
 
 	cn.receiver.Start()
 
@@ -63,9 +68,10 @@ func DialConn(ctx context.Context, pm *conn.SenderManager, remoteAddr string, ou
 func ListenConn(ctx context.Context, pm *conn.SenderManager, local string, out chan<- *mempool.Buffer) {
 	localConn := mustListenUDP(local)
 	conn := &udpConn{manager: pm, isServerSide: true, proberManager: prober.NewManager()}
-	conn.ctx, conn.cancel = context.WithCancel(ctx)
+	connCtx, connCancel := context.WithCancel(ctx)
+	conn.ctx = connCtx
 
-	conn.receiver = newUDPReceiver(conn.ctx, conn.cancel, localConn, out, nil, conn.manager, conn.proberManager, conn.onRecvAddr, true)
+	conn.receiver = newUDPReceiver(connCtx, connCancel, localConn, out, nil, conn.manager, conn.proberManager, conn.onRecvAddr, true)
 	conn.receiver.Start()
 }
 
