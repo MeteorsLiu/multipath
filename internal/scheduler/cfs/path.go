@@ -42,3 +42,8 @@ func (p *cfsPath) markAsLost() {
 func (p *cfsPath) updateVirtualSent() {
 	p.virtualSent = p.sentBytes / max(uint64(p.weight), 1)
 }
+
+func (p *cfsPath) setVirtualSent(virtualSent uint64) {
+	p.virtualSent = virtualSent
+	p.sentBytes = p.virtualSent * max(uint64(p.weight), 1)
+}

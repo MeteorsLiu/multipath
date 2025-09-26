@@ -42,8 +42,6 @@ type schedulerImpl struct {
 	mu           sync.Mutex
 	heap         pathHeap
 	isServerSide bool
-
-	minVirtualSent uint64
 }
 
 func NewCFSScheduler(isServerSide bool) scheduler.Scheduler {
@@ -57,12 +55,16 @@ func (s *schedulerImpl) AddPath(path scheduler.SchedulablePath) {
 		panic("invalid path underlying type")
 	}
 	prom.NodeConnInPool.With(prometheus.Labels{"addr": path.String()}).Inc()
+
 	s.mu.Lock()
-	minVirtualSent := s.minVirtualSent
-	if minVirtualSent > 1500 {
-		minVirtualSent -= 1500 // max allow 1 packet
+	if s.heap.Len() > 0 && s.heap[0].virtualSent > 0 {
+		minVirtualSent := s.heap[0].virtualSent
+
+		if minVirtualSent > 1500 {
+			minVirtualSent -= 1500 // max allow 1 packet
+		}
+		cPath.setVirtualSent(minVirtualSent)
 	}
-	cPath.virtualSent = minVirtualSent
 	heap.Push(&s.heap, path)
 	s.mu.Unlock()
 }
@@ -95,12 +97,6 @@ func (s *schedulerImpl) findBestPath(size int) (*cfsPath, error) {
 	bestPath := s.heap[0]
 	bestPath.beforeWrite(size)
 	heap.Fix(&s.heap, bestPath.heapIdx)
-
-	if s.minVirtualSent == 0 {
-		s.minVirtualSent = s.heap[0].virtualSent
-	} else {
-		s.minVirtualSent = min(s.minVirtualSent, s.heap[0].virtualSent)
-	}
 	return bestPath, nil
 }
 
