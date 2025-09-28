@@ -3,6 +3,7 @@ package cfs
 import (
 	"container/heap"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/MeteorsLiu/multipath/internal/mempool"
@@ -39,13 +40,12 @@ func (h *pathHeap) Pop() any {
 }
 
 type schedulerImpl struct {
-	mu           sync.Mutex
-	heap         pathHeap
-	isServerSide bool
+	mu   sync.Mutex
+	heap pathHeap
 }
 
-func NewCFSScheduler(isServerSide bool) scheduler.Scheduler {
-	return &schedulerImpl{isServerSide: isServerSide}
+func NewCFSScheduler() scheduler.Scheduler {
+	return &schedulerImpl{}
 }
 
 func (s *schedulerImpl) AddPath(path scheduler.SchedulablePath) {
@@ -57,7 +57,7 @@ func (s *schedulerImpl) AddPath(path scheduler.SchedulablePath) {
 	prom.NodeConnInPool.With(prometheus.Labels{"addr": path.String()}).Inc()
 
 	s.mu.Lock()
-	if s.heap.Len() > 0 && s.heap[0].virtualSent > 0 {
+	if cPath.virtualSent == 0 && s.heap.Len() > 0 && s.heap[0].virtualSent > 0 {
 		minVirtualSent := s.heap[0].virtualSent
 
 		if minVirtualSent > 1500 {
@@ -110,4 +110,17 @@ func (s *schedulerImpl) Write(b *mempool.Buffer) (err error) {
 		return
 	}
 	return path.Write(b)
+}
+
+func (s *schedulerImpl) String() string {
+	var sb strings.Builder
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, p := range s.heap {
+		sb.WriteString(fmt.Sprintf("%s: %d\n", p.addr, p.virtualSent))
+	}
+
+	return sb.String()
 }

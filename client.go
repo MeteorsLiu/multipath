@@ -21,7 +21,7 @@ func NewClient(ctx context.Context, cfg Config) (func(), error) {
 	prom.SetupServer(cfg.PromListenAddr)
 
 	pathMap := newSchedulablePathManager()
-	sche := cfs.NewCFSScheduler(false)
+	sche := cfs.NewCFSScheduler()
 
 	manager := path.NewManager(path.WithOnNewPath(func(event path.ManagerEvent, connPath path.Path) {
 		switch event {

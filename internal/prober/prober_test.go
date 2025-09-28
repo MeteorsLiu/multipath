@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MeteorsLiu/multipath/internal/conn"
 	"github.com/MeteorsLiu/multipath/internal/conn/protocol"
 	"github.com/MeteorsLiu/multipath/internal/mempool"
 	"github.com/google/uuid"
@@ -18,7 +17,7 @@ func TestProbePacketFormat(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	prober := New(ctx, "test-addr", func(conn.ConnWriter, Event) {})
+	prober := New(ctx, "test-addr", func(any, Event) {})
 	proberId := uuid.New()
 	prober.proberId = proberId
 
@@ -77,7 +76,7 @@ func TestProbePacketHeaderStructure(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	prober := New(ctx, "test-addr", func(conn.ConnWriter, Event) {})
+	prober := New(ctx, "test-addr", func(any, Event) {})
 	proberId := uuid.New()
 	prober.proberId = proberId
 
@@ -141,7 +140,7 @@ func TestInitializingStateTransition(t *testing.T) {
 	defer cancel()
 
 	events := make(chan Event, 10)
-	prober := New(ctx, "test-addr", func(_ conn.ConnWriter, event Event) {
+	prober := New(ctx, "test-addr", func(_ any, event Event) {
 		events <- event
 	})
 
@@ -205,7 +204,7 @@ func TestProbePacketReply(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	prober := New(ctx, "test-addr", func(conn.ConnWriter, Event) {})
+	prober := New(ctx, "test-addr", func(any, Event) {})
 	proberId := uuid.New()
 	prober.proberId = proberId
 
@@ -248,7 +247,7 @@ func TestProbePacketTimeout(t *testing.T) {
 	defer cancel()
 
 	eventReceived := make(chan Event, 10)
-	prober := New(ctx, "test-addr", func(_ conn.ConnWriter, event Event) {
+	prober := New(ctx, "test-addr", func(_ any, event Event) {
 		eventReceived <- event
 	})
 
@@ -312,7 +311,7 @@ func TestProbePacketWithSenderIntegration(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	prober := New(ctx, "test-addr", func(conn.ConnWriter, Event) {})
+	prober := New(ctx, "test-addr", func(any, Event) {})
 	proberId := uuid.New()
 	prober.proberId = proberId
 
@@ -351,7 +350,7 @@ func TestMultipleProbePackets(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	prober := New(ctx, "test-addr", func(conn.ConnWriter, Event) {})
+	prober := New(ctx, "test-addr", func(any, Event) {})
 	proberId := uuid.New()
 	prober.proberId = proberId
 
@@ -401,7 +400,7 @@ func TestProbePacketUnknownNonce(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	prober := New(ctx, "test-addr", func(conn.ConnWriter, Event) {})
+	prober := New(ctx, "test-addr", func(any, Event) {})
 
 	initialMapSize := len(prober.packetMap)
 
@@ -669,7 +668,7 @@ func TestProber_RTTEstimationWithHolt(t *testing.T) {
 	defer cancel()
 
 	events := make(chan Event, 10)
-	prober := New(ctx, "test-addr", func(_ conn.ConnWriter, event Event) {
+	prober := New(ctx, "test-addr", func(_ any, event Event) {
 		events <- event
 	})
 
@@ -726,7 +725,7 @@ func TestProber_AdaptiveTimeoutCalculation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	prober := New(ctx, "test-addr", func(conn.ConnWriter, Event) {})
+	prober := New(ctx, "test-addr", func(any, Event) {})
 	proberId := uuid.New()
 	prober.proberId = proberId
 
@@ -796,7 +795,7 @@ func TestProber_StateTransitionsWithHolt(t *testing.T) {
 	defer cancel()
 
 	events := make(chan Event, 20)
-	prober := New(ctx, "test-addr", func(_ conn.ConnWriter, event Event) {
+	prober := New(ctx, "test-addr", func(_ any, event Event) {
 		events <- event
 	})
 
@@ -866,7 +865,7 @@ func TestProber_RecoveryBehavior(t *testing.T) {
 	defer cancel()
 
 	events := make(chan Event, 10)
-	prober := New(ctx, "test-addr", func(_ conn.ConnWriter, event Event) {
+	prober := New(ctx, "test-addr", func(_ any, event Event) {
 		events <- event
 	})
 

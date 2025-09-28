@@ -11,6 +11,7 @@ var ErrNoPath = errors.New("failed to get path: no available path")
 
 type Scheduler interface {
 	mempool.Writer
+	String() string
 	AddPath(path SchedulablePath)
 	RemovePath(path SchedulablePath)
 }
