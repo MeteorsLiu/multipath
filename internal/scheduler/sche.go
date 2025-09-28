@@ -16,6 +16,8 @@ type Scheduler interface {
 }
 
 type SchedulablePath interface {
-	path.Path
+	String() string
 	SetWeight(w int)
+	AddConnPath(connPath path.Path)
+	RemoveConnPath(connPath path.Path)
 }

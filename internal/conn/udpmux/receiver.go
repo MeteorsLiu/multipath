@@ -6,11 +6,11 @@ import (
 	"net"
 	"sync"
 
-	"github.com/MeteorsLiu/multipath/internal/conn"
 	"github.com/MeteorsLiu/multipath/internal/conn/batch/udp"
 	"github.com/MeteorsLiu/multipath/internal/conn/protocol"
 	"github.com/MeteorsLiu/multipath/internal/conn/protocol/ip"
 	"github.com/MeteorsLiu/multipath/internal/mempool"
+	"github.com/MeteorsLiu/multipath/internal/path"
 	"github.com/MeteorsLiu/multipath/internal/prober"
 	"github.com/MeteorsLiu/multipath/internal/prom"
 	"github.com/prometheus/client_golang/prometheus"
@@ -64,7 +64,7 @@ type udpReader struct {
 	outCh  chan<- *mempool.Buffer
 
 	clientSender  chan<- *mempool.Buffer
-	senderManager *conn.SenderManager
+	senderManager *path.PathManager
 	proberManager *prober.Manager
 	onRecvAddr    func(string)
 
@@ -80,7 +80,7 @@ func newUDPReceiver(
 	conn net.PacketConn,
 	outCh chan<- *mempool.Buffer,
 	clientSender chan<- *mempool.Buffer,
-	senderManager *conn.SenderManager,
+	senderManager *path.PathManager,
 	proberManager *prober.Manager,
 	onRecvAddr func(string),
 	isServerSide bool,

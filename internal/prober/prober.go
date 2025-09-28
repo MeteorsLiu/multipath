@@ -22,7 +22,7 @@ const (
 	_defaultTimeoutDur = _defaultTimeout * time.Second
 	_minTimeout        = 500 * time.Millisecond
 	// slightly larget than TCP RTO, avoid TCP RTO causing us mistaken
-	_baselineBuffer     = 300 * time.Millisecond
+	_baselineBuffer     = 500 * time.Millisecond
 	_maxConsecutiveLoss = 10
 	_reconnectInterval  = 5 * time.Second
 )

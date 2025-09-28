@@ -87,17 +87,21 @@ func (s *schedulerImpl) RemovePath(path scheduler.SchedulablePath) {
 	heap.Remove(&s.heap, cPath.heapIdx)
 }
 
-func (s *schedulerImpl) findBestPath(size int) (*cfsPath, error) {
+func (s *schedulerImpl) findBestPath(n int) (mempool.Writer, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if s.heap.Len() == 0 {
 		return nil, scheduler.ErrNoPath
 	}
-	bestPath := s.heap[0]
-	bestPath.beforeWrite(size)
-	heap.Fix(&s.heap, bestPath.heapIdx)
-	return bestPath, nil
+	for _, bestPath := range s.heap {
+		if w := bestPath.getWriter(n); w != nil {
+			heap.Fix(&s.heap, bestPath.heapIdx)
+			return w, nil
+		}
+	}
+
+	return nil, scheduler.ErrNoPath
 }
 
 func (s *schedulerImpl) Write(b *mempool.Buffer) (err error) {

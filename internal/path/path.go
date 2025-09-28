@@ -31,3 +31,7 @@ func (p *pathImpl) String() string {
 func (p *pathImpl) Write(b *mempool.Buffer) (err error) {
 	return p.connSender.Write(b)
 }
+
+func (p *pathImpl) Remote() string {
+	return p.connSender.Remote()
+}

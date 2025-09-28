@@ -15,6 +15,7 @@ import (
 	"github.com/MeteorsLiu/multipath/internal/conn/protocol"
 	"github.com/MeteorsLiu/multipath/internal/conn/protocol/ip"
 	"github.com/MeteorsLiu/multipath/internal/mempool"
+	"github.com/MeteorsLiu/multipath/internal/path"
 	"github.com/MeteorsLiu/multipath/internal/prober"
 	"github.com/MeteorsLiu/multipath/internal/prom"
 	"github.com/prometheus/client_golang/prometheus"
@@ -29,7 +30,7 @@ type TcpConn struct {
 	prober        *prober.Prober
 	out           chan<- *mempool.Buffer
 	queue         chan *mempool.Buffer
-	manager       *conn.SenderManager
+	manager       *path.PathManager
 	proberManager *prober.Manager
 
 	conn      net.Conn
@@ -74,7 +75,7 @@ func (c *TcpConn) onProberEvent(context any, event prober.Event) {
 	}
 }
 
-func NewConn(ctx context.Context, pm *conn.SenderManager, cn net.Conn, out chan<- *mempool.Buffer, isServerSide bool) *TcpConn {
+func NewConn(ctx context.Context, pm *path.PathManager, cn net.Conn, out chan<- *mempool.Buffer, isServerSide bool) *TcpConn {
 	tc := &TcpConn{
 		conn: cn, manager: pm, isServerSide: isServerSide,
 		queue: make(chan *mempool.Buffer, queueSize),
@@ -95,12 +96,12 @@ func NewConn(ctx context.Context, pm *conn.SenderManager, cn net.Conn, out chan<
 	return tc
 }
 
-func DialConn(ctx context.Context, pm *conn.SenderManager, remoteAddr string, out chan<- *mempool.Buffer) {
+func DialConn(ctx context.Context, pm *path.PathManager, remoteAddr string, out chan<- *mempool.Buffer) {
 	cn := mustDial(remoteAddr)
 	NewConn(ctx, pm, cn, out, false)
 }
 
-func ListenConn(ctx context.Context, pm *conn.SenderManager, local string, out chan<- *mempool.Buffer) {
+func ListenConn(ctx context.Context, pm *path.PathManager, local string, out chan<- *mempool.Buffer) {
 	listener := mustListen(local)
 
 	go func() {
@@ -293,4 +294,8 @@ func (t *TcpConn) Write(b *mempool.Buffer) error {
 	case t.queue <- b:
 		return nil
 	}
+}
+
+func (u *TcpConn) Remote() string {
+	return u.conn.RemoteAddr().String()
 }

@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/MeteorsLiu/multipath/internal/conn"
 	"github.com/MeteorsLiu/multipath/internal/conn/tcp"
 	"github.com/MeteorsLiu/multipath/internal/conn/udpmux"
 	"github.com/MeteorsLiu/multipath/internal/path"
@@ -22,17 +21,21 @@ func NewServer(ctx context.Context, cfg Config) (closeFn func(), err error) {
 	pathMap := newSchedulablePathManager()
 	sche := cfs.NewCFSScheduler(true)
 
-	manager := conn.NewManager(conn.WithOnNewPath(func(event conn.ManagerEvent, cw conn.ConnWriter) {
+	manager := path.NewManager(path.WithOnNewPath(func(event path.ManagerEvent, p path.Path) {
 		switch event {
-		case conn.ConnAppend:
-			path := cfs.NewPath(path.NewPath(cw))
-			pathMap.add(cw.String(), path)
-			sche.AddPath(path)
-		case conn.ConnRemove:
-			if path := pathMap.get(cw.String()); path != nil {
-				sche.RemovePath(path)
-				pathMap.remove(cw.String())
+		case path.Append:
+			schePath, ok := pathMap.getOrSet(p.Remote(), cfs.NewPath(p.Remote()))
+			schePath.AddConnPath(p)
+
+			if !ok {
+				sche.AddPath(schePath)
 			}
+		case path.Remove:
+			schePath := pathMap.get(p.Remote())
+			if schePath == nil {
+				panic("unexpected behavior, schePath should not be nil")
+			}
+			schePath.RemoveConnPath(p)
 		}
 	}))
 

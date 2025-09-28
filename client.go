@@ -6,7 +6,6 @@ import (
 	"os"
 	"os/exec"
 
-	"github.com/MeteorsLiu/multipath/internal/conn"
 	"github.com/MeteorsLiu/multipath/internal/conn/tcp"
 	"github.com/MeteorsLiu/multipath/internal/conn/udpmux"
 	"github.com/MeteorsLiu/multipath/internal/path"
@@ -24,17 +23,20 @@ func NewClient(ctx context.Context, cfg Config) (func(), error) {
 	pathMap := newSchedulablePathManager()
 	sche := cfs.NewCFSScheduler(false)
 
-	manager := conn.NewManager(conn.WithOnNewPath(func(event conn.ManagerEvent, cw conn.ConnWriter) {
+	manager := path.NewManager(path.WithOnNewPath(func(event path.ManagerEvent, connPath path.Path) {
 		switch event {
-		case conn.ConnAppend:
-			path := cfs.NewPath(path.NewPath(cw))
-			pathMap.add(cw.String(), path)
-			sche.AddPath(path)
-		case conn.ConnRemove:
-			if path := pathMap.get(cw.String()); path != nil {
-				sche.RemovePath(path)
-				pathMap.remove(cw.String())
+		case path.Append:
+			schePath := pathMap.get(connPath.Remote())
+			if schePath == nil {
+				panic("unexpected behavior, schePath should not be nil")
 			}
+			schePath.AddConnPath(connPath)
+		case path.Remove:
+			schePath := pathMap.get(connPath.Remote())
+			if schePath == nil {
+				panic("unexpected behavior, schePath should not be nil")
+			}
+			schePath.RemoveConnPath(connPath)
 		}
 	}))
 
@@ -53,6 +55,10 @@ func NewClient(ctx context.Context, cfg Config) (func(), error) {
 	tunModule := tun.NewHandler(ctx, tunInterface, sche)
 
 	for _, path := range cfg.Client.Remotes {
+		schePath := cfs.NewPath(path.RemoteAddr)
+		pathMap.add(path.RemoteAddr, schePath)
+		sche.AddPath(schePath)
+
 		if cfg.IsTCP {
 			tcp.DialConn(ctx, manager, path.RemoteAddr, tunModule.In())
 			continue

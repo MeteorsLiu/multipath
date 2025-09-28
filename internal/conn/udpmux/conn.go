@@ -8,6 +8,7 @@ import (
 
 	"github.com/MeteorsLiu/multipath/internal/conn"
 	"github.com/MeteorsLiu/multipath/internal/mempool"
+	"github.com/MeteorsLiu/multipath/internal/path"
 	"github.com/MeteorsLiu/multipath/internal/prober"
 )
 
@@ -18,7 +19,7 @@ type udpConn struct {
 
 	proberManager *prober.Manager
 
-	manager *conn.SenderManager
+	manager *path.PathManager
 }
 
 type proberContext struct {
@@ -39,7 +40,7 @@ func mustListenUDP(addr string) net.PacketConn {
 	panic("try listening udp too many times")
 }
 
-func DialConn(ctx context.Context, pm *conn.SenderManager, remoteAddr string, out chan<- *mempool.Buffer) {
+func DialConn(ctx context.Context, pm *path.PathManager, remoteAddr string, out chan<- *mempool.Buffer) {
 	udpC := mustListenUDP(":0")
 
 	select {
@@ -65,7 +66,7 @@ func DialConn(ctx context.Context, pm *conn.SenderManager, remoteAddr string, ou
 	}, id)
 }
 
-func ListenConn(ctx context.Context, pm *conn.SenderManager, local string, out chan<- *mempool.Buffer) {
+func ListenConn(ctx context.Context, pm *path.PathManager, local string, out chan<- *mempool.Buffer) {
 	localConn := mustListenUDP(local)
 	conn := &udpConn{manager: pm, isServerSide: true, proberManager: prober.NewManager()}
 	connCtx, connCancel := context.WithCancel(ctx)

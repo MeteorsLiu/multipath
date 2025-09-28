@@ -7,14 +7,6 @@ import (
 	"github.com/MeteorsLiu/multipath/internal/mempool"
 )
 
-type ManagerEvent int
-
-const (
-	ConnNop ManagerEvent = iota
-	ConnAppend
-	ConnRemove
-)
-
 var ErrTooManySegments = errors.New("too many segments")
 
 type BatchReader interface {
@@ -37,6 +29,7 @@ type MuxConn interface {
 
 type ConnWriter interface {
 	mempool.Writer
+	Remote() string
 	String() string
 }
 

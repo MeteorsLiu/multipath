@@ -113,6 +113,10 @@ func (u *udpSender) String() string {
 	return u.remoteAddr
 }
 
+func (u *udpSender) Remote() string {
+	return u.remoteAddr
+}
+
 func (u *udpSender) Write(b *mempool.Buffer) error {
 	select {
 	case <-u.ctx.Done():
