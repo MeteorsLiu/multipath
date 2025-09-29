@@ -2,12 +2,15 @@ package cfs
 
 import (
 	"container/list"
+	"fmt"
 	"math"
 	"sync"
 
 	"github.com/MeteorsLiu/multipath/internal/mempool"
 	"github.com/MeteorsLiu/multipath/internal/path"
+	"github.com/MeteorsLiu/multipath/internal/prom"
 	"github.com/MeteorsLiu/multipath/internal/scheduler"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 type cfsPath struct {
@@ -56,6 +59,9 @@ func (p *cfsPath) setVirtualSent(virtualSent uint64) {
 }
 
 func (p *cfsPath) AddConnPath(connPath path.Path) {
+	fmt.Printf("push conn %s to %s\n", connPath.String(), p.addr)
+	prom.NodeConnInPool.With(prometheus.Labels{"addr": p.addr, "connaddr": connPath.String()}).Inc()
+
 	p.mu.Lock()
 	if _, ok := p.connPathsMap[connPath.PathID()]; ok {
 		panic("duplicated append")
@@ -66,6 +72,10 @@ func (p *cfsPath) AddConnPath(connPath path.Path) {
 }
 
 func (p *cfsPath) RemoveConnPath(connPath path.Path) {
+	fmt.Printf("remove conn %s from %s\n", connPath.String(), p.addr)
+
+	prom.NodeConnInPool.Delete(prometheus.Labels{"addr": p.addr, "connaddr": connPath.String()})
+
 	p.mu.Lock()
 	listNode := p.connPathsMap[connPath.PathID()]
 	if listNode == nil {

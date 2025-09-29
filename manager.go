@@ -28,13 +28,14 @@ func (spm *schedulablePathManager) get(addr string) scheduler.SchedulablePath {
 	return path
 }
 
-func (spm *schedulablePathManager) getOrSet(addr string, path scheduler.SchedulablePath) (scheduler.SchedulablePath, bool) {
+func (spm *schedulablePathManager) getOrSet(addr string, getPath func() scheduler.SchedulablePath) (scheduler.SchedulablePath, bool) {
 	spm.mu.Lock()
 	defer spm.mu.Unlock()
 
 	if path, ok := spm.pathMap[addr]; ok {
 		return path, true
 	}
+	path := getPath()
 	spm.pathMap[addr] = path
 	return path, false
 }

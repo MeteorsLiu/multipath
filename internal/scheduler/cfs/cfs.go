@@ -54,7 +54,7 @@ func (s *schedulerImpl) AddPath(path scheduler.SchedulablePath) {
 	if !ok {
 		panic("invalid path underlying type")
 	}
-	prom.NodeConnInPool.With(prometheus.Labels{"addr": path.String()}).Inc()
+	prom.ScheConnPool.With(prometheus.Labels{"addr": path.String()}).Inc()
 
 	s.mu.Lock()
 	if cPath.virtualSent == 0 && s.heap.Len() > 0 && s.heap[0].virtualSent > 0 {
@@ -76,7 +76,8 @@ func (s *schedulerImpl) RemovePath(path scheduler.SchedulablePath) {
 	if !ok {
 		panic("invalid path underlying type")
 	}
-	prom.NodeConnInPool.Delete(prometheus.Labels{"addr": path.String()})
+
+	prom.ScheConnPool.Delete(prometheus.Labels{"addr": path.String()})
 
 	s.mu.Lock()
 	defer s.mu.Unlock()

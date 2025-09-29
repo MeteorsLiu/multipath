@@ -62,12 +62,19 @@ var (
 		Help:      "The total number of node reconnections",
 	}, []string{"addr"})
 
+	ScheConnPool = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "multipath",
+		Subsystem: "scheduler",
+		Name:      "sche_conn",
+		Help:      "The total number of node reconnections",
+	}, []string{"addr"})
+
 	NodeConnInPool = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: "multipath",
 		Subsystem: "node",
 		Name:      "node_conn_in_pool_total",
 		Help:      "The total number of node reconnections",
-	}, []string{"addr"})
+	}, []string{"addr", "connaddr"})
 )
 
 func Register() {
@@ -79,6 +86,7 @@ func Register() {
 	prometheus.MustRegister(ProbeState)
 	prometheus.MustRegister(ProbeNextTimout)
 	prometheus.MustRegister(NodeReconnectNum)
+	prometheus.MustRegister(ScheConnPool)
 	prometheus.MustRegister(NodeConnInPool)
 }
 

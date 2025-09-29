@@ -8,6 +8,7 @@ import (
 	"github.com/MeteorsLiu/multipath/internal/conn/udpmux"
 	"github.com/MeteorsLiu/multipath/internal/path"
 	"github.com/MeteorsLiu/multipath/internal/prom"
+	"github.com/MeteorsLiu/multipath/internal/scheduler"
 	"github.com/MeteorsLiu/multipath/internal/scheduler/cfs"
 	"github.com/MeteorsLiu/multipath/internal/tun"
 )
@@ -24,7 +25,9 @@ func NewServer(ctx context.Context, cfg Config) (closeFn func(), err error) {
 	manager := path.NewManager(path.WithOnNewPath(func(event path.ManagerEvent, p path.Path) {
 		switch event {
 		case path.Append:
-			schePath, ok := pathMap.getOrSet(p.Remote(), cfs.NewPath(p.Remote()))
+			schePath, ok := pathMap.getOrSet(p.Remote(), func() scheduler.SchedulablePath {
+				return cfs.NewPath(p.Remote())
+			})
 			schePath.AddConnPath(p)
 
 			if !ok {
