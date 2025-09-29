@@ -97,6 +97,8 @@ func (p *cfsPath) getWriter(size int) mempool.Writer {
 	p.connPaths.MoveToBack(head)
 	p.tryWrite(size)
 
+	fmt.Println("select: ", p.virtualSent, head.Value.(path.Path).String())
+
 	return head.Value.(path.Path)
 }
 
