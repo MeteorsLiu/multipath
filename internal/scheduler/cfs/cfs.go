@@ -50,21 +50,10 @@ func NewCFSScheduler() scheduler.Scheduler {
 
 func (s *schedulerImpl) AddPath(path scheduler.SchedulablePath) {
 	fmt.Println("push", path.String())
-	cPath, ok := path.(*cfsPath)
-	if !ok {
-		panic("invalid path underlying type")
-	}
+
 	prom.ScheConnPool.With(prometheus.Labels{"addr": path.String()}).Inc()
 
 	s.mu.Lock()
-	if cPath.virtualSent == 0 && s.heap.Len() > 0 && s.heap[0].virtualSent > 0 {
-		minVirtualSent := s.heap[0].virtualSent
-
-		if minVirtualSent > 1500 {
-			minVirtualSent -= 1500 // max allow 1 packet
-		}
-		cPath.setVirtualSent(minVirtualSent)
-	}
 	heap.Push(&s.heap, path)
 	s.mu.Unlock()
 }
@@ -96,7 +85,18 @@ func (s *schedulerImpl) findBestPath(n int) (mempool.Writer, error) {
 		return nil, scheduler.ErrNoPath
 	}
 	for _, bestPath := range s.heap {
-		if w := bestPath.getWriter(n); w != nil {
+		if w := bestPath.getWriter(); w != nil {
+			if s.heap[0] != bestPath && bestPath.needRebalance.CompareAndSwap(true, false) {
+				minVirtualSent := s.heap[0].virtualSent
+
+				if minVirtualSent > 1500 {
+					minVirtualSent -= 1500 // max allow 1 packet
+				}
+				bestPath.setVirtualSent(minVirtualSent)
+			} else {
+				bestPath.tryWrite(n)
+			}
+
 			heap.Fix(&s.heap, bestPath.heapIdx)
 			return w, nil
 		}

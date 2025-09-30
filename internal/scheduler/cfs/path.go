@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"sync"
+	"sync/atomic"
 
 	"github.com/MeteorsLiu/multipath/internal/mempool"
 	"github.com/MeteorsLiu/multipath/internal/path"
@@ -23,6 +24,8 @@ type cfsPath struct {
 	sentBytes   uint64
 	weight      int
 	virtualSent uint64
+
+	needRebalance atomic.Bool
 }
 
 func NewPath(addr string) scheduler.SchedulablePath {
@@ -66,9 +69,16 @@ func (p *cfsPath) AddConnPath(connPath path.Path) {
 	if _, ok := p.connPathsMap[connPath.PathID()]; ok {
 		panic("duplicated append")
 	}
+	len := p.connPaths.Len()
 	node := p.connPaths.PushBack(connPath)
 	p.connPathsMap[connPath.PathID()] = node
 	p.mu.Unlock()
+
+	if len == 0 {
+		// needRebalance must be atomical here,
+		// when scheduler need to check it it's rebelance or not, it has dropped path mutex lock.
+		p.needRebalance.Store(true)
+	}
 }
 
 func (p *cfsPath) RemoveConnPath(connPath path.Path) {
@@ -86,7 +96,7 @@ func (p *cfsPath) RemoveConnPath(connPath path.Path) {
 	p.mu.Unlock()
 }
 
-func (p *cfsPath) getWriter(size int) mempool.Writer {
+func (p *cfsPath) getWriter() mempool.Writer {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -95,7 +105,6 @@ func (p *cfsPath) getWriter(size int) mempool.Writer {
 		return nil
 	}
 	p.connPaths.MoveToBack(head)
-	p.tryWrite(size)
 
 	fmt.Println("select: ", p.virtualSent, head.Value.(path.Path).String())
 
