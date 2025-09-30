@@ -25,7 +25,8 @@ type cfsPath struct {
 	weight      int
 	virtualSent uint64
 
-	needRebalance atomic.Bool
+	needRebalance  atomic.Bool
+	isDisconnected atomic.Bool
 }
 
 func NewPath(addr string) scheduler.SchedulablePath {
@@ -74,7 +75,7 @@ func (p *cfsPath) AddConnPath(connPath path.Path) {
 	p.connPathsMap[connPath.PathID()] = node
 	p.mu.Unlock()
 
-	if len == 0 {
+	if len == 0 && p.isDisconnected.CompareAndSwap(true, false) {
 		// needRebalance must be atomical here,
 		// when scheduler need to check it it's rebelance or not, it has dropped path mutex lock.
 		p.needRebalance.Store(true)
@@ -93,7 +94,12 @@ func (p *cfsPath) RemoveConnPath(connPath path.Path) {
 	}
 	p.connPaths.Remove(listNode)
 	delete(p.connPathsMap, connPath.PathID())
+	len := p.connPaths.Len()
 	p.mu.Unlock()
+
+	if len == 0 {
+		p.isDisconnected.Store(true)
+	}
 }
 
 func (p *cfsPath) getWriter() mempool.Writer {
@@ -105,8 +111,6 @@ func (p *cfsPath) getWriter() mempool.Writer {
 		return nil
 	}
 	p.connPaths.MoveToBack(head)
-
-	fmt.Println("select: ", p.virtualSent, head.Value.(path.Path).String())
 
 	return head.Value.(path.Path)
 }
