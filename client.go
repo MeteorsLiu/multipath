@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 
@@ -55,8 +56,10 @@ func NewClient(ctx context.Context, cfg Config) (func(), error) {
 	tunModule := tun.NewHandler(ctx, tunInterface, sche)
 
 	for _, path := range cfg.Client.Remotes {
-		schePath := cfs.NewPath(path.RemoteAddr)
-		pathMap.add(path.RemoteAddr, schePath)
+		host, _, _ := net.SplitHostPort(path.RemoteAddr)
+
+		schePath := cfs.NewPath(host)
+		pathMap.add(host, schePath)
 		sche.AddPath(schePath)
 
 		if cfg.IsTCP {

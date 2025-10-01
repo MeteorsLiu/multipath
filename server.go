@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
 
 	"github.com/MeteorsLiu/multipath/internal/conn/tcp"
 	"github.com/MeteorsLiu/multipath/internal/conn/udpmux"
@@ -23,10 +24,12 @@ func NewServer(ctx context.Context, cfg Config) (closeFn func(), err error) {
 	sche := cfs.NewCFSScheduler()
 
 	manager := path.NewManager(path.WithOnNewPath(func(event path.ManagerEvent, p path.Path) {
+		host, _, _ := net.SplitHostPort(p.Remote())
+
 		switch event {
 		case path.Append:
-			schePath, ok := pathMap.getOrSet(p.Remote(), func() scheduler.SchedulablePath {
-				return cfs.NewPath(p.Remote())
+			schePath, ok := pathMap.getOrSet(host, func() scheduler.SchedulablePath {
+				return cfs.NewPath(host)
 			})
 			schePath.AddConnPath(p)
 
@@ -34,7 +37,7 @@ func NewServer(ctx context.Context, cfg Config) (closeFn func(), err error) {
 				sche.AddPath(schePath)
 			}
 		case path.Remove:
-			schePath := pathMap.get(p.Remote())
+			schePath := pathMap.get(host)
 			if schePath == nil {
 				panic("unexpected behavior, schePath should not be nil")
 			}
