@@ -25,15 +25,17 @@ func NewClient(ctx context.Context, cfg Config) (func(), error) {
 	sche := cfs.NewCFSScheduler()
 
 	manager := path.NewManager(path.WithOnNewPath(func(event path.ManagerEvent, connPath path.Path) {
+		host, _, _ := net.SplitHostPort(connPath.Remote())
+
 		switch event {
 		case path.Append:
-			schePath := pathMap.get(connPath.Remote())
+			schePath := pathMap.get(host)
 			if schePath == nil {
 				panic("unexpected behavior, schePath should not be nil")
 			}
 			schePath.AddConnPath(connPath)
 		case path.Remove:
-			schePath := pathMap.get(connPath.Remote())
+			schePath := pathMap.get(host)
 			if schePath == nil {
 				panic("unexpected behavior, schePath should not be nil")
 			}
