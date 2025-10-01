@@ -19,9 +19,10 @@ type Server struct {
 }
 
 type Tun struct {
-	Name       string `json:"name,omitempty"`
-	LocalAddr  string `json:"localAddr"`
-	RemoteAddr string `json:"remoteAddr"`
+	Name       string   `json:"name,omitempty"`
+	LocalAddr  string   `json:"localAddr"`
+	RemoteAddr string   `json:"remoteAddr"`
+	AllowedIPs []string `json:"allowedIPs"`
 }
 
 type Config struct {

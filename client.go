@@ -55,6 +55,12 @@ func NewClient(ctx context.Context, cfg Config) (func(), error) {
 	execCommand("ip", "a", "add", cfg.LocalAddr, "peer", cfg.RemoteAddr, "dev", cfg.Tun.Name)
 	execCommand("ip", "l", "set", cfg.Tun.Name, "up")
 
+	// systemd ExecStartPost may be failed because we aren't initalized
+	// so add AllowedIps to avoid that problem
+	for _, allowedIps := range cfg.AllowedIPs {
+		execCommand("ip", "r", "add", allowedIps, "via", cfg.RemoteAddr)
+	}
+
 	tunModule := tun.NewHandler(ctx, tunInterface, sche)
 
 	for _, path := range cfg.Client.Remotes {

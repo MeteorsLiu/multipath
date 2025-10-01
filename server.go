@@ -57,6 +57,10 @@ func NewServer(ctx context.Context, cfg Config) (closeFn func(), err error) {
 	execCommand("ip", "a", "add", cfg.LocalAddr, "peer", cfg.RemoteAddr, "dev", cfg.Tun.Name)
 	execCommand("ip", "l", "set", cfg.Tun.Name, "up")
 
+	for _, allowedIps := range cfg.AllowedIPs {
+		execCommand("ip", "r", "add", allowedIps, "via", cfg.RemoteAddr)
+	}
+
 	tunModule := tun.NewHandler(ctx, tunInterface, sche)
 
 	if cfg.IsTCP {
