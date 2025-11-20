@@ -71,7 +71,14 @@ func mustListen(addr string) net.Listener {
 func (c *TcpConn) onProberEvent(context any, event prober.Event) {
 	switch event {
 	case prober.Lost:
-		c.manager.Remove(c)
+		// don't force to terminate the connection
+		// It can be an mistake becoming Lost here because of TCP retransmits.
+		// remove only when the connection is dead
+		select {
+		case <-c.ctx.Done():
+			c.manager.Remove(c)
+		default:
+		}
 	}
 }
 
@@ -87,6 +94,9 @@ func NewConn(ctx context.Context, pm *path.PathManager, cn net.Conn, out chan<- 
 
 	pm.Add(tc.String(), func() (w conn.ConnWriter, onRemove func()) {
 		return tc, func() {
+			// make sure we're closed.
+			tc.Close()
+
 			if isServerSide {
 				return
 			}

@@ -100,24 +100,44 @@ func newUDPReceiver(
 	return reader
 }
 
-func (u *udpReader) sendPacketToRemote(addr string, pkt *mempool.Buffer) {
+func (u *udpReader) sendPacketToRemote(addr string, pkt *mempool.Buffer) error {
 	if !u.isServerSide {
-		u.clientSender <- pkt
-		return
+		select {
+		case u.clientSender <- pkt:
+			return nil
+		case <-u.ctx.Done():
+			// Connection is closed, don't reply
+			return u.ctx.Err()
+		}
 	}
 	sender := u.senderManager.Get(addr)
-	if sender == nil {
-		panic("sender is nil")
-	}
+
 	if err := sender.Write(pkt); err != nil {
 		fmt.Println(err)
+		return err
 	}
+	return nil
 }
 
 func (u *udpReader) recvProbe(addr string, pkt *mempool.Buffer) error {
 	err := u.proberManager.PacketIn(u.ctx, pkt)
 	if err == prober.ErrProberIDNotFound {
-		u.sendPacketToRemote(addr, pkt)
+		// This probe is from the remote side (not our prober ID)
+		// Check if the connection is still alive before replying
+		if u.isServerSide {
+			// Server side: check if we still have a sender for this address
+			sender := u.senderManager.Get(addr)
+			if sender == nil {
+				// Connection is closed, do not reply to probe
+				return errPacketConsumed
+			}
+		}
+		// Try to reply to the probe
+		// If connection is closed (ctx.Done), sendPacketToRemote will fail
+		if err := u.sendPacketToRemote(addr, pkt); err != nil {
+			// Connection closed, consume the packet
+			return errPacketConsumed
+		}
 		return nil
 	}
 	if err != nil {
