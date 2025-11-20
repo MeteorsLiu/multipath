@@ -55,6 +55,8 @@ func NewServer(ctx context.Context, cfg Config) (closeFn func(), err error) {
 		return nil, err
 	}
 	execCommand("ip", "a", "add", cfg.LocalAddr, "peer", cfg.RemoteAddr, "dev", cfg.Tun.Name)
+	// by default, the txqueuelen value of an TUN interface is 500
+	execCommand("ip", "l", "set", cfg.Tun.Name, "txqueuelen", "1000")
 	execCommand("ip", "l", "set", cfg.Tun.Name, "up")
 
 	for _, allowedIps := range cfg.AllowedIPs {
