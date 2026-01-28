@@ -14,11 +14,14 @@ const (
 	Nop ManagerEvent = iota
 	Append
 	Remove
+	Suspend
+	Resume
 )
 
 type pathElem struct {
-	path     Path
-	onRemove func()
+	path      Path
+	onRemove  func()
+	suspended bool
 }
 
 type PathManager struct {
@@ -57,6 +60,18 @@ func (pm *PathManager) onRemovePath(conn Path) {
 	}
 }
 
+func (pm *PathManager) onSuspendPath(conn Path) {
+	if pm.onConnEvent != nil {
+		pm.onConnEvent(Suspend, conn)
+	}
+}
+
+func (pm *PathManager) onResumePath(conn Path) {
+	if pm.onConnEvent != nil {
+		pm.onConnEvent(Resume, conn)
+	}
+}
+
 func (pm *PathManager) Get(addr string) Path {
 	pm.mu.RLock()
 	sender := pm.connMap[addr]
@@ -74,7 +89,7 @@ func (pm *PathManager) Add(addr string, fn func() (w conn.ConnWriter, onRemove f
 	if cn, onRemove := fn(); cn != nil {
 		succ = true
 		p = NewPath(cn)
-		pm.connMap[addr] = &pathElem{p, onRemove}
+		pm.connMap[addr] = &pathElem{path: p, onRemove: onRemove}
 	}
 	pm.mu.Unlock()
 
@@ -83,6 +98,42 @@ func (pm *PathManager) Add(addr string, fn func() (w conn.ConnWriter, onRemove f
 	}
 
 	return
+}
+
+func (pm *PathManager) Suspend(conn conn.ConnWriter) bool {
+	if conn == nil {
+		return false
+	}
+	pm.mu.Lock()
+	elem, ok := pm.connMap[conn.String()]
+	if !ok || elem.suspended {
+		pm.mu.Unlock()
+		return false
+	}
+	elem.suspended = true
+	p := elem.path
+	pm.mu.Unlock()
+
+	pm.onSuspendPath(p)
+	return true
+}
+
+func (pm *PathManager) Resume(conn conn.ConnWriter) bool {
+	if conn == nil {
+		return false
+	}
+	pm.mu.Lock()
+	elem, ok := pm.connMap[conn.String()]
+	if !ok || !elem.suspended {
+		pm.mu.Unlock()
+		return false
+	}
+	elem.suspended = false
+	p := elem.path
+	pm.mu.Unlock()
+
+	pm.onResumePath(p)
+	return true
 }
 
 func (pm *PathManager) Remove(conn conn.ConnWriter) bool {
@@ -95,7 +146,9 @@ func (pm *PathManager) Remove(conn conn.ConnWriter) bool {
 	pm.mu.Unlock()
 
 	if ok {
-		pm.onRemovePath(elem.path)
+		if !elem.suspended {
+			pm.onRemovePath(elem.path)
+		}
 		if elem.onRemove != nil {
 			go func() {
 				prom.NodeReconnectNum.With(prometheus.Labels{"addr": conn.String()}).Inc()

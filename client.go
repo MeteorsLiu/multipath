@@ -34,6 +34,18 @@ func NewClient(ctx context.Context, cfg Config) (func(), error) {
 				panic("unexpected behavior, schePath should not be nil")
 			}
 			schePath.AddConnPath(connPath)
+		case path.Suspend:
+			schePath := pathMap.get(host)
+			if schePath == nil {
+				panic("unexpected behavior, schePath should not be nil")
+			}
+			schePath.RemoveConnPath(connPath)
+		case path.Resume:
+			schePath := pathMap.get(host)
+			if schePath == nil {
+				panic("unexpected behavior, schePath should not be nil")
+			}
+			schePath.AddConnPath(connPath)
 		case path.Remove:
 			schePath := pathMap.get(host)
 			if schePath == nil {

@@ -36,6 +36,18 @@ func NewServer(ctx context.Context, cfg Config) (closeFn func(), err error) {
 			if !ok {
 				sche.AddPath(schePath)
 			}
+		case path.Suspend:
+			schePath := pathMap.get(host)
+			if schePath == nil {
+				panic("unexpected behavior, schePath should not be nil")
+			}
+			schePath.RemoveConnPath(p)
+		case path.Resume:
+			schePath := pathMap.get(host)
+			if schePath == nil {
+				panic("unexpected behavior, schePath should not be nil")
+			}
+			schePath.AddConnPath(p)
 		case path.Remove:
 			schePath := pathMap.get(host)
 			if schePath == nil {
