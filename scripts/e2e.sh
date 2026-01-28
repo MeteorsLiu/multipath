@@ -42,7 +42,7 @@ cleanup() {
 trap cleanup EXIT
 
 build_bin() {
-  (cd "${ROOT_DIR}" && go build -o "${BIN}" ./...)
+  (cd "${ROOT_DIR}" && go build -o "${BIN}" .)
 }
 
 setup_netns() {
