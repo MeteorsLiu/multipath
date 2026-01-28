@@ -21,8 +21,8 @@ PORT_TCP=5000
 PORT_UDP=5001
 
 TUN_NAME="mptun0"
-TUN_C_LOCAL="172.16.0.1/30"
-TUN_S_LOCAL="172.16.0.2/30"
+TUN_C_LOCAL="172.16.0.1"
+TUN_S_LOCAL="172.16.0.2"
 TUN_C_REMOTE="172.16.0.2"
 TUN_S_REMOTE="172.16.0.1"
 
@@ -87,8 +87,7 @@ write_config() {
   "tun": {
     "name": "${TUN_NAME}",
     "localAddr": "${TUN_S_LOCAL}",
-    "remoteAddr": "${TUN_S_REMOTE}",
-    "allowedIPs": ["${TUN_C_REMOTE}/32"]
+    "remoteAddr": "${TUN_S_REMOTE}"
   },
   "promListenAddr": "127.0.0.1:2131",
   "tcp": ${tcp_flag},
@@ -107,8 +106,7 @@ EOF
   "tun": {
     "name": "${TUN_NAME}",
     "localAddr": "${TUN_C_LOCAL}",
-    "remoteAddr": "${TUN_C_REMOTE}",
-    "allowedIPs": ["${TUN_S_REMOTE}/32"]
+    "remoteAddr": "${TUN_C_REMOTE}"
   },
   "promListenAddr": "127.0.0.1:2132",
   "tcp": ${tcp_flag},
