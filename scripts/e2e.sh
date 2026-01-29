@@ -126,7 +126,7 @@ run_mode() {
 
   printf '%s\n' "---- ${mode} precheck ----" >>"${log_file}"
   echo "[${mode}] precheck: ping without tunnel (expected fail)"
-  precheck_out="$(ip netns exec "${NS_C}" ping -c 1 -W 1 "${TUN_S_REMOTE}" 2>&1 || true)"
+  precheck_out="$(ip netns exec "${NS_C}" ping -c 1 -W 1 "${TUN_C_REMOTE}" 2>&1 || true)"
   echo "${precheck_out}"
   if echo "${precheck_out}" | grep -q "1 packets transmitted, 1 received"; then
     echo "[${mode}] precheck FAIL: ping succeeded without tunnel"
@@ -144,12 +144,12 @@ run_mode() {
   sleep 2
 
   local ping_log="${WORKDIR}/ping_${mode}.log"
-  ip netns exec "${NS_C}" ping -D -i 0.2 "${TUN_S_REMOTE}" >"${ping_log}" 2>&1 &
+  ip netns exec "${NS_C}" ping -D -i 0.2 "${TUN_C_REMOTE}" >"${ping_log}" 2>&1 &
   local ping_pid=$!
 
   printf '%s\n' "---- ${mode} baseline ----" >>"${log_file}"
   echo "[${mode}] ping over TUN (baseline)"
-  ping_out="$(ip netns exec "${NS_C}" ping -c 3 -W 1 "${TUN_S_REMOTE}" 2>&1 || true)"
+  ping_out="$(ip netns exec "${NS_C}" ping -c 3 -W 1 "${TUN_C_REMOTE}" 2>&1 || true)"
   echo "${ping_out}"
   if echo "${ping_out}" | grep -q "0% packet loss"; then
     echo "[${mode}] PASS: baseline ping ok"
@@ -162,7 +162,7 @@ run_mode() {
     ip netns exec "${NS_S}" iperf3 -s -1 -B "${TUN_S_REMOTE}" >/dev/null 2>&1 &
     sleep 1
     echo "[${mode}] iperf3 over TUN (baseline)"
-    ip netns exec "${NS_C}" iperf3 -c "${TUN_S_REMOTE}" -t 3 -i 1 || true
+    ip netns exec "${NS_C}" iperf3 -c "${TUN_C_REMOTE}" -t 3 -i 1 || true
   else
     echo "[${mode}] iperf3 not found, skip throughput test"
   fi
@@ -171,7 +171,7 @@ run_mode() {
   echo "[${mode}] simulate loss on path2"
   ip netns exec "${NS_C}" tc qdisc replace dev "${VETHC2}" root netem loss 100%
   sleep 2
-  ping_out="$(ip netns exec "${NS_C}" ping -c 3 -W 1 "${TUN_S_REMOTE}" 2>&1 || true)"
+  ping_out="$(ip netns exec "${NS_C}" ping -c 3 -W 1 "${TUN_C_REMOTE}" 2>&1 || true)"
   echo "${ping_out}"
   if echo "${ping_out}" | grep -q "0% packet loss"; then
     echo "[${mode}] PASS: ping ok with path2 down"
@@ -183,7 +183,7 @@ run_mode() {
   echo "[${mode}] restore path2"
   ip netns exec "${NS_C}" tc qdisc del dev "${VETHC2}" root || true
   sleep 2
-  ping_out="$(ip netns exec "${NS_C}" ping -c 3 -W 1 "${TUN_S_REMOTE}" 2>&1 || true)"
+  ping_out="$(ip netns exec "${NS_C}" ping -c 3 -W 1 "${TUN_C_REMOTE}" 2>&1 || true)"
   echo "${ping_out}"
   if echo "${ping_out}" | grep -q "0% packet loss"; then
     echo "[${mode}] PASS: ping ok after path2 restore"
@@ -198,7 +198,7 @@ run_mode() {
   ip netns exec "${NS_S}" tc qdisc add dev "${VETHS1}" root netem loss 100%
   ip netns exec "${NS_S}" tc qdisc add dev "${VETHS2}" root netem loss 100%
   sleep 2
-  ping_out="$(ip netns exec "${NS_C}" ping -c 3 -W 1 "${TUN_S_REMOTE}" 2>&1 || true)"
+  ping_out="$(ip netns exec "${NS_C}" ping -c 3 -W 1 "${TUN_C_REMOTE}" 2>&1 || true)"
   echo "${ping_out}"
   if echo "${ping_out}" | grep -q "0% packet loss"; then
     echo "[${mode}] FAIL: ping succeeded with both paths down"
@@ -216,7 +216,7 @@ run_mode() {
     ip netns exec "${NS_S}" iperf3 -s -1 -B "${TUN_S_REMOTE}" >/dev/null 2>&1 &
     sleep 1
     echo "[${mode}] iperf3 over TUN (post-recovery)"
-    ip netns exec "${NS_C}" iperf3 -c "${TUN_S_REMOTE}" -t 3 -i 1 || true
+    ip netns exec "${NS_C}" iperf3 -c "${TUN_C_REMOTE}" -t 3 -i 1 || true
   fi
 
   kill "${ping_pid}" >/dev/null 2>&1 || true
