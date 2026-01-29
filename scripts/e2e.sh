@@ -37,7 +37,6 @@ cleanup() {
   ip netns del "${NS_C}" >/dev/null 2>&1 || true
   ip netns del "${NS_S}" >/dev/null 2>&1 || true
 
-  rm -rf "${WORKDIR}"
 }
 trap cleanup EXIT
 
