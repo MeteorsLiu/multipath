@@ -161,6 +161,19 @@ run_mode() {
   sleep 2
   ip netns exec "${NS_C}" ping -c 3 -W 1 "${TUN_S_REMOTE}"
 
+  echo "[${mode}] simulate loss on both paths (expected fail)"
+  ip netns exec "${NS_C}" tc qdisc add dev "${VETHC1}" root netem loss 100%
+  ip netns exec "${NS_C}" tc qdisc add dev "${VETHC2}" root netem loss 100%
+  sleep 2
+  if ip netns exec "${NS_C}" ping -c 3 -W 1 "${TUN_S_REMOTE}" >/dev/null 2>&1; then
+    echo "[${mode}] FAIL: ping succeeded with both paths down"
+  else
+    echo "[${mode}] PASS: ping failed with both paths down"
+  fi
+  ip netns exec "${NS_C}" tc qdisc del dev "${VETHC1}" root || true
+  ip netns exec "${NS_C}" tc qdisc del dev "${VETHC2}" root || true
+  sleep 2
+
   if command -v iperf3 >/dev/null 2>&1; then
     ip netns exec "${NS_S}" iperf3 -s -1 -B "${TUN_S_REMOTE}" >/dev/null 2>&1 &
     sleep 1
