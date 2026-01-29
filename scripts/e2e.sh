@@ -118,19 +118,27 @@ EOF
 run_mode() {
   local mode="$1"
   local port="$2"
+  local log_file="${WORKDIR}/${mode}.multipath.log"
+
+  printf "==== %s start %s ====\n" "${mode}" "$(date -Iseconds)" >>"${log_file}"
 
   write_config "${mode}" "${port}"
 
+  printf "---- %s precheck ----\n" "${mode}" >>"${log_file}"
   echo "[${mode}] precheck: ping without tunnel (expected fail)"
-  if ip netns exec "${NS_C}" ping -c 1 -W 1 "${TUN_S_REMOTE}" >/dev/null 2>&1; then
+  precheck_out="$(ip netns exec "${NS_C}" ping -c 1 -W 1 "${TUN_S_REMOTE}" 2>&1 || true)"
+  echo "${precheck_out}"
+  if echo "${precheck_out}" | grep -q "1 packets transmitted, 1 received"; then
     echo "[${mode}] precheck FAIL: ping succeeded without tunnel"
   else
     echo "[${mode}] precheck PASS: ping failed without tunnel"
   fi
 
-  ip netns exec "${NS_S}" "${BIN}" -config "${WORKDIR}/server.json" &
+  printf "---- %s server start ----\n" "${mode}" >>"${log_file}"
+  ip netns exec "${NS_S}" bash -c "${BIN} -config ${WORKDIR}/server.json" >>"${log_file}" 2>&1 &
   local server_pid=$!
-  ip netns exec "${NS_C}" "${BIN}" -config "${WORKDIR}/client.json" &
+  printf "---- %s client start ----\n" "${mode}" >>"${log_file}"
+  ip netns exec "${NS_C}" bash -c "${BIN} -config ${WORKDIR}/client.json" >>"${log_file}" 2>&1 &
   local client_pid=$!
 
   sleep 2
@@ -139,10 +147,18 @@ run_mode() {
   ip netns exec "${NS_C}" ping -D -i 0.2 "${TUN_S_REMOTE}" >"${ping_log}" 2>&1 &
   local ping_pid=$!
 
+  printf "---- %s baseline ----\n" "${mode}" >>"${log_file}"
   echo "[${mode}] ping over TUN (baseline)"
-  ip netns exec "${NS_C}" ping -c 3 -W 1 "${TUN_S_REMOTE}"
+  ping_out="$(ip netns exec "${NS_C}" ping -c 3 -W 1 "${TUN_S_REMOTE}" 2>&1 || true)"
+  echo "${ping_out}"
+  if echo "${ping_out}" | grep -q "0% packet loss"; then
+    echo "[${mode}] PASS: baseline ping ok"
+  else
+    echo "[${mode}] FAIL: baseline ping failed"
+  fi
 
   if command -v iperf3 >/dev/null 2>&1; then
+    printf "---- %s iperf baseline ----\n" "${mode}" >>"${log_file}"
     ip netns exec "${NS_S}" iperf3 -s -1 -B "${TUN_S_REMOTE}" >/dev/null 2>&1 &
     sleep 1
     echo "[${mode}] iperf3 over TUN (baseline)"
@@ -151,21 +167,38 @@ run_mode() {
     echo "[${mode}] iperf3 not found, skip throughput test"
   fi
 
+  printf "---- %s path2 down ----\n" "${mode}" >>"${log_file}"
   echo "[${mode}] simulate loss on path2"
   ip netns exec "${NS_C}" tc qdisc add dev "${VETHC2}" root netem loss 100%
   sleep 2
-  ip netns exec "${NS_C}" ping -c 3 -W 1 "${TUN_S_REMOTE}"
+  ping_out="$(ip netns exec "${NS_C}" ping -c 3 -W 1 "${TUN_S_REMOTE}" 2>&1 || true)"
+  echo "${ping_out}"
+  if echo "${ping_out}" | grep -q "0% packet loss"; then
+    echo "[${mode}] PASS: ping ok with path2 down"
+  else
+    echo "[${mode}] FAIL: ping failed with path2 down"
+  fi
 
+  printf "---- %s restore path2 ----\n" "${mode}" >>"${log_file}"
   echo "[${mode}] restore path2"
   ip netns exec "${NS_C}" tc qdisc del dev "${VETHC2}" root || true
   sleep 2
-  ip netns exec "${NS_C}" ping -c 3 -W 1 "${TUN_S_REMOTE}"
+  ping_out="$(ip netns exec "${NS_C}" ping -c 3 -W 1 "${TUN_S_REMOTE}" 2>&1 || true)"
+  echo "${ping_out}"
+  if echo "${ping_out}" | grep -q "0% packet loss"; then
+    echo "[${mode}] PASS: ping ok after path2 restore"
+  else
+    echo "[${mode}] FAIL: ping failed after path2 restore"
+  fi
 
+  printf "---- %s both down ----\n" "${mode}" >>"${log_file}"
   echo "[${mode}] simulate loss on both paths (expected fail)"
   ip netns exec "${NS_C}" tc qdisc add dev "${VETHC1}" root netem loss 100%
   ip netns exec "${NS_C}" tc qdisc add dev "${VETHC2}" root netem loss 100%
   sleep 2
-  if ip netns exec "${NS_C}" ping -c 3 -W 1 "${TUN_S_REMOTE}" >/dev/null 2>&1; then
+  ping_out="$(ip netns exec "${NS_C}" ping -c 3 -W 1 "${TUN_S_REMOTE}" 2>&1 || true)"
+  echo "${ping_out}"
+  if echo "${ping_out}" | grep -q "0% packet loss"; then
     echo "[${mode}] FAIL: ping succeeded with both paths down"
   else
     echo "[${mode}] PASS: ping failed with both paths down"
@@ -175,6 +208,7 @@ run_mode() {
   sleep 2
 
   if command -v iperf3 >/dev/null 2>&1; then
+    printf "---- %s iperf post-recovery ----\n" "${mode}" >>"${log_file}"
     ip netns exec "${NS_S}" iperf3 -s -1 -B "${TUN_S_REMOTE}" >/dev/null 2>&1 &
     sleep 1
     echo "[${mode}] iperf3 over TUN (post-recovery)"
@@ -187,6 +221,8 @@ run_mode() {
 
   kill "${client_pid}" "${server_pid}" >/dev/null 2>&1 || true
   wait "${client_pid}" "${server_pid}" >/dev/null 2>&1 || true
+  printf "==== %s end %s ====\n" "${mode}" "$(date -Iseconds)" >>"${log_file}"
+  echo "[${mode}] multipath log: ${log_file}"
 }
 
 build_bin
