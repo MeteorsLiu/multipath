@@ -121,6 +121,13 @@ run_mode() {
 
   write_config "${mode}" "${port}"
 
+  echo "[${mode}] precheck: ping without tunnel (expected fail)"
+  if ip netns exec "${NS_C}" ping -c 1 -W 1 "${TUN_S_REMOTE}" >/dev/null 2>&1; then
+    echo "[${mode}] precheck FAIL: ping succeeded without tunnel"
+  else
+    echo "[${mode}] precheck PASS: ping failed without tunnel"
+  fi
+
   ip netns exec "${NS_S}" "${BIN}" -config "${WORKDIR}/server.json" &
   local server_pid=$!
   ip netns exec "${NS_C}" "${BIN}" -config "${WORKDIR}/client.json" &
