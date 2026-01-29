@@ -182,11 +182,12 @@ run_mode() {
     echo "[${mode}] FAIL: ping failed with path2 down"
     FAIL_COUNT=$((FAIL_COUNT+1))
   fi
-
+  sleep 2
   printf '%s\n' "---- ${mode} restore path2 ----" >>"${log_file}"
   echo "[${mode}] restore path2"
   ip netns exec "${NS_C}" tc qdisc del dev "${VETHC2}" root || true
-  sleep 2
+  # wait recover
+  sleep 5
   ping_out="$(ip netns exec "${NS_C}" ping -c 3 -W 1 "${TUN_C_REMOTE}" 2>&1 || true)"
   echo "${ping_out}"
   if echo "${ping_out}" | grep -q "0% packet loss"; then
