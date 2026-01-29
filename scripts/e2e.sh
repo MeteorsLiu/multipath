@@ -169,7 +169,7 @@ run_mode() {
 
   printf '%s\n' "---- ${mode} path2 down ----" >>"${log_file}"
   echo "[${mode}] simulate loss on path2"
-  ip netns exec "${NS_C}" tc qdisc add dev "${VETHC2}" root netem loss 100%
+  ip netns exec "${NS_C}" tc qdisc replace dev "${VETHC2}" root netem loss 100%
   sleep 2
   ping_out="$(ip netns exec "${NS_C}" ping -c 3 -W 1 "${TUN_S_REMOTE}" 2>&1 || true)"
   echo "${ping_out}"
@@ -193,8 +193,10 @@ run_mode() {
 
   printf '%s\n' "---- ${mode} both down ----" >>"${log_file}"
   echo "[${mode}] simulate loss on both paths (expected fail)"
-  ip netns exec "${NS_C}" tc qdisc add dev "${VETHC1}" root netem loss 100%
-  ip netns exec "${NS_C}" tc qdisc add dev "${VETHC2}" root netem loss 100%
+  ip netns exec "${NS_C}" tc qdisc replace dev "${VETHC1}" root netem loss 100%
+  ip netns exec "${NS_C}" tc qdisc replace dev "${VETHC2}" root netem loss 100%
+  ip netns exec "${NS_S}" tc qdisc add dev "${VETHS1}" root netem loss 100%
+  ip netns exec "${NS_S}" tc qdisc add dev "${VETHS2}" root netem loss 100%
   sleep 2
   ping_out="$(ip netns exec "${NS_C}" ping -c 3 -W 1 "${TUN_S_REMOTE}" 2>&1 || true)"
   echo "${ping_out}"
@@ -205,6 +207,8 @@ run_mode() {
   fi
   ip netns exec "${NS_C}" tc qdisc del dev "${VETHC1}" root || true
   ip netns exec "${NS_C}" tc qdisc del dev "${VETHC2}" root || true
+  ip netns exec "${NS_S}" tc qdisc del dev "${VETHS1}" root || true
+  ip netns exec "${NS_S}" tc qdisc del dev "${VETHS2}" root || true
   sleep 2
 
   if command -v iperf3 >/dev/null 2>&1; then
