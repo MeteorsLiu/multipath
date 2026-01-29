@@ -115,6 +115,8 @@ EOF
 EOF
 }
 
+FAIL_COUNT=0
+
 run_mode() {
   local mode="$1"
   local port="$2"
@@ -130,6 +132,7 @@ run_mode() {
   echo "${precheck_out}"
   if echo "${precheck_out}" | grep -q "1 packets transmitted, 1 received"; then
     echo "[${mode}] precheck FAIL: ping succeeded without tunnel"
+    FAIL_COUNT=$((FAIL_COUNT+1))
   else
     echo "[${mode}] precheck PASS: ping failed without tunnel"
   fi
@@ -155,6 +158,7 @@ run_mode() {
     echo "[${mode}] PASS: baseline ping ok"
   else
     echo "[${mode}] FAIL: baseline ping failed"
+    FAIL_COUNT=$((FAIL_COUNT+1))
   fi
 
   if command -v iperf3 >/dev/null 2>&1; then
@@ -177,6 +181,7 @@ run_mode() {
     echo "[${mode}] PASS: ping ok with path2 down"
   else
     echo "[${mode}] FAIL: ping failed with path2 down"
+    FAIL_COUNT=$((FAIL_COUNT+1))
   fi
 
   printf '%s\n' "---- ${mode} restore path2 ----" >>"${log_file}"
@@ -189,6 +194,7 @@ run_mode() {
     echo "[${mode}] PASS: ping ok after path2 restore"
   else
     echo "[${mode}] FAIL: ping failed after path2 restore"
+    FAIL_COUNT=$((FAIL_COUNT+1))
   fi
 
   printf '%s\n' "---- ${mode} both down ----" >>"${log_file}"
@@ -204,6 +210,7 @@ run_mode() {
     echo "[${mode}] PASS: ping failed with both paths down"
   else
     echo "[${mode}] FAIL: ping succeeded with both paths down"
+    FAIL_COUNT=$((FAIL_COUNT+1))
   fi
   ip netns exec "${NS_C}" tc qdisc del dev "${VETHC1}" root || true
   ip netns exec "${NS_C}" tc qdisc del dev "${VETHC2}" root || true
@@ -235,4 +242,8 @@ setup_netns
 run_mode "udp" "${PORT_UDP}"
 run_mode "tcp" "${PORT_TCP}"
 
+if [[ "${FAIL_COUNT}" -gt 0 ]]; then
+  echo "e2e fail (${FAIL_COUNT} failures)"
+  exit 1
+fi
 echo "e2e ok"
