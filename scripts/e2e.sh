@@ -159,7 +159,7 @@ run_mode() {
 
   if command -v iperf3 >/dev/null 2>&1; then
     printf '%s\n' "---- ${mode} iperf baseline ----" >>"${log_file}"
-    ip netns exec "${NS_S}" iperf3 -s -1 -B "${TUN_S_REMOTE}" >/dev/null 2>&1 &
+    ip netns exec "${NS_S}" iperf3 -s -1 -B "${TUN_S_LOCAL}" >/dev/null 2>&1 &
     sleep 1
     echo "[${mode}] iperf3 over TUN (baseline)"
     ip netns exec "${NS_C}" iperf3 -c "${TUN_C_REMOTE}" -t 3 -i 1 || true
@@ -200,10 +200,10 @@ run_mode() {
   sleep 2
   ping_out="$(ip netns exec "${NS_C}" ping -c 3 -W 1 "${TUN_C_REMOTE}" 2>&1 || true)"
   echo "${ping_out}"
-  if echo "${ping_out}" | grep -q "0% packet loss"; then
-    echo "[${mode}] FAIL: ping succeeded with both paths down"
-  else
+  if echo "${ping_out}" | grep -q "100% packet loss"; then
     echo "[${mode}] PASS: ping failed with both paths down"
+  else
+    echo "[${mode}] FAIL: ping succeeded with both paths down"
   fi
   ip netns exec "${NS_C}" tc qdisc del dev "${VETHC1}" root || true
   ip netns exec "${NS_C}" tc qdisc del dev "${VETHC2}" root || true
@@ -213,7 +213,7 @@ run_mode() {
 
   if command -v iperf3 >/dev/null 2>&1; then
     printf '%s\n' "---- ${mode} iperf post-recovery ----" >>"${log_file}"
-    ip netns exec "${NS_S}" iperf3 -s -1 -B "${TUN_S_REMOTE}" >/dev/null 2>&1 &
+    ip netns exec "${NS_S}" iperf3 -s -1 -B "${TUN_S_LOCAL}" >/dev/null 2>&1 &
     sleep 1
     echo "[${mode}] iperf3 over TUN (post-recovery)"
     ip netns exec "${NS_C}" iperf3 -c "${TUN_C_REMOTE}" -t 3 -i 1 || true
