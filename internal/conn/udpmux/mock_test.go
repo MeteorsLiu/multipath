@@ -290,29 +290,25 @@ func TestProberIntegrationWithUDPMux(t *testing.T) {
 		t.Error("Timeout waiting for data packet")
 	}
 
-	// Test Phase 3: Connection loss simulation (Normal -> Unstable -> Lost)
+	// Test Phase 3: Connection loss simulation (Normal -> Lost)
 	t.Log("Phase 3: Testing connection loss and recovery")
 
 	// Stop the server to simulate network issues
 	serverReceiver.Close()
 	serverConn.Close()
 
-	// Wait for state transition to Unstable and then Lost
-	unstableReceived := false
+	// Wait for state transition to Lost
 	lostReceived := false
 
 	for i := 0; i < 10; i++ {
 		select {
 		case event := <-stateEvents:
 			switch event {
-			case prober.Unstable:
-				unstableReceived = true
-				t.Log("✓ Successfully transitioned to Unstable state")
 			case prober.Lost:
 				lostReceived = true
 				t.Log("✓ Successfully transitioned to Lost state")
 			}
-			if unstableReceived && lostReceived {
+			if lostReceived {
 				break
 			}
 		case <-time.After(1 * time.Second):
@@ -320,9 +316,6 @@ func TestProberIntegrationWithUDPMux(t *testing.T) {
 		}
 	}
 
-	if !unstableReceived {
-		t.Error("Expected transition to Unstable state")
-	}
 	if !lostReceived {
 		t.Error("Expected transition to Lost state")
 	}

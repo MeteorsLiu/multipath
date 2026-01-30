@@ -71,14 +71,9 @@ func mustListen(addr string) net.Listener {
 func (c *TcpConn) onProberEvent(context any, event prober.Event) {
 	switch event {
 	case prober.Lost:
-		// don't force to terminate the connection
-		// It can be an mistake becoming Lost here because of TCP retransmits.
-		// remove only when the connection is dead
-		select {
-		case <-c.ctx.Done():
-			c.manager.Remove(c)
-		default:
-		}
+		c.manager.Suspend(c)
+	case prober.Normal:
+		c.manager.Resume(c)
 	}
 }
 
@@ -145,7 +140,11 @@ func (t *TcpConn) Start() {
 
 func (t *TcpConn) Close() error {
 	t.cancel()
-	return t.conn.Close()
+	err := t.conn.Close()
+	if err == nil {
+		t.manager.Remove(t)
+	}
+	return err
 }
 
 func (u *TcpConn) readLoop() {

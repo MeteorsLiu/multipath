@@ -778,11 +778,11 @@ func TestProber_AdaptiveTimeoutCalculation(t *testing.T) {
 				scenario.name, predictedRtt/1000, trend, safetyMultiplier, timeout)
 
 			if scenario.expectHighTimeout {
-				if timeout < 300*time.Millisecond {
+				if timeout < _baselineBuffer+300*time.Millisecond {
 					t.Errorf("Expected higher timeout for %s, got %v", scenario.name, timeout)
 				}
 			} else {
-				if timeout > 400*time.Millisecond {
+				if timeout > _baselineBuffer+300*time.Millisecond {
 					t.Errorf("Expected lower timeout for %s, got %v", scenario.name, timeout)
 				}
 			}
@@ -849,15 +849,15 @@ func TestProber_StateTransitionsWithHolt(t *testing.T) {
 	t.Logf("First markTimeout result: %v, consecutiveLoss: %d, packetMap size: %d",
 		hasTimeout, prober.consecutiveLoss, len(prober.packetMap))
 
-	// Manually trigger second consecutive timeout to reach Unstable state
-	prober.consecutiveLoss = 2
-	prober.switchState(Unstable)
+	// Manually trigger consecutive timeouts to reach Lost state
+	prober.consecutiveLoss = _maxConsecutiveLoss
+	prober.switchState(Lost)
 
-	if prober.state != Unstable {
-		t.Errorf("Expected state to be Unstable, got %v", prober.state)
+	if prober.state != Lost {
+		t.Errorf("Expected state to be Lost, got %v", prober.state)
 	}
 
-	t.Logf("Successfully transitioned to Unstable state after 2 consecutive timeouts")
+	t.Logf("Successfully transitioned to Lost state after consecutive timeouts")
 }
 
 func TestProber_RecoveryBehavior(t *testing.T) {
@@ -875,12 +875,12 @@ func TestProber_RecoveryBehavior(t *testing.T) {
 	// Initialize estimator with some data
 	prober.rttEstimator.Update(50000) // 50ms
 
-	// Force into Unstable state
-	prober.consecutiveLoss = 2
-	prober.switchState(Unstable)
+	// Force into Lost state
+	prober.consecutiveLoss = _maxConsecutiveLoss
+	prober.switchState(Lost)
 
-	if prober.state != Unstable {
-		t.Fatal("Failed to set Unstable state")
+	if prober.state != Lost {
+		t.Fatal("Failed to set Lost state")
 	}
 
 	// Send packet and receive successful reply
@@ -898,21 +898,20 @@ func TestProber_RecoveryBehavior(t *testing.T) {
 	// Create successful reply
 	replyPacket := mempool.Get(NonceSize)
 	binary.LittleEndian.PutUint64(replyPacket.Bytes(), nonce)
+	prober.consecutiveSuccess = _recoverSuccess - 1
 	prober.recvProbePacket(replyPacket)
 
-	// For Unstable state, need to clear debit (3 successful packets) or be immediate
-	// Since we're testing immediate recovery behavior, check if debit was decremented
-	if prober.debit <= 0 && prober.state != Normal {
-		t.Errorf("Expected recovery to Normal state when debit is 0, got %v with debit %f", prober.state, prober.debit)
+	if prober.state != Normal {
+		t.Errorf("Expected recovery to Normal state, got %v", prober.state)
 	}
 
 	if prober.consecutiveLoss != 0 {
 		t.Errorf("Expected consecutiveLoss to reset to 0, got %d", prober.consecutiveLoss)
 	}
 
-	t.Logf("Recovery state: %v, debit: %f", prober.state, prober.debit)
+	t.Logf("Recovery state: %v", prober.state)
 
-	t.Log("Successfully recovered from Unstable to Normal state")
+	t.Log("Successfully recovered from Lost to Normal state")
 }
 
 func TestProber_PerformanceComparison(t *testing.T) {

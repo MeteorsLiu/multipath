@@ -20,11 +20,11 @@ const (
 	NonceSize          = 8
 	_defaultTimeout    = 5
 	_defaultTimeoutDur = _defaultTimeout * time.Second
-	_minTimeout        = 500 * time.Millisecond
+	_minRTOGuard       = 200 * time.Millisecond
 	// slightly larget than TCP RTO, avoid TCP RTO causing us mistaken
 	_baselineBuffer     = 500 * time.Millisecond
-	_maxConsecutiveLoss = 10
-	_reconnectInterval  = 5 * time.Second
+	_maxConsecutiveLoss = 3
+	_recoverSuccess     = 3
 )
 
 type Event int
@@ -32,7 +32,6 @@ type Event int
 const (
 	Initializing Event = iota
 	Normal
-	Unstable
 	Lost
 )
 
@@ -42,8 +41,6 @@ func (e Event) String() string {
 		return "initializing"
 	case Normal:
 		return "normal"
-	case Unstable:
-		return "unstable"
 	case Lost:
 		return "lost"
 	}
@@ -127,7 +124,6 @@ type Prober struct {
 	addr         string
 	minRtt       float64
 	lost         float64
-	debit        float64
 
 	deadline       *time.Timer
 	reschedule     *time.Timer
@@ -135,10 +131,11 @@ type Prober struct {
 
 	packetMap map[uint64]*packetInfo
 
-	eventContext     any
-	lastMaxStartTime int64
-	consecutiveLoss  int
-	lastSuccessTime  time.Time
+	eventContext       any
+	lastMaxStartTime   int64
+	consecutiveLoss    int
+	consecutiveSuccess int
+	lastSuccessTime    time.Time
 }
 
 func New(ctx context.Context, addr string, on ProberCallback) *Prober {
@@ -214,6 +211,9 @@ func (p *Prober) sendProbePacket() {
 	}
 
 	p.currentTimeout = time.Duration(predictedRtt*safetyMultiplier)*time.Microsecond + _baselineBuffer
+	if p.currentTimeout < _minRTOGuard {
+		p.currentTimeout = _minRTOGuard
+	}
 
 	prom.ProbeRttPredict.With(prometheus.Labels{"addr": p.addr}).Set(predictedRtt)
 	prom.ProbeNextTimout.With(prometheus.Labels{"addr": p.addr}).Set(float64(p.currentTimeout.Milliseconds()))
@@ -259,6 +259,7 @@ func (p *Prober) markTimeout() (hasTimeouts bool) {
 	// Update consecutive loss counter
 	if timeoutCount > 0 {
 		p.consecutiveLoss++
+		p.consecutiveSuccess = 0
 		hasTimeouts = true
 
 		// State transitions based on consecutive timeouts
@@ -266,10 +267,6 @@ func (p *Prober) markTimeout() (hasTimeouts bool) {
 		case Initializing:
 			// Stay in initializing state until first packet arrives
 		case Normal:
-			if p.consecutiveLoss >= 2 {
-				p.switchState(Unstable)
-			}
-		case Unstable:
 			if p.consecutiveLoss >= _maxConsecutiveLoss {
 				p.switchState(Lost)
 			}
@@ -316,15 +313,13 @@ func (p *Prober) recvProbePacket(packet *mempool.Buffer) {
 		(p.currentTimeout > 0 && elapsedTimeUs >= p.currentTimeout.Microseconds())
 
 	if isTimeout {
-		if p.debit > 0 {
-			p.debit = 10
-		}
 		return
 	}
 
 	// Successful packet received - reset counters
 	p.lastMaxStartTime = 0
 	p.consecutiveLoss = 0
+	p.consecutiveSuccess++
 	p.lastSuccessTime = time.Now()
 	p.deadline.Stop()
 
@@ -332,22 +327,8 @@ func (p *Prober) recvProbePacket(packet *mempool.Buffer) {
 	if p.state == Initializing {
 		// First packet received successfully, transition to Normal
 		p.switchState(Normal)
-	} else if p.debit > 0 {
-		p.debit--
-
-		if p.debit == 0 {
-			switch p.state {
-			case Unstable:
-				p.switchState(Normal)
-			case Lost:
-				p.switchState(Normal)
-			}
-		}
-	} else {
-		// Immediate recovery for unstable state
-		if p.state == Unstable {
-			p.switchState(Normal)
-		}
+	} else if p.state == Lost && p.consecutiveSuccess >= _recoverSuccess {
+		p.switchState(Normal)
 	}
 
 	elapsedTime := float64(elapsedTimeUs)
@@ -374,18 +355,15 @@ func (p *Prober) recvProbePacket(packet *mempool.Buffer) {
 	}
 
 	nextTimeout := time.Duration(predictedRtt*safetyMultiplier)*time.Microsecond + _baselineBuffer
+	if nextTimeout < _minRTOGuard {
+		nextTimeout = _minRTOGuard
+	}
 
 	// Schedule next probe with adaptive interval based on state
 	var probeInterval time.Duration
 	switch p.state {
 	case Normal:
 		probeInterval = nextTimeout
-	case Unstable:
-		// Increase probe frequency for unstable connections
-		probeInterval = nextTimeout / 2
-		if probeInterval < 100*time.Millisecond {
-			probeInterval = 100 * time.Millisecond
-		}
 	case Lost:
 		// Reduce probe frequency for lost connections
 		probeInterval = nextTimeout * 2
@@ -411,31 +389,27 @@ func (p *Prober) switchState(to Event) {
 
 	switch to {
 	case Initializing:
-		p.debit = 0
 		p.consecutiveLoss = 0
+		p.consecutiveSuccess = 0
 	case Normal:
-		p.debit = 0
 		p.consecutiveLoss = 0
-	case Unstable:
-		p.debit = 3 // Require fewer successful packets to recover
+		p.consecutiveSuccess = 0
 	case Lost:
 		p.lost++
-		p.debit = 10
+		p.consecutiveSuccess = 0
 	}
 
-	fmt.Printf("Switch State %s: %s => %s Debit: %f ConsecutiveLoss: %d RTT: %.2fms Trend: %.2f\n",
-		p.addr, oldState, p.state, p.debit, p.consecutiveLoss,
+	fmt.Printf("Switch State %s: %s => %s ConsecutiveLoss: %d RTT: %.2fms Trend: %.2f\n",
+		p.addr, oldState, p.state, p.consecutiveLoss,
 		p.rttEstimator.GetCurrent()/1000, p.rttEstimator.GetTrend())
 
 	p.on(p.eventContext, to)
 }
 
-// Enhanced State Machine:
+// State Machine:
 // Initializing -> Normal (first successful packet)
-// Normal -> Unstable (2 consecutive timeouts)
-// Unstable -> Normal (1 successful packet)
-// Unstable -> Lost (5 consecutive timeouts)
-// Lost -> Normal (10 successful packets)
+// Normal -> Lost (consecutive timeouts)
+// Lost -> Normal (consecutive successful packets)
 func (p *Prober) start() {
 	p.sendProbePacket()
 
