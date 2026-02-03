@@ -89,9 +89,6 @@ func NewConn(ctx context.Context, pm *path.PathManager, cn net.Conn, out chan<- 
 
 	pm.Add(tc.String(), func() (w conn.ConnWriter, onRemove func()) {
 		return tc, func() {
-			// make sure we're closed.
-			tc.Close()
-
 			if isServerSide {
 				return
 			}
@@ -139,11 +136,12 @@ func (t *TcpConn) Start() {
 }
 
 func (t *TcpConn) Close() error {
-	t.cancel()
-	err := t.conn.Close()
-	if err == nil {
+	err := net.ErrClosed
+	t.closeOnce.Do(func() {
+		t.cancel()
+		err = t.conn.Close()
 		t.manager.Remove(t)
-	}
+	})
 	return err
 }
 
