@@ -43,14 +43,19 @@ func Encode(frame Frame, dst []byte) ([]byte, error) {
 		frame.Version = Version
 	}
 	if frame.Version != Version {
-		return nil, fmt.Errorf("%w: version out of range", ErrInvalidFrame)
+		err := fmt.Errorf("%w: version out of range", ErrInvalidFrame)
+		debugEncodeError(frame, err)
+		return nil, err
 	}
 	if frame.Type == 0 || frame.Type > TypeCLOSE {
-		return nil, fmt.Errorf("%w: type out of range", ErrInvalidFrame)
+		err := fmt.Errorf("%w: type out of range", ErrInvalidFrame)
+		debugEncodeError(frame, err)
+		return nil, err
 	}
 
 	bodyLen, err := encodedBodySize(frame)
 	if err != nil {
+		debugEncodeError(frame, err)
 		return nil, err
 	}
 
@@ -64,13 +69,16 @@ func Encode(frame Frame, dst []byte) ([]byte, error) {
 	binary.BigEndian.PutUint64(out[1:9], frame.SessionID)
 	out[9] = frame.LaneID
 	if err := encodeBodyInto(frame, out[headerSize:]); err != nil {
+		debugEncodeError(frame, err)
 		return nil, err
 	}
+	debugEncodeFrame(frame, need)
 	return dst, nil
 }
 
 func Decode(src []byte) (Frame, error) {
 	if len(src) < headerSize {
+		debugDecodeError(len(src), ErrFrameTooShort)
 		return Frame{}, ErrFrameTooShort
 	}
 
@@ -78,6 +86,7 @@ func Decode(src []byte) (Frame, error) {
 	version := vt >> 4
 	frameType := FrameType(vt & 0x0f)
 	if version != Version || frameType == 0 || frameType > TypeCLOSE {
+		debugDecodeError(len(src), ErrInvalidFrame)
 		return Frame{}, ErrInvalidFrame
 	}
 
@@ -88,7 +97,9 @@ func Decode(src []byte) (Frame, error) {
 		LaneID:    src[9],
 	}
 	if err := decodeBody(&frame, src[headerSize:]); err != nil {
+		debugDecodeError(len(src), err)
 		return Frame{}, err
 	}
+	debugDecodeFrame(frame, len(src))
 	return frame, nil
 }

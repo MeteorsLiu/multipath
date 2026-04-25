@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/MeteorsLiu/multipath/internal/debuglog"
 	"github.com/MeteorsLiu/multipath/internal/protocol"
 	"github.com/MeteorsLiu/multipath/internal/transport"
 	core "github.com/MeteorsLiu/multipath/internal/tunnel/probe/core"
@@ -43,11 +44,18 @@ func New(sender *send.Send, configs ...Config) *Loop {
 }
 
 func (l *Loop) Bootstrap(ctx context.Context) error {
-	return l.sender.Bootstrap(ctx)
+	debuglog.Printf("probe/loop", "bootstrap")
+	err := l.sender.Bootstrap(ctx)
+	if err != nil {
+		debuglog.Printf("probe/loop", "bootstrap err=%v", err)
+	}
+	return err
 }
 
 func (l *Loop) Write(ctx context.Context, frame protocol.Frame, leg transport.LegRef) (recv.Result, error) {
+	debuglog.Printf("probe/loop", "control_in type=%d session=%d lane=%d leg_kind=%d", frame.Type, frame.SessionID, frame.LaneID, leg.Kind)
 	result, err := l.sender.WriteFrame(ctx, frame, leg)
+	debuglog.Printf("probe/loop", "control_out accepted=%t caps=%#x fec_profile=%d err=%v", result.Accepted, result.Caps, result.FECProfile, err)
 	return recv.Result{
 		Accepted:   result.Accepted,
 		Caps:       result.Caps,
@@ -57,6 +65,7 @@ func (l *Loop) Write(ctx context.Context, frame protocol.Frame, leg transport.Le
 
 func (l *Loop) Run(ctx context.Context) error {
 	if l.sender == nil || l.interval <= 0 {
+		debuglog.Printf("probe/loop", "disabled sender_nil=%t interval=%s", l.sender == nil, l.interval)
 		<-ctx.Done()
 		return ctx.Err()
 	}
@@ -68,16 +77,19 @@ func (l *Loop) Run(ctx context.Context) error {
 	errCh := make(chan error, 1)
 	done := make(chan struct{})
 	var wg sync.WaitGroup
-	start := func(fn func() error) {
+	start := func(name string, fn func() error) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			debuglog.Printf("probe/loop", "worker start name=%s", name)
 			if err := fn(); err != nil && !errors.Is(err, context.Canceled) {
+				debuglog.Printf("probe/loop", "worker error name=%s err=%v", name, err)
 				select {
 				case errCh <- err:
 				case <-runCtx.Done():
 				}
 			}
+			debuglog.Printf("probe/loop", "worker stop name=%s", name)
 		}()
 	}
 	if l.events != nil {
@@ -87,9 +99,9 @@ func (l *Loop) Run(ctx context.Context) error {
 			MaxLoss:        1,
 			RecoverSuccess: 1,
 		})
-		start(func() error { return runner.Run(runCtx, l.events, runnerOut) })
+		start("core", func() error { return runner.Run(runCtx, l.events, runnerOut) })
 	}
-	start(func() error { return l.run(runCtx, runnerOut) })
+	start("adapter", func() error { return l.run(runCtx, runnerOut) })
 
 	go func() {
 		wg.Wait()
@@ -121,13 +133,18 @@ func (l *Loop) run(ctx context.Context, events <-chan core.Event) error {
 		case event, ok := <-events:
 			if !ok {
 				events = nil
+				debuglog.Printf("probe/loop", "core_events closed")
 				continue
 			}
+			debuglog.Printf("probe/loop", "event %s", debugProbeEvent(event))
 			if err := l.sender.WriteProbeEvent(ctx, event); err != nil {
+				debuglog.Printf("probe/loop", "event err=%v", err)
 				return err
 			}
 		case now := <-ticker.C:
+			debuglog.Printf("probe/loop", "retry_hello now_ms=%d", now.UnixMilli())
 			if err := l.sender.RetryHELLO(ctx, uint64(now.UnixMilli())); err != nil {
+				debuglog.Printf("probe/loop", "retry_hello err=%v", err)
 				return err
 			}
 		}

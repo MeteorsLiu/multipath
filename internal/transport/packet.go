@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/MeteorsLiu/multipath/internal/debuglog"
 	"github.com/MeteorsLiu/multipath/internal/packetbuf"
 )
 
@@ -53,6 +54,7 @@ func (p *Packet) Run(ctx context.Context, writer PacketWriter) error {
 		endpoints = append(endpoints, PacketEndpoint{ID: id, Conn: conn})
 	}
 	p.mu.RUnlock()
+	debuglog.Printf("transport/udp", "run endpoints=%d", len(endpoints))
 
 	errCh := make(chan error, len(endpoints))
 	var wg sync.WaitGroup
@@ -88,6 +90,7 @@ func (p *Packet) WriteTo(ctx context.Context, endpointID string, remote net.Addr
 	conn := p.endpoints[endpointID]
 	p.mu.RUnlock()
 	if conn == nil {
+		debuglog.Printf("transport/udp", "write unknown endpoint=%s remote=%v bytes=%d", endpointID, remote, len(payload))
 		return 0, ErrUnknownEndpoint
 	}
 
@@ -96,7 +99,13 @@ func (p *Packet) WriteTo(ctx context.Context, endpointID string, remote net.Addr
 		return 0, ctx.Err()
 	default:
 	}
-	return conn.WriteTo(payload, remote)
+	n, err := conn.WriteTo(payload, remote)
+	if err != nil {
+		debuglog.Printf("transport/udp", "write endpoint=%s remote=%v bytes=%d err=%v", endpointID, remote, len(payload), err)
+		return n, err
+	}
+	debuglog.Printf("transport/udp", "write endpoint=%s remote=%v bytes=%d", endpointID, remote, n)
+	return n, nil
 }
 
 func (p *Packet) readLoop(ctx context.Context, endpoint PacketEndpoint, writer PacketWriter) error {
@@ -109,6 +118,7 @@ func (p *Packet) readLoop(ctx context.Context, endpoint PacketEndpoint, writer P
 		packet := packetbuf.Acquire(bufSize)
 		if err := endpoint.Conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
 			packet.Release()
+			debuglog.Printf("transport/udp", "read endpoint=%s deadline err=%v", endpoint.ID, err)
 			return err
 		}
 
@@ -123,6 +133,7 @@ func (p *Packet) readLoop(ctx context.Context, endpoint PacketEndpoint, writer P
 					continue
 				}
 			}
+			debuglog.Printf("transport/udp", "read endpoint=%s err=%v", endpoint.ID, err)
 			return err
 		}
 		leg := LegRef{
@@ -131,8 +142,10 @@ func (p *Packet) readLoop(ctx context.Context, endpoint PacketEndpoint, writer P
 			RemoteAddr: remote,
 		}
 		packet.SetLen(n)
+		debuglog.Printf("transport/udp", "read endpoint=%s remote=%v bytes=%d", endpoint.ID, remote, n)
 
 		if err := writer.WriteTo(ctx, leg, packet); err != nil {
+			debuglog.Printf("transport/udp", "deliver endpoint=%s remote=%v bytes=%d err=%v", endpoint.ID, remote, n, err)
 			return err
 		}
 	}

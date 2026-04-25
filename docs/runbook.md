@@ -140,18 +140,22 @@ scripts/e2e.sh
 
 The real E2E builds the current binary, creates two Linux network namespaces,
 connects them with two veth paths, starts client/server with real TUN devices,
-checks UDP bootstrap and legacy `tcp` flag compatibility, injects path loss with
-`tc netem`, verifies ping recovery over the tunnel, and runs a weak-network FEC
-comparison. It requires Linux, `go`, root privileges, `ip`, `tc`, and `ping`.
-Run it as a
-regular user when possible; the script builds the binary before escalating for
-network namespace setup. `iperf3` and `timeout` enable an optional throughput
-smoke.
+and runs protocol-level cases for multipath scheduling, legacy `tcp` flag
+compatibility, UDP-to-TCP fallback, and FEC. It requires Linux, `go`, root
+privileges, `ip`, `tc`, and `ping`. Run it as a regular user when possible; the
+script builds the binary before escalating for network namespace setup. `iperf3`
+and `timeout` enable an optional throughput smoke.
 
-The FEC comparison runs the same one-lane UDP scenario with `fec=false` and
-`fec=true` under 20% client-to-server underlay loss. The script prints both
-observed ping packet-loss values and requires the FEC case to be lower. See
-`docs/e2e-evaluation.md` for interpretation and limits.
+The FEC comparison runs the same one-lane scenario with `fec=false` and
+`fec=true` under 20% client-to-server UDP tunnel loss while TCP fallback is
+blocked. The script prints both observed ping packet-loss values and requires the
+FEC case to be lower. See `docs/e2e-evaluation.md` for interpretation and
+limits.
+
+The script starts client and server with `MULTIPATH_DEBUG=1` by default, so each
+case writes verbose protocol, transport, probe, fallback, and FEC traces to the
+printed `${case}.multipath.log` file in the work directory. Set
+`MULTIPATH_REAL_E2E_DEBUG=0` to keep those logs quiet for routine runs.
 
 The same script can be invoked through Go's test runner when explicitly
 enabled:

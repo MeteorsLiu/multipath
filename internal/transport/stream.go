@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/MeteorsLiu/multipath/internal/debuglog"
 	"github.com/MeteorsLiu/multipath/internal/packetbuf"
 )
 
@@ -41,9 +42,11 @@ func (s *Stream) Run(ctx context.Context, writer PacketWriter) error {
 	s.mu.Lock()
 	s.writer = writer
 	for connID, conn := range s.conns {
+		debuglog.Printf("transport/tcp", "start existing read_loop conn=%s remote=%v", connID, debugRemoteAddr(conn))
 		go s.readLoop(ctx, connID, conn, writer)
 	}
 	s.mu.Unlock()
+	debuglog.Printf("transport/tcp", "run listener=%v", s.listener != nil)
 
 	errCh := make(chan error, 1)
 	if s.listener != nil {
@@ -62,12 +65,15 @@ func (s *Stream) Run(ctx context.Context, writer PacketWriter) error {
 
 func (s *Stream) Dial(ctx context.Context, remote string) (LegRef, error) {
 	var dialer net.Dialer
+	debuglog.Printf("transport/tcp", "dial remote=%s", remote)
 	conn, err := dialer.DialContext(ctx, "tcp", remote)
 	if err != nil {
+		debuglog.Printf("transport/tcp", "dial remote=%s err=%v", remote, err)
 		return LegRef{}, err
 	}
 
 	connID := s.addConn(conn)
+	debuglog.Printf("transport/tcp", "dial ok remote=%s conn=%s local=%v", remote, connID, debugLocalAddr(conn))
 	writer := s.currentWriter()
 	if writer != nil {
 		go s.readLoop(ctx, connID, conn, writer)
@@ -88,6 +94,7 @@ func (s *Stream) Write(ctx context.Context, connID string, payload []byte) (int,
 	conn := s.conns[connID]
 	s.mu.RUnlock()
 	if conn == nil {
+		debuglog.Printf("transport/tcp", "write unknown conn=%s bytes=%d", connID, len(payload))
 		return 0, ErrUnknownConn
 	}
 
@@ -101,6 +108,11 @@ func (s *Stream) Write(ctx context.Context, connID string, payload []byte) (int,
 	default:
 	}
 	n, err := writeBuffersFull(conn, buffers)
+	if err != nil {
+		debuglog.Printf("transport/tcp", "write conn=%s bytes=%d err=%v", connID, len(payload), err)
+		return payloadBytesWritten(n), err
+	}
+	debuglog.Printf("transport/tcp", "write conn=%s bytes=%d", connID, payloadBytesWritten(n))
 	return payloadBytesWritten(n), err
 }
 
@@ -110,16 +122,20 @@ func (s *Stream) Close(ctx context.Context, connID string) error {
 	delete(s.conns, connID)
 	s.mu.Unlock()
 	if conn == nil {
+		debuglog.Printf("transport/tcp", "close unknown conn=%s", connID)
 		return ErrUnknownConn
 	}
 
-	return conn.Close()
+	err := conn.Close()
+	debuglog.Printf("transport/tcp", "close conn=%s err=%v", connID, err)
+	return err
 }
 
 func (s *Stream) acceptLoop(ctx context.Context, writer PacketWriter) error {
 	for {
 		if tcpListener, ok := s.listener.(*net.TCPListener); ok {
 			if err := tcpListener.SetDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+				debuglog.Printf("transport/tcp", "accept deadline err=%v", err)
 				return err
 			}
 		}
@@ -134,10 +150,12 @@ func (s *Stream) acceptLoop(ctx context.Context, writer PacketWriter) error {
 					continue
 				}
 			}
+			debuglog.Printf("transport/tcp", "accept err=%v", err)
 			return err
 		}
 
 		connID := s.addConn(conn)
+		debuglog.Printf("transport/tcp", "accept conn=%s remote=%v local=%v", connID, debugRemoteAddr(conn), debugLocalAddr(conn))
 		go s.readLoop(ctx, connID, conn, writer)
 	}
 }
@@ -150,10 +168,12 @@ func (s *Stream) readLoop(ctx context.Context, connID string, conn net.Conn, wri
 		}
 		s.mu.Unlock()
 		_ = conn.Close()
+		debuglog.Printf("transport/tcp", "read_loop exit conn=%s remote=%v", connID, debugRemoteAddr(conn))
 	}()
 
 	for {
 		if err := conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+			debuglog.Printf("transport/tcp", "read deadline conn=%s err=%v", connID, err)
 			return
 		}
 
@@ -167,17 +187,20 @@ func (s *Stream) readLoop(ctx context.Context, connID string, conn net.Conn, wri
 					continue
 				}
 			}
+			debuglog.Printf("transport/tcp", "read header conn=%s err=%v", connID, err)
 			return
 		}
 
 		frameLen := int(binary.BigEndian.Uint16(header[:]))
 		if frameLen == 0 || frameLen > maxStreamFrameLen {
+			debuglog.Printf("transport/tcp", "invalid frame_len conn=%s frame_len=%d", connID, frameLen)
 			return
 		}
 
 		packet := packetbuf.Acquire(frameLen)
 		if _, err := io.ReadFull(conn, packet.Payload); err != nil {
 			packet.Release()
+			debuglog.Printf("transport/tcp", "read frame conn=%s frame_len=%d err=%v", connID, frameLen, err)
 			return
 		}
 		leg := LegRef{
@@ -185,7 +208,9 @@ func (s *Stream) readLoop(ctx context.Context, connID string, conn net.Conn, wri
 			ConnID: connID,
 		}
 
+		debuglog.Printf("transport/tcp", "read conn=%s bytes=%d", connID, frameLen)
 		if err := writer.WriteTo(ctx, leg, packet); err != nil {
+			debuglog.Printf("transport/tcp", "deliver conn=%s bytes=%d err=%v", connID, frameLen, err)
 			return
 		}
 	}
@@ -196,6 +221,7 @@ func (s *Stream) addConn(conn net.Conn) string {
 	s.mu.Lock()
 	s.conns[connID] = conn
 	s.mu.Unlock()
+	debuglog.Printf("transport/tcp", "add_conn conn=%s remote=%v local=%v", connID, debugRemoteAddr(conn), debugLocalAddr(conn))
 	return connID
 }
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 
+	"github.com/MeteorsLiu/multipath/internal/debuglog"
 	"github.com/MeteorsLiu/multipath/internal/packetbuf"
 )
 
@@ -59,9 +60,11 @@ func RunWriter(ctx context.Context, packets <-chan Payload, packet PacketTranspo
 			if payload.Packet == nil {
 				continue
 			}
+			debuglog.Printf("transport", "writer dispatch %s bytes=%d", debugLeg(payload.Leg), len(payload.Packet.Payload))
 			err := writePayload(ctx, payload, packet, stream)
 			payload.Packet.Release()
 			if err != nil {
+				debuglog.Printf("transport", "writer error %s err=%v", debugLeg(payload.Leg), err)
 				return err
 			}
 		}
@@ -82,6 +85,7 @@ func writePayload(ctx context.Context, payload Payload, packet PacketTransport, 
 		}
 		_, err := stream.Write(ctx, payload.Leg.ConnID, payload.Packet.Payload)
 		if errors.Is(err, ErrUnknownConn) || errors.Is(err, net.ErrClosed) {
+			debuglog.Printf("transport", "drop stale tcp payload conn=%s bytes=%d err=%v", payload.Leg.ConnID, len(payload.Packet.Payload), err)
 			return nil
 		}
 		return err

@@ -1,5 +1,7 @@
 package recv
 
+import "github.com/MeteorsLiu/multipath/internal/debuglog"
+
 const (
 	defaultRxSLCWindowDataLimit   = 4096
 	defaultRxSLCWindowRepairLimit = 1024
@@ -42,22 +44,26 @@ func newRxSLCWindow(sourceCount int) *rxSLCWindow {
 
 func (w *rxSLCWindow) addData(packetID uint32, packet []byte) (rxRecoverable, bool) {
 	if w.sourceCount <= 0 {
+		debuglog.Printf("recv/fec_window", "rx_data_drop invalid_source_count source_count=%d packet_id=%d", w.sourceCount, packetID)
 		return rxRecoverable{}, false
 	}
 	if _, exists := w.data[packetID]; !exists {
 		w.dataOrder = append(w.dataOrder, packetID)
 	}
 	w.data[packetID] = append([]byte(nil), packet...)
+	debuglog.Printf("recv/fec_window", "rx_data packet_id=%d bytes=%d data=%d repairs=%d", packetID, len(packet), len(w.data), len(w.repairs))
 
 	for _, repair := range w.repairs {
 		if w.contains(repair, packetID) {
 			recoverable, ok := w.recoverable(repair)
 			if ok {
 				w.prune()
+				debuglog.Printf("recv/fec_window", "rx_data_recoverable base_packet_id=%d key=%d missing_index=%d", recoverable.basePacketID, recoverable.key, recoverable.missingIndex)
 				return recoverable, true
 			}
 			if w.allKnown(repair) {
 				delete(w.repairs, repair.basePacketID)
+				debuglog.Printf("recv/fec_window", "rx_repair_complete_drop base_packet_id=%d key=%d", repair.basePacketID, repair.key)
 			}
 		}
 	}
@@ -67,6 +73,7 @@ func (w *rxSLCWindow) addData(packetID uint32, packet []byte) (rxRecoverable, bo
 
 func (w *rxSLCWindow) addRepair(basePacketID uint32, key uint16, symbol []byte) (rxRecoverable, bool) {
 	if w.sourceCount <= 0 {
+		debuglog.Printf("recv/fec_window", "rx_repair_drop invalid_source_count source_count=%d base_packet_id=%d key=%d", w.sourceCount, basePacketID, key)
 		return rxRecoverable{}, false
 	}
 	repair := rxRepair{
@@ -75,6 +82,7 @@ func (w *rxSLCWindow) addRepair(basePacketID uint32, key uint16, symbol []byte) 
 		symbol:       append([]byte(nil), symbol...),
 	}
 	if w.allKnown(repair) {
+		debuglog.Printf("recv/fec_window", "rx_repair_drop all_known base_packet_id=%d key=%d", basePacketID, key)
 		return rxRecoverable{}, false
 	}
 	if _, exists := w.repairs[basePacketID]; !exists {
@@ -83,14 +91,17 @@ func (w *rxSLCWindow) addRepair(basePacketID uint32, key uint16, symbol []byte) 
 	w.repairs[basePacketID] = repair
 	recoverable, ok := w.recoverable(repair)
 	w.prune()
+	debuglog.Printf("recv/fec_window", "rx_repair base_packet_id=%d key=%d symbol_len=%d recoverable=%t data=%d repairs=%d", basePacketID, key, len(symbol), ok, len(w.data), len(w.repairs))
 	return recoverable, ok
 }
 
 func (w *rxSLCWindow) markEmitted(packetID uint32) bool {
 	if w.emitted[packetID] {
+		debuglog.Printf("recv/fec_window", "rx_emit_skip duplicate packet_id=%d", packetID)
 		return false
 	}
 	w.emitted[packetID] = true
+	debuglog.Printf("recv/fec_window", "rx_emit_mark packet_id=%d", packetID)
 	return true
 }
 
@@ -150,6 +161,7 @@ func (w *rxSLCWindow) prune() {
 			}
 			delete(w.data, packetID)
 			delete(w.emitted, packetID)
+			debuglog.Printf("recv/fec_window", "rx_prune_data packet_id=%d data=%d", packetID, len(w.data))
 		}
 	}
 
@@ -159,6 +171,7 @@ func (w *rxSLCWindow) prune() {
 			basePacketID := w.repairOrder[0]
 			w.repairOrder = w.repairOrder[1:]
 			delete(w.repairs, basePacketID)
+			debuglog.Printf("recv/fec_window", "rx_prune_repair base_packet_id=%d repairs=%d", basePacketID, len(w.repairs))
 			w.dropStaleRepairOrder()
 		}
 	}

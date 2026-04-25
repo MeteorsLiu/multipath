@@ -1,6 +1,7 @@
 package send
 
 import (
+	"github.com/MeteorsLiu/multipath/internal/debuglog"
 	fecpkg "github.com/MeteorsLiu/multipath/internal/fec"
 )
 
@@ -31,5 +32,6 @@ func (l *Send) session(sessionID uint64) *sessionRuntime {
 	}
 	session.fecCodec, _ = fecpkg.NewCodec(4, 1)
 	l.sessions[sessionID] = session
+	debuglog.Printf("send", "session_create session=%d fec_codec=%t", sessionID, session.fecCodec != nil)
 	return session
 }

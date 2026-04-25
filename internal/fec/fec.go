@@ -3,6 +3,7 @@ package fec
 import (
 	"errors"
 
+	"github.com/MeteorsLiu/multipath/internal/debuglog"
 	"github.com/klauspost/reedsolomon"
 )
 
@@ -26,8 +27,10 @@ type Codec struct {
 
 func NewCodec(dataShards, repairShards int) (*Codec, error) {
 	if dataShards <= 0 || repairShards != 1 {
+		debuglog.Printf("fec", "new_codec_err data_shards=%d repair_shards=%d err=%v", dataShards, repairShards, ErrInvalidShardConfig)
 		return nil, ErrInvalidShardConfig
 	}
+	debuglog.Printf("fec", "new_codec data_shards=%d repair_shards=%d", dataShards, repairShards)
 	return &Codec{
 		dataShards:   dataShards,
 		repairShards: repairShards,
@@ -35,7 +38,12 @@ func NewCodec(dataShards, repairShards int) (*Codec, error) {
 }
 
 func (c *Codec) Encode(shards [][]byte, key uint16) error {
+	if debuglog.Enabled() {
+		dataShards, repairShards := debugCodecShape(c)
+		debuglog.Printf("fec", "encode_start key=%d data_shards=%d repair_shards=%d lens=%v", key, dataShards, repairShards, debugShardLens(shards))
+	}
 	if err := c.validate(shards); err != nil {
+		debuglog.Printf("fec", "encode_validate_err key=%d err=%v", key, err)
 		return err
 	}
 
@@ -46,11 +54,13 @@ func (c *Codec) Encode(shards [][]byte, key uint16) error {
 		}
 	}
 	if repairLen == 0 {
+		debuglog.Printf("fec", "encode_err key=%d err=%v reason=empty_repair", key, ErrInvalidShardConfig)
 		return ErrInvalidShardConfig
 	}
 
 	for i := 0; i < c.dataShards; i++ {
 		if shards[i] == nil {
+			debuglog.Printf("fec", "encode_err key=%d shard=%d err=%v reason=nil_data_shard", key, i, ErrInvalidShardConfig)
 			return ErrInvalidShardConfig
 		}
 	}
@@ -76,16 +86,23 @@ func (c *Codec) Encode(shards [][]byte, key uint16) error {
 	}
 
 	shards[c.dataShards] = repair
+	debuglog.Printf("fec", "encode_done key=%d repair_len=%d", key, len(repair))
 	return nil
 }
 
 func (c *Codec) Reconstruct(shards [][]byte, key uint16) error {
+	if debuglog.Enabled() {
+		dataShards, repairShards := debugCodecShape(c)
+		debuglog.Printf("fec", "reconstruct_start key=%d data_shards=%d repair_shards=%d lens=%v", key, dataShards, repairShards, debugShardLens(shards))
+	}
 	if err := c.validate(shards); err != nil {
+		debuglog.Printf("fec", "reconstruct_validate_err key=%d err=%v", key, err)
 		return err
 	}
 
 	repair := shards[c.dataShards]
 	if len(repair) == 0 {
+		debuglog.Printf("fec", "reconstruct_err key=%d err=%v reason=empty_repair", key, ErrUnrecoverable)
 		return ErrUnrecoverable
 	}
 	repairLen := len(repair)
@@ -99,6 +116,7 @@ func (c *Codec) Reconstruct(shards [][]byte, key uint16) error {
 		}
 	}
 	if missingCount != 1 {
+		debuglog.Printf("fec", "reconstruct_err key=%d missing_count=%d err=%v", key, missingCount, ErrUnrecoverable)
 		return ErrUnrecoverable
 	}
 
@@ -107,6 +125,7 @@ func (c *Codec) Reconstruct(shards [][]byte, key uint16) error {
 			continue
 		}
 		if len(shards[i]) > repairLen {
+			debuglog.Printf("fec", "reconstruct_err key=%d shard=%d shard_len=%d repair_len=%d err=%v", key, i, len(shards[i]), repairLen, ErrUnrecoverable)
 			return ErrUnrecoverable
 		}
 	}
@@ -136,6 +155,7 @@ func (c *Codec) Reconstruct(shards [][]byte, key uint16) error {
 	c.low.GalMulSlice(reedsolomon.Inv(coeffs[missingIndex]), recovered, recovered)
 
 	shards[missingIndex] = recovered
+	debuglog.Printf("fec", "reconstruct_done key=%d missing_index=%d recovered_len=%d", key, missingIndex, len(recovered))
 	return nil
 }
 
@@ -156,6 +176,21 @@ func fillCodingCoefficients(key uint16, coeffs []byte) {
 			coeffs[i] = byte(rng.generate() & 0xff)
 		}
 	}
+}
+
+func debugShardLens(shards [][]byte) []int {
+	lens := make([]int, len(shards))
+	for i := range shards {
+		lens[i] = len(shards[i])
+	}
+	return lens
+}
+
+func debugCodecShape(c *Codec) (int, int) {
+	if c == nil {
+		return 0, 0
+	}
+	return c.dataShards, c.repairShards
 }
 
 type tinyMT32 struct {

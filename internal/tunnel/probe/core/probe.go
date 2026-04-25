@@ -3,6 +3,8 @@ package core
 import (
 	"context"
 	"time"
+
+	"github.com/MeteorsLiu/multipath/internal/debuglog"
 )
 
 type Target uint64
@@ -93,9 +95,11 @@ func (r *Runner) handleInput(ctx context.Context, out chan<- Event, event Event)
 	case EventTrack:
 		if event.Target != 0 && r.targets[event.Target] == nil {
 			r.targets[event.Target] = &targetRuntime{pending: make(map[uint64]uint64)}
+			debuglog.Printf("probe/core", "track target=%d", event.Target)
 		}
 	case EventUntrack:
 		delete(r.targets, event.Target)
+		debuglog.Printf("probe/core", "untrack target=%d", event.Target)
 	case EventPingFailed:
 		targetInfo := r.targets[event.Target]
 		if targetInfo == nil {
@@ -125,6 +129,7 @@ func (r *Runner) tick(ctx context.Context, out chan<- Event, nowMS uint64) bool 
 		}) {
 			return false
 		}
+		debuglog.Printf("probe/core", "send_ping target=%d ping_id=%d pending=%d", target, pingID, len(targetInfo.pending))
 	}
 	return true
 }
@@ -140,6 +145,7 @@ func (r *Runner) expire(ctx context.Context, out chan<- Event, target Target, ta
 		}
 		delete(targetInfo.pending, pingID)
 		timedOut = true
+		debuglog.Printf("probe/core", "ping_timeout target=%d ping_id=%d age_ms=%d", target, pingID, nowMS-timeMS)
 	}
 	if timedOut {
 		return r.markLost(ctx, out, target, targetInfo)
@@ -154,10 +160,12 @@ func (r *Runner) handlePONG(ctx context.Context, out chan<- Event, event Event) 
 	}
 	timeMS, ok := targetInfo.pending[event.PingID]
 	if !ok || timeMS != event.TimeMS {
+		debuglog.Printf("probe/core", "drop_pong target=%d ping_id=%d expected_time=%d got_time=%d matched=%v", event.Target, event.PingID, timeMS, event.TimeMS, ok)
 		return true
 	}
 	delete(targetInfo.pending, event.PingID)
 	targetInfo.lossCount = 0
+	debuglog.Printf("probe/core", "pong target=%d ping_id=%d lost=%v pending=%d", event.Target, event.PingID, targetInfo.lost, len(targetInfo.pending))
 	if !targetInfo.lost {
 		targetInfo.recoverSuccess = 0
 		return true
@@ -169,16 +177,19 @@ func (r *Runner) handlePONG(ctx context.Context, out chan<- Event, event Event) 
 	}
 	targetInfo.lost = false
 	targetInfo.recoverSuccess = 0
+	debuglog.Printf("probe/core", "target_recovered target=%d", event.Target)
 	return emit(ctx, out, Event{Type: EventTargetRecovered, Target: event.Target})
 }
 
 func (r *Runner) markLost(ctx context.Context, out chan<- Event, target Target, targetInfo *targetRuntime) bool {
 	targetInfo.lossCount++
 	targetInfo.recoverSuccess = 0
+	debuglog.Printf("probe/core", "mark_lost target=%d loss_count=%d lost=%v", target, targetInfo.lossCount, targetInfo.lost)
 	if targetInfo.lost || targetInfo.lossCount < r.config.MaxLoss {
 		return true
 	}
 	targetInfo.lost = true
+	debuglog.Printf("probe/core", "target_lost target=%d", target)
 	return emit(ctx, out, Event{Type: EventTargetLost, Target: target})
 }
 

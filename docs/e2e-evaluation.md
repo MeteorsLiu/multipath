@@ -7,12 +7,15 @@ and how to interpret its results.
 
 | Test | Topology | Fault | Main Signal |
 | --- | --- | --- | --- |
-| UDP multipath | two UDP lanes over two veth paths | path2 100% loss, both paths 100% loss, recovery | scheduler keeps traffic alive while at least one lane works |
-| TCP bootstrap | two TCP lanes over two veth paths | path2 100% loss, both paths 100% loss, recovery | TCP leg can carry a lane and still follows multipath scheduling |
-| FEC weak-net comparison | one UDP lane over one veth path | 20% client-to-server `tc netem` loss | `fec=true` reduces observed tunnel packet loss versus `fec=false` |
+| Multipath | two UDP-first lanes over two veth paths | path1 100% loss, path2 100% loss, both paths 100% loss, recovery | scheduler keeps traffic alive while at least one lane works and fails closed when no lane works |
+| Legacy TCP flag | two UDP-first lanes with legacy `tcp: true` config | client TCP dials to the server port are dropped, then path2 is dropped | old configs still parse, but `tcp: true` no longer forces TCP-only bootstrap |
+| Fallback | one UDP-first lane over one veth path | UDP tunnel traffic is dropped while TCP is clean, then TCP traffic is dropped after UDP is restored | a lane falls back to TCP when UDP fails and recovers back to UDP |
+| FEC weak-net comparison | one UDP-first lane over one veth path | 20% client-to-server UDP tunnel loss with TCP fallback blocked | `fec=true` reduces observed tunnel packet loss versus `fec=false` |
 
 The FEC comparison intentionally uses one lane. Multipath failover would hide
-some losses and make it harder to isolate the FEC signal.
+some losses and make it harder to isolate the FEC signal. TCP fallback is also
+blocked during the weak-net sample so the comparison measures FEC rather than
+transport fallback.
 
 ## FEC Comparison Method
 
@@ -25,16 +28,23 @@ case B: fec=true
 ```
 
 For each case it starts a real server and client, waits for baseline ping over
-the TUN to succeed, then applies:
+the TUN to succeed, then applies filtered `tc` loss to client-to-server UDP
+tunnel traffic:
 
 ```bash
-tc qdisc replace dev <client-path1> root netem loss 20%
+tc qdisc replace dev <client-path1> root handle 1: prio bands 4
+tc qdisc replace dev <client-path1> parent 1:3 handle 30: netem loss 20%
+tc filter replace dev <client-path1> protocol ip parent 1:0 prio 1 u32 \
+  match ip protocol 17 0xff \
+  match ip dport <server-port> 0xffff \
+  flowid 1:3
 ```
 
-The loss is applied only on the client-to-server underlay direction. That makes
-lost tunnel DATA packets recoverable when the corresponding REPAIR frame
+The loss is applied only on the client-to-server UDP tunnel direction. That
+makes lost tunnel DATA packets recoverable when the corresponding REPAIR frame
 arrives. The return path is left clean so the measured ping loss mainly reflects
-whether client-to-server tunnel packets survive.
+whether client-to-server tunnel packets survive. TCP dials to the same server
+port are dropped during this sample so fallback cannot hide UDP loss.
 
 The script records Linux `ping` packet loss for both cases and requires:
 
@@ -45,7 +55,7 @@ fec_on_loss < fec_off_loss
 ## Expected Result
 
 With `fec=false`, observed tunnel loss should roughly track the injected
-client-to-server underlay loss.
+client-to-server UDP tunnel loss.
 
 With `fec=true`, observed tunnel loss should be lower because the current 4+1
 SLC profile sends one REPAIR frame for every four DATA frames. A single missing
@@ -73,7 +83,8 @@ it is not a retransmission protocol and does not guarantee delivery.
 This is a functional weak-network smoke test, not a rigorous benchmark.
 `tc netem` random loss and `ping` sampling can vary between runs. If the FEC
 case does not beat the non-FEC case, inspect the ping logs in the script's
-printed work directory and rerun before drawing a performance conclusion.
+printed work directory plus the `${case}.multipath.log` protocol trace, then
+rerun before drawing a performance conclusion.
 
 For a real benchmark, run multiple samples per case and record:
 

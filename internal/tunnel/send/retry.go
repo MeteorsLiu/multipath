@@ -5,6 +5,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/MeteorsLiu/multipath/internal/debuglog"
 	"github.com/MeteorsLiu/multipath/internal/transport"
 )
 
@@ -54,10 +55,12 @@ func (l *Send) retryPendingHELLO(ctx context.Context, nowMS uint64) error {
 		retry := &lane.helloRetry
 		if retry.startedMS == 0 {
 			retry.startedMS = nowMS
+			debuglog.Printf("send/retry", "hello_retry_start session=%d lane=%d nonce=%d leg={%s}", key.sessionID, key.laneID, retry.nonce, debugLeg(retry.leg))
 		}
 		if l.probeTimeout > 0 && elapsedMS(nowMS, retry.startedMS) >= l.probeTimeout {
 			leg := retry.leg
 			retry.clear()
+			debuglog.Printf("send/retry", "hello_retry_timeout session=%d lane=%d leg={%s}", key.sessionID, key.laneID, debugLeg(leg))
 			switch leg.Kind {
 			case transport.KindUDP:
 				lane.udpReady = false
@@ -76,11 +79,14 @@ func (l *Send) retryPendingHELLO(ctx context.Context, nowMS uint64) error {
 		}
 		if err := l.writePayloadOnLeg(ctx, retry.leg, retry.payload); err != nil {
 			if errors.Is(err, errLaneUnavailable) {
+				debuglog.Printf("send/retry", "hello_retry_lane_unavailable session=%d lane=%d nonce=%d leg={%s}", key.sessionID, key.laneID, retry.nonce, debugLeg(retry.leg))
 				continue
 			}
+			debuglog.Printf("send/retry", "hello_retry_send_err session=%d lane=%d nonce=%d leg={%s} err=%v", key.sessionID, key.laneID, retry.nonce, debugLeg(retry.leg), err)
 			return err
 		}
 		retry.lastSentMS = nowMS
+		debuglog.Printf("send/retry", "hello_retry_send session=%d lane=%d nonce=%d leg={%s} bytes=%d", key.sessionID, key.laneID, retry.nonce, debugLeg(retry.leg), len(retry.payload))
 	}
 	return nil
 }

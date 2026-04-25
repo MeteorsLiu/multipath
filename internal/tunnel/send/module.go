@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/MeteorsLiu/multipath/internal/debuglog"
 	"github.com/MeteorsLiu/multipath/internal/packetbuf"
 	"github.com/MeteorsLiu/multipath/internal/protocol"
 	"github.com/MeteorsLiu/multipath/internal/scheduler"
@@ -76,9 +77,11 @@ func (l *Send) Packets() <-chan transport.Payload {
 
 func (l *Send) bootstrapLocked(ctx context.Context) error {
 	if l.bootstrapped {
+		debuglog.Printf("send", "bootstrap_skip already_bootstrapped")
 		return nil
 	}
 	l.bootstrapped = true
+	debuglog.Printf("send", "bootstrap lanes=%d", len(l.bootstrapLanes))
 
 	for _, lane := range l.bootstrapLanes {
 		nonce := lane.Nonce
@@ -92,6 +95,7 @@ func (l *Send) bootstrapLocked(ctx context.Context) error {
 			caps |= protocol.CapFEC
 			fecProfile = protocol.FECProfileSLC4Plus1
 		}
+		debuglog.Printf("send", "bootstrap_lane session=%d lane=%d weight=%d leg={%s} tcp_remote=%s nonce=%d caps=%#x fec_profile=%d", lane.SessionID, lane.LaneID, lane.Weight, debugLeg(lane.Leg), lane.TCPRemote, nonce, caps, fecProfile)
 		if err := l.startLane(ctx, startLaneConfig{
 			SessionID:  lane.SessionID,
 			LaneID:     lane.LaneID,
@@ -102,6 +106,7 @@ func (l *Send) bootstrapLocked(ctx context.Context) error {
 			Caps:       caps,
 			FECProfile: fecProfile,
 		}); err != nil {
+			debuglog.Printf("send", "bootstrap_lane_err session=%d lane=%d err=%v", lane.SessionID, lane.LaneID, err)
 			return err
 		}
 	}
@@ -147,6 +152,7 @@ func (l *Send) enqueueLane(sessionID uint64, lane *laneRuntime) error {
 		return err
 	}
 	lane.queued = true
+	debuglog.Printf("send", "lane_enqueue session=%d lane=%d weight=%d", sessionID, lane.id, lane.weight)
 	return nil
 }
 
@@ -173,15 +179,18 @@ func (l *Send) enqueuePayload(ctx context.Context, leg transport.LegRef, payload
 	packet := packetbuf.Acquire(len(payload))
 	copy(packet.Payload, payload)
 	packet.SetLen(len(payload))
+	debuglog.Printf("send", "enqueue_payload leg={%s} bytes=%d", debugLeg(leg), len(payload))
 	return l.WriteTo(ctx, leg, packet)
 }
 
 func (l *Send) enqueueFrame(ctx context.Context, leg transport.LegRef, frame protocol.Frame) (int, error) {
 	packet, err := l.encodePacket(frame)
 	if err != nil {
+		debuglog.Printf("send", "enqueue_frame_encode_err frame=%s err=%v", debugFrameSummary(frame), err)
 		return 0, err
 	}
 	size := len(packet.Payload)
+	debuglog.Printf("send", "enqueue_frame frame=%s leg={%s} bytes=%d", debugFrameSummary(frame), debugLeg(leg), size)
 	return size, l.WriteTo(ctx, leg, packet)
 }
 
