@@ -173,6 +173,9 @@ setup_netns() {
   ip netns exec "${NS_N}" iptables -t nat -A POSTROUTING \
     -s "${NAT_CLIENT_SUBNET}" -d "${NAT_SERVER_SUBNET}" -o "${VETHNS}" \
     -j SNAT --to-source "${NAT_ROUTER_SERVER_IP}"
+
+  echo "real e2e namespaces: client=${NS_C} server=${NS_S} nat=${NS_N}"
+  echo "real e2e nat: client_dev=${VETHCN} router_client_dev=${VETHNC} router_server_dev=${VETHNS} server_dev=${VETHSN}"
 }
 
 write_two_lane_config() {
