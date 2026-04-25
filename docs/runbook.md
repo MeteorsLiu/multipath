@@ -141,10 +141,15 @@ scripts/e2e.sh
 The real E2E builds the current binary, creates two Linux network namespaces,
 connects them with two veth paths, starts client/server with real TUN devices,
 and runs protocol-level cases for multipath scheduling, legacy `tcp` flag
-compatibility, UDP-to-TCP fallback, and FEC. It requires Linux, `go`, root
-privileges, `ip`, `tc`, and `ping`. Run it as a regular user when possible; the
-script builds the binary before escalating for network namespace setup. `iperf3`
-and `timeout` enable an optional throughput smoke.
+compatibility, UDP-to-TCP fallback, NAT traversal, and FEC. It requires Linux,
+`go`, root privileges, `ip`, `tc`, `ping`, and `iptables`. Run it as a regular
+user when possible; the script builds the binary before escalating for network
+namespace setup. `iperf3` and `timeout` enable an optional throughput smoke.
+
+The NAT case adds a router namespace between the client and server namespaces,
+enables IPv4 forwarding, and SNATs the client-side underlay subnet toward the
+server. TCP fallback is blocked in that case, so a passing TUN ping proves the
+UDP leg works through NAT/conntrack.
 
 The FEC comparison runs the same one-lane scenario with `fec=false` and
 `fec=true` under 20% client-to-server UDP tunnel loss while TCP fallback is

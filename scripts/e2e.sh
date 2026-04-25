@@ -43,16 +43,22 @@ echo "real e2e workdir: ${WORKDIR}"
 SUFFIX="$$"
 NS_C="mp_c_${SUFFIX}"
 NS_S="mp_s_${SUFFIX}"
+NS_N="mp_n_${SUFFIX}"
 
 VETHC1="mpc1_${SUFFIX}"
 VETHS1="mps1_${SUFFIX}"
 VETHC2="mpc2_${SUFFIX}"
 VETHS2="mps2_${SUFFIX}"
+VETHCN="mpcn_${SUFFIX}"
+VETHNC="mpnc_${SUFFIX}"
+VETHNS="mpns_${SUFFIX}"
+VETHSN="mpsn_${SUFFIX}"
 
 PORT_MULTIPATH=5001
 PORT_LEGACY=5002
 PORT_FALLBACK=5003
 PORT_FEC=5004
+PORT_NAT=5005
 
 PATH1_C="10.201.1.1/24"
 PATH1_S="10.201.1.2/24"
@@ -60,6 +66,16 @@ PATH2_C="10.201.2.1/24"
 PATH2_S="10.201.2.2/24"
 PATH1_REMOTE="10.201.1.2"
 PATH2_REMOTE="10.201.2.2"
+
+NAT_CLIENT_ADDR="10.202.1.2/24"
+NAT_ROUTER_CLIENT_ADDR="10.202.1.1/24"
+NAT_ROUTER_SERVER_ADDR="10.202.2.1/24"
+NAT_SERVER_ADDR="10.202.2.2/24"
+NAT_CLIENT_SUBNET="10.202.1.0/24"
+NAT_SERVER_SUBNET="10.202.2.0/24"
+NAT_CLIENT_GW="10.202.1.1"
+NAT_ROUTER_SERVER_IP="10.202.2.1"
+NAT_SERVER_REMOTE="10.202.2.2"
 
 TUN_C_LOCAL="172.31.0.1"
 TUN_S_LOCAL="172.31.0.2"
@@ -85,6 +101,7 @@ cleanup() {
   fi
   ip netns del "${NS_C}" >/dev/null 2>&1 || true
   ip netns del "${NS_S}" >/dev/null 2>&1 || true
+  ip netns del "${NS_N}" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -92,6 +109,7 @@ build_bin() {
   require_command ip
   require_command tc
   require_command ping
+  require_command iptables
 
   if [[ "${PREBUILT_BIN}" == "1" ]]; then
     if [[ ! -x "${BIN}" ]]; then
@@ -108,29 +126,53 @@ build_bin() {
 setup_netns() {
   ip netns del "${NS_C}" >/dev/null 2>&1 || true
   ip netns del "${NS_S}" >/dev/null 2>&1 || true
+  ip netns del "${NS_N}" >/dev/null 2>&1 || true
 
   ip netns add "${NS_C}"
   ip netns add "${NS_S}"
+  ip netns add "${NS_N}"
 
   ip link add "${VETHC1}" type veth peer name "${VETHS1}"
   ip link add "${VETHC2}" type veth peer name "${VETHS2}"
+  ip link add "${VETHCN}" type veth peer name "${VETHNC}"
+  ip link add "${VETHNS}" type veth peer name "${VETHSN}"
 
   ip link set "${VETHC1}" netns "${NS_C}"
   ip link set "${VETHS1}" netns "${NS_S}"
   ip link set "${VETHC2}" netns "${NS_C}"
   ip link set "${VETHS2}" netns "${NS_S}"
+  ip link set "${VETHCN}" netns "${NS_C}"
+  ip link set "${VETHNC}" netns "${NS_N}"
+  ip link set "${VETHNS}" netns "${NS_N}"
+  ip link set "${VETHSN}" netns "${NS_S}"
 
   ip netns exec "${NS_C}" ip addr add "${PATH1_C}" dev "${VETHC1}"
   ip netns exec "${NS_S}" ip addr add "${PATH1_S}" dev "${VETHS1}"
   ip netns exec "${NS_C}" ip addr add "${PATH2_C}" dev "${VETHC2}"
   ip netns exec "${NS_S}" ip addr add "${PATH2_S}" dev "${VETHS2}"
+  ip netns exec "${NS_C}" ip addr add "${NAT_CLIENT_ADDR}" dev "${VETHCN}"
+  ip netns exec "${NS_N}" ip addr add "${NAT_ROUTER_CLIENT_ADDR}" dev "${VETHNC}"
+  ip netns exec "${NS_N}" ip addr add "${NAT_ROUTER_SERVER_ADDR}" dev "${VETHNS}"
+  ip netns exec "${NS_S}" ip addr add "${NAT_SERVER_ADDR}" dev "${VETHSN}"
 
   ip netns exec "${NS_C}" ip link set lo up
   ip netns exec "${NS_S}" ip link set lo up
+  ip netns exec "${NS_N}" ip link set lo up
   ip netns exec "${NS_C}" ip link set "${VETHC1}" up
   ip netns exec "${NS_C}" ip link set "${VETHC2}" up
   ip netns exec "${NS_S}" ip link set "${VETHS1}" up
   ip netns exec "${NS_S}" ip link set "${VETHS2}" up
+  ip netns exec "${NS_C}" ip link set "${VETHCN}" up
+  ip netns exec "${NS_N}" ip link set "${VETHNC}" up
+  ip netns exec "${NS_N}" ip link set "${VETHNS}" up
+  ip netns exec "${NS_S}" ip link set "${VETHSN}" up
+
+  ip netns exec "${NS_C}" ip route add "${NAT_SERVER_SUBNET}" via "${NAT_CLIENT_GW}" dev "${VETHCN}"
+  ip netns exec "${NS_N}" sh -c 'echo 1 > /proc/sys/net/ipv4/ip_forward'
+  ip netns exec "${NS_N}" iptables -P FORWARD ACCEPT
+  ip netns exec "${NS_N}" iptables -t nat -A POSTROUTING \
+    -s "${NAT_CLIENT_SUBNET}" -d "${NAT_SERVER_SUBNET}" -o "${VETHNS}" \
+    -j SNAT --to-source "${NAT_ROUTER_SERVER_IP}"
 }
 
 write_two_lane_config() {
@@ -216,6 +258,48 @@ EOF
     "allowedIPs": ["${TUN_C_REMOTE}/32"]
   },
   "fec": ${fec_flag},
+  "probeIntervalMS": ${probe_interval_ms},
+  "probeTimeoutMS": ${probe_timeout_ms}
+}
+EOF
+}
+
+write_nat_config() {
+  local name="$1"
+  local port="$2"
+  local probe_interval_ms="${3:-200}"
+  local probe_timeout_ms="${4:-600}"
+
+  cat >"${WORKDIR}/server-${name}.json" <<EOF
+{
+  "isServer": true,
+  "tcp": false,
+  "server": { "listen": "0.0.0.0:${port}" },
+  "tun": {
+    "localAddr": "${TUN_S_LOCAL}",
+    "remoteAddr": "${TUN_S_REMOTE}",
+    "allowedIPs": ["${TUN_S_REMOTE}/32"]
+  },
+  "fec": false,
+  "probeIntervalMS": ${probe_interval_ms},
+  "probeTimeoutMS": ${probe_timeout_ms}
+}
+EOF
+
+  cat >"${WORKDIR}/client-${name}.json" <<EOF
+{
+  "tcp": false,
+  "client": {
+    "remotePaths": [
+      { "remoteAddr": "${NAT_SERVER_REMOTE}:${port}", "weight": 1 }
+    ]
+  },
+  "tun": {
+    "localAddr": "${TUN_C_LOCAL}",
+    "remoteAddr": "${TUN_C_REMOTE}",
+    "allowedIPs": ["${TUN_C_REMOTE}/32"]
+  },
+  "fec": false,
   "probeIntervalMS": ${probe_interval_ms},
   "probeTimeoutMS": ${probe_timeout_ms}
 }
@@ -346,8 +430,12 @@ stop_multipath() {
 clear_loss() {
   ip netns exec "${NS_C}" tc qdisc del dev "${VETHC1}" root >/dev/null 2>&1 || true
   ip netns exec "${NS_C}" tc qdisc del dev "${VETHC2}" root >/dev/null 2>&1 || true
+  ip netns exec "${NS_C}" tc qdisc del dev "${VETHCN}" root >/dev/null 2>&1 || true
   ip netns exec "${NS_S}" tc qdisc del dev "${VETHS1}" root >/dev/null 2>&1 || true
   ip netns exec "${NS_S}" tc qdisc del dev "${VETHS2}" root >/dev/null 2>&1 || true
+  ip netns exec "${NS_S}" tc qdisc del dev "${VETHSN}" root >/dev/null 2>&1 || true
+  ip netns exec "${NS_N}" tc qdisc del dev "${VETHNC}" root >/dev/null 2>&1 || true
+  ip netns exec "${NS_N}" tc qdisc del dev "${VETHNS}" root >/dev/null 2>&1 || true
 }
 
 setup_prio_qdisc() {
@@ -465,6 +553,13 @@ apply_tcp_tunnel_block_path1() {
   add_port_filter "${NS_S}" "${VETHS1}" 1 tcp sport "${port}" 3
 }
 
+apply_nat_tcp_block() {
+  local port="$1"
+  setup_prio_qdisc "${NS_C}" "${VETHCN}"
+  add_loss_band "${NS_C}" "${VETHCN}" 3 30 100%
+  add_port_filter "${NS_C}" "${VETHCN}" 1 tcp dport "${port}" 3
+}
+
 apply_fec_loss() {
   local port="$1"
   setup_prio_qdisc "${NS_C}" "${VETHC1}"
@@ -569,6 +664,22 @@ run_fallback_case() {
 
   clear_loss
   wait_ping_ok "${name} final-clean" 12
+  stop_multipath
+  clear_loss
+  echo "==== ${name} e2e end ===="
+}
+
+run_nat_case() {
+  local name="nat"
+  echo "==== ${name} e2e start ===="
+  clear_loss
+  write_nat_config "${name}" "${PORT_NAT}" 200 600
+
+  echo "[${name}] block TCP fallback; UDP must traverse SNAT and conntrack"
+  apply_nat_tcp_block "${PORT_NAT}"
+  start_multipath "${name}"
+  wait_ping_ok "${name} udp-through-snat" 15
+
   stop_multipath
   clear_loss
   echo "==== ${name} e2e end ===="
@@ -702,6 +813,7 @@ setup_netns
 run_multipath_case
 run_legacy_tcp_flag_case
 run_fallback_case
+run_nat_case
 run_fec_comparison
 
 if [[ "${FAIL_COUNT}" -gt 0 ]]; then

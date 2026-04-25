@@ -10,6 +10,7 @@ and how to interpret its results.
 | Multipath | two UDP-first lanes over two veth paths | path1 100% loss, path2 100% loss, both paths 100% loss, recovery | scheduler keeps traffic alive while at least one lane works and fails closed when no lane works |
 | Legacy TCP flag | two UDP-first lanes with legacy `tcp: true` config | client TCP dials to the server port are dropped, then path2 is dropped | old configs still parse, but `tcp: true` no longer forces TCP-only bootstrap |
 | Fallback | one UDP-first lane over one veth path | UDP tunnel traffic is dropped while TCP is clean, then TCP traffic is dropped after UDP is restored | a lane falls back to TCP when UDP fails and recovers back to UDP |
+| NAT | client namespace behind a router namespace doing SNAT to the server namespace | TCP fallback is blocked | UDP HELLO/ACK, DATA, and probes work through NAT/conntrack using observed source addresses |
 | FEC weak-net comparison | one UDP-first lane over one veth path | 20% client-to-server UDP tunnel loss with TCP fallback blocked | `fec=true` reduces observed tunnel packet loss versus `fec=false` |
 | FEC high-RTT weak-net comparison | one UDP-first lane over one veth path | 20% client-to-server UDP tunnel loss, added UDP tunnel delay in both directions, TCP fallback blocked | FEC loss reduction still holds while ping RTT shows recovery-delay impact |
 
@@ -17,6 +18,20 @@ The FEC comparison intentionally uses one lane. Multipath failover would hide
 some losses and make it harder to isolate the FEC signal. TCP fallback is also
 blocked during the weak-net sample so the comparison measures FEC rather than
 transport fallback.
+
+## NAT Method
+
+The NAT case adds a router namespace between the client and server namespaces:
+
+```text
+client namespace -> NAT namespace -> server namespace
+```
+
+The NAT namespace enables IPv4 forwarding and SNATs the client-side underlay
+subnet to the NAT namespace's server-facing address. The client dials the
+server-facing underlay address, and TCP fallback is blocked on the client side.
+Passing ping over the TUN proves that UDP session setup and data forwarding work
+through conntrack, including server replies to the observed UDP source address.
 
 ## FEC Comparison Method
 
