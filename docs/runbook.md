@@ -150,7 +150,9 @@ The FEC comparison runs the same one-lane scenario with `fec=false` and
 `fec=true` under 20% client-to-server UDP tunnel loss while TCP fallback is
 blocked. The script prints both observed ping packet-loss values and requires the
 FEC case to be lower. See `docs/e2e-evaluation.md` for interpretation and
-limits.
+limits. By default each FEC sample sends 1000 ping packets at 20ms intervals;
+override `MULTIPATH_REAL_E2E_FEC_PING_COUNT` or
+`MULTIPATH_REAL_E2E_FEC_PING_INTERVAL` for faster local smoke runs.
 
 The script starts client and server with `MULTIPATH_DEBUG=1` by default, so each
 case writes verbose protocol, transport, probe, fallback, and FEC traces to the

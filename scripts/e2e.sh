@@ -11,6 +11,8 @@ WORKDIR="${MULTIPATH_REAL_E2E_WORKDIR:-$(mktemp -d)}"
 BIN="${MULTIPATH_REAL_E2E_BIN:-${WORKDIR}/multipath}"
 PREBUILT_BIN="${MULTIPATH_REAL_E2E_PREBUILT_BIN:-0}"
 REAL_E2E_DEBUG="${MULTIPATH_REAL_E2E_DEBUG:-1}"
+FEC_PING_COUNT="${MULTIPATH_REAL_E2E_FEC_PING_COUNT:-1000}"
+FEC_PING_INTERVAL="${MULTIPATH_REAL_E2E_FEC_PING_INTERVAL:-0.02}"
 
 require_command() {
   local cmd="$1"
@@ -29,6 +31,8 @@ if [[ ${EUID:-0} -ne 0 ]]; then
     MULTIPATH_REAL_E2E_BIN="${BIN}" \
     MULTIPATH_REAL_E2E_PREBUILT_BIN=1 \
     MULTIPATH_REAL_E2E_DEBUG="${REAL_E2E_DEBUG}" \
+    MULTIPATH_REAL_E2E_FEC_PING_COUNT="${FEC_PING_COUNT}" \
+    MULTIPATH_REAL_E2E_FEC_PING_INTERVAL="${FEC_PING_INTERVAL}" \
     bash "$0" "$@"
 fi
 
@@ -534,9 +538,10 @@ run_fallback_case() {
 
 run_ping_sample() {
   local label="$1"
-  local count=160
-  local interval=0.03
+  local count="${FEC_PING_COUNT}"
+  local interval="${FEC_PING_INTERVAL}"
   local output
+  echo "[${label}] ping sample: count=${count} interval=${interval}s"
   output="$(ip netns exec "${NS_C}" ping -c "${count}" -i "${interval}" -W 1 "${TUN_C_REMOTE}" 2>&1 || true)"
   echo "${output}" >"${WORKDIR}/${label}.ping.log"
   echo "[${label}] ping log: ${WORKDIR}/${label}.ping.log"

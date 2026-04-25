@@ -46,7 +46,11 @@ arrives. The return path is left clean so the measured ping loss mainly reflects
 whether client-to-server tunnel packets survive. TCP dials to the same server
 port are dropped during this sample so fallback cannot hide UDP loss.
 
-The script records Linux `ping` packet loss for both cases and requires:
+The script records Linux `ping` packet loss for both cases. The default sample
+is 1000 packets at 20ms intervals to reduce random `tc netem` variance. The
+count and interval can be overridden with
+`MULTIPATH_REAL_E2E_FEC_PING_COUNT` and
+`MULTIPATH_REAL_E2E_FEC_PING_INTERVAL`. The pass condition requires:
 
 ```text
 fec_on_loss < fec_off_loss
