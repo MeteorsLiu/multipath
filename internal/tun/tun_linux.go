@@ -1,299 +1,80 @@
-/* SPDX-License-Identifier: MIT
- *
- * Copyright (C) 2017-2023 WireGuard LLC. All Rights Reserved.
- * Copyright (C) 2025 MeteorsLiu. All Rights Reserved.
- */
+//go:build linux
 
 package tun
 
-/* Implementation of the TUN device interface for linux
- */
-
 import (
 	"fmt"
-	"io"
 	"os"
-	"sync"
-	"syscall"
-	"unsafe"
+	"strconv"
 
-	"github.com/MeteorsLiu/multipath/internal/conn"
-	"github.com/MeteorsLiu/multipath/internal/conn/batch"
-	"github.com/MeteorsLiu/multipath/internal/conn/protocol/ip"
 	"golang.org/x/sys/unix"
 )
 
-type tunDevice struct {
-	tunFile     *os.File
-	vnetHdr     bool
-	udpGSO      bool
-	tcpGROTable *tcpGROTable
-	udpGROTable *udpGROTable
+const linuxCloneDevicePath = "/dev/net/tun"
 
-	nameOnce  sync.Once // guards calling initNameCache, which sets following fields
-	nameCache string    // name of interface
-	nameErr   error
-
-	fallbackReader conn.BatchReader
-	fallbackWriter conn.BatchWriter
-}
-
-const (
-	cloneDevicePath = "/dev/net/tun"
-	ifReqSize       = unix.IFNAMSIZ + 64
-)
-
-func (tun *tunDevice) File() *os.File {
-	return tun.tunFile
-}
-
-func (tun *tunDevice) setMTU(n int) error {
-	name, err := tun.Name()
+func Open(name string, mtu int) (*Device, error) {
+	fd, err := unix.Open(linuxCloneDevicePath, unix.O_RDWR|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return err
-	}
-
-	// open datagram socket
-	fd, err := unix.Socket(
-		unix.AF_INET,
-		unix.SOCK_DGRAM|unix.SOCK_CLOEXEC,
-		0,
-	)
-	if err != nil {
-		return err
-	}
-
-	defer unix.Close(fd)
-
-	// do ioctl call
-	var ifr [ifReqSize]byte
-	copy(ifr[:], name)
-	*(*uint32)(unsafe.Pointer(&ifr[unix.IFNAMSIZ])) = uint32(n)
-	_, _, errno := unix.Syscall(
-		unix.SYS_IOCTL,
-		uintptr(fd),
-		uintptr(unix.SIOCSIFMTU),
-		uintptr(unsafe.Pointer(&ifr[0])),
-	)
-
-	if errno != 0 {
-		return fmt.Errorf("failed to set MTU of TUN device: %w", errno)
-	}
-
-	return nil
-}
-
-func (tun *tunDevice) MTU() (int, error) {
-	name, err := tun.Name()
-	if err != nil {
-		return 0, err
-	}
-
-	// open datagram socket
-	fd, err := unix.Socket(
-		unix.AF_INET,
-		unix.SOCK_DGRAM|unix.SOCK_CLOEXEC,
-		0,
-	)
-	if err != nil {
-		return 0, err
-	}
-
-	defer unix.Close(fd)
-
-	// do ioctl call
-
-	var ifr [ifReqSize]byte
-	copy(ifr[:], name)
-	_, _, errno := unix.Syscall(
-		unix.SYS_IOCTL,
-		uintptr(fd),
-		uintptr(unix.SIOCGIFMTU),
-		uintptr(unsafe.Pointer(&ifr[0])),
-	)
-	if errno != 0 {
-		return 0, fmt.Errorf("failed to get MTU of TUN device: %w", errno)
-	}
-
-	return int(*(*int32)(unsafe.Pointer(&ifr[unix.IFNAMSIZ]))), nil
-}
-
-func (tun *tunDevice) Name() (string, error) {
-	tun.nameOnce.Do(tun.initNameCache)
-	return tun.nameCache, tun.nameErr
-}
-
-func (tun *tunDevice) initNameCache() {
-	tun.nameCache, tun.nameErr = tun.nameSlow()
-}
-
-func (tun *tunDevice) nameSlow() (string, error) {
-	sysconn, err := tun.tunFile.SyscallConn()
-	if err != nil {
-		return "", err
-	}
-	var ifr [ifReqSize]byte
-	var errno syscall.Errno
-	err = sysconn.Control(func(fd uintptr) {
-		_, _, errno = unix.Syscall(
-			unix.SYS_IOCTL,
-			fd,
-			uintptr(unix.TUNGETIFF),
-			uintptr(unsafe.Pointer(&ifr[0])),
-		)
-	})
-	if err != nil {
-		return "", fmt.Errorf("failed to get name of TUN device: %w", err)
-	}
-	if errno != 0 {
-		return "", fmt.Errorf("failed to get name of TUN device: %w", errno)
-	}
-	return unix.ByteSliceToString(ifr[:]), nil
-}
-
-// TODO: GRO Support
-
-func (tun *tunDevice) Write(buf []byte) (int, error) {
-	return tun.tunFile.Write(buf)
-}
-
-func (tun *tunDevice) Read(buf []byte) (int, error) {
-	n, err := tun.tunFile.Read(buf)
-	if err != nil {
-		return 0, err
-	}
-	if n < 20 {
-		_, err := io.ReadFull(tun.tunFile, buf[n:20])
-		if err != nil {
-			return 0, err
-		}
-		n = 20
-	}
-	fullSize, err := ip.Header(buf).Size()
-	if err != nil {
-		return 0, err
-	}
-	if n < int(fullSize) {
-		fmt.Println("small")
-		_, err := io.ReadFull(tun.tunFile, buf[n:fullSize])
-		if err != nil {
-			return 0, err
-		}
-		n = int(fullSize)
-	}
-	return n, err
-}
-
-// TODO: GRO Support
-func (tun *tunDevice) ReadBatch(bufs [][]byte) (int, int64, error) {
-	return tun.fallbackReader.ReadBatch(bufs)
-}
-
-func (tun *tunDevice) Close() error {
-	return tun.tunFile.Close()
-}
-
-const (
-	// TODO: support TSO with ECN bits
-	tunTCPOffloads = unix.TUN_F_CSUM | unix.TUN_F_TSO4 | unix.TUN_F_TSO6
-	tunUDPOffloads = unix.TUN_F_USO4 | unix.TUN_F_USO6
-)
-
-func (tun *tunDevice) initFromFlags(name string) error {
-	sc, err := tun.tunFile.SyscallConn()
-	if err != nil {
-		return err
-	}
-	if e := sc.Control(func(fd uintptr) {
-		var (
-			ifr *unix.Ifreq
-		)
-		ifr, err = unix.NewIfreq(name)
-		if err != nil {
-			return
-		}
-		err = unix.IoctlIfreq(int(fd), unix.TUNGETIFF, ifr)
-		if err != nil {
-			return
-		}
-		got := ifr.Uint16()
-		if got&unix.IFF_VNET_HDR != 0 {
-			// tunTCPOffloads were added in Linux v2.6. We require their support
-			// if IFF_VNET_HDR is set.
-			err = unix.IoctlSetInt(int(fd), unix.TUNSETOFFLOAD, tunTCPOffloads)
-			if err != nil {
-				return
-			}
-			tun.vnetHdr = true
-			// tunUDPOffloads were added in Linux v6.2. We do not return an
-			// error if they are unsupported at runtime.
-			tun.udpGSO = unix.IoctlSetInt(int(fd), unix.TUNSETOFFLOAD, tunTCPOffloads|tunUDPOffloads) == nil
-		}
-	}); e != nil {
-		return e
-	}
-	return err
-}
-
-// CreateTUN creates a Device with the provided name and MTU.
-func CreateTUN(name string, mtu int) (OSTun, error) {
-	nfd, err := unix.Open(cloneDevicePath, unix.O_RDWR|unix.O_CLOEXEC, 0)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("CreateTUN(%q) failed; %s does not exist", name, cloneDevicePath)
-		}
 		return nil, err
 	}
 
 	ifr, err := unix.NewIfreq(name)
 	if err != nil {
+		_ = unix.Close(fd)
 		return nil, err
 	}
-
 	ifr.SetUint16(unix.IFF_TUN | unix.IFF_NO_PI)
-	err = unix.IoctlIfreq(nfd, unix.TUNSETIFF, ifr)
-	if err != nil {
+	if err := unix.IoctlIfreq(fd, unix.TUNSETIFF, ifr); err != nil {
+		_ = unix.Close(fd)
 		return nil, err
 	}
 
-	err = unix.SetNonblock(nfd, true)
-	if err != nil {
-		unix.Close(nfd)
+	if err := unix.SetNonblock(fd, false); err != nil {
+		_ = unix.Close(fd)
 		return nil, err
 	}
 
-	// Note that the above -- open,ioctl,nonblock -- must happen prior to handing it to netpoll as below this line.
-
-	fd := os.NewFile(uintptr(nfd), cloneDevicePath)
-	return CreateTUNFromFile(fd, mtu)
+	file := os.NewFile(uintptr(fd), linuxCloneDevicePath)
+	device := newDevice(file, mtu, ifr.Name())
+	if mtu > 0 {
+		if err := Configure(device.Name(), "", "", mtu); err != nil {
+			_ = device.Close()
+			return nil, err
+		}
+	}
+	return device, nil
 }
 
-// CreateTUNFromFile creates a Device from an os.File with the provided MTU.
-func CreateTUNFromFile(file *os.File, mtu int) (OSTun, error) {
-	sc, err := file.SyscallConn()
-	if err != nil {
-		return nil, err
+func Configure(name string, localAddr string, remoteAddr string, mtu int) error {
+	if name == "" {
+		return nil
 	}
-	tun := &tunDevice{
-		tunFile:        file,
-		fallbackReader: batch.NewReader(sc),
-		fallbackWriter: batch.NewWriter(sc),
+	if localAddr != "" {
+		args := []string{"addr", "add", localAddr}
+		if remoteAddr != "" {
+			args = append(args, "peer", remoteAddr)
+		}
+		args = append(args, "dev", name)
+		if err := runCommand("ip", args...); err != nil {
+			return fmt.Errorf("configure address for %s: %w", name, err)
+		}
 	}
-
-	// name, err := tun.Name()
-	// if err != nil {
-	// 	return nil, err
-	// }
-
-	// err = tun.initFromFlags(name)
-	// if err != nil {
-	// 	return nil, err
-	// }
-
-	err = tun.setMTU(mtu)
-	if err != nil {
-		return nil, err
+	if mtu > 0 {
+		if err := runCommand("ip", "link", "set", "dev", name, "mtu", strconv.Itoa(mtu)); err != nil {
+			return fmt.Errorf("set mtu for %s: %w", name, err)
+		}
 	}
+	return runCommand("ip", "link", "set", "dev", name, "up")
+}
 
-	return tun, nil
+func configureRoutes(name string, allowedIPs []string) error {
+	for _, cidr := range allowedIPs {
+		if cidr == "" {
+			continue
+		}
+		if err := runCommand("ip", "route", "replace", cidr, "dev", name); err != nil {
+			return fmt.Errorf("route %s via %s: %w", cidr, name, err)
+		}
+	}
+	return nil
 }

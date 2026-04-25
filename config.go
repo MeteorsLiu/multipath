@@ -3,53 +3,89 @@ package main
 import (
 	"encoding/json"
 	"os"
+	"time"
 )
 
-type Path struct {
+const (
+	defaultTunMTU        = 1440
+	defaultPromListen    = "127.0.0.1:0"
+	defaultProbeInterval = 1 * time.Second
+	defaultProbeTimeout  = 3 * time.Second
+)
+
+type PathConfig struct {
 	RemoteAddr string `json:"remoteAddr"`
 	Weight     int    `json:"weight"`
 }
 
-type Client struct {
-	Remotes []Path `json:"remotePaths"`
+type ClientConfig struct {
+	RemotePaths []PathConfig `json:"remotePaths"`
 }
 
-type Server struct {
+type ServerConfig struct {
 	ListenAddr string `json:"listen"`
 }
 
-type Tun struct {
+type TunConfig struct {
 	Name       string   `json:"name,omitempty"`
 	LocalAddr  string   `json:"localAddr"`
 	RemoteAddr string   `json:"remoteAddr"`
 	AllowedIPs []string `json:"allowedIPs"`
+	MTU        int      `json:"mtu"`
 }
 
 type Config struct {
-	Client         `json:"client,omitempty"`
-	Server         `json:"server,omitempty"`
-	Tun            `json:"tun"`
-	PromListenAddr string `json:"promListenAddr"`
-	IsTCP          bool   `json:"tcp"`
-	IsServerSide   bool   `json:"isServer"`
+	Client          ClientConfig `json:"client,omitempty"`
+	Server          ServerConfig `json:"server,omitempty"`
+	Tun             TunConfig    `json:"tun"`
+	PromListenAddr  string       `json:"promListenAddr"`
+	IsServerSide    bool         `json:"isServer"`
+	IsTCP           bool         `json:"tcp"`
+	FEC             bool         `json:"fec"`
+	SessionID       uint64       `json:"sessionID"`
+	ProbeIntervalMS int          `json:"probeIntervalMS"`
+	ProbeTimeoutMS  int          `json:"probeTimeoutMS"`
 }
 
-func ParseConfig(configFile string) (cfg Config, err error) {
-	file, err := os.Open(configFile)
+func ParseConfig(path string) (Config, error) {
+	file, err := os.Open(path)
 	if err != nil {
-		return
+		return Config{}, err
 	}
 	defer file.Close()
 
-	err = json.NewDecoder(file).Decode(&cfg)
-	if err != nil {
-		return
+	cfg := Config{FEC: true}
+	if err := json.NewDecoder(file).Decode(&cfg); err != nil {
+		return Config{}, err
 	}
-	if cfg.PromListenAddr == "" {
-		cfg.PromListenAddr = "0.0.0.0:2131"
+	cfg.setDefaults()
+	return cfg, nil
+}
+
+func (c *Config) setDefaults() {
+	if c.Tun.MTU == 0 {
+		c.Tun.MTU = defaultTunMTU
 	}
-	if cfg.Tun.Name == "" {
-		cfg.Tun.Name = "multipath-veth0"
+	if c.PromListenAddr == "" {
+		c.PromListenAddr = defaultPromListen
 	}
-	return
+	if c.ProbeIntervalMS == 0 {
+		c.ProbeIntervalMS = int(defaultProbeInterval / time.Millisecond)
+	}
+	if c.ProbeTimeoutMS == 0 {
+		c.ProbeTimeoutMS = int(defaultProbeTimeout / time.Millisecond)
+	}
+	for i := range c.Client.RemotePaths {
+		if c.Client.RemotePaths[i].Weight <= 0 {
+			c.Client.RemotePaths[i].Weight = 1
+		}
+	}
+}
+
+func (c Config) probeInterval() time.Duration {
+	return time.Duration(c.ProbeIntervalMS) * time.Millisecond
+}
+
+func (c Config) probeTimeout() time.Duration {
+	return time.Duration(c.ProbeTimeoutMS) * time.Millisecond
 }

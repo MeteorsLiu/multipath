@@ -3,36 +3,32 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
 )
 
 func main() {
-	var cfgFile string
-	flag.StringVar(&cfgFile, "config", "", "Config File")
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	configPath := flag.String("config", "", "path to config file")
 	flag.Parse()
+	if *configPath == "" {
+		return fmt.Errorf("missing -config")
+	}
 
-	cfg, err := ParseConfig(cfgFile)
+	cfg, err := ParseConfig(*configPath)
 	if err != nil {
-		panic(err)
+		return err
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
-	var close func()
-	if cfg.IsServerSide {
-		close, err = NewServer(ctx, cfg)
-	} else {
-		close, err = NewClient(ctx, cfg)
-	}
-	if err != nil {
-		panic(err)
-	}
-	defer close()
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
-
-	<-sigCh
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return runWithConfig(ctx, cfg)
 }

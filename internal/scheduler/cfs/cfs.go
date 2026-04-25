@@ -2,126 +2,136 @@ package cfs
 
 import (
 	"container/heap"
-	"fmt"
-	"strings"
-	"sync"
-
-	"github.com/MeteorsLiu/multipath/internal/mempool"
-	"github.com/MeteorsLiu/multipath/internal/prom"
-	"github.com/MeteorsLiu/multipath/internal/scheduler"
-	"github.com/prometheus/client_golang/prometheus"
+	"errors"
+	"math"
 )
 
-type pathHeap []*cfsPath
+const defaultScale = uint64(1024)
 
-func (h pathHeap) Len() int           { return len(h) }
-func (h pathHeap) Less(i, j int) bool { return h[i].virtualSent < h[j].virtualSent }
-func (h pathHeap) Swap(i, j int) {
-	h[i], h[j] = h[j], h[i]
-	h[i].heapIdx = i
-	h[j].heapIdx = j
+var (
+	ErrInvalidWeight = errors.New("cfs: weight must be greater than zero")
+	ErrQueuedLane    = errors.New("cfs: lane already queued")
+)
+
+type Scheduler struct {
+	items map[uint8]*item
+	queue priorityQueue
+	minVR uint64
 }
 
-func (h *pathHeap) Push(x any) {
-	n := len(*h)
-	item := x.(*cfsPath)
-	item.heapIdx = n
-	*h = append(*h, item)
+func New() *Scheduler {
+	return &Scheduler{
+		items: make(map[uint8]*item),
+	}
 }
 
-func (h *pathHeap) Pop() any {
-	old := *h
-	n := len(old)
-	item := old[n-1]
-	old[n-1] = nil    // don't stop the GC from reclaiming the item eventually
-	item.heapIdx = -1 // for safety
-	*h = old[0 : n-1]
-	return item
-}
+func (s *Scheduler) Enqueue(laneID uint8, weight uint32, charge uint32) error {
+	if weight == 0 {
+		return ErrInvalidWeight
+	}
 
-type schedulerImpl struct {
-	mu   sync.Mutex
-	heap pathHeap
-}
-
-func NewCFSScheduler() scheduler.Scheduler {
-	return &schedulerImpl{}
-}
-
-func (s *schedulerImpl) AddPath(path scheduler.SchedulablePath) {
-	fmt.Println("push", path.String())
-
-	prom.ScheConnPool.With(prometheus.Labels{"addr": path.String()}).Inc()
-
-	s.mu.Lock()
-	heap.Push(&s.heap, path)
-	s.mu.Unlock()
-}
-
-func (s *schedulerImpl) RemovePath(path scheduler.SchedulablePath) {
-	fmt.Println("remove", path.String())
-
-	cPath, ok := path.(*cfsPath)
+	it, ok := s.items[laneID]
 	if !ok {
-		panic("invalid path underlying type")
-	}
-
-	prom.ScheConnPool.Delete(prometheus.Labels{"addr": path.String()})
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if cPath.heapIdx < 0 {
-		panic("path has been removed")
-	}
-	heap.Remove(&s.heap, cPath.heapIdx)
-}
-
-func (s *schedulerImpl) findBestPath(n int) (mempool.Writer, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.heap.Len() == 0 {
-		return nil, scheduler.ErrNoPath
-	}
-	for _, bestPath := range s.heap {
-		if w := bestPath.getWriter(); w != nil {
-			if s.heap[0] != bestPath && bestPath.needRebalance.CompareAndSwap(true, false) {
-				minVirtualSent := s.heap[0].virtualSent
-
-				if minVirtualSent > 1500 {
-					minVirtualSent -= 1500 // max allow 1 packet
-				}
-				bestPath.setVirtualSent(minVirtualSent)
-			} else {
-				bestPath.tryWrite(n)
-			}
-
-			heap.Fix(&s.heap, bestPath.heapIdx)
-			return w, nil
+		it = &item{
+			laneID:   laneID,
+			weight:   weight,
+			vruntime: s.minVR,
+			index:    -1,
 		}
+		s.items[laneID] = it
+	}
+	if it.index >= 0 {
+		return ErrQueuedLane
 	}
 
-	return nil, scheduler.ErrNoPath
+	it.weight = weight
+	if it.vruntime < s.minVR {
+		it.vruntime = s.minVR
+	}
+	s.addCharge(it, charge, weight)
+	heap.Push(&s.queue, it)
+	return nil
 }
 
-func (s *schedulerImpl) Write(b *mempool.Buffer) (err error) {
-	path, err := s.findBestPath(b.Len())
-	if err != nil {
+func (s *Scheduler) Dequeue() (uint8, bool) {
+	if len(s.queue) == 0 {
+		return 0, false
+	}
+
+	it := heap.Pop(&s.queue).(*item)
+	s.minVR = it.vruntime
+	return it.laneID, true
+}
+
+func (s *Scheduler) addCharge(it *item, charge uint32, weight uint32) {
+	if charge == 0 {
 		return
 	}
-	return path.Write(b)
+
+	delta := uint64(charge) * defaultScale / uint64(weight)
+	if math.MaxUint64-it.vruntime < delta {
+		s.rebase(s.minVR)
+	}
+	it.vruntime += delta
 }
 
-func (s *schedulerImpl) String() string {
-	var sb strings.Builder
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	for _, p := range s.heap {
-		sb.WriteString(fmt.Sprintf("%s: %d\n", p.addr, p.virtualSent))
+func (s *Scheduler) rebase(base uint64) {
+	if base == 0 {
+		return
 	}
+	for _, it := range s.items {
+		if it.vruntime >= base {
+			it.vruntime -= base
+		} else {
+			it.vruntime = 0
+		}
+	}
+	if s.minVR >= base {
+		s.minVR -= base
+	} else {
+		s.minVR = 0
+	}
+	heap.Init(&s.queue)
+}
 
-	return sb.String()
+type item struct {
+	laneID   uint8
+	weight   uint32
+	vruntime uint64
+	index    int
+}
+
+type priorityQueue []*item
+
+func (q priorityQueue) Len() int {
+	return len(q)
+}
+
+func (q priorityQueue) Less(i, j int) bool {
+	if q[i].vruntime == q[j].vruntime {
+		return q[i].laneID < q[j].laneID
+	}
+	return q[i].vruntime < q[j].vruntime
+}
+
+func (q priorityQueue) Swap(i, j int) {
+	q[i], q[j] = q[j], q[i]
+	q[i].index = i
+	q[j].index = j
+}
+
+func (q *priorityQueue) Push(x any) {
+	it := x.(*item)
+	it.index = len(*q)
+	*q = append(*q, it)
+}
+
+func (q *priorityQueue) Pop() any {
+	old := *q
+	n := len(old)
+	it := old[n-1]
+	old[n-1] = nil
+	it.index = -1
+	*q = old[:n-1]
+	return it
 }
