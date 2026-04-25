@@ -6,13 +6,30 @@ if [[ "$(uname -s)" != "Linux" ]]; then
   exit 1
 fi
 
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+WORKDIR="${MULTIPATH_REAL_E2E_WORKDIR:-$(mktemp -d)}"
+BIN="${MULTIPATH_REAL_E2E_BIN:-${WORKDIR}/multipath}"
+PREBUILT_BIN="${MULTIPATH_REAL_E2E_PREBUILT_BIN:-0}"
+
+require_command() {
+  local cmd="$1"
+  if ! command -v "${cmd}" >/dev/null 2>&1; then
+    echo "missing required command: ${cmd}"
+    exit 1
+  fi
+}
+
 if [[ ${EUID:-0} -ne 0 ]]; then
-  exec sudo -E bash "$0" "$@"
+  require_command go
+  require_command sudo
+  (cd "${ROOT_DIR}" && go build -o "${BIN}" .)
+  exec sudo -E env \
+    MULTIPATH_REAL_E2E_WORKDIR="${WORKDIR}" \
+    MULTIPATH_REAL_E2E_BIN="${BIN}" \
+    MULTIPATH_REAL_E2E_PREBUILT_BIN=1 \
+    bash "$0" "$@"
 fi
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WORKDIR="$(mktemp -d)"
-BIN="${WORKDIR}/multipath"
 echo "real e2e workdir: ${WORKDIR}"
 
 SUFFIX="$$"
@@ -65,20 +82,20 @@ cleanup() {
 }
 trap cleanup EXIT
 
-require_command() {
-  local cmd="$1"
-  if ! command -v "${cmd}" >/dev/null 2>&1; then
-    echo "missing required command: ${cmd}"
-    exit 1
-  fi
-}
-
 build_bin() {
-  require_command go
   require_command ip
   require_command tc
   require_command ping
 
+  if [[ "${PREBUILT_BIN}" == "1" ]]; then
+    if [[ ! -x "${BIN}" ]]; then
+      echo "prebuilt multipath binary missing or not executable: ${BIN}"
+      exit 1
+    fi
+    return 0
+  fi
+
+  require_command go
   (cd "${ROOT_DIR}" && go build -o "${BIN}" .)
 }
 
@@ -113,10 +130,7 @@ setup_netns() {
 write_config() {
   local mode="$1"
   local port="$2"
-  local tcp_flag="false"
-  if [[ "${mode}" == "tcp" ]]; then
-    tcp_flag="true"
-  fi
+  local tcp_flag="${3:-false}"
 
   cat >"${WORKDIR}/server-${mode}.json" <<EOF
 {
@@ -226,12 +240,17 @@ run_iperf_if_available() {
     echo "[${label}] iperf3 not found, skip throughput smoke"
     return 0
   fi
+  if ! command -v timeout >/dev/null 2>&1; then
+    echo "[${label}] timeout not found, skip throughput smoke"
+    return 0
+  fi
 
   ip netns exec "${NS_S}" iperf3 -s -1 -B "${TUN_S_LOCAL}" >/dev/null 2>&1 &
   local iperf_server=$!
   sleep 1
   echo "[${label}] iperf3 over TUN"
-  ip netns exec "${NS_C}" iperf3 -c "${TUN_C_REMOTE}" -t 3 -i 1 || true
+  timeout 8s ip netns exec "${NS_C}" iperf3 -c "${TUN_C_REMOTE}" -t 3 -i 1 || true
+  kill "${iperf_server}" >/dev/null 2>&1 || true
   wait "${iperf_server}" >/dev/null 2>&1 || true
 }
 
@@ -277,9 +296,10 @@ clear_loss() {
 run_mode() {
   local mode="$1"
   local port="$2"
+  local tcp_flag="${3:-false}"
 
   echo "==== ${mode} real e2e start ===="
-  write_config "${mode}" "${port}"
+  write_config "${mode}" "${port}" "${tcp_flag}"
 
   expect_ping_fail "${mode} precheck"
 
@@ -385,8 +405,8 @@ run_fec_comparison() {
 build_bin
 setup_netns
 
-run_mode "udp" "${PORT_UDP}"
-run_mode "tcp" "${PORT_TCP}"
+run_mode "udp" "${PORT_UDP}" "false"
+run_mode "legacy-tcp-flag" "${PORT_TCP}" "true"
 run_fec_comparison
 
 if [[ "${FAIL_COUNT}" -gt 0 ]]; then

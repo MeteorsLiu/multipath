@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -147,13 +146,40 @@ func TestBuildClientRuntime(t *testing.T) {
 	cfg.setDefaults()
 
 	device := tun.NewDevice(&appMemoryTun{}, cfg.Tun.MTU)
-	runtime, closers, err := buildClientRuntime(context.Background(), cfg, device)
+	runtime, closers, err := buildClientRuntime(cfg, device)
 	if err != nil {
 		t.Fatalf("buildClientRuntime failed: %v", err)
 	}
 	defer closeAll(closers)
 	if runtime == nil {
 		t.Fatal("runtime is nil")
+	}
+}
+
+func TestBuildClientRuntimeIgnoresLegacyTCPFlag(t *testing.T) {
+	cfg := Config{
+		IsTCP: true,
+		Client: ClientConfig{
+			RemotePaths: []PathConfig{
+				{RemoteAddr: "127.0.0.1:9000", Weight: 1},
+			},
+		},
+		SessionID: 7,
+	}
+	cfg.setDefaults()
+
+	device := tun.NewDevice(&appMemoryTun{}, cfg.Tun.MTU)
+	runtime, closers, err := buildClientRuntime(cfg, device)
+	if err != nil {
+		t.Fatalf("buildClientRuntime failed: %v", err)
+	}
+	defer closeAll(closers)
+
+	if runtime.packetTransport == nil {
+		t.Fatal("packetTransport is nil when legacy tcp flag is set")
+	}
+	if runtime.streamTransport == nil {
+		t.Fatal("streamTransport is nil when legacy tcp flag is set")
 	}
 }
 

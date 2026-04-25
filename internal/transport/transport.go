@@ -81,6 +81,9 @@ func writePayload(ctx context.Context, payload Payload, packet PacketTransport, 
 			return ErrInvalidLeg
 		}
 		_, err := stream.Write(ctx, payload.Leg.ConnID, payload.Packet.Payload)
+		if errors.Is(err, ErrUnknownConn) || errors.Is(err, net.ErrClosed) {
+			return nil
+		}
 		return err
 	default:
 		return ErrInvalidLeg

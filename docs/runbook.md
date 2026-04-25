@@ -74,7 +74,7 @@ Each `remotePaths` entry becomes one lane. Lane IDs are assigned from `1` in
 configuration order. A lane prefers UDP and may fall back to TCP independently
 of other lanes.
 
-## TCP-Only Client Bootstrap
+## Legacy TCP Flag
 
 ```json
 {
@@ -97,8 +97,9 @@ of other lanes.
 }
 ```
 
-`tcp: true` makes the client bootstrap lanes over TCP. It does not change the
-protocol into a single global TCP tunnel.
+The legacy `tcp` field is accepted so older config files keep parsing, but the
+current protocol ignores it. Client lanes bootstrap over UDP and fall back to TCP
+per lane when UDP becomes unhealthy.
 
 ## Current Defaults
 
@@ -139,9 +140,13 @@ scripts/e2e.sh
 
 The real E2E builds the current binary, creates two Linux network namespaces,
 connects them with two veth paths, starts client/server with real TUN devices,
-checks UDP and TCP bootstrap modes, injects path loss with `tc netem`, verifies
-ping recovery over the tunnel, and runs a weak-network FEC comparison. It
-requires Linux, root privileges, `ip`, `tc`, and `ping`. `iperf3` is optional.
+checks UDP bootstrap and legacy `tcp` flag compatibility, injects path loss with
+`tc netem`, verifies ping recovery over the tunnel, and runs a weak-network FEC
+comparison. It requires Linux, `go`, root privileges, `ip`, `tc`, and `ping`.
+Run it as a
+regular user when possible; the script builds the binary before escalating for
+network namespace setup. `iperf3` and `timeout` enable an optional throughput
+smoke.
 
 The FEC comparison runs the same one-lane UDP scenario with `fec=false` and
 `fec=true` under 20% client-to-server underlay loss. The script prints both

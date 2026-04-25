@@ -37,7 +37,7 @@ func runWithConfig(ctx context.Context, cfg Config) error {
 		return err
 	}
 
-	runtime, closers, err := buildRuntime(ctx, cfg, device)
+	runtime, closers, err := buildRuntime(cfg, device)
 	if err != nil {
 		return err
 	}
@@ -46,11 +46,11 @@ func runWithConfig(ctx context.Context, cfg Config) error {
 	return runtime.Run(ctx)
 }
 
-func buildRuntime(ctx context.Context, cfg Config, device *tun.Device) (*appRuntime, []io.Closer, error) {
+func buildRuntime(cfg Config, device *tun.Device) (*appRuntime, []io.Closer, error) {
 	if cfg.IsServerSide {
 		return buildServerRuntime(cfg, device)
 	}
-	return buildClientRuntime(ctx, cfg, device)
+	return buildClientRuntime(cfg, device)
 }
 
 func buildServerRuntime(cfg Config, device *tun.Device) (*appRuntime, []io.Closer, error) {
@@ -104,7 +104,7 @@ func buildServerRuntime(cfg Config, device *tun.Device) (*appRuntime, []io.Close
 	}, []io.Closer{udpConn, tcpListener}, nil
 }
 
-func buildClientRuntime(ctx context.Context, cfg Config, device *tun.Device) (*appRuntime, []io.Closer, error) {
+func buildClientRuntime(cfg Config, device *tun.Device) (*appRuntime, []io.Closer, error) {
 	if len(cfg.Client.RemotePaths) == 0 {
 		return nil, nil, errMissingRemotePaths
 	}
@@ -127,23 +127,6 @@ func buildClientRuntime(ctx context.Context, cfg Config, device *tun.Device) (*a
 	streamTransport := transport.NewStream(nil)
 	for i, path := range cfg.Client.RemotePaths {
 		laneID := uint8(i + 1)
-		if cfg.IsTCP {
-			leg, err := streamTransport.Dial(ctx, path.RemoteAddr)
-			if err != nil {
-				closeAll(closers)
-				return nil, nil, err
-			}
-			bootstrap = append(bootstrap, send.BootstrapLane{
-				SessionID: sessionID,
-				LaneID:    laneID,
-				Weight:    uint32(path.Weight),
-				Leg:       leg,
-				TCPRemote: path.RemoteAddr,
-				EnableFEC: cfg.FEC,
-			})
-			continue
-		}
-
 		conn, err := net.ListenPacket("udp", ":0")
 		if err != nil {
 			closeAll(closers)
