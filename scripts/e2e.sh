@@ -176,6 +176,25 @@ setup_netns() {
 
   echo "real e2e namespaces: client=${NS_C} server=${NS_S} nat=${NS_N}"
   echo "real e2e nat: client_dev=${VETHCN} router_client_dev=${VETHNC} router_server_dev=${VETHNS} server_dev=${VETHSN}"
+  print_netns_debug
+}
+
+print_netns_debug() {
+  echo "---- real e2e netns debug ----"
+  ip netns list | grep -E "${NS_C}|${NS_S}|${NS_N}" || true
+  echo "[client routes]"
+  ip netns exec "${NS_C}" ip -4 route show
+  echo "[nat routes]"
+  ip netns exec "${NS_N}" ip -4 route show
+  echo "[server routes]"
+  ip netns exec "${NS_S}" ip -4 route show
+  echo "[nat ip_forward]"
+  ip netns exec "${NS_N}" cat /proc/sys/net/ipv4/ip_forward
+  echo "[nat iptables filter]"
+  ip netns exec "${NS_N}" iptables -S FORWARD
+  echo "[nat iptables nat]"
+  ip netns exec "${NS_N}" iptables -t nat -S
+  echo "---- end real e2e netns debug ----"
 }
 
 write_two_lane_config() {
