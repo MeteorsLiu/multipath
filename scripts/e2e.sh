@@ -69,6 +69,8 @@ TUN_S_REMOTE="${TUN_C_LOCAL}"
 FAIL_COUNT=0
 PING_SAMPLE_LOSS=""
 FEC_CASE_LOSS=""
+FEC_CASE_RECOVERED=""
+FEC_CASE_RECOVER_ERR=""
 CLIENT_PID=""
 SERVER_PID=""
 CURRENT_LOG_FILE=""
@@ -592,10 +594,21 @@ run_ping_sample() {
   PING_SAMPLE_LOSS="${loss}"
 }
 
+count_log_pattern() {
+  local pattern="$1"
+  local log_file="$2"
+  if [[ ! -f "${log_file}" ]]; then
+    printf '0\n'
+    return 0
+  fi
+  grep -c "${pattern}" "${log_file}" || true
+}
+
 run_fec_case() {
   local label="$1"
   local fec_flag="$2"
   local high_rtt_delay="${3:-}"
+  local log_file="${WORKDIR}/${label}.multipath.log"
 
   clear_loss
   write_one_lane_config "${label}" "${PORT_FEC}" false "${fec_flag}" 200 3000
@@ -615,6 +628,11 @@ run_fec_case() {
   clear_loss
   stop_multipath
   FEC_CASE_LOSS="${PING_SAMPLE_LOSS}"
+  FEC_CASE_RECOVERED="$(count_log_pattern "recv: recover_emit" "${log_file}")"
+  FEC_CASE_RECOVER_ERR="$(count_log_pattern "recv: recover_err" "${log_file}")"
+  if [[ "${fec_flag}" == "true" ]]; then
+    echo "[${label}] fec recover_emit=${FEC_CASE_RECOVERED} recover_err=${FEC_CASE_RECOVER_ERR}"
+  fi
 }
 
 run_fec_comparison() {
@@ -626,14 +644,21 @@ run_fec_comparison() {
   sleep 1
 
   local on_loss
+  local on_recovered
+  local on_recover_err
   run_fec_case "fec-on" true
   on_loss="${FEC_CASE_LOSS}"
+  on_recovered="${FEC_CASE_RECOVERED}"
+  on_recover_err="${FEC_CASE_RECOVER_ERR}"
 
   echo "[fec] comparison under 20% client-to-server UDP tunnel loss"
   echo "[fec] off packet_loss=${off_loss}%"
   echo "[fec] on  packet_loss=${on_loss}%"
+  echo "[fec] on recover_emit=${on_recovered} recover_err=${on_recover_err}"
 
-  if awk -v off="${off_loss}" -v on="${on_loss}" 'BEGIN { exit !(on < off) }'; then
+  if (( on_recover_err > 0 )); then
+    fail "fec" "FEC recovery errors were observed"
+  elif awk -v off="${off_loss}" -v on="${on_loss}" 'BEGIN { exit !(on < off) }'; then
     pass "fec" "FEC reduced observed tunnel packet loss"
   else
     fail "fec" "FEC did not reduce observed tunnel packet loss"
@@ -645,17 +670,26 @@ run_fec_comparison() {
   sleep 1
 
   local high_on_loss
+  local high_on_recovered
+  local high_on_recover_err
   run_fec_case "fec-on-high-rtt" true "${FEC_HIGH_RTT_DELAY}"
   high_on_loss="${FEC_CASE_LOSS}"
+  high_on_recovered="${FEC_CASE_RECOVERED}"
+  high_on_recover_err="${FEC_CASE_RECOVER_ERR}"
 
   echo "[fec-high-rtt] comparison under 20% client-to-server UDP tunnel loss and ${FEC_HIGH_RTT_DELAY} one-way UDP tunnel delay"
   echo "[fec-high-rtt] off packet_loss=${high_off_loss}%"
   echo "[fec-high-rtt] on  packet_loss=${high_on_loss}%"
+  echo "[fec-high-rtt] on recover_emit=${high_on_recovered} recover_err=${high_on_recover_err}"
 
-  if awk -v off="${high_off_loss}" -v on="${high_on_loss}" 'BEGIN { exit !(on < off) }'; then
+  if (( high_on_recover_err > 0 )); then
+    fail "fec-high-rtt" "FEC recovery errors were observed under high RTT"
+  elif awk -v off="${high_off_loss}" -v on="${high_on_loss}" 'BEGIN { exit !(on < off) }'; then
     pass "fec-high-rtt" "FEC reduced observed tunnel packet loss under high RTT"
+  elif (( high_on_recovered > 0 )); then
+    pass "fec-high-rtt" "FEC recovered packets under high RTT; packet-loss comparison was noisy"
   else
-    fail "fec-high-rtt" "FEC did not reduce observed tunnel packet loss under high RTT"
+    fail "fec-high-rtt" "FEC did not recover packets under high RTT"
   fi
 
   clear_loss

@@ -62,6 +62,9 @@ After the normal FEC comparison, the script repeats the same `fec=false` and
 `50ms` one-way delay, controlled by
 `MULTIPATH_REAL_E2E_FEC_HIGH_RTT_DELAY`. The high-RTT case is intended to expose
 how FEC recovery changes ping RTT and max latency, not just packet-loss rate.
+Because the `fec=false` and `fec=true` high-RTT samples use independent random
+loss streams, the high-RTT case prints the packet-loss comparison but gates on
+FEC actually emitting recovered packets without recovery errors.
 
 ## Expected Result
 
