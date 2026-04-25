@@ -13,6 +13,7 @@ PREBUILT_BIN="${MULTIPATH_REAL_E2E_PREBUILT_BIN:-0}"
 REAL_E2E_DEBUG="${MULTIPATH_REAL_E2E_DEBUG:-1}"
 FEC_PING_COUNT="${MULTIPATH_REAL_E2E_FEC_PING_COUNT:-1000}"
 FEC_PING_INTERVAL="${MULTIPATH_REAL_E2E_FEC_PING_INTERVAL:-0.02}"
+FEC_HIGH_RTT_DELAY="${MULTIPATH_REAL_E2E_FEC_HIGH_RTT_DELAY:-50ms}"
 
 require_command() {
   local cmd="$1"
@@ -33,6 +34,7 @@ if [[ ${EUID:-0} -ne 0 ]]; then
     MULTIPATH_REAL_E2E_DEBUG="${REAL_E2E_DEBUG}" \
     MULTIPATH_REAL_E2E_FEC_PING_COUNT="${FEC_PING_COUNT}" \
     MULTIPATH_REAL_E2E_FEC_PING_INTERVAL="${FEC_PING_INTERVAL}" \
+    MULTIPATH_REAL_E2E_FEC_HIGH_RTT_DELAY="${FEC_HIGH_RTT_DELAY}" \
     bash "$0" "$@"
 fi
 
@@ -361,6 +363,25 @@ add_loss_band() {
   ip netns exec "${ns}" tc qdisc replace dev "${dev}" parent "1:${band}" handle "${handle}:" netem loss "${loss}"
 }
 
+add_loss_delay_band() {
+  local ns="$1"
+  local dev="$2"
+  local band="$3"
+  local handle="$4"
+  local loss="$5"
+  local delay="$6"
+  ip netns exec "${ns}" tc qdisc replace dev "${dev}" parent "1:${band}" handle "${handle}:" netem delay "${delay}" loss "${loss}"
+}
+
+add_delay_band() {
+  local ns="$1"
+  local dev="$2"
+  local band="$3"
+  local handle="$4"
+  local delay="$5"
+  ip netns exec "${ns}" tc qdisc replace dev "${dev}" parent "1:${band}" handle "${handle}:" netem delay "${delay}"
+}
+
 add_port_filter() {
   local ns="$1"
   local dev="$2"
@@ -449,6 +470,21 @@ apply_fec_loss() {
   add_port_filter "${NS_C}" "${VETHC1}" 1 udp dport "${port}" 3
   add_loss_band "${NS_C}" "${VETHC1}" 4 40 100%
   add_port_filter "${NS_C}" "${VETHC1}" 2 tcp dport "${port}" 4
+}
+
+apply_fec_loss_high_rtt() {
+  local port="$1"
+  local delay="$2"
+
+  setup_prio_qdisc "${NS_C}" "${VETHC1}"
+  add_loss_delay_band "${NS_C}" "${VETHC1}" 3 30 20% "${delay}"
+  add_port_filter "${NS_C}" "${VETHC1}" 1 udp dport "${port}" 3
+  add_loss_band "${NS_C}" "${VETHC1}" 4 40 100%
+  add_port_filter "${NS_C}" "${VETHC1}" 2 tcp dport "${port}" 4
+
+  setup_prio_qdisc "${NS_S}" "${VETHS1}"
+  add_delay_band "${NS_S}" "${VETHS1}" 3 30 "${delay}"
+  add_port_filter "${NS_S}" "${VETHS1}" 1 udp sport "${port}" 3
 }
 
 run_multipath_case() {
@@ -559,14 +595,20 @@ run_ping_sample() {
 run_fec_case() {
   local label="$1"
   local fec_flag="$2"
+  local high_rtt_delay="${3:-}"
 
   clear_loss
   write_one_lane_config "${label}" "${PORT_FEC}" false "${fec_flag}" 200 3000
   start_multipath "${label}"
   wait_ping_ok "${label} baseline" 12
 
-  echo "[${label}] apply 20% UDP data loss and block TCP fallback"
-  apply_fec_loss "${PORT_FEC}"
+  if [[ -n "${high_rtt_delay}" ]]; then
+    echo "[${label}] apply 20% UDP data loss, ${high_rtt_delay} one-way UDP tunnel delay, and block TCP fallback"
+    apply_fec_loss_high_rtt "${PORT_FEC}" "${high_rtt_delay}"
+  else
+    echo "[${label}] apply 20% UDP data loss and block TCP fallback"
+    apply_fec_loss "${PORT_FEC}"
+  fi
   sleep 1
   run_ping_sample "${label}-weak"
 
@@ -595,6 +637,25 @@ run_fec_comparison() {
     pass "fec" "FEC reduced observed tunnel packet loss"
   else
     fail "fec" "FEC did not reduce observed tunnel packet loss"
+  fi
+
+  local high_off_loss
+  run_fec_case "fec-off-high-rtt" false "${FEC_HIGH_RTT_DELAY}"
+  high_off_loss="${FEC_CASE_LOSS}"
+  sleep 1
+
+  local high_on_loss
+  run_fec_case "fec-on-high-rtt" true "${FEC_HIGH_RTT_DELAY}"
+  high_on_loss="${FEC_CASE_LOSS}"
+
+  echo "[fec-high-rtt] comparison under 20% client-to-server UDP tunnel loss and ${FEC_HIGH_RTT_DELAY} one-way UDP tunnel delay"
+  echo "[fec-high-rtt] off packet_loss=${high_off_loss}%"
+  echo "[fec-high-rtt] on  packet_loss=${high_on_loss}%"
+
+  if awk -v off="${high_off_loss}" -v on="${high_on_loss}" 'BEGIN { exit !(on < off) }'; then
+    pass "fec-high-rtt" "FEC reduced observed tunnel packet loss under high RTT"
+  else
+    fail "fec-high-rtt" "FEC did not reduce observed tunnel packet loss under high RTT"
   fi
 
   clear_loss

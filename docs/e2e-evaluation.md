@@ -11,6 +11,7 @@ and how to interpret its results.
 | Legacy TCP flag | two UDP-first lanes with legacy `tcp: true` config | client TCP dials to the server port are dropped, then path2 is dropped | old configs still parse, but `tcp: true` no longer forces TCP-only bootstrap |
 | Fallback | one UDP-first lane over one veth path | UDP tunnel traffic is dropped while TCP is clean, then TCP traffic is dropped after UDP is restored | a lane falls back to TCP when UDP fails and recovers back to UDP |
 | FEC weak-net comparison | one UDP-first lane over one veth path | 20% client-to-server UDP tunnel loss with TCP fallback blocked | `fec=true` reduces observed tunnel packet loss versus `fec=false` |
+| FEC high-RTT weak-net comparison | one UDP-first lane over one veth path | 20% client-to-server UDP tunnel loss, added UDP tunnel delay in both directions, TCP fallback blocked | FEC loss reduction still holds while ping RTT shows recovery-delay impact |
 
 The FEC comparison intentionally uses one lane. Multipath failover would hide
 some losses and make it harder to isolate the FEC signal. TCP fallback is also
@@ -55,6 +56,12 @@ count and interval can be overridden with
 ```text
 fec_on_loss < fec_off_loss
 ```
+
+After the normal FEC comparison, the script repeats the same `fec=false` and
+`fec=true` cases with added UDP tunnel delay in both directions. The default is
+`50ms` one-way delay, controlled by
+`MULTIPATH_REAL_E2E_FEC_HIGH_RTT_DELAY`. The high-RTT case is intended to expose
+how FEC recovery changes ping RTT and max latency, not just packet-loss rate.
 
 ## Expected Result
 

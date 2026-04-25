@@ -152,7 +152,10 @@ blocked. The script prints both observed ping packet-loss values and requires th
 FEC case to be lower. See `docs/e2e-evaluation.md` for interpretation and
 limits. By default each FEC sample sends 1000 ping packets at 20ms intervals;
 override `MULTIPATH_REAL_E2E_FEC_PING_COUNT` or
-`MULTIPATH_REAL_E2E_FEC_PING_INTERVAL` for faster local smoke runs.
+`MULTIPATH_REAL_E2E_FEC_PING_INTERVAL` for faster local smoke runs. The script
+also repeats the FEC comparison under added UDP tunnel delay; the default is
+`50ms` one-way and can be changed with
+`MULTIPATH_REAL_E2E_FEC_HIGH_RTT_DELAY`.
 
 The script starts client and server with `MULTIPATH_DEBUG=1` by default, so each
 case writes verbose protocol, transport, probe, fallback, and FEC traces to the
