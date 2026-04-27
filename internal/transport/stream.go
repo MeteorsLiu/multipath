@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/MeteorsLiu/multipath/internal/debuglog"
+	"github.com/MeteorsLiu/multipath/internal/metrics"
 	"github.com/MeteorsLiu/multipath/internal/packetbuf"
 )
 
@@ -69,6 +70,10 @@ func (s *Stream) Dial(ctx context.Context, remote string) (LegRef, error) {
 	conn, err := dialer.DialContext(ctx, "tcp", remote)
 	if err != nil {
 		debuglog.Printf("transport/tcp", "dial remote=%s err=%v", remote, err)
+		metrics.IncCounter(metrics.TransportErrorsTotal,
+			metrics.L("transport", "tcp"),
+			metrics.L("operation", "dial"),
+		)
 		return LegRef{}, err
 	}
 
@@ -95,6 +100,10 @@ func (s *Stream) Write(ctx context.Context, connID string, payload []byte) (int,
 	s.mu.RUnlock()
 	if conn == nil {
 		debuglog.Printf("transport/tcp", "write unknown conn=%s bytes=%d", connID, len(payload))
+		metrics.IncCounter(metrics.TransportErrorsTotal,
+			metrics.L("transport", "tcp"),
+			metrics.L("operation", "write_unknown_conn"),
+		)
 		return 0, ErrUnknownConn
 	}
 
@@ -110,9 +119,24 @@ func (s *Stream) Write(ctx context.Context, connID string, payload []byte) (int,
 	n, err := writeBuffersFull(conn, buffers)
 	if err != nil {
 		debuglog.Printf("transport/tcp", "write conn=%s bytes=%d err=%v", connID, len(payload), err)
+		metrics.IncCounter(metrics.TransportErrorsTotal,
+			metrics.L("transport", "tcp"),
+			metrics.L("operation", "write"),
+		)
 		return payloadBytesWritten(n), err
 	}
 	debuglog.Printf("transport/tcp", "write conn=%s bytes=%d", connID, payloadBytesWritten(n))
+	written := payloadBytesWritten(n)
+	metrics.IncCounter(metrics.TransportPacketsTotal,
+		metrics.L("transport", "tcp"),
+		metrics.L("direction", "tx"),
+		metrics.L("endpoint", ""),
+	)
+	metrics.AddCounter(metrics.TransportBytesTotal, uint64(written),
+		metrics.L("transport", "tcp"),
+		metrics.L("direction", "tx"),
+		metrics.L("endpoint", ""),
+	)
 	return payloadBytesWritten(n), err
 }
 
@@ -151,6 +175,10 @@ func (s *Stream) acceptLoop(ctx context.Context, writer PacketWriter) error {
 				}
 			}
 			debuglog.Printf("transport/tcp", "accept err=%v", err)
+			metrics.IncCounter(metrics.TransportErrorsTotal,
+				metrics.L("transport", "tcp"),
+				metrics.L("operation", "accept"),
+			)
 			return err
 		}
 
@@ -174,6 +202,10 @@ func (s *Stream) readLoop(ctx context.Context, connID string, conn net.Conn, wri
 	for {
 		if err := conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
 			debuglog.Printf("transport/tcp", "read deadline conn=%s err=%v", connID, err)
+			metrics.IncCounter(metrics.TransportErrorsTotal,
+				metrics.L("transport", "tcp"),
+				metrics.L("operation", "read_deadline"),
+			)
 			return
 		}
 
@@ -188,12 +220,20 @@ func (s *Stream) readLoop(ctx context.Context, connID string, conn net.Conn, wri
 				}
 			}
 			debuglog.Printf("transport/tcp", "read header conn=%s err=%v", connID, err)
+			metrics.IncCounter(metrics.TransportErrorsTotal,
+				metrics.L("transport", "tcp"),
+				metrics.L("operation", "read_header"),
+			)
 			return
 		}
 
 		frameLen := int(binary.BigEndian.Uint16(header[:]))
 		if frameLen == 0 || frameLen > maxStreamFrameLen {
 			debuglog.Printf("transport/tcp", "invalid frame_len conn=%s frame_len=%d", connID, frameLen)
+			metrics.IncCounter(metrics.TransportErrorsTotal,
+				metrics.L("transport", "tcp"),
+				metrics.L("operation", "read_invalid_frame_len"),
+			)
 			return
 		}
 
@@ -201,6 +241,10 @@ func (s *Stream) readLoop(ctx context.Context, connID string, conn net.Conn, wri
 		if _, err := io.ReadFull(conn, packet.Payload); err != nil {
 			packet.Release()
 			debuglog.Printf("transport/tcp", "read frame conn=%s frame_len=%d err=%v", connID, frameLen, err)
+			metrics.IncCounter(metrics.TransportErrorsTotal,
+				metrics.L("transport", "tcp"),
+				metrics.L("operation", "read_frame"),
+			)
 			return
 		}
 		leg := LegRef{
@@ -209,8 +253,22 @@ func (s *Stream) readLoop(ctx context.Context, connID string, conn net.Conn, wri
 		}
 
 		debuglog.Printf("transport/tcp", "read conn=%s bytes=%d", connID, frameLen)
+		metrics.IncCounter(metrics.TransportPacketsTotal,
+			metrics.L("transport", "tcp"),
+			metrics.L("direction", "rx"),
+			metrics.L("endpoint", ""),
+		)
+		metrics.AddCounter(metrics.TransportBytesTotal, uint64(frameLen),
+			metrics.L("transport", "tcp"),
+			metrics.L("direction", "rx"),
+			metrics.L("endpoint", ""),
+		)
 		if err := writer.WriteTo(ctx, leg, packet); err != nil {
 			debuglog.Printf("transport/tcp", "deliver conn=%s bytes=%d err=%v", connID, frameLen, err)
+			metrics.IncCounter(metrics.TransportErrorsTotal,
+				metrics.L("transport", "tcp"),
+				metrics.L("operation", "deliver"),
+			)
 			return
 		}
 	}

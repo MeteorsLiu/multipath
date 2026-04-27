@@ -100,10 +100,11 @@ func TestEndToEndFECRecoversOneDroppedUDPPacket(t *testing.T) {
 	clientPacket := newPacketTransport(t, transport.PacketEndpoint{ID: "lane-1", Conn: clientConn})
 	serverTun := newE2ETUN()
 	clientTun := newE2ETUN()
-	serverIn := New(Config{})
+	serverIn := New(Config{EnableFEC: true})
 	clientIn := New(Config{
 		ProbeInterval: 25 * time.Millisecond,
 		ProbeTimeout:  time.Second,
+		EnableFEC:     true,
 		BootstrapLanes: []BootstrapLane{
 			{
 				SessionID: 202,
@@ -114,7 +115,6 @@ func TestEndToEndFECRecoversOneDroppedUDPPacket(t *testing.T) {
 					EndpointID: "lane-1",
 					RemoteAddr: serverRaw.LocalAddr(),
 				},
-				EnableFEC: true,
 			},
 		},
 	})
@@ -322,9 +322,7 @@ func runE2ERuntime(ctx context.Context, in *Send, tunReader tunio.PacketReader, 
 		start(func() error { return tunio.Run(runCtx, tunReader, testSendPacketWriter{send: in}) })
 	}
 	start(func() error { return transport.RunWriter(runCtx, in.Packets(), packetTransport, streamTransport) })
-	out := recvpkg.New(recvpkg.Config{
-		Controller: testRecvController{send: in},
-	})
+	out := recvpkg.New(recvpkg.Config{Control: NewRecvState(in), SessionManager: in.sessionManager})
 	if tunWriter != nil {
 		start(func() error { return tunio.RunWriter(runCtx, out.Packets(), tunWriter) })
 	}

@@ -62,3 +62,14 @@ func debugLeg(leg transport.LegRef) string {
 		return fmt.Sprintf("kind=%d", leg.Kind)
 	}
 }
+
+func kindMetricLabel(kind transport.Kind) string {
+	switch kind {
+	case transport.KindUDP:
+		return "udp"
+	case transport.KindTCP:
+		return "tcp"
+	default:
+		return "unknown"
+	}
+}

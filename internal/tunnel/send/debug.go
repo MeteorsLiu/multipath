@@ -64,18 +64,28 @@ func debugLeg(leg transport.LegRef) string {
 	}
 }
 
+func kindMetricLabel(kind transport.Kind) string {
+	switch kind {
+	case transport.KindUDP:
+		return "udp"
+	case transport.KindTCP:
+		return "tcp"
+	default:
+		return "unknown"
+	}
+}
+
 func debugLaneState(key laneKey, lane *laneRuntime) string {
 	if lane == nil {
 		return fmt.Sprintf("session=%d lane=%d nil=true", key.sessionID, key.laneID)
 	}
 	return fmt.Sprintf(
-		"session=%d lane=%d weight=%d udp_ready=%t tcp_ready=%t queued=%t fallback_dialing=%t udp={%s} tcp={%s}",
+		"session=%d lane=%d weight=%d udp_ready=%t tcp_ready=%t fallback_dialing=%t udp={%s} tcp={%s}",
 		key.sessionID,
 		key.laneID,
 		lane.weight,
 		lane.udpReady,
 		lane.tcpReady,
-		lane.queued,
 		lane.fallbackDialing,
 		debugLeg(lane.udpLeg),
 		debugLeg(lane.tcpLeg),

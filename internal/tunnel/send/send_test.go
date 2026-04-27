@@ -10,6 +10,7 @@ import (
 	fecpkg "github.com/MeteorsLiu/multipath/internal/fec"
 	"github.com/MeteorsLiu/multipath/internal/packetbuf"
 	"github.com/MeteorsLiu/multipath/internal/protocol"
+	sessionpkg "github.com/MeteorsLiu/multipath/internal/session"
 	"github.com/MeteorsLiu/multipath/internal/transport"
 	tunio "github.com/MeteorsLiu/multipath/internal/tun"
 	probe "github.com/MeteorsLiu/multipath/internal/tunnel/probe/core"
@@ -25,9 +26,6 @@ func TestSendWriteScheduledFrame(t *testing.T) {
 		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
 	})
 	in.lanes[laneKey{sessionID: 99, laneID: 3}] = lane
-	if err := in.scheduler(99).Enqueue(3, lane.weight, 0); err != nil {
-		t.Fatalf("Enqueue: %v", err)
-	}
 
 	laneID, charge, err := in.writeScheduledFrame(context.Background(), protocol.Frame{
 		Type:      protocol.TypeDATA,
@@ -56,38 +54,42 @@ func TestSendWriteScheduledFrame(t *testing.T) {
 	if got.Type != protocol.TypeDATA {
 		t.Fatalf("written Type = %d, want DATA", got.Type)
 	}
-
-	nextLaneID, ok := in.scheduler(99).Dequeue()
-	if !ok || nextLaneID != 3 {
-		t.Fatalf("requeued lane = (%d,%v), want (3,true)", nextLaneID, ok)
-	}
 }
 
 func TestSendWriteScheduledFrameNoRunnableLane(t *testing.T) {
 	in := New()
-	_, _, err := in.writeScheduledFrame(context.Background(), protocol.Frame{Type: protocol.TypeDATA})
+	_, _, err := in.writeScheduledFrame(context.Background(), protocol.Frame{
+		Type: protocol.TypeDATA,
+		Body: protocol.DataBody{},
+	})
 	if !errors.Is(err, errNoRunnableLane) {
 		t.Fatalf("err = %v, want errNoRunnableLane", err)
 	}
 }
 
-func TestSendWriteScheduledFrameSkipsUnknownLane(t *testing.T) {
+func TestSendWriteScheduledFrameIgnoresOtherSessionLane(t *testing.T) {
 	in := New()
-	if err := in.scheduler(0).Enqueue(9, 1, 0); err != nil {
-		t.Fatalf("Enqueue: %v", err)
-	}
+	lane := newLaneRuntime(9, 1)
+	lane.observeLeg(transport.LegRef{
+		Kind:       transport.KindUDP,
+		EndpointID: "udp0",
+		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
+	})
+	in.lanes[laneKey{sessionID: 100, laneID: 9}] = lane
 
-	_, _, err := in.writeScheduledFrame(context.Background(), protocol.Frame{Type: protocol.TypeDATA})
+	_, _, err := in.writeScheduledFrame(context.Background(), protocol.Frame{
+		Type:      protocol.TypeDATA,
+		SessionID: 99,
+		Body:      protocol.DataBody{},
+	})
 	if !errors.Is(err, errNoRunnableLane) {
 		t.Fatalf("err = %v, want errNoRunnableLane", err)
 	}
 }
 
-func TestSendWriteScheduledFrameSkipsStaleLaneAndUsesNext(t *testing.T) {
+func TestSendWriteScheduledFrameSkipsUnavailableLaneAndUsesNext(t *testing.T) {
 	in := New()
-	if err := in.scheduler(99).Enqueue(1, 1, 0); err != nil {
-		t.Fatalf("Enqueue stale lane: %v", err)
-	}
+	in.lanes[laneKey{sessionID: 99, laneID: 1}] = newLaneRuntime(1, 1)
 	lane := newLaneRuntime(2, 1)
 	lane.observeLeg(transport.LegRef{
 		Kind:       transport.KindUDP,
@@ -95,9 +97,6 @@ func TestSendWriteScheduledFrameSkipsStaleLaneAndUsesNext(t *testing.T) {
 		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
 	})
 	in.lanes[laneKey{sessionID: 99, laneID: 2}] = lane
-	if err := in.scheduler(99).Enqueue(2, 1, 0); err != nil {
-		t.Fatalf("Enqueue valid lane: %v", err)
-	}
 
 	laneID, _, err := in.writeScheduledFrame(context.Background(), protocol.Frame{
 		Type:      protocol.TypeDATA,
@@ -112,6 +111,43 @@ func TestSendWriteScheduledFrameSkipsStaleLaneAndUsesNext(t *testing.T) {
 	}
 }
 
+func TestSendRunnableLanesCacheInvalidatesWhenDirty(t *testing.T) {
+	in := New()
+	lane1 := newLaneRuntime(1, 1)
+	lane1.observeLeg(transport.LegRef{
+		Kind:       transport.KindUDP,
+		EndpointID: "udp0",
+		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
+	})
+	in.lanes[laneKey{sessionID: 99, laneID: 1}] = lane1
+
+	got := in.runnableLanes(99)
+	if len(got) != 1 || got[0].id != 1 {
+		t.Fatalf("initial runnable lanes = %+v, want lane 1", got)
+	}
+
+	lane2 := newLaneRuntime(2, 1)
+	lane2.observeLeg(transport.LegRef{
+		Kind:       transport.KindUDP,
+		EndpointID: "udp0",
+		RemoteAddr: mustUDPAddr(t, "127.0.0.1:2234"),
+	})
+	in.lanes[laneKey{sessionID: 99, laneID: 2}] = lane2
+	in.markRunnableLanesDirty(99)
+
+	got = in.runnableLanes(99)
+	if len(got) != 2 || got[0].id != 1 || got[1].id != 2 {
+		t.Fatalf("dirty rebuilt runnable lanes = %+v, want lanes 1,2", got)
+	}
+
+	lane1.udpReady = false
+	in.markRunnableLanesDirty(99)
+	got = in.runnableLanes(99)
+	if len(got) != 1 || got[0].id != 2 {
+		t.Fatalf("after lane loss runnable lanes = %+v, want lane 2", got)
+	}
+}
+
 func TestSendWritePacketAllocatesPacketIDAfterSuccessfulWrite(t *testing.T) {
 	in := New()
 	lane := newLaneRuntime(3, 10)
@@ -121,9 +157,6 @@ func TestSendWritePacketAllocatesPacketIDAfterSuccessfulWrite(t *testing.T) {
 		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
 	})
 	in.lanes[laneKey{sessionID: 99, laneID: 3}] = lane
-	if err := in.scheduler(99).Enqueue(3, lane.weight, 0); err != nil {
-		t.Fatalf("Enqueue: %v", err)
-	}
 
 	packetID, laneID, _, err := in.writeTUNPacket(context.Background(), 99, []byte("ip-packet"))
 	if err != nil {
@@ -152,21 +185,21 @@ func TestSendWritePacketAllocatesPacketIDAfterSuccessfulWrite(t *testing.T) {
 	if string(body.Packet) != "ip-packet" {
 		t.Fatalf("written packet = %q, want ip-packet", body.Packet)
 	}
-	if len(in.sessions[99].txWindow.pending) != 0 {
+	if len(mustSendState(t, in, 99).txWindow.pending) != 0 {
 		t.Fatal("txWindow stored packet while FEC is off")
 	}
-	in.sessions[99].fecProfile = protocol.FECProfileSLC4Plus1
+	in.enableFEC()
 	if _, _, _, err := in.writeTUNPacket(context.Background(), 99, []byte("fec-packet")); err != nil {
 		t.Fatalf("writeTUNPacket with FEC failed: %v", err)
 	}
-	if len(in.sessions[99].txWindow.pending) != 1 {
-		t.Fatalf("txWindow pending = %d, want 1", len(in.sessions[99].txWindow.pending))
+	if len(mustSendState(t, in, 99).txWindow.pending) != 1 {
+		t.Fatalf("txWindow pending = %d, want 1", len(mustSendState(t, in, 99).txWindow.pending))
 	}
 }
 
 func TestSendWritePacketDoesNotAdvancePacketIDOnFailure(t *testing.T) {
 	in := New()
-	session := in.session(99)
+	session := mustSendState(t, in, 99)
 
 	packetID, _, _, err := in.writeTUNPacket(context.Background(), 99, []byte("ip-packet"))
 	if !errors.Is(err, errNoRunnableLane) {
@@ -182,7 +215,7 @@ func TestSendWritePacketDoesNotAdvancePacketIDOnFailure(t *testing.T) {
 
 func TestSendWritePacketDoesNotHardStopAtMaxPacketID(t *testing.T) {
 	in := New()
-	session := in.session(99)
+	session := mustSendState(t, in, 99)
 	session.nextPacketID = ^uint32(0)
 	lane := newLaneRuntime(3, 10)
 	lane.observeLeg(transport.LegRef{
@@ -191,9 +224,6 @@ func TestSendWritePacketDoesNotHardStopAtMaxPacketID(t *testing.T) {
 		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
 	})
 	in.lanes[laneKey{sessionID: 99, laneID: 3}] = lane
-	if err := in.scheduler(99).Enqueue(3, lane.weight, 0); err != nil {
-		t.Fatalf("Enqueue: %v", err)
-	}
 
 	packetID, _, _, err := in.writeTUNPacket(context.Background(), 99, []byte("ip-packet"))
 	if err != nil {
@@ -211,9 +241,9 @@ func TestSendWritePacketDoesNotHardStopAtMaxPacketID(t *testing.T) {
 
 func TestSendWritePacketSendsRepairAfterFECGroup(t *testing.T) {
 	in := New()
-	session := in.session(99)
-	session.fecProfile = protocol.FECProfileSLC4Plus1
-	session.fecCodec = &fakeFECCodec{
+	in.enableFEC()
+	session := mustSendState(t, in, 99)
+	in.fecCodec = &fakeFECCodec{
 		encodeFunc: func(shards [][]byte, key uint16) error {
 			shards[len(shards)-1] = []byte("repair")
 			return nil
@@ -226,9 +256,6 @@ func TestSendWritePacketSendsRepairAfterFECGroup(t *testing.T) {
 		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
 	})
 	in.lanes[laneKey{sessionID: 99, laneID: 3}] = lane
-	if err := in.scheduler(99).Enqueue(3, lane.weight, 0); err != nil {
-		t.Fatalf("Enqueue: %v", err)
-	}
 
 	for i := 0; i < 4; i++ {
 		if _, _, _, err := in.writeTUNPacket(context.Background(), 99, []byte{byte('a' + i)}); err != nil {
@@ -275,7 +302,6 @@ func TestSendStartLaneSendsHELLOWithoutEnqueue(t *testing.T) {
 			EndpointID: "udp0",
 			RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
 		},
-		Nonce:      123,
 		Caps:       3,
 		FECProfile: 1,
 	})
@@ -299,7 +325,7 @@ func TestSendStartLaneSendsHELLOWithoutEnqueue(t *testing.T) {
 	if !ok {
 		t.Fatalf("body type = %T, want HelloBody", frame.Body)
 	}
-	if hello.Nonce != 123 || hello.Caps != 3 || hello.FECProfile != 1 {
+	if hello.Nonce != 0 || hello.Caps != 3 || hello.FECProfile != 1 {
 		t.Fatalf("HELLO body = %+v", hello)
 	}
 
@@ -307,11 +333,12 @@ func TestSendStartLaneSendsHELLOWithoutEnqueue(t *testing.T) {
 	if lane == nil {
 		t.Fatal("lane was not created")
 	}
-	if !lane.helloRetry.awaiting || lane.helloRetry.nonce != 123 {
-		t.Fatalf("lane pending HELLO_ACK = (%v,%d), want (true,123)", lane.helloRetry.awaiting, lane.helloRetry.nonce)
+	route, ok := in.helloRoutes[laneKey{sessionID: 99, laneID: 3}]
+	if !ok || !route.valid() || route.nonce() != 0 {
+		t.Fatalf("hello route = (%v,%v,%d), want valid nonce 0", ok, route.valid(), route.nonce())
 	}
-	if len(lane.helloRetry.payload) == 0 || lane.helloRetry.leg.EndpointID != "udp0" {
-		t.Fatalf("pending HELLO not stored: leg=%+v payload=%d", lane.helloRetry.leg, len(lane.helloRetry.payload))
+	if len(route.payload) == 0 || route.leg.EndpointID != "udp0" {
+		t.Fatalf("hello route not stored: leg=%+v payload=%d", route.leg, len(route.payload))
 	}
 	if lane.udpLeg.EndpointID != "udp0" || lane.udpLeg.RemoteAddr.String() != "127.0.0.1:1234" {
 		t.Fatalf("udp probe leg = %+v, want udp0/127.0.0.1:1234", lane.udpLeg)
@@ -322,12 +349,12 @@ func TestSendStartLaneSendsHELLOWithoutEnqueue(t *testing.T) {
 	if lane.ready() {
 		t.Fatal("lane was ready before HELLO_ACK")
 	}
-	if _, ok := in.scheduler(99).Dequeue(); ok {
-		t.Fatal("lane was enqueued before HELLO_ACK")
+	if got := in.runnableLanes(99); len(got) != 0 {
+		t.Fatalf("runnable lanes before HELLO_ACK = %d, want 0", len(got))
 	}
 }
 
-func TestSendRetriesPendingHELLOOnProbeTick(t *testing.T) {
+func TestSendRetriesHELLOOnProbeTick(t *testing.T) {
 	in := New()
 	in.probeInterval = time.Second
 	in.probeTimeout = 3 * time.Second
@@ -341,25 +368,24 @@ func TestSendRetriesPendingHELLOOnProbeTick(t *testing.T) {
 			EndpointID: "udp0",
 			RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
 		},
-		Nonce: 123,
-		Caps:  protocol.CapTCPFallback,
+		Caps: protocol.CapTCPFallback,
 	})
 	if err != nil {
 		t.Fatalf("startLane failed: %v", err)
 	}
 	readSendPayload(t, in).Packet.Release()
 
-	if err := in.retryPendingHELLO(context.Background(), 1000); err != nil {
-		t.Fatalf("retryPendingHELLO failed: %v", err)
+	if err := in.retryOpenHELLO(context.Background(), 1000); err != nil {
+		t.Fatalf("retryOpenHELLO failed: %v", err)
 	}
 	readSendPayload(t, in).Packet.Release()
-	lane := in.lanes[laneKey{sessionID: 99, laneID: 3}]
-	if lane.helloRetry.lastSentMS != 1000 {
-		t.Fatalf("helloLastSentMS = %d, want 1000", lane.helloRetry.lastSentMS)
+	route := in.helloRoutes[laneKey{sessionID: 99, laneID: 3}]
+	if route.lastRetryMS != 1000 {
+		t.Fatalf("hello last retry = %d, want 1000", route.lastRetryMS)
 	}
 
-	if err := in.retryPendingHELLO(context.Background(), 1200); err != nil {
-		t.Fatalf("retryPendingHELLO second failed: %v", err)
+	if err := in.retryOpenHELLO(context.Background(), 1200); err != nil {
+		t.Fatalf("retryOpenHELLO second failed: %v", err)
 	}
 	assertNoSendPayload(t, in)
 }
@@ -388,7 +414,6 @@ func TestSendHELLOTimeoutStartsTCPFallback(t *testing.T) {
 			RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
 		},
 		TCPRemote:  "127.0.0.1:4321",
-		Nonce:      123,
 		Caps:       protocol.CapTCPFallback | protocol.CapFEC,
 		FECProfile: protocol.FECProfileSLC4Plus1,
 	})
@@ -397,12 +422,12 @@ func TestSendHELLOTimeoutStartsTCPFallback(t *testing.T) {
 	}
 	readSendPayload(t, in).Packet.Release()
 
-	if err := in.retryPendingHELLO(context.Background(), 1000); err != nil {
-		t.Fatalf("retryPendingHELLO failed: %v", err)
+	if err := in.retryOpenHELLO(context.Background(), 1000); err != nil {
+		t.Fatalf("retryOpenHELLO failed: %v", err)
 	}
 	readSendPayload(t, in).Packet.Release()
-	if err := in.retryPendingHELLO(context.Background(), 2000); err != nil {
-		t.Fatalf("retryPendingHELLO timeout failed: %v", err)
+	if err := in.retryOpenHELLO(context.Background(), 2000); err != nil {
+		t.Fatalf("retryOpenHELLO timeout failed: %v", err)
 	}
 
 	lane := in.lanes[laneKey{sessionID: 99, laneID: 3}]
@@ -516,12 +541,8 @@ func TestSendConfigBootstrapsLanes(t *testing.T) {
 }
 
 func TestRecvHandleDATAWritesTUN(t *testing.T) {
-	in := New()
 	tun := &recordTUNWriter{}
-	out := newTestRecv(in)
-	in.session(99)
-	lane := newLaneRuntime(3, 10)
-	in.lanes[laneKey{sessionID: 99, laneID: 3}] = lane
+	out := newTestRecv(t, nil)
 
 	payload, err := protocol.Encode(protocol.Frame{
 		Type:      protocol.TypeDATA,
@@ -547,17 +568,11 @@ func TestRecvHandleDATAWritesTUN(t *testing.T) {
 	if string(tun.packet) != "ip-packet" {
 		t.Fatalf("tun packet = %q, want ip-packet", tun.packet)
 	}
-	if !lane.udpReady {
-		t.Fatal("lane udpReady = false, want true")
-	}
-	if lane.udpLeg.EndpointID != "udp0" {
-		t.Fatalf("lane endpoint = %q, want udp0", lane.udpLeg.EndpointID)
-	}
 }
 
-func TestRecvHandleDropsUnknownSession(t *testing.T) {
-	in := New()
-	out := newTestRecv(in)
+func TestRecvHandleDATAWritesWithoutControlAccept(t *testing.T) {
+	tun := &recordTUNWriter{}
+	out := newTestRecv(t, nil)
 
 	payload, err := protocol.Encode(protocol.Frame{
 		Type:      protocol.TypeDATA,
@@ -572,12 +587,14 @@ func TestRecvHandleDropsUnknownSession(t *testing.T) {
 	if err := writeRecvPayload(context.Background(), out, testEvent(transport.LegRef{}, payload)); err != nil {
 		t.Fatalf("recv Write failed: %v", err)
 	}
-	assertNoRecvPacket(t, out)
+	writeRecvPacketToTUN(t, out, tun)
+	if string(tun.packet) != "ip-packet" {
+		t.Fatalf("tun packet = %q, want ip-packet", tun.packet)
+	}
 }
 
 func TestRecvHandleDropsInvalidFrame(t *testing.T) {
-	in := New()
-	out := newTestRecv(in)
+	out := newTestRecv(t, nil)
 
 	if err := writeRecvPayload(context.Background(), out, testEvent(transport.LegRef{}, []byte{0x10})); err != nil {
 		t.Fatalf("recv Write invalid frame err = %v, want nil", err)
@@ -586,10 +603,7 @@ func TestRecvHandleDropsInvalidFrame(t *testing.T) {
 }
 
 func TestRecvHandleDropsInvalidBody(t *testing.T) {
-	in := New()
-	out := newTestRecv(in)
-	in.session(99)
-	in.lanes[laneKey{sessionID: 99, laneID: 3}] = newLaneRuntime(3, 1)
+	out := newTestRecv(t, nil)
 
 	payload := []byte{protocol.Version<<4 | uint8(protocol.TypeDATA), 0, 0, 0, 0, 0, 0, 0, 99, 3, 1, 2, 3}
 
@@ -600,7 +614,7 @@ func TestRecvHandleDropsInvalidBody(t *testing.T) {
 }
 
 func TestSendHandleHELLOCreatesLaneAndRepliesOnObservedLeg(t *testing.T) {
-	in := New()
+	in := New(Config{EnableFEC: true})
 
 	payload, err := protocol.Encode(protocol.Frame{
 		Type:      protocol.TypeHELLO,
@@ -616,7 +630,7 @@ func TestSendHandleHELLOCreatesLaneAndRepliesOnObservedLeg(t *testing.T) {
 		t.Fatalf("Encode: %v", err)
 	}
 
-	err = writeTestRecv(context.Background(), in, testEvent(transport.LegRef{
+	err = writeTestControl(context.Background(), in, testEvent(transport.LegRef{
 		Kind:       transport.KindUDP,
 		EndpointID: "udp0",
 		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
@@ -646,9 +660,8 @@ func TestSendHandleHELLOCreatesLaneAndRepliesOnObservedLeg(t *testing.T) {
 	if body.Nonce != 123 || body.Accepted != 1 || body.Caps != wantCaps || body.FECProfile != protocol.FECProfileSLC4Plus1 {
 		t.Fatalf("HELLO_ACK body = %+v", body)
 	}
-	session := in.sessions[99]
-	if session.negotiatedCaps != wantCaps || session.fecProfile != protocol.FECProfileSLC4Plus1 {
-		t.Fatalf("session negotiated = (%#x,%d), want (%#x,%d)", session.negotiatedCaps, session.fecProfile, wantCaps, protocol.FECProfileSLC4Plus1)
+	if in.negotiatedCaps != wantCaps || in.fecProfile != protocol.FECProfileSLC4Plus1 {
+		t.Fatalf("negotiated = (%#x,%d), want (%#x,%d)", in.negotiatedCaps, in.fecProfile, wantCaps, protocol.FECProfileSLC4Plus1)
 	}
 
 	lane := in.lanes[laneKey{sessionID: 99, laneID: 3}]
@@ -658,10 +671,8 @@ func TestSendHandleHELLOCreatesLaneAndRepliesOnObservedLeg(t *testing.T) {
 	if !lane.udpReady {
 		t.Fatal("created lane udpReady = false, want true")
 	}
-
-	laneID, ok := in.scheduler(99).Dequeue()
-	if !ok || laneID != 3 {
-		t.Fatalf("scheduled lane = (%d,%v), want (3,true)", laneID, ok)
+	if got := in.runnableLanes(99); len(got) != 1 || got[0].id != 3 {
+		t.Fatalf("runnable lanes = %+v, want lane 3", got)
 	}
 }
 
@@ -682,7 +693,7 @@ func TestSendHandleHELLORejectsSessionControlLaneID(t *testing.T) {
 		t.Fatalf("Encode: %v", err)
 	}
 
-	err = writeTestRecv(context.Background(), in, testEvent(transport.LegRef{
+	err = writeTestControl(context.Background(), in, testEvent(transport.LegRef{
 		Kind:       transport.KindUDP,
 		EndpointID: "udp0",
 		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
@@ -709,11 +720,10 @@ func TestSendHandleHELLORejectsSessionControlLaneID(t *testing.T) {
 }
 
 func TestSendHandleHELLOACKMarksLaneReady(t *testing.T) {
-	in := New()
-	in.session(99)
+	in := New(Config{EnableFEC: true})
+	mustSendState(t, in, 99)
 	lane := newLaneRuntime(3, 1)
-	lane.helloRetry.awaiting = true
-	lane.helloRetry.nonce = 123
+	nonce := startTestHELLORoute(t, in, 99, 3)
 	in.lanes[laneKey{sessionID: 99, laneID: 3}] = lane
 
 	payload, err := protocol.Encode(protocol.Frame{
@@ -721,7 +731,7 @@ func TestSendHandleHELLOACKMarksLaneReady(t *testing.T) {
 		SessionID: 99,
 		LaneID:    3,
 		Body: protocol.HelloAckBody{
-			Nonce:      123,
+			Nonce:      nonce,
 			Accepted:   1,
 			Caps:       protocol.CapTCPFallback | protocol.CapFEC,
 			FECProfile: protocol.FECProfileSLC4Plus1,
@@ -731,7 +741,7 @@ func TestSendHandleHELLOACKMarksLaneReady(t *testing.T) {
 		t.Fatalf("Encode: %v", err)
 	}
 
-	err = writeTestRecv(context.Background(), in, testEvent(transport.LegRef{
+	err = writeTestControl(context.Background(), in, testEvent(transport.LegRef{
 		Kind:       transport.KindUDP,
 		EndpointID: "udp0",
 		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
@@ -742,27 +752,23 @@ func TestSendHandleHELLOACKMarksLaneReady(t *testing.T) {
 	if !lane.udpReady {
 		t.Fatal("lane udpReady = false, want true")
 	}
-	if lane.helloRetry.awaiting {
-		t.Fatal("lane still awaits HELLO_ACK")
+	if _, ok := in.helloRoutes[laneKey{sessionID: 99, laneID: 3}]; ok {
+		t.Fatal("hello route still exists after HELLO_ACK")
 	}
-	session := in.sessions[99]
 	wantCaps := protocol.CapTCPFallback | protocol.CapFEC
-	if session.negotiatedCaps != wantCaps || session.fecProfile != protocol.FECProfileSLC4Plus1 {
-		t.Fatalf("session negotiated = (%#x,%d), want (%#x,%d)", session.negotiatedCaps, session.fecProfile, wantCaps, protocol.FECProfileSLC4Plus1)
+	if in.negotiatedCaps != wantCaps || in.fecProfile != protocol.FECProfileSLC4Plus1 {
+		t.Fatalf("negotiated = (%#x,%d), want (%#x,%d)", in.negotiatedCaps, in.fecProfile, wantCaps, protocol.FECProfileSLC4Plus1)
 	}
-
-	laneID, ok := in.scheduler(99).Dequeue()
-	if !ok || laneID != 3 {
-		t.Fatalf("scheduled lane = (%d,%v), want (3,true)", laneID, ok)
+	if got := in.runnableLanes(99); len(got) != 1 || got[0].id != 3 {
+		t.Fatalf("runnable lanes = %+v, want lane 3", got)
 	}
 }
 
 func TestSendHandleHELLOACKDropsNonceMismatch(t *testing.T) {
 	in := New()
-	in.session(99)
+	mustSendState(t, in, 99)
 	lane := newLaneRuntime(3, 1)
-	lane.helloRetry.awaiting = true
-	lane.helloRetry.nonce = 123
+	startTestHELLORoute(t, in, 99, 3)
 	in.lanes[laneKey{sessionID: 99, laneID: 3}] = lane
 
 	payload, err := protocol.Encode(protocol.Frame{
@@ -775,7 +781,7 @@ func TestSendHandleHELLOACKDropsNonceMismatch(t *testing.T) {
 		t.Fatalf("Encode: %v", err)
 	}
 
-	err = writeTestRecv(context.Background(), in, testEvent(transport.LegRef{
+	err = writeTestControl(context.Background(), in, testEvent(transport.LegRef{
 		Kind:       transport.KindUDP,
 		EndpointID: "udp0",
 		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
@@ -786,17 +792,17 @@ func TestSendHandleHELLOACKDropsNonceMismatch(t *testing.T) {
 	if lane.udpReady {
 		t.Fatal("lane udpReady = true, want false")
 	}
-	if !lane.helloRetry.awaiting {
-		t.Fatal("lane awaitingHELLOACK = false, want true")
+	if _, ok := in.helloRoutes[laneKey{sessionID: 99, laneID: 3}]; !ok {
+		t.Fatal("hello route was removed after nonce mismatch")
 	}
-	if _, ok := in.scheduler(99).Dequeue(); ok {
-		t.Fatal("lane was enqueued after nonce mismatch")
+	if got := in.runnableLanes(99); len(got) != 0 {
+		t.Fatalf("runnable lanes after nonce mismatch = %d, want 0", len(got))
 	}
 }
 
 func TestSendHandlePINGRepliesWithPONGOnObservedLeg(t *testing.T) {
 	in := New()
-	in.session(99)
+	mustSendState(t, in, 99)
 	lane := newLaneRuntime(3, 1)
 	in.lanes[laneKey{sessionID: 99, laneID: 3}] = lane
 
@@ -810,7 +816,7 @@ func TestSendHandlePINGRepliesWithPONGOnObservedLeg(t *testing.T) {
 		t.Fatalf("Encode: %v", err)
 	}
 
-	err = writeTestRecv(context.Background(), in, testEvent(transport.LegRef{
+	err = writeTestControl(context.Background(), in, testEvent(transport.LegRef{
 		Kind:       transport.KindUDP,
 		EndpointID: "udp0",
 		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
@@ -842,7 +848,7 @@ func TestSendHandlePINGRepliesWithPONGOnObservedLeg(t *testing.T) {
 
 func TestSendHandlePONGEmitsProbeEvent(t *testing.T) {
 	in := New()
-	in.session(99)
+	mustSendState(t, in, 99)
 	probeEvents := make(chan probe.Event, 4)
 	in.probeEvents = probeEvents
 	lane := newLaneRuntime(3, 1)
@@ -872,7 +878,7 @@ func TestSendHandlePONGEmitsProbeEvent(t *testing.T) {
 		t.Fatalf("Encode: %v", err)
 	}
 
-	err = writeTestRecv(context.Background(), in, testEvent(leg, payload))
+	err = writeTestControl(context.Background(), in, testEvent(leg, payload))
 	if err != nil {
 		t.Fatalf("recv Write PONG failed: %v", err)
 	}
@@ -889,7 +895,7 @@ func TestSendHandlePONGEmitsProbeEvent(t *testing.T) {
 
 func TestSendHandlePONGDropsUnmatchedPING(t *testing.T) {
 	in := New()
-	in.session(99)
+	mustSendState(t, in, 99)
 	lane := newLaneRuntime(3, 1)
 	in.lanes[laneKey{sessionID: 99, laneID: 3}] = lane
 	leg := transport.LegRef{
@@ -908,15 +914,15 @@ func TestSendHandlePONGDropsUnmatchedPING(t *testing.T) {
 		t.Fatalf("Encode: %v", err)
 	}
 
-	err = writeTestRecv(context.Background(), in, testEvent(leg, payload))
+	err = writeTestControl(context.Background(), in, testEvent(leg, payload))
 	if err != nil {
 		t.Fatalf("recv Write PONG failed: %v", err)
 	}
 	if lane.udpReady {
 		t.Fatal("lane udpReady = true, want false")
 	}
-	if _, ok := in.scheduler(99).Dequeue(); ok {
-		t.Fatal("lane was enqueued by unmatched PONG")
+	if got := in.runnableLanes(99); len(got) != 0 {
+		t.Fatalf("runnable lanes after unmatched PONG = %d, want 0", len(got))
 	}
 }
 
@@ -1015,8 +1021,8 @@ func TestSendProbeTimeoutStartsTCPFallbackHELLO(t *testing.T) {
 	in := New()
 	in.streamTransport = streamTransport
 	in.probeTimeout = 500 * time.Millisecond
-	session := in.session(99)
-	session.negotiatedCaps = protocol.CapTCPFallback
+	mustSendState(t, in, 99)
+	in.negotiatedCaps = protocol.CapTCPFallback
 	udpLeg := transport.LegRef{
 		Kind:       transport.KindUDP,
 		EndpointID: "udp0",
@@ -1053,8 +1059,8 @@ func TestSendProbeTimeoutStartsTCPFallbackHELLO(t *testing.T) {
 	if lane.tcpReady {
 		t.Fatal("tcpReady = true before TCP HELLO_ACK")
 	}
-	if !lane.helloRetry.awaiting {
-		t.Fatal("awaitingHELLOACK = false, want true")
+	if _, ok := in.helloRoutes[laneKey{sessionID: 99, laneID: 3}]; !ok {
+		t.Fatal("hello route missing before TCP HELLO_ACK")
 	}
 	frame, err := protocol.Decode(written.Packet.Payload)
 	if err != nil {
@@ -1076,7 +1082,7 @@ func TestSendHandleCLOSELane(t *testing.T) {
 	streamTransport := &fakeStreamTransport{}
 	in := New()
 	in.streamTransport = streamTransport
-	in.session(99)
+	mustSendState(t, in, 99)
 	lane := newLaneRuntime(3, 1)
 	lane.bindLeg(transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp0"})
 	in.lanes[laneKey{sessionID: 99, laneID: 3}] = lane
@@ -1091,13 +1097,13 @@ func TestSendHandleCLOSELane(t *testing.T) {
 		t.Fatalf("Encode: %v", err)
 	}
 
-	if err := writeTestRecv(context.Background(), in, testEvent(transport.LegRef{}, payload)); err != nil {
+	if err := writeTestControl(context.Background(), in, testEvent(transport.LegRef{}, payload)); err != nil {
 		t.Fatalf("recv Write CLOSE lane failed: %v", err)
 	}
 	if _, ok := in.lanes[laneKey{sessionID: 99, laneID: 3}]; ok {
 		t.Fatal("lane still exists after CLOSE lane")
 	}
-	if in.sessions[99] == nil {
+	if getSendState(in, 99) == nil {
 		t.Fatal("session was removed by lane CLOSE")
 	}
 	if got := streamTransport.closed["tcp0"]; got != 1 {
@@ -1105,11 +1111,12 @@ func TestSendHandleCLOSELane(t *testing.T) {
 	}
 }
 
-func TestSendHandleREPAIRObservesLane(t *testing.T) {
+func TestRecvHandleREPAIRDoesNotTouchSendControlState(t *testing.T) {
 	in := New()
-	in.session(99)
+	mustSendState(t, in, 99)
 	lane := newLaneRuntime(3, 1)
 	in.lanes[laneKey{sessionID: 99, laneID: 3}] = lane
+	out := newTestRecv(t, in)
 
 	payload, err := protocol.Encode(protocol.Frame{
 		Type:      protocol.TypeREPAIR,
@@ -1121,54 +1128,27 @@ func TestSendHandleREPAIRObservesLane(t *testing.T) {
 		t.Fatalf("Encode: %v", err)
 	}
 
-	if err := writeTestRecv(context.Background(), in, testEvent(transport.LegRef{
+	if err := writeRecvPayload(context.Background(), out, testEvent(transport.LegRef{
 		Kind:       transport.KindUDP,
 		EndpointID: "udp0",
 		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
 	}, payload)); err != nil {
 		t.Fatalf("recv Write REPAIR failed: %v", err)
 	}
-	clear(payload)
-	if !lane.udpReady {
-		t.Fatal("lane udpReady = false, want true")
-	}
-	if lane.udpLeg.EndpointID != "udp0" {
-		t.Fatalf("lane endpoint = %q, want udp0", lane.udpLeg.EndpointID)
-	}
-}
 
-func TestSendHandleREPAIRDropsWhenFECOff(t *testing.T) {
-	in := New()
-	in.session(99)
-	lane := newLaneRuntime(3, 1)
-	in.lanes[laneKey{sessionID: 99, laneID: 3}] = lane
-
-	payload, err := protocol.Encode(protocol.Frame{
-		Type:      protocol.TypeREPAIR,
-		SessionID: 99,
-		LaneID:    3,
-		Body:      protocol.RepairBody{BasePacketID: 100, Key: 7, Symbol: []byte("repair")},
-	}, nil)
-	if err != nil {
-		t.Fatalf("Encode: %v", err)
+	if lane.udpReady {
+		t.Fatal("lane udpReady = true, want false")
 	}
-
-	if err := writeTestRecv(context.Background(), in, testEvent(transport.LegRef{
-		Kind:       transport.KindUDP,
-		EndpointID: "udp0",
-		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
-	}, payload)); err != nil {
-		t.Fatalf("recv Write REPAIR failed: %v", err)
+	if lane.udpLeg.EndpointID != "" {
+		t.Fatalf("lane endpoint = %q, want empty", lane.udpLeg.EndpointID)
 	}
-	if !lane.udpReady {
-		t.Fatal("lane udpReady = false, want true")
-	}
+	assertNoSendPayload(t, in)
+	assertNoRecvPacket(t, out)
 }
 
 func TestSendHandleREPAIRRecoversMissingPacket(t *testing.T) {
 	tun := &recordTUNWriter{}
-	in := New()
-	out := newTestRecv(in)
+	out := newTestRecv(t, nil)
 	recoveredPacket := ipv4TestPacket(20)
 
 	leg := transport.LegRef{
@@ -1262,7 +1242,7 @@ func TestSendHandleCLOSESession(t *testing.T) {
 	streamTransport := &fakeStreamTransport{}
 	in := New()
 	in.streamTransport = streamTransport
-	in.session(99)
+	mustSendState(t, in, 99)
 	in.activateSession(99)
 	lane1 := newLaneRuntime(1, 1)
 	lane1.bindLeg(transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp1"})
@@ -1273,9 +1253,7 @@ func TestSendHandleCLOSESession(t *testing.T) {
 	in.lanes[laneKey{sessionID: 99, laneID: 1}] = lane1
 	in.lanes[laneKey{sessionID: 99, laneID: 2}] = lane2
 	in.lanes[laneKey{sessionID: 100, laneID: 1}] = otherLane
-	if err := in.scheduler(99).Enqueue(1, 1, 0); err != nil {
-		t.Fatalf("Enqueue: %v", err)
-	}
+	in.strategy(99)
 
 	payload, err := protocol.Encode(protocol.Frame{
 		Type:      protocol.TypeCLOSE,
@@ -1287,14 +1265,14 @@ func TestSendHandleCLOSESession(t *testing.T) {
 		t.Fatalf("Encode: %v", err)
 	}
 
-	if err := writeTestRecv(context.Background(), in, testEvent(transport.LegRef{}, payload)); err != nil {
+	if err := writeTestControl(context.Background(), in, testEvent(transport.LegRef{}, payload)); err != nil {
 		t.Fatalf("recv Write CLOSE session failed: %v", err)
 	}
-	if in.sessions[99] != nil {
+	if getSendState(in, 99) != nil {
 		t.Fatal("session still exists after CLOSE session")
 	}
-	if in.schedulers[99] != nil {
-		t.Fatal("scheduler still exists after CLOSE session")
+	if in.strategies[99] != nil {
+		t.Fatal("strategy still exists after CLOSE session")
 	}
 	if in.hasActiveSession || in.activeSessionID != 0 {
 		t.Fatalf("active session = (%v,%d), want cleared", in.hasActiveSession, in.activeSessionID)
@@ -1302,7 +1280,7 @@ func TestSendHandleCLOSESession(t *testing.T) {
 	if err := in.handleTUNPacket(context.Background(), []byte("ip-packet")); err != nil {
 		t.Fatalf("handleTUNPacket after session CLOSE failed: %v", err)
 	}
-	if in.sessions[99] != nil {
+	if getSendState(in, 99) != nil {
 		t.Fatal("closed active session was recreated by TUN packet")
 	}
 	if _, ok := in.lanes[laneKey{sessionID: 99, laneID: 1}]; ok {
@@ -1328,9 +1306,6 @@ func TestSendHandleCLOSESession(t *testing.T) {
 func TestPacketTransportWritesRecv(t *testing.T) {
 	tun := &recordTUNWriter{wrote: make(chan struct{}, 1)}
 	fake := &fakePacketTransport{sent: make(chan struct{})}
-	in := New()
-	in.session(99)
-	in.lanes[laneKey{sessionID: 99, laneID: 3}] = newLaneRuntime(3, 1)
 
 	payload, err := protocol.Encode(protocol.Frame{
 		Type:      protocol.TypeDATA,
@@ -1348,7 +1323,7 @@ func TestPacketTransportWritesRecv(t *testing.T) {
 	}, payload)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	out := newTestRecv(in)
+	out := newTestRecv(t, nil)
 	errCh := make(chan error, 2)
 	go func() {
 		errCh <- fake.Run(ctx, out)
@@ -1388,9 +1363,6 @@ func TestTUNRunWritesSend(t *testing.T) {
 		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
 	})
 	in.lanes[laneKey{sessionID: 99, laneID: 3}] = lane
-	if err := in.scheduler(99).Enqueue(3, lane.weight, 0); err != nil {
-		t.Fatalf("Enqueue: %v", err)
-	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
@@ -1542,12 +1514,68 @@ func testEvent(leg transport.LegRef, payload []byte) transport.Payload {
 	}
 }
 
-func writeTestRecv(ctx context.Context, in *Send, event transport.Payload) error {
-	return newTestRecv(in).WriteTo(ctx, event.Leg, event.Packet)
+func writeTestControl(ctx context.Context, in *Send, event transport.Payload) error {
+	defer event.Packet.Release()
+	frame, err := protocol.Decode(event.Packet.Payload)
+	if err != nil {
+		return err
+	}
+	state := NewRecvState(in)
+	switch frame.Type {
+	case protocol.TypeHELLO:
+		return state.OnHello(ctx, event.Leg, frame)
+	case protocol.TypeHELLOACK:
+		return state.OnHelloAck(ctx, event.Leg, frame)
+	case protocol.TypePING:
+		return state.OnPing(ctx, event.Leg, frame)
+	case protocol.TypePONG:
+		return state.OnPong(ctx, event.Leg, frame)
+	case protocol.TypeCLOSE:
+		return state.OnClose(ctx, event.Leg, frame)
+	default:
+		return nil
+	}
 }
 
 func writeRecvPayload(ctx context.Context, out *recvpkg.Recv, event transport.Payload) error {
 	return out.WriteTo(ctx, event.Leg, event.Packet)
+}
+
+func getSendState(in *Send, sessionID uint64) *sendState {
+	_, state, ok := in.getSessionState(sessionID)
+	if !ok {
+		return nil
+	}
+	return state
+}
+
+func mustSendState(t *testing.T, in *Send, sessionID uint64) *sendState {
+	t.Helper()
+	_, state, ok := in.getOrCreateSessionState(sessionID)
+	if !ok {
+		t.Fatalf("missing session %d", sessionID)
+	}
+	return state
+}
+
+func startTestHELLORoute(t *testing.T, in *Send, sessionID uint64, laneID uint8) uint64 {
+	t.Helper()
+	sessionState, ok := in.sessionManager.Get(sessionID)
+	if !ok {
+		t.Fatalf("missing session %d", sessionID)
+	}
+	hello := sessionState.Open(0)
+	var nonce uint64
+	if err := hello.Do(func(v sessionpkg.View) error {
+		nonce = v.Nonce()
+		return nil
+	}); err != nil {
+		t.Fatalf("Hello.Do: %v", err)
+	}
+	var route helloRoute
+	route.set(hello, transport.LegRef{}, []byte("hello"))
+	in.helloRoutes[laneKey{sessionID: sessionID, laneID: laneID}] = route
+	return nonce
 }
 
 func readSendPayload(t *testing.T, in *Send) transport.Payload {
@@ -1571,14 +1599,16 @@ func assertNoSendPayload(t *testing.T, in *Send) {
 	}
 }
 
-func newTestRecv(in *Send) *recvpkg.Recv {
-	return recvpkg.New(recvpkg.Config{
-		Controller: testRecvController{send: in},
-	})
-}
-
-type testRecvController struct {
-	send *Send
+func newTestRecv(t *testing.T, in *Send) *recvpkg.Recv {
+	t.Helper()
+	if in == nil {
+		manager := &sessionpkg.Manager{}
+		if _, ok := manager.Create(99); !ok {
+			t.Fatal("Create session failed")
+		}
+		return recvpkg.New(recvpkg.Config{SessionManager: manager})
+	}
+	return recvpkg.New(recvpkg.Config{Control: NewRecvState(in), SessionManager: in.sessionManager})
 }
 
 type testProbeLoopRunner struct {
@@ -1586,15 +1616,6 @@ type testProbeLoopRunner struct {
 	events   <-chan probe.Event
 	interval time.Duration
 	timeout  time.Duration
-}
-
-func (c testRecvController) Write(ctx context.Context, frame protocol.Frame, leg transport.LegRef) (recvpkg.Result, error) {
-	result, err := c.send.writeControlFrame(ctx, leg, frame)
-	return recvpkg.Result{
-		Accepted:   result.Accepted,
-		Caps:       result.Caps,
-		FECProfile: result.FECProfile,
-	}, err
 }
 
 func (w testProbeLoopRunner) Run(ctx context.Context) error {

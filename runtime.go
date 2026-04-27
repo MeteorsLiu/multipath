@@ -6,9 +6,9 @@ import (
 	"sync"
 
 	"github.com/MeteorsLiu/multipath/internal/debuglog"
+	"github.com/MeteorsLiu/multipath/internal/metrics"
 	"github.com/MeteorsLiu/multipath/internal/transport"
 	"github.com/MeteorsLiu/multipath/internal/tun"
-	"github.com/MeteorsLiu/multipath/internal/tunnel/probe"
 	"github.com/MeteorsLiu/multipath/internal/tunnel/recv"
 	"github.com/MeteorsLiu/multipath/internal/tunnel/send"
 )
@@ -17,10 +17,11 @@ type appRuntime struct {
 	tunReader       tun.PacketReader
 	tunWriter       *tun.Device
 	send            *send.Send
-	probeLoop       *probe.Loop
+	probeLoop       *send.ProbeLoop
 	recv            *recv.Recv
 	packetTransport transport.PacketTransport
 	streamTransport transport.StreamTransport
+	metricsServer   *metrics.Server
 }
 
 func (r *appRuntime) Run(ctx context.Context) error {
@@ -58,6 +59,10 @@ func (r *appRuntime) Run(ctx context.Context) error {
 	if r.probeLoop != nil {
 		started = true
 		start("probe", func() error { return r.probeLoop.Run(runCtx) })
+	}
+	if r.metricsServer != nil {
+		started = true
+		start("prom", func() error { return r.metricsServer.Run(runCtx) })
 	}
 	if r.tunReader != nil {
 		started = true

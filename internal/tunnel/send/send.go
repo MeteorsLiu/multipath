@@ -5,8 +5,10 @@ import (
 	"errors"
 
 	"github.com/MeteorsLiu/multipath/internal/debuglog"
+	"github.com/MeteorsLiu/multipath/internal/metrics"
 	"github.com/MeteorsLiu/multipath/internal/packetbuf"
 	"github.com/MeteorsLiu/multipath/internal/protocol"
+	sessionpkg "github.com/MeteorsLiu/multipath/internal/session"
 	"github.com/MeteorsLiu/multipath/internal/transport"
 	probe "github.com/MeteorsLiu/multipath/internal/tunnel/probe/core"
 )
@@ -38,32 +40,10 @@ func (i *Send) WriteTo(ctx context.Context, leg transport.LegRef, packet *packet
 	}
 }
 
-func (i *Send) Bootstrap(ctx context.Context) error {
-	return i.bootstrap(ctx)
-}
-
-func (i *Send) WriteFrame(ctx context.Context, frame protocol.Frame, leg transport.LegRef) (Result, error) {
-	return i.writeControlFrame(ctx, leg, frame)
-}
-
-func (i *Send) WriteProbeEvent(ctx context.Context, event probe.Event) error {
-	return i.writeProbeEvent(ctx, event)
-}
-
-func (i *Send) RetryHELLO(ctx context.Context, nowMS uint64) error {
-	return i.retryHELLO(ctx, nowMS)
-}
-
 func (i *Send) bootstrap(ctx context.Context) error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	return i.bootstrapLocked(ctx)
-}
-
-func (i *Send) writeControlFrame(ctx context.Context, leg transport.LegRef, frame protocol.Frame) (Result, error) {
-	i.mu.Lock()
-	defer i.mu.Unlock()
-	return i.handleTransportFrame(ctx, leg, frame)
 }
 
 func (i *Send) writeProbeEvent(ctx context.Context, event probe.Event) error {
@@ -75,7 +55,7 @@ func (i *Send) writeProbeEvent(ctx context.Context, event probe.Event) error {
 func (i *Send) retryHELLO(ctx context.Context, nowMS uint64) error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	return i.retryPendingHELLO(ctx, nowMS)
+	return i.retryOpenHELLO(ctx, nowMS)
 }
 
 func (i *Send) finishFallbackDial(ctx context.Context, result fallbackDialResult) error {
@@ -99,9 +79,12 @@ func (l *Send) handleTUNPacket(ctx context.Context, packet []byte) error {
 }
 
 func (l *Send) writeTUNPacket(ctx context.Context, sessionID uint64, packet []byte) (packetID uint32, laneID uint8, charge uint32, err error) {
-	session := l.session(sessionID)
-	packetID = session.nextPacketID
-	debuglog.Printf("send", "data_schedule session=%d packet_id=%d bytes=%d fec_profile=%d", sessionID, packetID, len(packet), session.fecProfile)
+	_, state, ok := l.getOrCreateSessionState(sessionID)
+	if !ok {
+		return 0, 0, 0, errNoRunnableLane
+	}
+	packetID = state.nextPacketID
+	debuglog.Printf("send", "data_schedule session=%d packet_id=%d bytes=%d fec_profile=%d", sessionID, packetID, len(packet), l.fecProfile)
 
 	laneID, charge, err = l.writeScheduledFrame(ctx, protocol.Frame{
 		Type:      protocol.TypeDATA,
@@ -115,9 +98,9 @@ func (l *Send) writeTUNPacket(ctx context.Context, sessionID uint64, packet []by
 		return packetID, laneID, charge, err
 	}
 
-	session.nextPacketID++
-	if session.fecProfile == protocol.FECProfileSLC4Plus1 {
-		if group, ok := session.txWindow.add(packetID, packet); ok {
+	state.nextPacketID++
+	if l.fecProfile == protocol.FECProfileSLC4Plus1 {
+		if group, ok := state.txWindow.add(packetID, packet); ok {
 			debuglog.Printf("send", "fec_group_ready session=%d base_packet_id=%d shards=%d", sessionID, group.basePacketID, len(group.packets))
 			l.maybeSendRepair(ctx, sessionID, group)
 		}
@@ -126,53 +109,54 @@ func (l *Send) writeTUNPacket(ctx context.Context, sessionID uint64, packet []by
 }
 
 func (l *Send) writeScheduledFrame(ctx context.Context, frame protocol.Frame) (laneID uint8, charge uint32, err error) {
-	sched := l.scheduler(frame.SessionID)
-	for {
-		laneID, ok := sched.Dequeue()
-		if !ok {
-			debuglog.Printf("send", "schedule_empty session=%d frame=%s", frame.SessionID, debugFrameSummary(frame))
-			return 0, 0, errNoRunnableLane
-		}
-
-		lane := l.lanes[laneKey{sessionID: frame.SessionID, laneID: laneID}]
-		if lane == nil {
-			debuglog.Printf("send", "schedule_skip missing_lane session=%d lane=%d", frame.SessionID, laneID)
-			continue
-		}
-		lane.queued = false
-		if !lane.ready() {
-			debuglog.Printf("send", "schedule_skip not_ready %s", debugLaneState(laneKey{sessionID: frame.SessionID, laneID: laneID}, lane))
-			continue
-		}
-
-		frame.LaneID = laneID
-		leg, ok := lane.selectLeg()
-		if !ok {
-			debuglog.Printf("send", "schedule_skip no_leg %s", debugLaneState(laneKey{sessionID: frame.SessionID, laneID: laneID}, lane))
-			continue
-		}
-		debuglog.Printf("send", "schedule_select %s leg={%s} frame=%s", debugLaneState(laneKey{sessionID: frame.SessionID, laneID: laneID}, lane), debugLeg(leg), debugFrameSummary(frame))
-		size, err := l.enqueueFrame(ctx, leg, frame)
-		if err != nil {
-			debuglog.Printf("send", "schedule_enqueue_err session=%d lane=%d leg={%s} err=%v", frame.SessionID, laneID, debugLeg(leg), err)
-			return laneID, 0, err
-		}
-
-		charge = legCharge(leg, size)
-		if err := sched.Enqueue(laneID, lane.weight, charge); err != nil {
-			debuglog.Printf("send", "schedule_requeue_err session=%d lane=%d charge=%d err=%v", frame.SessionID, laneID, charge, err)
-			return laneID, charge, err
-		}
-		lane.queued = true
-		debuglog.Printf("send", "schedule_done session=%d lane=%d leg={%s} frame_bytes=%d charge=%d", frame.SessionID, laneID, debugLeg(leg), size, charge)
-		return laneID, charge, nil
+	sizeHint, err := frameEncodeCapacity(frame)
+	if err != nil {
+		return 0, 0, err
 	}
+	lane, ok := l.pickLane(frame.SessionID, uint32(sizeHint))
+	if !ok {
+		debuglog.Printf("send", "schedule_empty session=%d frame=%s", frame.SessionID, debugFrameSummary(frame))
+		metrics.IncCounter(metrics.ScheduleNoRunnableTotal,
+			metrics.L("session", frame.SessionID),
+			metrics.L("frame_type", debugFrameType(frame.Type)),
+		)
+		return 0, 0, errNoRunnableLane
+	}
+
+	laneID = lane.id
+	frame.LaneID = laneID
+	leg, ok := lane.selectLeg()
+	if !ok {
+		debuglog.Printf("send", "schedule_skip no_leg %s", debugLaneState(laneKey{sessionID: frame.SessionID, laneID: laneID}, lane))
+		metrics.IncCounter(metrics.ScheduleSkipTotal,
+			metrics.L("session", frame.SessionID),
+			metrics.L("lane", laneID),
+			metrics.L("reason", "no_leg"),
+		)
+		return 0, 0, errNoRunnableLane
+	}
+	debuglog.Printf("send", "schedule_select %s leg={%s} frame=%s", debugLaneState(laneKey{sessionID: frame.SessionID, laneID: laneID}, lane), debugLeg(leg), debugFrameSummary(frame))
+	metrics.IncCounter(metrics.SchedulePickTotal,
+		metrics.L("session", frame.SessionID),
+		metrics.L("lane", laneID),
+		metrics.L("frame_type", debugFrameType(frame.Type)),
+		metrics.L("leg", kindMetricLabel(leg.Kind)),
+	)
+	size, err := l.enqueueFrame(ctx, leg, frame)
+	if err != nil {
+		debuglog.Printf("send", "schedule_enqueue_err session=%d lane=%d leg={%s} err=%v", frame.SessionID, laneID, debugLeg(leg), err)
+		return laneID, 0, err
+	}
+
+	charge = legCharge(leg, size)
+	debuglog.Printf("send", "schedule_done session=%d lane=%d leg={%s} frame_bytes=%d charge=%d", frame.SessionID, laneID, debugLeg(leg), size, charge)
+	return laneID, charge, nil
 }
 
 func (l *Send) maybeSendRepair(ctx context.Context, sessionID uint64, group txRepairGroup) {
-	session := l.sessions[sessionID]
-	if session == nil || session.fecCodec == nil {
-		debuglog.Printf("send", "repair_skip session=%d session_nil=%t fec_nil=%t", sessionID, session == nil, session == nil || session.fecCodec == nil)
+	_, state, ok := l.getSessionState(sessionID)
+	if !ok || l.fecCodec == nil {
+		debuglog.Printf("send", "repair_skip session=%d session_nil=%t fec_nil=%t", sessionID, !ok, !ok || l.fecCodec == nil)
 		return
 	}
 
@@ -186,13 +170,21 @@ func (l *Send) maybeSendRepair(ctx context.Context, sessionID uint64, group txRe
 	for i := range group.packets {
 		shards[i] = group.packets[i]
 	}
-	key := session.nextRepairKey
-	session.nextRepairKey++
-	if err := session.fecCodec.Encode(shards, key); err != nil {
+	key := state.nextRepairKey
+	state.nextRepairKey++
+	if err := l.fecCodec.Encode(shards, key); err != nil {
 		debuglog.Printf("send", "repair_encode_err session=%d base_packet_id=%d key=%d err=%v", sessionID, group.basePacketID, key, err)
+		metrics.IncCounter(metrics.FECEventsTotal,
+			metrics.L("event", "repair_encode_err"),
+			metrics.L("session", sessionID),
+		)
 		return
 	}
 	debuglog.Printf("send", "repair_encode session=%d base_packet_id=%d key=%d symbol_len=%d", sessionID, group.basePacketID, key, len(shards[len(shards)-1]))
+	metrics.IncCounter(metrics.FECEventsTotal,
+		metrics.L("event", "repair_encode"),
+		metrics.L("session", sessionID),
+	)
 
 	laneID, charge, err := l.writeScheduledFrame(ctx, protocol.Frame{
 		Type:      protocol.TypeREPAIR,
@@ -212,7 +204,6 @@ type startLaneConfig struct {
 	Weight     uint32
 	Leg        transport.LegRef
 	TCPRemote  string
-	Nonce      uint64
 	Caps       uint16
 	FECProfile uint8
 }
@@ -223,7 +214,10 @@ func (l *Send) startLane(ctx context.Context, cfg startLaneConfig) error {
 		return errInvalidLane
 	}
 
-	l.session(cfg.SessionID)
+	sessionState, _, ok := l.getOrCreateSessionState(cfg.SessionID)
+	if !ok {
+		return nil
+	}
 	l.activateSession(cfg.SessionID)
 	key := laneKey{sessionID: cfg.SessionID, laneID: cfg.LaneID}
 	lane := l.lanes[key]
@@ -233,30 +227,47 @@ func (l *Send) startLane(ctx context.Context, cfg startLaneConfig) error {
 	}
 	lane.weight = cfg.Weight
 	lane.rememberLeg(cfg.Leg)
+	l.markRunnableLanesDirty(cfg.SessionID)
 	if cfg.TCPRemote != "" {
 		lane.tcpRemote = cfg.TCPRemote
 	}
-	debuglog.Printf("send", "start_lane %s leg={%s} tcp_remote=%s nonce=%d caps=%#x fec_profile=%d", debugLaneState(key, lane), debugLeg(cfg.Leg), cfg.TCPRemote, cfg.Nonce, cfg.Caps, cfg.FECProfile)
-	hello := protocol.Frame{
-		Type:      protocol.TypeHELLO,
-		SessionID: cfg.SessionID,
-		LaneID:    cfg.LaneID,
-		Body: protocol.HelloBody{
-			Nonce:      cfg.Nonce,
-			Caps:       cfg.Caps,
-			FECProfile: cfg.FECProfile,
-		},
-	}
-	packet, err := l.encodePacket(hello)
-	if err != nil {
+	lane.helloCaps = cfg.Caps
+	lane.helloFECProfile = cfg.FECProfile
+	l.cancelHelloRoute(key)
+	hello := sessionState.Open(0)
+	var nonce uint64
+	var retryPayload []byte
+	var packet *packetbuf.Packet
+	if err := hello.Do(func(v sessionpkg.View) error {
+		nonce = v.Nonce()
+		frame := protocol.Frame{
+			Type:      protocol.TypeHELLO,
+			SessionID: v.SessionID(),
+			LaneID:    cfg.LaneID,
+			Body: protocol.HelloBody{
+				Nonce:      nonce,
+				Caps:       cfg.Caps,
+				FECProfile: cfg.FECProfile,
+			},
+		}
+		var err error
+		packet, err = l.encodePacket(frame)
+		if err != nil {
+			return err
+		}
+		retryPayload = append([]byte(nil), packet.Payload...)
+		return nil
+	}); err != nil {
 		return err
 	}
-	retryPayload := append([]byte(nil), packet.Payload...)
+	debuglog.Printf("send", "start_lane %s leg={%s} tcp_remote=%s nonce=%d caps=%#x fec_profile=%d", debugLaneState(key, lane), debugLeg(cfg.Leg), cfg.TCPRemote, nonce, cfg.Caps, cfg.FECProfile)
 	if err := l.WriteTo(ctx, cfg.Leg, packet); err != nil {
 		debuglog.Printf("send", "start_lane_write_err session=%d lane=%d leg={%s} err=%v", cfg.SessionID, cfg.LaneID, debugLeg(cfg.Leg), err)
 		return err
 	}
-	lane.helloRetry.start(cfg.Nonce, cfg.Leg, retryPayload, cfg.Caps, cfg.FECProfile)
-	debuglog.Printf("send", "start_lane_hello session=%d lane=%d nonce=%d bytes=%d", cfg.SessionID, cfg.LaneID, cfg.Nonce, len(retryPayload))
+	var route helloRoute
+	route.set(hello, cfg.Leg, retryPayload)
+	l.helloRoutes[key] = route
+	debuglog.Printf("send", "start_lane_hello session=%d lane=%d nonce=%d bytes=%d", cfg.SessionID, cfg.LaneID, nonce, len(retryPayload))
 	return nil
 }

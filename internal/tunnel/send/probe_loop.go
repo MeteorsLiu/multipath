@@ -1,4 +1,4 @@
-package probe
+package send
 
 import (
 	"context"
@@ -7,28 +7,24 @@ import (
 	"time"
 
 	"github.com/MeteorsLiu/multipath/internal/debuglog"
-	"github.com/MeteorsLiu/multipath/internal/protocol"
-	"github.com/MeteorsLiu/multipath/internal/transport"
 	core "github.com/MeteorsLiu/multipath/internal/tunnel/probe/core"
-	"github.com/MeteorsLiu/multipath/internal/tunnel/recv"
-	"github.com/MeteorsLiu/multipath/internal/tunnel/send"
 )
 
-type Config struct {
+type ProbeLoopConfig struct {
 	Events   <-chan core.Event
 	Interval time.Duration
 	Timeout  time.Duration
 }
 
-type Loop struct {
-	sender   *send.Send
+type ProbeLoop struct {
+	sender   *Send
 	events   <-chan core.Event
 	interval time.Duration
 	timeout  time.Duration
 }
 
-func New(sender *send.Send, configs ...Config) *Loop {
-	loop := &Loop{sender: sender}
+func NewProbeLoop(sender *Send, configs ...ProbeLoopConfig) *ProbeLoop {
+	loop := &ProbeLoop{sender: sender}
 	for _, cfg := range configs {
 		if cfg.Events != nil {
 			loop.events = cfg.Events
@@ -43,27 +39,16 @@ func New(sender *send.Send, configs ...Config) *Loop {
 	return loop
 }
 
-func (l *Loop) Bootstrap(ctx context.Context) error {
+func (l *ProbeLoop) Bootstrap(ctx context.Context) error {
 	debuglog.Printf("probe/loop", "bootstrap")
-	err := l.sender.Bootstrap(ctx)
+	err := l.sender.bootstrap(ctx)
 	if err != nil {
 		debuglog.Printf("probe/loop", "bootstrap err=%v", err)
 	}
 	return err
 }
 
-func (l *Loop) Write(ctx context.Context, frame protocol.Frame, leg transport.LegRef) (recv.Result, error) {
-	debuglog.Printf("probe/loop", "control_in type=%d session=%d lane=%d leg_kind=%d", frame.Type, frame.SessionID, frame.LaneID, leg.Kind)
-	result, err := l.sender.WriteFrame(ctx, frame, leg)
-	debuglog.Printf("probe/loop", "control_out accepted=%t caps=%#x fec_profile=%d err=%v", result.Accepted, result.Caps, result.FECProfile, err)
-	return recv.Result{
-		Accepted:   result.Accepted,
-		Caps:       result.Caps,
-		FECProfile: result.FECProfile,
-	}, err
-}
-
-func (l *Loop) Run(ctx context.Context) error {
+func (l *ProbeLoop) Run(ctx context.Context) error {
 	if l.sender == nil || l.interval <= 0 {
 		debuglog.Printf("probe/loop", "disabled sender_nil=%t interval=%s", l.sender == nil, l.interval)
 		<-ctx.Done()
@@ -122,7 +107,7 @@ func (l *Loop) Run(ctx context.Context) error {
 	}
 }
 
-func (l *Loop) run(ctx context.Context, events <-chan core.Event) error {
+func (l *ProbeLoop) run(ctx context.Context, events <-chan core.Event) error {
 	ticker := time.NewTicker(l.interval)
 	defer ticker.Stop()
 
@@ -137,13 +122,13 @@ func (l *Loop) run(ctx context.Context, events <-chan core.Event) error {
 				continue
 			}
 			debuglog.Printf("probe/loop", "event %s", debugProbeEvent(event))
-			if err := l.sender.WriteProbeEvent(ctx, event); err != nil {
+			if err := l.sender.writeProbeEvent(ctx, event); err != nil {
 				debuglog.Printf("probe/loop", "event err=%v", err)
 				return err
 			}
 		case now := <-ticker.C:
 			debuglog.Printf("probe/loop", "retry_hello now_ms=%d", now.UnixMilli())
-			if err := l.sender.RetryHELLO(ctx, uint64(now.UnixMilli())); err != nil {
+			if err := l.sender.retryHELLO(ctx, uint64(now.UnixMilli())); err != nil {
 				debuglog.Printf("probe/loop", "retry_hello err=%v", err)
 				return err
 			}

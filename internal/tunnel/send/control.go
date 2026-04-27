@@ -4,82 +4,36 @@ import (
 	"context"
 
 	"github.com/MeteorsLiu/multipath/internal/debuglog"
+	"github.com/MeteorsLiu/multipath/internal/metrics"
 	"github.com/MeteorsLiu/multipath/internal/protocol"
+	sessionpkg "github.com/MeteorsLiu/multipath/internal/session"
 	"github.com/MeteorsLiu/multipath/internal/transport"
 	probe "github.com/MeteorsLiu/multipath/internal/tunnel/probe/core"
 )
 
-func (i *Send) handleTransportFrame(ctx context.Context, leg transport.LegRef, frame protocol.Frame) (Result, error) {
-	debuglog.Printf("send/control", "frame_in %s leg={%s}", debugFrameSummary(frame), debugLeg(leg))
-	switch frame.Type {
-	case protocol.TypeHELLO:
-		body, ok := frame.Body.(protocol.HelloBody)
-		if !ok {
-			debuglog.Printf("send/control", "invalid_body type=HELLO")
-			return Result{}, protocol.ErrInvalidFrame
-		}
-		return i.acceptHello(ctx, frame.SessionID, frame.LaneID, leg, body)
-	case protocol.TypeHELLOACK:
-		body, ok := frame.Body.(protocol.HelloAckBody)
-		if !ok {
-			debuglog.Printf("send/control", "invalid_body type=HELLO_ACK")
-			return Result{}, protocol.ErrInvalidFrame
-		}
-		return i.acceptHelloAck(ctx, frame.SessionID, frame.LaneID, leg, body)
-	case protocol.TypePING:
-		body, ok := frame.Body.(protocol.PingBody)
-		if !ok {
-			debuglog.Printf("send/control", "invalid_body type=PING")
-			return Result{}, protocol.ErrInvalidFrame
-		}
-		return Result{}, i.receivePing(ctx, frame.SessionID, frame.LaneID, leg, body)
-	case protocol.TypePONG:
-		body, ok := frame.Body.(protocol.PingBody)
-		if !ok {
-			debuglog.Printf("send/control", "invalid_body type=PONG")
-			return Result{}, protocol.ErrInvalidFrame
-		}
-		return Result{}, i.receivePong(ctx, frame.SessionID, frame.LaneID, leg, body)
-	case protocol.TypeDATA, protocol.TypeREPAIR:
-		accepted, err := i.observeLane(frame.SessionID, frame.LaneID, leg)
-		debuglog.Printf("send/control", "observe_data accepted=%t err=%v", accepted, err)
-		return Result{Accepted: accepted}, err
-	case protocol.TypeCLOSE:
-		body, ok := frame.Body.(protocol.CloseBody)
-		if !ok {
-			debuglog.Printf("send/control", "invalid_body type=CLOSE")
-			return Result{}, protocol.ErrInvalidFrame
-		}
-		return Result{}, i.close(ctx, frame.SessionID, frame.LaneID, body.Scope)
-	default:
-		debuglog.Printf("send/control", "ignore_unknown type=%d", frame.Type)
-		return Result{}, nil
-	}
-}
-
-func (i *Send) acceptHello(ctx context.Context, sessionID uint64, laneID uint8, leg transport.LegRef, body protocol.HelloBody) (Result, error) {
+func (i *Send) acceptHello(ctx context.Context, sessionID uint64, laneID uint8, leg transport.LegRef, body protocol.HelloBody) error {
 	caps := uint16(0)
 	fecProfile := protocol.FECProfileOff
 	if laneID != protocol.SessionControlLaneID {
-		caps, fecProfile = negotiateCapabilities(body.Caps, body.FECProfile)
-	}
-	res := Result{
-		Caps:       caps,
-		FECProfile: fecProfile,
+		caps, fecProfile = negotiateCapabilities(body.Caps, body.FECProfile, i.fecProfile)
 	}
 	debuglog.Printf("send/control", "accept_hello session=%d lane=%d leg={%s} caps=%#x fec_profile=%d negotiated_caps=%#x negotiated_fec_profile=%d", sessionID, laneID, debugLeg(leg), body.Caps, body.FECProfile, caps, fecProfile)
 
 	if laneID == protocol.SessionControlLaneID {
 		debuglog.Printf("send/control", "hello_control_lane session=%d lane=%d", sessionID, laneID)
-		return res, i.writeHelloAck(ctx, sessionID, laneID, leg, body.Nonce, false, caps, fecProfile)
+		return i.writeHelloAck(ctx, sessionID, laneID, leg, body.Nonce, false, caps, fecProfile)
 	}
 
-	session := i.session(sessionID)
+	sessionState, _, ok := i.getOrCreateSessionState(sessionID)
+	if !ok {
+		debuglog.Printf("send/control", "hello_drop session_create_denied session=%d lane=%d", sessionID, laneID)
+		return i.writeHelloAck(ctx, sessionID, laneID, leg, body.Nonce, false, caps, fecProfile)
+	}
 	if !i.hasActiveSession {
 		i.activateSession(sessionID)
 	}
-	session.negotiatedCaps = caps
-	session.fecProfile = fecProfile
+	i.negotiatedCaps = caps
+	i.fecProfile = fecProfile
 
 	key := laneKey{sessionID: sessionID, laneID: laneID}
 	lane := i.lanes[key]
@@ -88,74 +42,64 @@ func (i *Send) acceptHello(ctx context.Context, sessionID uint64, laneID uint8, 
 		i.lanes[key] = lane
 	}
 	lane.observeLeg(leg)
+	i.markRunnableLanesDirty(sessionID)
 	i.trackProbeTarget(ctx, sessionID, laneID, leg)
-	if err := i.enqueueLane(sessionID, lane); err != nil {
-		debuglog.Printf("send/control", "accept_hello enqueue err=%v %s", err, debugLaneState(key, lane))
-		return res, err
-	}
-	res.Accepted = true
+	metrics.IncCounter(metrics.LaneEventsTotal,
+		metrics.L("event", "hello_accept"),
+		metrics.L("session", sessionID),
+		metrics.L("lane", laneID),
+		metrics.L("leg", kindMetricLabel(leg.Kind)),
+	)
 	debuglog.Printf("send/control", "hello_accepted %s", debugLaneState(key, lane))
-	return res, i.writeHelloAck(ctx, sessionID, laneID, leg, body.Nonce, true, caps, fecProfile)
+	return sessionState.Do(func(v sessionpkg.View) error {
+		return i.writeHelloAck(ctx, v.SessionID(), laneID, leg, body.Nonce, true, caps, fecProfile)
+	})
 }
 
-func (i *Send) acceptHelloAck(ctx context.Context, sessionID uint64, laneID uint8, leg transport.LegRef, body protocol.HelloAckBody) (Result, error) {
-	caps, fecProfile := negotiateCapabilities(body.Caps, body.FECProfile)
-	res := Result{
-		Caps:       caps,
-		FECProfile: fecProfile,
-	}
+func (i *Send) acceptHelloAck(ctx context.Context, sessionID uint64, laneID uint8, leg transport.LegRef, body protocol.HelloAckBody) error {
+	caps, fecProfile := negotiateCapabilities(body.Caps, body.FECProfile, i.fecProfile)
 	debuglog.Printf("send/control", "accept_hello_ack session=%d lane=%d leg={%s} accepted=%d caps=%#x fec_profile=%d negotiated_caps=%#x negotiated_fec_profile=%d", sessionID, laneID, debugLeg(leg), body.Accepted, body.Caps, body.FECProfile, caps, fecProfile)
 
-	session := i.sessions[sessionID]
-	if session == nil {
+	sessionState, _, ok := i.getSessionState(sessionID)
+	if !ok {
 		debuglog.Printf("send/control", "hello_ack_drop missing_session session=%d lane=%d", sessionID, laneID)
-		return res, nil
+		return nil
 	}
-	lane := i.lanes[laneKey{sessionID: sessionID, laneID: laneID}]
+	key := laneKey{sessionID: sessionID, laneID: laneID}
+	lane := i.lanes[key]
 	if lane == nil {
 		debuglog.Printf("send/control", "hello_ack_drop missing_lane session=%d lane=%d", sessionID, laneID)
-		return res, nil
+		return nil
 	}
-	if !lane.helloRetry.matches(body.Nonce) {
+	route, ok := i.helloRoutes[key]
+	if !ok || !route.matches(body.Nonce) {
 		debuglog.Printf("send/control", "hello_ack_drop nonce_mismatch session=%d lane=%d nonce=%d", sessionID, laneID, body.Nonce)
-		return res, nil
+		return nil
 	}
-	lane.helloRetry.clear()
-	if body.Accepted != 1 {
+	accepted := sessionState.Ack(body.Nonce, body.Accepted == 1)
+	delete(i.helloRoutes, key)
+	if !accepted {
 		debuglog.Printf("send/control", "hello_ack_rejected session=%d lane=%d", sessionID, laneID)
-		return res, nil
+		return nil
 	}
 
-	session.negotiatedCaps = caps
-	session.fecProfile = fecProfile
+	i.negotiatedCaps = caps
+	i.fecProfile = fecProfile
 	lane.observeLeg(leg)
+	i.markRunnableLanesDirty(sessionID)
 	i.trackProbeTarget(ctx, sessionID, laneID, leg)
-	if err := i.enqueueLane(sessionID, lane); err != nil {
-		debuglog.Printf("send/control", "hello_ack enqueue err=%v %s", err, debugLaneState(laneKey{sessionID: sessionID, laneID: laneID}, lane))
-		return res, err
-	}
-	res.Accepted = true
+	metrics.IncCounter(metrics.LaneEventsTotal,
+		metrics.L("event", "hello_ack_accept"),
+		metrics.L("session", sessionID),
+		metrics.L("lane", laneID),
+		metrics.L("leg", kindMetricLabel(leg.Kind)),
+	)
 	debuglog.Printf("send/control", "hello_ack_accepted %s", debugLaneState(laneKey{sessionID: sessionID, laneID: laneID}, lane))
-	return res, nil
-}
-
-func (i *Send) observeLane(sessionID uint64, laneID uint8, leg transport.LegRef) (bool, error) {
-	if i.sessions[sessionID] == nil {
-		debuglog.Printf("send/control", "observe_lane_drop missing_session session=%d lane=%d leg={%s}", sessionID, laneID, debugLeg(leg))
-		return false, nil
-	}
-	lane := i.lanes[laneKey{sessionID: sessionID, laneID: laneID}]
-	if lane == nil {
-		debuglog.Printf("send/control", "observe_lane_drop missing_lane session=%d lane=%d leg={%s}", sessionID, laneID, debugLeg(leg))
-		return false, nil
-	}
-	lane.observeLeg(leg)
-	debuglog.Printf("send/control", "observe_lane %s", debugLaneState(laneKey{sessionID: sessionID, laneID: laneID}, lane))
-	return true, nil
+	return nil
 }
 
 func (i *Send) receivePing(ctx context.Context, sessionID uint64, laneID uint8, leg transport.LegRef, body protocol.PingBody) error {
-	if i.sessions[sessionID] == nil {
+	if _, _, ok := i.getSessionState(sessionID); !ok {
 		debuglog.Printf("send/control", "ping_drop missing_session session=%d lane=%d ping_id=%d", sessionID, laneID, body.PingID)
 		return nil
 	}
@@ -165,6 +109,7 @@ func (i *Send) receivePing(ctx context.Context, sessionID uint64, laneID uint8, 
 		return nil
 	}
 	lane.observeLeg(leg)
+	i.markRunnableLanesDirty(sessionID)
 	debuglog.Printf("send/control", "ping session=%d lane=%d ping_id=%d leg={%s}", sessionID, laneID, body.PingID, debugLeg(leg))
 	return i.writeControlFrameOnLeg(ctx, leg, protocol.Frame{
 		Type:      protocol.TypePONG,
@@ -175,7 +120,7 @@ func (i *Send) receivePing(ctx context.Context, sessionID uint64, laneID uint8, 
 }
 
 func (i *Send) receivePong(ctx context.Context, sessionID uint64, laneID uint8, leg transport.LegRef, body protocol.PingBody) error {
-	if i.sessions[sessionID] == nil {
+	if _, _, ok := i.getSessionState(sessionID); !ok {
 		debuglog.Printf("send/control", "pong_drop missing_session session=%d lane=%d ping_id=%d", sessionID, laneID, body.PingID)
 		return nil
 	}
@@ -204,8 +149,8 @@ func (i *Send) close(ctx context.Context, sessionID uint64, laneID uint8, scope 
 	case protocol.CloseScopeLane:
 		i.closeLane(ctx, laneKey{sessionID: sessionID, laneID: laneID})
 	case protocol.CloseScopeSession:
-		delete(i.sessions, sessionID)
-		delete(i.schedulers, sessionID)
+		i.deleteSessionState(sessionID)
+		delete(i.strategies, sessionID)
 		if i.hasActiveSession && i.activeSessionID == sessionID {
 			i.hasActiveSession = false
 			i.activeSessionID = 0
@@ -215,6 +160,7 @@ func (i *Send) close(ctx context.Context, sessionID uint64, laneID uint8, scope 
 				i.closeLane(ctx, key)
 			}
 		}
+		i.deleteRunnableLanesCache(sessionID)
 	}
 	return nil
 }
@@ -222,16 +168,29 @@ func (i *Send) close(ctx context.Context, sessionID uint64, laneID uint8, scope 
 func (i *Send) closeLane(ctx context.Context, key laneKey) {
 	lane := i.lanes[key]
 	delete(i.lanes, key)
+	i.markRunnableLanesDirty(key.sessionID)
 	if lane == nil {
 		debuglog.Printf("send/control", "close_lane missing session=%d lane=%d", key.sessionID, key.laneID)
 		return
 	}
+	i.cancelHelloRoute(key)
 	debuglog.Printf("send/control", "close_lane %s", debugLaneState(key, lane))
 	i.untrackProbeTarget(ctx, lane.udpLeg)
 	i.untrackProbeTarget(ctx, lane.tcpLeg)
 	if i.streamTransport != nil && lane.tcpLeg.ConnID != "" {
 		_ = i.streamTransport.Close(ctx, lane.tcpLeg.ConnID)
 	}
+}
+
+func (i *Send) cancelHelloRoute(key laneKey) {
+	route, ok := i.helloRoutes[key]
+	if !ok || !route.valid() {
+		return
+	}
+	if sessionState, ok := i.sessionManager.Get(key.sessionID); ok {
+		sessionState.Ack(route.nonce(), false)
+	}
+	delete(i.helloRoutes, key)
 }
 
 func (i *Send) writeHelloAck(ctx context.Context, sessionID uint64, laneID uint8, leg transport.LegRef, nonce uint64, accepted bool, caps uint16, fecProfile uint8) error {
@@ -290,9 +249,9 @@ func (i *Send) writePayloadOnLeg(ctx context.Context, leg transport.LegRef, payl
 	return i.enqueuePayload(ctx, leg, payload)
 }
 
-func negotiateCapabilities(peerCaps uint16, peerFECProfile uint8) (uint16, uint8) {
+func negotiateCapabilities(peerCaps uint16, peerFECProfile uint8, localFECProfile uint8) (uint16, uint8) {
 	caps := peerCaps & protocol.SupportedCaps
-	if caps&protocol.CapFEC == 0 || peerFECProfile != protocol.FECProfileSLC4Plus1 {
+	if caps&protocol.CapFEC == 0 || peerFECProfile != protocol.FECProfileSLC4Plus1 || localFECProfile != protocol.FECProfileSLC4Plus1 {
 		return caps &^ protocol.CapFEC, protocol.FECProfileOff
 	}
 	return caps, protocol.FECProfileSLC4Plus1

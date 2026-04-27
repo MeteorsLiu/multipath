@@ -1,8 +1,13 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/MeteorsLiu/multipath/internal/tun"
@@ -180,6 +185,60 @@ func TestBuildClientRuntimeIgnoresLegacyTCPFlag(t *testing.T) {
 	}
 	if runtime.streamTransport == nil {
 		t.Fatal("streamTransport is nil when legacy tcp flag is set")
+	}
+}
+
+func TestBuildRuntimeMetricsServer(t *testing.T) {
+	cfg := Config{
+		Client: ClientConfig{
+			RemotePaths: []PathConfig{
+				{RemoteAddr: "127.0.0.1:9000", Weight: 1},
+			},
+		},
+		PromListenAddr: "127.0.0.1:0",
+		SessionID:      7,
+	}
+	cfg.setDefaults()
+
+	device := tun.NewDevice(&appMemoryTun{}, cfg.Tun.MTU)
+	runtime, closers, err := buildClientRuntime(cfg, device)
+	if err != nil {
+		t.Fatalf("buildClientRuntime failed: %v", err)
+	}
+	defer closeAll(closers)
+	if runtime.metricsServer == nil {
+		t.Fatal("metricsServer is nil")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- runtime.metricsServer.Run(ctx)
+	}()
+
+	resp, err := http.Get("http://" + runtime.metricsServer.Addr() + "/metrics")
+	if err != nil {
+		cancel()
+		t.Fatalf("GET /metrics: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		cancel()
+		t.Fatalf("GET /metrics status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		cancel()
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if !strings.Contains(string(body), "multipath_runtime_info") {
+		cancel()
+		t.Fatalf("metrics missing runtime info:\n%s", body)
+	}
+
+	cancel()
+	if err := <-errCh; !errors.Is(err, context.Canceled) {
+		t.Fatalf("metrics Run err = %v, want context.Canceled", err)
 	}
 }
 

@@ -6,87 +6,107 @@ import (
 	"time"
 
 	"github.com/MeteorsLiu/multipath/internal/debuglog"
+	sessionpkg "github.com/MeteorsLiu/multipath/internal/session"
 	"github.com/MeteorsLiu/multipath/internal/transport"
 )
 
-type helloRetry struct {
-	awaiting   bool
-	nonce      uint64
-	leg        transport.LegRef
-	payload    []byte
-	caps       uint16
-	fecProfile uint8
-	startedMS  uint64
-	lastSentMS uint64
+type helloRoute struct {
+	hello        *sessionpkg.Hello
+	leg          transport.LegRef
+	payload      []byte
+	firstRetryMS uint64
+	lastRetryMS  uint64
 }
 
-func (r *helloRetry) start(nonce uint64, leg transport.LegRef, payload []byte, caps uint16, fecProfile uint8) {
-	r.awaiting = true
-	r.nonce = nonce
+func (r *helloRoute) set(hello *sessionpkg.Hello, leg transport.LegRef, payload []byte) {
+	r.hello = hello
 	r.leg = leg
 	r.payload = append(r.payload[:0], payload...)
-	r.caps = caps
-	r.fecProfile = fecProfile
-	r.startedMS = 0
-	r.lastSentMS = 0
+	r.firstRetryMS = 0
+	r.lastRetryMS = 0
 }
 
-func (r *helloRetry) clear() {
-	r.awaiting = false
-	r.leg = transport.LegRef{}
-	r.payload = nil
-	r.startedMS = 0
-	r.lastSentMS = 0
+func (r helloRoute) valid() bool {
+	return r.hello != nil && len(r.payload) != 0
 }
 
-func (r *helloRetry) pending() bool {
-	return r.awaiting && len(r.payload) != 0
+func (r helloRoute) nonce() uint64 {
+	var nonce uint64
+	if r.hello == nil {
+		return 0
+	}
+	_ = r.hello.Do(func(v sessionpkg.View) error {
+		nonce = v.Nonce()
+		return nil
+	})
+	return nonce
 }
 
-func (r *helloRetry) matches(nonce uint64) bool {
-	return r.awaiting && r.nonce == nonce
+func (r helloRoute) matches(nonce uint64) bool {
+	return r.hello != nil && r.nonce() == nonce
 }
 
-func (l *Send) retryPendingHELLO(ctx context.Context, nowMS uint64) error {
-	for key, lane := range l.lanes {
-		if lane == nil || !lane.helloRetry.pending() {
+func (l *Send) retryOpenHELLO(ctx context.Context, nowMS uint64) error {
+	for key, route := range l.helloRoutes {
+		if !route.valid() {
+			delete(l.helloRoutes, key)
 			continue
 		}
-		retry := &lane.helloRetry
-		if retry.startedMS == 0 {
-			retry.startedMS = nowMS
-			debuglog.Printf("send/retry", "hello_retry_start session=%d lane=%d nonce=%d leg={%s}", key.sessionID, key.laneID, retry.nonce, debugLeg(retry.leg))
+		nonce := route.nonce()
+		if route.firstRetryMS == 0 {
+			route.firstRetryMS = nowMS
+			l.helloRoutes[key] = route
+			debuglog.Printf("send/retry", "hello_retry_start session=%d lane=%d nonce=%d leg={%s}", key.sessionID, key.laneID, nonce, debugLeg(route.leg))
 		}
-		if l.probeTimeout > 0 && elapsedMS(nowMS, retry.startedMS) >= l.probeTimeout {
-			leg := retry.leg
-			retry.clear()
-			debuglog.Printf("send/retry", "hello_retry_timeout session=%d lane=%d leg={%s}", key.sessionID, key.laneID, debugLeg(leg))
+		if l.probeTimeout > 0 && elapsedMS(nowMS, route.firstRetryMS) >= l.probeTimeout {
+			l.cancelHelloRoute(key)
+			lane := l.lanes[key]
+			if lane == nil {
+				debuglog.Printf("send/retry", "hello_retry_timeout missing_lane session=%d lane=%d nonce=%d", key.sessionID, key.laneID, nonce)
+				continue
+			}
+			leg := route.leg
+			debuglog.Printf("send/retry", "hello_retry_timeout session=%d lane=%d nonce=%d leg={%s}", key.sessionID, key.laneID, nonce, debugLeg(leg))
 			switch leg.Kind {
 			case transport.KindUDP:
 				lane.udpReady = false
+				l.markRunnableLanesDirty(key.sessionID)
 				l.trackProbeTarget(ctx, key.sessionID, key.laneID, leg)
 				l.startFallbackDial(ctx, key, lane)
 			case transport.KindTCP:
 				lane.tcpReady = false
+				l.markRunnableLanesDirty(key.sessionID)
 				if l.streamTransport != nil && leg.ConnID != "" {
 					_ = l.streamTransport.Close(ctx, leg.ConnID)
 				}
 			}
 			continue
 		}
-		if retry.lastSentMS != 0 && l.probeInterval > 0 && elapsedMS(nowMS, retry.lastSentMS) < l.probeInterval {
+		if route.lastRetryMS != 0 && l.probeInterval > 0 && elapsedMS(nowMS, route.lastRetryMS) < l.probeInterval {
 			continue
 		}
-		if err := l.writePayloadOnLeg(ctx, retry.leg, retry.payload); err != nil {
+		sent, expired, err := route.hello.Retry(nowMS, func(sessionpkg.View) error {
+			return l.writePayloadOnLeg(ctx, route.leg, route.payload)
+		})
+		if err != nil {
 			if errors.Is(err, errLaneUnavailable) {
-				debuglog.Printf("send/retry", "hello_retry_lane_unavailable session=%d lane=%d nonce=%d leg={%s}", key.sessionID, key.laneID, retry.nonce, debugLeg(retry.leg))
+				debuglog.Printf("send/retry", "hello_retry_lane_unavailable session=%d lane=%d nonce=%d leg={%s}", key.sessionID, key.laneID, nonce, debugLeg(route.leg))
 				continue
 			}
-			debuglog.Printf("send/retry", "hello_retry_send_err session=%d lane=%d nonce=%d leg={%s} err=%v", key.sessionID, key.laneID, retry.nonce, debugLeg(retry.leg), err)
+			debuglog.Printf("send/retry", "hello_retry_send_err session=%d lane=%d nonce=%d leg={%s} err=%v", key.sessionID, key.laneID, nonce, debugLeg(route.leg), err)
 			return err
 		}
-		retry.lastSentMS = nowMS
-		debuglog.Printf("send/retry", "hello_retry_send session=%d lane=%d nonce=%d leg={%s} bytes=%d", key.sessionID, key.laneID, retry.nonce, debugLeg(retry.leg), len(retry.payload))
+		if expired {
+			delete(l.helloRoutes, key)
+			debuglog.Printf("send/retry", "hello_retry_expired session=%d lane=%d nonce=%d", key.sessionID, key.laneID, nonce)
+			continue
+		}
+		if !sent {
+			continue
+		}
+		route.lastRetryMS = nowMS
+		l.helloRoutes[key] = route
+		debuglog.Printf("send/retry", "hello_retry_send session=%d lane=%d nonce=%d leg={%s} bytes=%d", key.sessionID, key.laneID, nonce, debugLeg(route.leg), len(route.payload))
 	}
 	return nil
 }

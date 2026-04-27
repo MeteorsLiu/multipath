@@ -8,10 +8,12 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 
+	"github.com/MeteorsLiu/multipath/internal/metrics"
+	"github.com/MeteorsLiu/multipath/internal/session"
 	"github.com/MeteorsLiu/multipath/internal/transport"
 	"github.com/MeteorsLiu/multipath/internal/tun"
-	"github.com/MeteorsLiu/multipath/internal/tunnel/probe"
 	probecore "github.com/MeteorsLiu/multipath/internal/tunnel/probe/core"
 	"github.com/MeteorsLiu/multipath/internal/tunnel/recv"
 	"github.com/MeteorsLiu/multipath/internal/tunnel/send"
@@ -78,21 +80,28 @@ func buildServerRuntime(cfg Config, device *tun.Device) (*appRuntime, []io.Close
 		return nil, nil, err
 	}
 	streamTransport := transport.NewStream(tcpListener)
+	metricsServer, err := newMetricsServer(cfg)
+	if err != nil {
+		_ = udpConn.Close()
+		_ = tcpListener.Close()
+		return nil, nil, err
+	}
 	probeEvents := make(chan probecore.Event, 128)
+	sessions := &session.Manager{}
 	in := send.New(send.Config{
 		StreamTransport: streamTransport,
+		SessionManager:  sessions,
 		ProbeInterval:   cfg.probeInterval(),
 		ProbeTimeout:    cfg.probeTimeout(),
 		ProbeEvents:     probeEvents,
+		EnableFEC:       cfg.FEC,
 	})
-	probeLoop := probe.New(in, probe.Config{
+	probeLoop := send.NewProbeLoop(in, send.ProbeLoopConfig{
 		Events:   probeEvents,
 		Interval: cfg.probeInterval(),
 		Timeout:  cfg.probeTimeout(),
 	})
-	out := recv.New(recv.Config{
-		Controller: probeLoop,
-	})
+	out := recv.New(recv.Config{Control: send.NewRecvState(in), SessionManager: sessions})
 	return &appRuntime{
 		tunReader:       device,
 		tunWriter:       device,
@@ -101,7 +110,8 @@ func buildServerRuntime(cfg Config, device *tun.Device) (*appRuntime, []io.Close
 		recv:            out,
 		packetTransport: packetTransport,
 		streamTransport: streamTransport,
-	}, []io.Closer{udpConn, tcpListener}, nil
+		metricsServer:   metricsServer,
+	}, appendClosers([]io.Closer{udpConn, tcpListener}, metricsServer), nil
 }
 
 func buildClientRuntime(cfg Config, device *tun.Device) (*appRuntime, []io.Closer, error) {
@@ -153,7 +163,6 @@ func buildClientRuntime(cfg Config, device *tun.Device) (*appRuntime, []io.Close
 				RemoteAddr: remote,
 			},
 			TCPRemote: path.RemoteAddr,
-			EnableFEC: cfg.FEC,
 		})
 	}
 
@@ -166,22 +175,28 @@ func buildClientRuntime(cfg Config, device *tun.Device) (*appRuntime, []io.Close
 			return nil, nil, err
 		}
 	}
+	metricsServer, err := newMetricsServer(cfg)
+	if err != nil {
+		closeAll(closers)
+		return nil, nil, err
+	}
 	probeEvents := make(chan probecore.Event, 128)
+	sessions := &session.Manager{}
 	in := send.New(send.Config{
 		StreamTransport: streamTransport,
+		SessionManager:  sessions,
 		ProbeInterval:   cfg.probeInterval(),
 		ProbeTimeout:    cfg.probeTimeout(),
 		ProbeEvents:     probeEvents,
+		EnableFEC:       cfg.FEC,
 		BootstrapLanes:  bootstrap,
 	})
-	probeLoop := probe.New(in, probe.Config{
+	probeLoop := send.NewProbeLoop(in, send.ProbeLoopConfig{
 		Events:   probeEvents,
 		Interval: cfg.probeInterval(),
 		Timeout:  cfg.probeTimeout(),
 	})
-	out := recv.New(recv.Config{
-		Controller: probeLoop,
-	})
+	out := recv.New(recv.Config{Control: send.NewRecvState(in), SessionManager: sessions})
 	return &appRuntime{
 		tunReader:       device,
 		tunWriter:       device,
@@ -190,7 +205,35 @@ func buildClientRuntime(cfg Config, device *tun.Device) (*appRuntime, []io.Close
 		recv:            out,
 		packetTransport: packetTransport,
 		streamTransport: streamTransport,
-	}, closers, nil
+		metricsServer:   metricsServer,
+	}, appendClosers(closers, metricsServer), nil
+}
+
+func newMetricsServer(cfg Config) (*metrics.Server, error) {
+	role := "client"
+	if cfg.IsServerSide {
+		role = "server"
+	}
+	metrics.SetGauge(metrics.RuntimeInfo, 1,
+		metrics.L("role", role),
+		metrics.L("fec", cfg.FEC),
+		metrics.L("paths", len(cfg.Client.RemotePaths)),
+	)
+	server, err := metrics.NewServer(cfg.PromListenAddr)
+	if err != nil {
+		return nil, err
+	}
+	if server != nil {
+		fmt.Fprintf(os.Stderr, "multipath prom listen: %s\n", server.Addr())
+	}
+	return server, nil
+}
+
+func appendClosers(closers []io.Closer, extra io.Closer) []io.Closer {
+	if extra == nil {
+		return closers
+	}
+	return append(closers, extra)
 }
 
 func randomSessionID() (uint64, error) {

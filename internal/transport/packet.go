@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/MeteorsLiu/multipath/internal/debuglog"
+	"github.com/MeteorsLiu/multipath/internal/metrics"
 	"github.com/MeteorsLiu/multipath/internal/packetbuf"
 )
 
@@ -91,20 +92,42 @@ func (p *Packet) WriteTo(ctx context.Context, endpointID string, remote net.Addr
 	p.mu.RUnlock()
 	if conn == nil {
 		debuglog.Printf("transport/udp", "write unknown endpoint=%s remote=%v bytes=%d", endpointID, remote, len(payload))
+		metrics.IncCounter(metrics.TransportErrorsTotal,
+			metrics.L("transport", "udp"),
+			metrics.L("operation", "write_unknown_endpoint"),
+		)
 		return 0, ErrUnknownEndpoint
 	}
 
 	select {
 	case <-ctx.Done():
+		metrics.IncCounter(metrics.TransportErrorsTotal,
+			metrics.L("transport", "udp"),
+			metrics.L("operation", "write_ctx_done"),
+		)
 		return 0, ctx.Err()
 	default:
 	}
 	n, err := conn.WriteTo(payload, remote)
 	if err != nil {
 		debuglog.Printf("transport/udp", "write endpoint=%s remote=%v bytes=%d err=%v", endpointID, remote, len(payload), err)
+		metrics.IncCounter(metrics.TransportErrorsTotal,
+			metrics.L("transport", "udp"),
+			metrics.L("operation", "write"),
+		)
 		return n, err
 	}
 	debuglog.Printf("transport/udp", "write endpoint=%s remote=%v bytes=%d", endpointID, remote, n)
+	metrics.IncCounter(metrics.TransportPacketsTotal,
+		metrics.L("transport", "udp"),
+		metrics.L("direction", "tx"),
+		metrics.L("endpoint", endpointID),
+	)
+	metrics.AddCounter(metrics.TransportBytesTotal, uint64(n),
+		metrics.L("transport", "udp"),
+		metrics.L("direction", "tx"),
+		metrics.L("endpoint", endpointID),
+	)
 	return n, nil
 }
 
@@ -119,6 +142,10 @@ func (p *Packet) readLoop(ctx context.Context, endpoint PacketEndpoint, writer P
 		if err := endpoint.Conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
 			packet.Release()
 			debuglog.Printf("transport/udp", "read endpoint=%s deadline err=%v", endpoint.ID, err)
+			metrics.IncCounter(metrics.TransportErrorsTotal,
+				metrics.L("transport", "udp"),
+				metrics.L("operation", "read_deadline"),
+			)
 			return err
 		}
 
@@ -134,6 +161,10 @@ func (p *Packet) readLoop(ctx context.Context, endpoint PacketEndpoint, writer P
 				}
 			}
 			debuglog.Printf("transport/udp", "read endpoint=%s err=%v", endpoint.ID, err)
+			metrics.IncCounter(metrics.TransportErrorsTotal,
+				metrics.L("transport", "udp"),
+				metrics.L("operation", "read"),
+			)
 			return err
 		}
 		leg := LegRef{
@@ -143,9 +174,23 @@ func (p *Packet) readLoop(ctx context.Context, endpoint PacketEndpoint, writer P
 		}
 		packet.SetLen(n)
 		debuglog.Printf("transport/udp", "read endpoint=%s remote=%v bytes=%d", endpoint.ID, remote, n)
+		metrics.IncCounter(metrics.TransportPacketsTotal,
+			metrics.L("transport", "udp"),
+			metrics.L("direction", "rx"),
+			metrics.L("endpoint", endpoint.ID),
+		)
+		metrics.AddCounter(metrics.TransportBytesTotal, uint64(n),
+			metrics.L("transport", "udp"),
+			metrics.L("direction", "rx"),
+			metrics.L("endpoint", endpoint.ID),
+		)
 
 		if err := writer.WriteTo(ctx, leg, packet); err != nil {
 			debuglog.Printf("transport/udp", "deliver endpoint=%s remote=%v bytes=%d err=%v", endpoint.ID, remote, n, err)
+			metrics.IncCounter(metrics.TransportErrorsTotal,
+				metrics.L("transport", "udp"),
+				metrics.L("operation", "deliver"),
+			)
 			return err
 		}
 	}

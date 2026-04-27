@@ -60,21 +60,34 @@ Public architecture boundaries:
 Send
 Recv
 ProbeLoop
-Scheduler
+Session
+Schedule Strategy
 Transport
 Protocol
 FEC
 ```
 
-Do not introduce public `Session`, `Path`, or `Lane` modules unless the design
-docs are changed first. Do not introduce a public `Tunnel` module, a tunnel
-facade, or a shared runtime-data module between Send and Recv.
+Do not introduce public `Path` or `Lane` modules unless the design docs are
+changed first. Do not introduce a public `Tunnel` module, a tunnel facade, or a
+shared runtime-data module between Send and Recv.
 
 Important constraints:
 
-- Scheduler exposes only `Enqueue` and `Dequeue`.
-- Scheduler does not know sessions, protocol frames, transports, or lane
-  runtime objects.
+- Schedule Strategy exposes only `Pick`.
+- Schedule Strategy does not know sessions, protocol frames, transports, or
+  lane runtime objects.
+- Session exposes only `Manager`, `Session`, `Hello`, and `View` with the
+  interface in `docs/architecture.md`.
+- Manager only owns session lifetime and creation admission:
+  `Get`, `Create`, `GetOrCreate`, and `Delete`.
+- Session only owns session id, nonce, and HELLO open/ack/retry state:
+  `Open`, `Ack`, and `Do`.
+- Hello only exposes `Do` and `Retry`.
+- View has no exported fields and only exposes `SessionID()` and `Nonce()`.
+- Session must not know lanes, transport legs, protocol frames, FEC, schedule
+  strategy, caps, fallback, or packet output.
+- Do not add `OpenLane`, `RunnableLanes`, `ReceiveHello`, `ReceiveHelloAck`,
+  `AcceptHello`, or other lane/protocol-specific methods to Session.
 - Transport works with bytes and Go network primitives. It does not know
   `Frame` or `Protocol`.
 - Protocol public behavior is `Encode` and `Decode` only. `Frame` carries one
@@ -92,24 +105,27 @@ Important constraints:
 - The TUN read loop belongs in `internal/tun`. Send must not own a
   `TUNReader` or application lifecycle loop.
 - Send has one TUN input method: `Write`, one direct transport-bound output
-  method: `WriteTo`, one transport output channel: `Packets`, and the narrow
-  maintenance entry points required by ProbeLoop.
+  method: `WriteTo`, and one transport output channel: `Packets`. Send must not
+  expose control-plane maintenance methods; the ProbeLoop adapter lives in the
+  send package and uses Send's unexported control hooks.
 - Do not expose semantic
   control methods such as `AcceptHello`, `AcceptHelloAck`, `ObserveLane`,
   `ReceivePing`, `ReceivePong`, or `Close` on Send.
-- Recv and runtime bootstrap must go through ProbeLoop instead of calling Send
-  control internals directly.
+- HELLO and HELLO_ACK state transitions must go through Session. Protocol frame
+  construction stays in the caller's callback; Session must not encode frames or
+  write transport packets.
+- Send must not participate in HELLO_ACK admission/decision logic. The caller
+  updates Send-owned lane readiness, negotiated caps, FEC profile, and probe
+  state only after `Session.Ack` accepts the nonce and accepted flag.
 - Transport loops call `Recv.WriteTo`. The TUN write loop consumes
   `Recv.Packets()`. Recv must not write TUN directly.
-- Recv must not own or call transport writers; transport replies caused by
-  received control frames go through ProbeLoop and then Send's transport output
-  channel because Send owns lane state.
+- Recv must not own transport writers. Control replies use caller-owned protocol
+  frame construction and the runtime transport-bound output path.
 - Do not reintroduce a tunnel loop object inside `internal/tunnel`. `Send`,
-  `Recv`, and ProbeLoop are separate modules and should own only
+  `Recv`, and ProbeLoop are separate runtime roles and should own only
   the runtime data/dependencies they directly need.
-- ProbeLoop is the only non-TUN control-plane adapter into Send. Do not
-  bypass ProbeLoop when wiring Recv, bootstrap, probe, HELLO retry, or
-  fallback flow.
+- ProbeLoop drives probe, HELLO retry, and fallback flow. It must not become a
+  raw decoded-control-frame forwarder.
 - Recv packets may reuse transport read buffers; the TUN write loop must
   release each packet after writing. Transport
   `Write`/`WriteTo` implementations must finish using the provided payload
@@ -136,6 +152,11 @@ go test ./...
 - If the user says a design or conclusion is wrong, re-check before defending
   it.
 - Keep abstractions minimal and aligned with `docs/architecture.md`.
+- Before implementing custom infrastructure, protocol helpers, encoders,
+  schedulers, metrics/exporters, parsers, crypto, compression, FEC, or other
+  broadly solved functionality, first research maintained existing libraries
+  and use one when it fits the design. Hand-roll only after verifying no
+  suitable library exists or after documenting why existing options do not fit.
 - Do not add type aliases or pass-through helper APIs just to preserve old names
   or hide an existing concrete type. Use the owning type or function directly
   unless the design documents require a real semantic boundary.

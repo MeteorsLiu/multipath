@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/MeteorsLiu/multipath/internal/debuglog"
+	"github.com/MeteorsLiu/multipath/internal/metrics"
 	"github.com/MeteorsLiu/multipath/internal/protocol"
 	"github.com/MeteorsLiu/multipath/internal/transport"
 	probe "github.com/MeteorsLiu/multipath/internal/tunnel/probe/core"
@@ -37,13 +38,13 @@ func (l *Send) sendPING(ctx context.Context, sessionID uint64, laneID uint8, leg
 }
 
 func (l *Send) maybeStartFallbackDial(ctx context.Context, key laneKey, lane *laneRuntime) {
-	session := l.sessions[key.sessionID]
-	if session == nil || session.negotiatedCaps&protocol.CapTCPFallback == 0 {
-		debuglog.Printf("send/probe", "fallback_skip session=%d lane=%d session_nil=%t caps=%#x", key.sessionID, key.laneID, session == nil, func() uint16 {
-			if session == nil {
+	_, _, ok := l.getSessionState(key.sessionID)
+	if !ok || l.negotiatedCaps&protocol.CapTCPFallback == 0 {
+		debuglog.Printf("send/probe", "fallback_skip session=%d lane=%d session_nil=%t caps=%#x", key.sessionID, key.laneID, !ok, func() uint16 {
+			if !ok {
 				return 0
 			}
-			return session.negotiatedCaps
+			return l.negotiatedCaps
 		}())
 		return
 	}
@@ -59,6 +60,12 @@ func (l *Send) startFallbackDial(ctx context.Context, key laneKey, lane *laneRun
 	lane.fallbackDialing = true
 	remote := lane.tcpRemote
 	debuglog.Printf("send/probe", "fallback_dial_start session=%d lane=%d remote=%s", key.sessionID, key.laneID, remote)
+	metrics.IncCounter(metrics.LaneEventsTotal,
+		metrics.L("event", "fallback_dial_start"),
+		metrics.L("session", key.sessionID),
+		metrics.L("lane", key.laneID),
+		metrics.L("leg", "tcp"),
+	)
 	go func() {
 		leg, err := l.streamTransport.Dial(ctx, remote)
 		debuglog.Printf("send/probe", "fallback_dial_done session=%d lane=%d remote=%s leg={%s} err=%v", key.sessionID, key.laneID, remote, debugLeg(leg), err)
@@ -80,30 +87,39 @@ func (l *Send) handleFallbackDialResult(ctx context.Context, result fallbackDial
 	lane.fallbackDialing = false
 	if result.err != nil {
 		debuglog.Printf("send/probe", "fallback_result_err %s err=%v", debugLaneState(result.key, lane), result.err)
+		metrics.IncCounter(metrics.LaneEventsTotal,
+			metrics.L("event", "fallback_dial_error"),
+			metrics.L("session", result.key.sessionID),
+			metrics.L("lane", result.key.laneID),
+			metrics.L("leg", "tcp"),
+		)
 		return nil
 	}
-	session := l.sessions[result.key.sessionID]
-	if session == nil {
+	_, _, ok := l.getSessionState(result.key.sessionID)
+	if !ok {
 		debuglog.Printf("send/probe", "fallback_result_drop missing_session session=%d lane=%d leg={%s}", result.key.sessionID, result.key.laneID, debugLeg(result.leg))
 		return nil
 	}
 
-	nonce := l.nextNonce
-	l.nextNonce++
-	caps := session.negotiatedCaps
-	fecProfile := session.fecProfile
-	if caps == 0 && lane.helloRetry.caps != 0 {
-		caps = lane.helloRetry.caps
-		fecProfile = lane.helloRetry.fecProfile
+	caps := l.negotiatedCaps
+	fecProfile := l.fecProfile
+	if caps == 0 && lane.helloCaps != 0 {
+		caps = lane.helloCaps
+		fecProfile = lane.helloFECProfile
 	}
 	debuglog.Printf("send/probe", "fallback_result_start_lane session=%d lane=%d leg={%s} caps=%#x fec_profile=%d", result.key.sessionID, result.key.laneID, debugLeg(result.leg), caps, fecProfile)
+	metrics.IncCounter(metrics.LaneEventsTotal,
+		metrics.L("event", "fallback_dial_success"),
+		metrics.L("session", result.key.sessionID),
+		metrics.L("lane", result.key.laneID),
+		metrics.L("leg", kindMetricLabel(result.leg.Kind)),
+	)
 	return l.startLane(ctx, startLaneConfig{
 		SessionID:  result.key.sessionID,
 		LaneID:     result.key.laneID,
 		Weight:     lane.weight,
 		Leg:        result.leg,
 		TCPRemote:  lane.tcpRemote,
-		Nonce:      nonce,
 		Caps:       caps,
 		FECProfile: fecProfile,
 	})
@@ -111,6 +127,10 @@ func (l *Send) handleFallbackDialResult(ctx context.Context, result fallbackDial
 
 func (l *Send) handleProbeEvent(ctx context.Context, event probe.Event) error {
 	debuglog.Printf("send/probe", "event %s", debugProbeEvent(event))
+	metrics.IncCounter(metrics.ProbeEventsTotal,
+		metrics.L("event", debugProbeEventType(event.Type)),
+		metrics.L("direction", "in"),
+	)
 	switch event.Type {
 	case probe.EventSendPing:
 		binding, ok := l.probeTargets[event.Target]
@@ -148,21 +168,25 @@ func (l *Send) handleProbeTargetLost(ctx context.Context, target probe.Target) e
 		return nil
 	}
 	debuglog.Printf("send/probe", "target_lost target=%d leg={%s} before=%s", target, debugLeg(binding.leg), debugLaneState(key, lane))
+	metrics.IncCounter(metrics.LaneEventsTotal,
+		metrics.L("event", "target_lost"),
+		metrics.L("session", key.sessionID),
+		metrics.L("lane", key.laneID),
+		metrics.L("leg", kindMetricLabel(binding.leg.Kind)),
+	)
 
 	switch binding.leg.Kind {
 	case transport.KindUDP:
 		lane.udpReady = false
+		l.markRunnableLanesDirty(key.sessionID)
 		l.maybeStartFallbackDial(ctx, key, lane)
 	case transport.KindTCP:
 		lane.tcpReady = false
+		l.markRunnableLanesDirty(key.sessionID)
 		if l.streamTransport != nil && binding.leg.ConnID != "" {
 			_ = l.streamTransport.Close(ctx, binding.leg.ConnID)
 		}
 		l.untrackProbeTarget(ctx, binding.leg)
-	}
-	if lane.ready() && !lane.queued {
-		debuglog.Printf("send/probe", "target_lost_requeue %s", debugLaneState(key, lane))
-		return l.enqueueLane(key.sessionID, lane)
 	}
 	debuglog.Printf("send/probe", "target_lost_done %s", debugLaneState(key, lane))
 	return nil
@@ -180,10 +204,13 @@ func (l *Send) handleProbeTargetRecovered(target probe.Target) error {
 		return nil
 	}
 	lane.observeLeg(binding.leg)
-	if lane.ready() && !lane.queued {
-		debuglog.Printf("send/probe", "target_recovered_requeue target=%d %s", target, debugLaneState(laneKey{sessionID: binding.sessionID, laneID: binding.laneID}, lane))
-		return l.enqueueLane(binding.sessionID, lane)
-	}
+	l.markRunnableLanesDirty(binding.sessionID)
+	metrics.IncCounter(metrics.LaneEventsTotal,
+		metrics.L("event", "target_recovered"),
+		metrics.L("session", binding.sessionID),
+		metrics.L("lane", binding.laneID),
+		metrics.L("leg", kindMetricLabel(binding.leg.Kind)),
+	)
 	debuglog.Printf("send/probe", "target_recovered target=%d %s", target, debugLaneState(laneKey{sessionID: binding.sessionID, laneID: binding.laneID}, lane))
 	return nil
 }
@@ -237,6 +264,10 @@ func (l *Send) sendProbeEvent(ctx context.Context, event probe.Event) {
 		return
 	}
 	debuglog.Printf("send/probe", "event_out %s", debugProbeEvent(event))
+	metrics.IncCounter(metrics.ProbeEventsTotal,
+		metrics.L("event", debugProbeEventType(event.Type)),
+		metrics.L("direction", "out"),
+	)
 	select {
 	case l.probeEvents <- event:
 	case <-ctx.Done():

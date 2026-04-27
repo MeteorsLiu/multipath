@@ -8,7 +8,6 @@ import (
 
 	"github.com/MeteorsLiu/multipath/internal/protocol"
 	"github.com/MeteorsLiu/multipath/internal/transport"
-	"github.com/MeteorsLiu/multipath/internal/tunnel/probe"
 	"github.com/MeteorsLiu/multipath/internal/tunnel/send"
 )
 
@@ -73,7 +72,7 @@ func TestRuntimeBootstrapFailureDoesNotStartLoops(t *testing.T) {
 
 	err := (&appRuntime{
 		send:            sender,
-		probeLoop:       probe.New(sender),
+		probeLoop:       send.NewProbeLoop(sender),
 		packetTransport: packet,
 	}).Run(context.Background())
 	if err == nil {

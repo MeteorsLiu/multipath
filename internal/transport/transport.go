@@ -6,6 +6,7 @@ import (
 	"net"
 
 	"github.com/MeteorsLiu/multipath/internal/debuglog"
+	"github.com/MeteorsLiu/multipath/internal/metrics"
 	"github.com/MeteorsLiu/multipath/internal/packetbuf"
 )
 
@@ -65,9 +66,24 @@ func RunWriter(ctx context.Context, packets <-chan Payload, packet PacketTranspo
 			payload.Packet.Release()
 			if err != nil {
 				debuglog.Printf("transport", "writer error %s err=%v", debugLeg(payload.Leg), err)
+				metrics.IncCounter(metrics.TransportErrorsTotal,
+					metrics.L("transport", kindLabel(payload.Leg.Kind)),
+					metrics.L("operation", "write_dispatch"),
+				)
 				return err
 			}
 		}
+	}
+}
+
+func kindLabel(kind Kind) string {
+	switch kind {
+	case KindUDP:
+		return "udp"
+	case KindTCP:
+		return "tcp"
+	default:
+		return "unknown"
 	}
 }
 

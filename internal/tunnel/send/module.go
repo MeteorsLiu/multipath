@@ -3,21 +3,24 @@ package send
 import (
 	"context"
 	"errors"
+	"sort"
 	"sync"
 	"time"
 
 	"github.com/MeteorsLiu/multipath/internal/debuglog"
+	"github.com/MeteorsLiu/multipath/internal/metrics"
 	"github.com/MeteorsLiu/multipath/internal/packetbuf"
 	"github.com/MeteorsLiu/multipath/internal/protocol"
-	"github.com/MeteorsLiu/multipath/internal/scheduler"
-	"github.com/MeteorsLiu/multipath/internal/scheduler/cfs"
+	"github.com/MeteorsLiu/multipath/internal/schedule"
+	"github.com/MeteorsLiu/multipath/internal/schedule/cfs"
+	sessionpkg "github.com/MeteorsLiu/multipath/internal/session"
 	"github.com/MeteorsLiu/multipath/internal/transport"
 	probe "github.com/MeteorsLiu/multipath/internal/tunnel/probe/core"
 )
 
 var (
 	errNoRunnableLane = errors.New("tunnel: no runnable lane")
-	errUnknownLane    = errors.New("tunnel: scheduler returned unknown lane")
+	errUnknownLane    = errors.New("tunnel: unknown lane")
 	errInvalidLane    = errors.New("tunnel: invalid lane")
 )
 
@@ -27,11 +30,16 @@ type Send struct {
 	hasActiveSession bool
 	probeInterval    time.Duration
 	probeTimeout     time.Duration
-	nextNonce        uint64
 	nextProbeTarget  probe.Target
+	negotiatedCaps   uint16
+	fecProfile       uint8
+	fecCodec         fecCodec
 	lanes            map[laneKey]*laneRuntime
-	sessions         map[uint64]*sessionRuntime
-	schedulers       map[uint64]scheduler.Scheduler
+	sessionManager   *sessionpkg.Manager
+	sendStates       map[*sessionpkg.Session]*sendState
+	runnableCaches   map[uint64]*runnableLaneCache
+	helloRoutes      map[laneKey]helloRoute
+	strategies       map[uint64]schedule.Strategy[*laneRuntime]
 	probeTargets     map[probe.Target]probeBinding
 	probeKeys        map[pingKey]probe.Target
 	bootstrapLanes   []BootstrapLane
@@ -44,10 +52,13 @@ type Send struct {
 
 func New(configs ...Config) *Send {
 	in := &Send{
-		lanes:      make(map[laneKey]*laneRuntime),
-		sessions:   make(map[uint64]*sessionRuntime),
-		schedulers: make(map[uint64]scheduler.Scheduler),
-		packets:    make(chan transport.Payload, defaultPacketQueueSize),
+		lanes:          make(map[laneKey]*laneRuntime),
+		sendStates:     make(map[*sessionpkg.Session]*sendState),
+		runnableCaches: make(map[uint64]*runnableLaneCache),
+		helloRoutes:    make(map[laneKey]helloRoute),
+		strategies:     make(map[uint64]schedule.Strategy[*laneRuntime]),
+		packets:        make(chan transport.Payload, defaultPacketQueueSize),
+		sessionManager: &sessionpkg.Manager{},
 	}
 	for _, cfg := range configs {
 		in.applyConfig(cfg)
@@ -56,6 +67,9 @@ func New(configs ...Config) *Send {
 }
 
 func (l *Send) applyConfig(cfg Config) {
+	if cfg.SessionManager != nil {
+		l.sessionManager = cfg.SessionManager
+	}
 	if cfg.StreamTransport != nil {
 		l.streamTransport = cfg.StreamTransport
 	}
@@ -67,6 +81,9 @@ func (l *Send) applyConfig(cfg Config) {
 	}
 	if cfg.ProbeEvents != nil {
 		l.probeEvents = cfg.ProbeEvents
+	}
+	if cfg.EnableFEC {
+		l.enableFEC()
 	}
 	l.bootstrapLanes = append(l.bootstrapLanes, cfg.BootstrapLanes...)
 }
@@ -84,25 +101,18 @@ func (l *Send) bootstrapLocked(ctx context.Context) error {
 	debuglog.Printf("send", "bootstrap lanes=%d", len(l.bootstrapLanes))
 
 	for _, lane := range l.bootstrapLanes {
-		nonce := lane.Nonce
-		if nonce == 0 {
-			nonce = l.nextNonce
-			l.nextNonce++
-		}
-		caps := protocol.SupportedCaps
-		fecProfile := protocol.FECProfileOff
-		if lane.EnableFEC {
+		caps := protocol.CapTCPFallback
+		fecProfile := l.fecProfile
+		if fecProfile == protocol.FECProfileSLC4Plus1 {
 			caps |= protocol.CapFEC
-			fecProfile = protocol.FECProfileSLC4Plus1
 		}
-		debuglog.Printf("send", "bootstrap_lane session=%d lane=%d weight=%d leg={%s} tcp_remote=%s nonce=%d caps=%#x fec_profile=%d", lane.SessionID, lane.LaneID, lane.Weight, debugLeg(lane.Leg), lane.TCPRemote, nonce, caps, fecProfile)
+		debuglog.Printf("send", "bootstrap_lane session=%d lane=%d weight=%d leg={%s} tcp_remote=%s caps=%#x fec_profile=%d", lane.SessionID, lane.LaneID, lane.Weight, debugLeg(lane.Leg), lane.TCPRemote, caps, fecProfile)
 		if err := l.startLane(ctx, startLaneConfig{
 			SessionID:  lane.SessionID,
 			LaneID:     lane.LaneID,
 			Weight:     lane.Weight,
 			Leg:        lane.Leg,
 			TCPRemote:  lane.TCPRemote,
-			Nonce:      nonce,
 			Caps:       caps,
 			FECProfile: fecProfile,
 		}); err != nil {
@@ -133,27 +143,65 @@ func (l *Send) encodePacket(frame protocol.Frame) (*packetbuf.Packet, error) {
 	return packet, nil
 }
 
-func (l *Send) scheduler(sessionID uint64) scheduler.Scheduler {
-	sched := l.schedulers[sessionID]
-	if sched != nil {
-		return sched
+func (l *Send) strategy(sessionID uint64) schedule.Strategy[*laneRuntime] {
+	strategy := l.strategies[sessionID]
+	if strategy != nil {
+		return strategy
 	}
 
-	sched = cfs.New()
-	l.schedulers[sessionID] = sched
-	return sched
+	strategy = cfs.New[*laneRuntime]()
+	l.strategies[sessionID] = strategy
+	return strategy
 }
 
-func (l *Send) enqueueLane(sessionID uint64, lane *laneRuntime) error {
-	if lane == nil || lane.queued {
-		return nil
+func (l *Send) pickLane(sessionID uint64, cost uint32) (*laneRuntime, bool) {
+	lanes := l.runnableLanes(sessionID)
+	if len(lanes) == 0 {
+		return nil, false
 	}
-	if err := l.scheduler(sessionID).Enqueue(lane.id, lane.weight, 0); err != nil {
-		return err
+	return l.strategy(sessionID).Pick(lanes, cost)
+}
+
+func (l *Send) runnableLanes(sessionID uint64) []*laneRuntime {
+	cache := l.runnableCaches[sessionID]
+	if cache != nil && !cache.dirty {
+		return cache.lanes
 	}
-	lane.queued = true
-	debuglog.Printf("send", "lane_enqueue session=%d lane=%d weight=%d", sessionID, lane.id, lane.weight)
-	return nil
+	if cache == nil {
+		cache = &runnableLaneCache{dirty: true}
+		l.runnableCaches[sessionID] = cache
+	}
+	lanes := cache.lanes[:0]
+	for key, lane := range l.lanes {
+		if key.sessionID == sessionID && lane.ready() {
+			lanes = append(lanes, lane)
+		}
+	}
+	sort.Slice(lanes, func(i, j int) bool {
+		return lanes[i].id < lanes[j].id
+	})
+	cache.lanes = lanes
+	cache.dirty = false
+	return lanes
+}
+
+func (l *Send) markRunnableLanesDirty(sessionID uint64) {
+	cache := l.runnableCaches[sessionID]
+	if cache == nil {
+		cache = &runnableLaneCache{dirty: true}
+		l.runnableCaches[sessionID] = cache
+		return
+	}
+	cache.dirty = true
+}
+
+func (l *Send) deleteRunnableLanesCache(sessionID uint64) {
+	delete(l.runnableCaches, sessionID)
+}
+
+type runnableLaneCache struct {
+	lanes []*laneRuntime
+	dirty bool
 }
 
 type laneKey struct {
@@ -191,6 +239,13 @@ func (l *Send) enqueueFrame(ctx context.Context, leg transport.LegRef, frame pro
 	}
 	size := len(packet.Payload)
 	debuglog.Printf("send", "enqueue_frame frame=%s leg={%s} bytes=%d", debugFrameSummary(frame), debugLeg(leg), size)
+	metrics.IncCounter(metrics.ProtocolFramesTotal,
+		metrics.L("direction", "tx"),
+		metrics.L("type", debugFrameType(frame.Type)),
+		metrics.L("session", frame.SessionID),
+		metrics.L("lane", frame.LaneID),
+		metrics.L("leg", kindMetricLabel(leg.Kind)),
+	)
 	return size, l.WriteTo(ctx, leg, packet)
 }
 

@@ -117,11 +117,16 @@ Set `"fec": false` explicitly to disable FEC.
 
 When `tun.name` is omitted, the OS chooses an available TUN device name and the
 runtime configures that actual device name. When `promListenAddr` is omitted,
-the default uses port `0` so a future metrics listener can bind an available
-port instead of failing on a fixed occupied port.
+the default uses port `0` so the metrics listener binds an available local port
+instead of failing on a fixed occupied port. Set `promListenAddr` to a concrete
+address such as `"127.0.0.1:9100"` when Prometheus should scrape a stable port.
+Set it to `"off"` to disable the listener.
 
-`promListenAddr` is accepted for compatibility with old config files. The
-current refactor does not start a Prometheus metrics server yet.
+The process prints the resolved metrics listen address at startup. Metrics are
+served at `/metrics` in Prometheus text format. Current counters cover TUN
+read/write, UDP/TCP transport read/write and errors, protocol frame tx/rx,
+schedule strategy lane pick/skip/no-runnable events, lane/probe/fallback events,
+and FEC repair/recovery events.
 
 ## Verification
 

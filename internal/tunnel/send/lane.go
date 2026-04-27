@@ -19,11 +19,10 @@ type laneRuntime struct {
 	tcpLeg    transport.LegRef
 	tcpRemote string
 
-	helloRetry helloRetry
+	helloCaps       uint16
+	helloFECProfile uint8
 
 	fallbackDialing bool
-
-	queued bool
 }
 
 func newLaneRuntime(id uint8, weight uint32) *laneRuntime {
@@ -39,6 +38,13 @@ func (l *laneRuntime) ready() bool {
 	}
 	_, ok := l.selectLeg()
 	return ok
+}
+
+func (l *laneRuntime) Weight() uint32 {
+	if l == nil {
+		return 0
+	}
+	return l.weight
 }
 
 func (l *laneRuntime) selectLeg() (transport.LegRef, bool) {
@@ -79,41 +85,5 @@ func (l *laneRuntime) bindLeg(leg transport.LegRef) {
 	case transport.KindTCP:
 		l.tcpLeg = leg
 		l.tcpReady = leg.ConnID != ""
-	}
-}
-
-func (l *laneRuntime) canProbe(leg transport.LegRef) bool {
-	switch leg.Kind {
-	case transport.KindUDP:
-		if leg.EndpointID == "" || leg.RemoteAddr == nil {
-			return false
-		}
-	case transport.KindTCP:
-		if !l.tcpReady || leg.ConnID == "" {
-			return false
-		}
-	default:
-		return false
-	}
-	return !l.helloRetry.pending() || !sameLeg(l.helloRetry.leg, leg)
-}
-
-func sameLeg(a transport.LegRef, b transport.LegRef) bool {
-	if a.Kind != b.Kind {
-		return false
-	}
-	switch a.Kind {
-	case transport.KindUDP:
-		if a.EndpointID != b.EndpointID {
-			return false
-		}
-		if a.RemoteAddr == nil || b.RemoteAddr == nil {
-			return a.RemoteAddr == b.RemoteAddr
-		}
-		return a.RemoteAddr.String() == b.RemoteAddr.String()
-	case transport.KindTCP:
-		return a.ConnID == b.ConnID
-	default:
-		return false
 	}
 }
