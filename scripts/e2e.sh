@@ -66,6 +66,7 @@ PORT_CONCURRENT_FALLBACK=5009
 PORT_FALLBACK_DIAL_ERROR=5010
 PORT_WEIGHTED=5011
 PORT_MTU=5012
+PORT_FEC_LOADED_LATENCY=5013
 
 PATH1_C="10.201.1.1/24"
 PATH1_S="10.201.1.2/24"
@@ -1024,6 +1025,65 @@ run_multipath_fec_case() {
   echo "==== ${name} e2e end ===="
 }
 
+run_fec_loaded_latency_case() {
+  local name="fec-loaded-latency"
+  local iperf_rate="${MULTIPATH_REAL_E2E_FEC_LOAD_RATE:-10M}"
+  local iperf_duration="${MULTIPATH_REAL_E2E_FEC_LOAD_DURATION:-25}"
+  local ping_count="${MULTIPATH_REAL_E2E_FEC_LOAD_PING_COUNT:-400}"
+  local ping_interval="${MULTIPATH_REAL_E2E_FEC_LOAD_PING_INTERVAL:-0.05}"
+
+  echo "==== ${name} e2e start ===="
+  if ! command -v iperf3 >/dev/null 2>&1; then
+    echo "[${name}] iperf3 not found, skip loaded-latency measurement"
+    echo "==== ${name} e2e end ===="
+    return 0
+  fi
+
+  clear_loss
+  write_one_lane_config "${name}" "${PORT_FEC_LOADED_LATENCY}" false true 200 3000
+  start_multipath "${name}"
+  wait_ping_ok "${name} baseline" 12
+
+  echo "[${name}] apply 20% UDP data loss and block TCP fallback"
+  apply_fec_loss "${PORT_FEC_LOADED_LATENCY}"
+  sleep 1
+
+  echo "[${name}] start iperf3 UDP background load: rate=${iperf_rate} duration=${iperf_duration}s"
+  ip netns exec "${NS_S}" iperf3 -s -1 -B "${TUN_S_LOCAL}" >"${WORKDIR}/${name}.iperf-server.log" 2>&1 &
+  local iperf_server=$!
+  sleep 1
+  ip netns exec "${NS_C}" iperf3 -c "${TUN_C_REMOTE}" -u -b "${iperf_rate}" -t "${iperf_duration}" -i 0 \
+    >"${WORKDIR}/${name}.iperf-client.log" 2>&1 &
+  local iperf_client=$!
+  sleep 0.5
+
+  echo "[${name}] sparse ping under load: count=${ping_count} interval=${ping_interval}s"
+  local output
+  output="$(ip netns exec "${NS_C}" ping -c "${ping_count}" -i "${ping_interval}" -W 1 "${TUN_C_REMOTE}" 2>&1 || true)"
+  echo "${output}" >"${WORKDIR}/${name}.ping.log"
+  echo "[${name}] ping log: ${WORKDIR}/${name}.ping.log"
+  echo "[${name}] iperf3 client log: ${WORKDIR}/${name}.iperf-client.log"
+  echo "[${name}] iperf3 server log: ${WORKDIR}/${name}.iperf-server.log"
+  printf '%s\n' "${output}" | tail -n 2
+
+  kill "${iperf_client}" >/dev/null 2>&1 || true
+  wait "${iperf_client}" >/dev/null 2>&1 || true
+  kill "${iperf_server}" >/dev/null 2>&1 || true
+  wait "${iperf_server}" >/dev/null 2>&1 || true
+
+  local rtt_line
+  rtt_line="$(printf '%s\n' "${output}" | grep -E '^rtt min/avg/max/mdev' | tail -n 1)"
+  if [[ -n "${rtt_line}" ]]; then
+    pass "${name}" "loaded-latency captured: ${rtt_line}"
+  else
+    fail "${name}" "ping under load did not produce an rtt summary"
+  fi
+
+  clear_loss
+  stop_multipath
+  echo "==== ${name} e2e end ===="
+}
+
 run_concurrent_fallback_case() {
   local name="concurrent-fallback"
   echo "==== ${name} e2e start ===="
@@ -1172,6 +1232,7 @@ run_nat_case
 run_fec_comparison
 run_fec_tcp_fallback_case
 run_multipath_fec_case
+run_fec_loaded_latency_case
 run_weighted_scheduling_case
 run_mtu_case
 

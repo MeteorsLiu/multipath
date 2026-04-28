@@ -18,6 +18,7 @@ and how to interpret its results.
 | FEC high-RTT weak-net comparison | one UDP-first lane over one veth path | 20% client-to-server UDP tunnel loss, added UDP tunnel delay in both directions, TCP fallback blocked | FEC loss reduction still holds while ping RTT shows recovery-delay impact |
 | FEC over TCP fallback | one UDP-first lane with `fec=true` | UDP tunnel traffic is dropped while TCP is clean | the lane falls back to TCP and the TCP HELLO_ACK preserves the FEC capability and `fec_profile` |
 | Multipath + FEC | two UDP-first lanes with `fec=true` | path1 has 20% UDP tunnel loss and TCP fallback blocked; path2 stays clean | observed ping packet loss stays under 10%, validating combined multipath spreading and FEC recovery |
+| FEC loaded latency | one UDP-first lane with `fec=true` | 20% client-to-server UDP tunnel loss, TCP fallback blocked, iperf3 UDP background load fills the FEC group quickly | sparse ping reports the realistic loaded-latency RTT distribution (line `rtt min/avg/max/mdev = ...`) so that FEC recovery delay can be evaluated under traffic instead of under sparse ping |
 | Weighted scheduling | two UDP-first lanes with `weight: 4` and `weight: 1` | clean network | observed client-side `tun_done` lane=1 fraction tracks `4/(4+1)` within ±0.15, validating per-lane weight handling |
 | MTU | one UDP-first lane over one veth path | clean network, then UDP tunnel traffic dropped to force TCP fallback | near-MTU pings (`ping -s 1412 -M do`) survive both UDP transport and TCP fallback, validating tunnel header overhead math |
 
@@ -87,6 +88,37 @@ how FEC recovery changes ping RTT and max latency, not just packet-loss rate.
 Because the `fec=false` and `fec=true` high-RTT samples use independent random
 loss streams, the high-RTT case prints the packet-loss comparison but gates on
 FEC actually emitting recovered packets without recovery errors.
+
+## FEC Loaded Latency Method
+
+Sparse ping (e.g., one packet every 20ms) is a worst case for the 4+1 SLC FEC
+profile because each repair group needs four DATA frames before the REPAIR is
+emitted. With sparse traffic the group fill time stretches recovery delay to
+multiple inter-packet gaps. Real applications usually carry a steady underlying
+flow that fills the repair group in microseconds, so observed FEC recovery delay
+is much smaller than the sparse-ping case implies.
+
+The loaded-latency case loads the tunnel with an iperf3 UDP background flow at a
+configurable rate, then runs a separate sparse ping concurrently to measure the
+RTT distribution that an interactive flow would observe. The sparse ping is the
+measurement; the iperf3 stream only fills the FEC group fast enough to make the
+measurement realistic.
+
+Tunable env vars:
+
+```text
+MULTIPATH_REAL_E2E_FEC_LOAD_RATE             default 10M
+MULTIPATH_REAL_E2E_FEC_LOAD_DURATION         default 25 (seconds)
+MULTIPATH_REAL_E2E_FEC_LOAD_PING_COUNT       default 400
+MULTIPATH_REAL_E2E_FEC_LOAD_PING_INTERVAL    default 0.05 (seconds)
+```
+
+The ping output is recorded under `${case}.ping.log` and the iperf3 logs under
+`${case}.iperf-client.log` and `${case}.iperf-server.log`. The pass condition is
+that ping produces an `rtt min/avg/max/mdev` summary line; the actual RTT
+numbers are reported but not gated.
+
+The case is skipped if `iperf3` is not installed.
 
 ## Expected Result
 
