@@ -117,7 +117,9 @@ func (p *Packet) WriteTo(ctx context.Context, endpointID string, remote net.Addr
 		)
 		return n, err
 	}
-	debuglog.Printf("transport/udp", "write endpoint=%s remote=%v bytes=%d", endpointID, remote, n)
+	if debuglog.Enabled() {
+		debuglog.Printf("transport/udp", "write endpoint=%s remote=%v bytes=%d", endpointID, remote, n)
+	}
 	metrics.IncCounter(metrics.TransportPacketsTotal,
 		metrics.L("transport", "udp"),
 		metrics.L("direction", "tx"),
@@ -173,7 +175,9 @@ func (p *Packet) readLoop(ctx context.Context, endpoint PacketEndpoint, writer P
 			RemoteAddr: remote,
 		}
 		packet.SetLen(n)
-		debuglog.Printf("transport/udp", "read endpoint=%s remote=%v bytes=%d", endpoint.ID, remote, n)
+		if debuglog.Enabled() {
+			debuglog.Printf("transport/udp", "read endpoint=%s remote=%v bytes=%d", endpoint.ID, remote, n)
+		}
 		metrics.IncCounter(metrics.TransportPacketsTotal,
 			metrics.L("transport", "udp"),
 			metrics.L("direction", "rx"),

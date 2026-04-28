@@ -125,8 +125,10 @@ func (s *Stream) Write(ctx context.Context, connID string, payload []byte) (int,
 		)
 		return payloadBytesWritten(n), err
 	}
-	debuglog.Printf("transport/tcp", "write conn=%s bytes=%d", connID, payloadBytesWritten(n))
 	written := payloadBytesWritten(n)
+	if debuglog.Enabled() {
+		debuglog.Printf("transport/tcp", "write conn=%s bytes=%d", connID, written)
+	}
 	metrics.IncCounter(metrics.TransportPacketsTotal,
 		metrics.L("transport", "tcp"),
 		metrics.L("direction", "tx"),
@@ -252,7 +254,9 @@ func (s *Stream) readLoop(ctx context.Context, connID string, conn net.Conn, wri
 			ConnID: connID,
 		}
 
-		debuglog.Printf("transport/tcp", "read conn=%s bytes=%d", connID, frameLen)
+		if debuglog.Enabled() {
+			debuglog.Printf("transport/tcp", "read conn=%s bytes=%d", connID, frameLen)
+		}
 		metrics.IncCounter(metrics.TransportPacketsTotal,
 			metrics.L("transport", "tcp"),
 			metrics.L("direction", "rx"),
