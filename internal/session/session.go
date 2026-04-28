@@ -67,12 +67,16 @@ func (m *Manager) Delete(id uint64) {
 }
 
 type Session struct {
-	id        uint64
+	id uint64
+
+	mu        sync.Mutex
 	nextNonce uint64
 	hellos    map[uint64]*Hello
 }
 
 func (s *Session) Open(nowMS uint64) *Hello {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	nonce := s.nextNonce
 	s.nextNonce++
 	hello := &Hello{
@@ -89,12 +93,18 @@ func (s *Session) Open(nowMS uint64) *Hello {
 }
 
 func (s *Session) Ack(nonce uint64, accepted bool) bool {
+	s.mu.Lock()
 	hello := s.hellos[nonce]
 	if hello == nil {
+		s.mu.Unlock()
 		return false
 	}
 	delete(s.hellos, nonce)
+	s.mu.Unlock()
+
+	hello.mu.Lock()
 	hello.pending = false
+	hello.mu.Unlock()
 	return accepted
 }
 
@@ -106,7 +116,9 @@ type Hello struct {
 	sessionID uint64
 	nonce     uint64
 	openedMS  uint64
-	pending   bool
+
+	mu      sync.Mutex
+	pending bool
 }
 
 func (h *Hello) Do(fn func(View) error) error {
@@ -114,7 +126,13 @@ func (h *Hello) Do(fn func(View) error) error {
 }
 
 func (h *Hello) Retry(nowMS uint64, fn func(View) error) (sent bool, expired bool, err error) {
-	if h == nil || !h.pending {
+	if h == nil {
+		return false, true, nil
+	}
+	h.mu.Lock()
+	pending := h.pending
+	h.mu.Unlock()
+	if !pending {
 		return false, true, nil
 	}
 	if err := h.Do(fn); err != nil {

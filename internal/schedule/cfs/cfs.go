@@ -2,6 +2,7 @@ package cfs
 
 import (
 	"math"
+	"sync"
 
 	"github.com/MeteorsLiu/multipath/internal/schedule"
 )
@@ -9,6 +10,7 @@ import (
 const defaultScale = uint64(1024)
 
 type Strategy[L schedule.Lane] struct {
+	mu    sync.Mutex
 	items map[L]*item[L]
 	minVR uint64
 	round uint64
@@ -25,6 +27,8 @@ func (s *Strategy[L]) Pick(lanes []L, cost uint32) (L, bool) {
 	if len(lanes) == 0 {
 		return zero, false
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.items == nil {
 		s.items = make(map[L]*item[L])
 	}

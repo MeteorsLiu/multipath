@@ -1,16 +1,51 @@
 package send
 
 import (
+	"sync"
+
 	"github.com/MeteorsLiu/multipath/internal/debuglog"
 	fecpkg "github.com/MeteorsLiu/multipath/internal/fec"
 	"github.com/MeteorsLiu/multipath/internal/protocol"
 	sessionpkg "github.com/MeteorsLiu/multipath/internal/session"
 )
 
+// sendState holds per-session send-side state. Mutators take mu so the state
+// is safe under concurrent access from the data path and control path.
 type sendState struct {
+	mu            sync.Mutex
 	nextPacketID  uint32
 	nextRepairKey uint16
 	txWindow      *txSLCWindow
+}
+
+// peekPacketID returns the next packet id without advancing it.
+func (s *sendState) peekPacketID() uint32 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.nextPacketID
+}
+
+// commitPacket advances nextPacketID past packetID and, if requested, adds the
+// packet to the FEC window. Returns the repair group when a window completes.
+func (s *sendState) commitPacket(packetID uint32, packet []byte, addToWindow bool) (txRepairGroup, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if packetID == s.nextPacketID {
+		s.nextPacketID++
+	}
+	if !addToWindow || s.txWindow == nil {
+		return txRepairGroup{}, false
+	}
+	return s.txWindow.add(packetID, packet)
+}
+
+// reserveRepairKey reserves and returns the next repair key.
+func (s *sendState) reserveRepairKey() uint16 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := s.nextRepairKey
+	s.nextRepairKey++
+	return key
 }
 
 type fecCodec interface {
@@ -18,25 +53,43 @@ type fecCodec interface {
 	Reconstruct(shards [][]byte, key uint16) error
 }
 
+// getSessionState looks up an existing send-side session state. The
+// sessionStatesMu read lock is held for the map lookup only.
 func (l *Send) getSessionState(sessionID uint64) (*sessionpkg.Session, *sendState, bool) {
 	session, ok := l.sessionManager.Get(sessionID)
 	if !ok {
 		return nil, nil, false
 	}
+	l.sessionStatesMu.RLock()
 	state := l.sendStates[session]
+	l.sessionStatesMu.RUnlock()
 	return session, state, state != nil
 }
 
+// getOrCreateSessionState resolves the *sessionpkg.Session for sessionID and
+// installs a fresh sendState entry on first use. The fast path uses
+// Manager.Get (RLock) and only falls back to Manager.GetOrCreate (Lock) when
+// the session has not yet been admitted.
 func (l *Send) getOrCreateSessionState(sessionID uint64) (*sessionpkg.Session, *sendState, bool) {
-	session, ok := l.sessionManager.GetOrCreate(sessionID)
+	session, ok := l.sessionManager.Get(sessionID)
 	if !ok {
-		return nil, nil, false
+		session, ok = l.sessionManager.GetOrCreate(sessionID)
+		if !ok {
+			return nil, nil, false
+		}
 	}
+	l.sessionStatesMu.RLock()
 	state := l.sendStates[session]
+	l.sessionStatesMu.RUnlock()
 	if state != nil {
 		return session, state, true
 	}
 
+	l.sessionStatesMu.Lock()
+	defer l.sessionStatesMu.Unlock()
+	if state := l.sendStates[session]; state != nil {
+		return session, state, true
+	}
 	state = &sendState{
 		txWindow: newTxSLCWindow(4),
 	}
@@ -45,22 +98,36 @@ func (l *Send) getOrCreateSessionState(sessionID uint64) (*sessionpkg.Session, *
 	return session, state, true
 }
 
+// deleteSessionState removes the send-side state for a session, cancels any
+// HELLO routes associated with it, and deletes the session from the manager.
 func (l *Send) deleteSessionState(sessionID uint64) {
-	if session, ok := l.sessionManager.Get(sessionID); ok {
+	session, ok := l.sessionManager.Get(sessionID)
+	if ok {
+		l.sessionStatesMu.Lock()
 		delete(l.sendStates, session)
+		delete(l.strategies, sessionID)
+		l.sessionStatesMu.Unlock()
+
+		l.helloRoutesMu.Lock()
+		var pending []uint64
 		for key, route := range l.helloRoutes {
 			if key.sessionID != sessionID {
 				continue
 			}
-			session.Ack(route.nonce(), false)
+			pending = append(pending, route.nonce())
 			delete(l.helloRoutes, key)
+		}
+		l.helloRoutesMu.Unlock()
+
+		for _, nonce := range pending {
+			session.Ack(nonce, false)
 		}
 	}
 	l.sessionManager.Delete(sessionID)
 }
 
 func (l *Send) enableFEC() {
-	l.fecProfile = protocol.FECProfileSLC4Plus1
+	l.fecProfile.Store(uint32(protocol.FECProfileSLC4Plus1))
 	if l.fecCodec == nil {
 		l.fecCodec, _ = fecpkg.NewCodec(4, 1)
 	}

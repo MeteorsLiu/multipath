@@ -21,8 +21,12 @@ func TestRxSLCWindowRepairBecomesRecoverable(t *testing.T) {
 	if recoverable.missingIndex != 1 {
 		t.Fatalf("missingIndex = %d, want 1", recoverable.missingIndex)
 	}
-	if string(recoverable.shards[0]) != "a" || string(recoverable.shards[2]) != "c" || string(recoverable.shards[3]) != "d" || string(recoverable.shards[4]) != "repair" {
-		t.Fatalf("unexpected shards: %#v", recoverable.shards)
+	shards, ok := window.buildShardsLocked(recoverable, nil)
+	if !ok {
+		t.Fatal("buildShardsLocked: ok = false")
+	}
+	if string(shards[0]) != "a" || string(shards[2]) != "c" || string(shards[3]) != "d" || string(shards[4]) != "repair" {
+		t.Fatalf("unexpected shards: %#v", shards)
 	}
 }
 
@@ -94,11 +98,15 @@ func TestRxSLCWindowCopiesInputs(t *testing.T) {
 		t.Fatal("expected recoverable group")
 	}
 	repair[0] = 'x'
-	if string(recoverable.shards[0]) != "a" {
-		t.Fatalf("data shard = %q, want a", recoverable.shards[0])
+	shards, ok := window.buildShardsLocked(recoverable, nil)
+	if !ok {
+		t.Fatal("buildShardsLocked: ok = false")
 	}
-	if string(recoverable.shards[4]) != "repair" {
-		t.Fatalf("repair shard = %q, want repair", recoverable.shards[4])
+	if string(shards[0]) != "a" {
+		t.Fatalf("data shard = %q, want a", shards[0])
+	}
+	if string(shards[4]) != "repair" {
+		t.Fatalf("repair shard = %q, want repair", shards[4])
 	}
 }
 

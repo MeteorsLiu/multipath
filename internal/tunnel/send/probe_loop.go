@@ -122,13 +122,13 @@ func (l *ProbeLoop) run(ctx context.Context, events <-chan core.Event) error {
 				continue
 			}
 			debuglog.Printf("probe/loop", "event %s", debugProbeEvent(event))
-			if err := l.sender.writeProbeEvent(ctx, event); err != nil {
+			if err := l.sender.handleProbeEvent(ctx, event); err != nil {
 				debuglog.Printf("probe/loop", "event err=%v", err)
 				return err
 			}
 		case now := <-ticker.C:
 			debuglog.Printf("probe/loop", "retry_hello now_ms=%d", now.UnixMilli())
-			if err := l.sender.retryHELLO(ctx, uint64(now.UnixMilli())); err != nil {
+			if err := l.sender.retryOpenHELLO(ctx, uint64(now.UnixMilli())); err != nil {
 				debuglog.Printf("probe/loop", "retry_hello err=%v", err)
 				return err
 			}

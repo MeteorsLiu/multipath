@@ -660,8 +660,8 @@ func TestSendHandleHELLOCreatesLaneAndRepliesOnObservedLeg(t *testing.T) {
 	if body.Nonce != 123 || body.Accepted != 1 || body.Caps != wantCaps || body.FECProfile != protocol.FECProfileSLC4Plus1 {
 		t.Fatalf("HELLO_ACK body = %+v", body)
 	}
-	if in.negotiatedCaps != wantCaps || in.fecProfile != protocol.FECProfileSLC4Plus1 {
-		t.Fatalf("negotiated = (%#x,%d), want (%#x,%d)", in.negotiatedCaps, in.fecProfile, wantCaps, protocol.FECProfileSLC4Plus1)
+	if uint16(in.negotiatedCaps.Load()) != wantCaps || uint8(in.fecProfile.Load()) != protocol.FECProfileSLC4Plus1 {
+		t.Fatalf("negotiated = (%#x,%d), want (%#x,%d)", uint16(in.negotiatedCaps.Load()), uint8(in.fecProfile.Load()), wantCaps, protocol.FECProfileSLC4Plus1)
 	}
 
 	lane := in.lanes[laneKey{sessionID: 99, laneID: 3}]
@@ -756,8 +756,8 @@ func TestSendHandleHELLOACKMarksLaneReady(t *testing.T) {
 		t.Fatal("hello route still exists after HELLO_ACK")
 	}
 	wantCaps := protocol.CapTCPFallback | protocol.CapFEC
-	if in.negotiatedCaps != wantCaps || in.fecProfile != protocol.FECProfileSLC4Plus1 {
-		t.Fatalf("negotiated = (%#x,%d), want (%#x,%d)", in.negotiatedCaps, in.fecProfile, wantCaps, protocol.FECProfileSLC4Plus1)
+	if uint16(in.negotiatedCaps.Load()) != wantCaps || uint8(in.fecProfile.Load()) != protocol.FECProfileSLC4Plus1 {
+		t.Fatalf("negotiated = (%#x,%d), want (%#x,%d)", uint16(in.negotiatedCaps.Load()), uint8(in.fecProfile.Load()), wantCaps, protocol.FECProfileSLC4Plus1)
 	}
 	if got := in.runnableLanes(99); len(got) != 1 || got[0].id != 3 {
 		t.Fatalf("runnable lanes = %+v, want lane 3", got)
@@ -1022,7 +1022,7 @@ func TestSendProbeTimeoutStartsTCPFallbackHELLO(t *testing.T) {
 	in.streamTransport = streamTransport
 	in.probeTimeout = 500 * time.Millisecond
 	mustSendState(t, in, 99)
-	in.negotiatedCaps = protocol.CapTCPFallback
+	in.negotiatedCaps.Store(uint32(protocol.CapTCPFallback))
 	udpLeg := transport.LegRef{
 		Kind:       transport.KindUDP,
 		EndpointID: "udp0",
@@ -1274,8 +1274,8 @@ func TestSendHandleCLOSESession(t *testing.T) {
 	if in.strategies[99] != nil {
 		t.Fatal("strategy still exists after CLOSE session")
 	}
-	if in.hasActiveSession || in.activeSessionID != 0 {
-		t.Fatalf("active session = (%v,%d), want cleared", in.hasActiveSession, in.activeSessionID)
+	if in.hasActiveSession.Load() || in.activeSessionID.Load() != 0 {
+		t.Fatalf("active session = (%v,%d), want cleared", in.hasActiveSession.Load(), in.activeSessionID.Load())
 	}
 	if err := in.handleTUNPacket(context.Background(), []byte("ip-packet")); err != nil {
 		t.Fatalf("handleTUNPacket after session CLOSE failed: %v", err)
@@ -1648,11 +1648,11 @@ func (w testProbeLoopRunner) Run(ctx context.Context) error {
 		case err := <-runnerErr:
 			return err
 		case event := <-runnerOut:
-			if err := w.send.writeProbeEvent(ctx, event); err != nil {
+			if err := w.send.handleProbeEvent(ctx, event); err != nil {
 				return err
 			}
 		case now := <-ticker.C:
-			if err := w.send.retryHELLO(ctx, uint64(now.UnixMilli())); err != nil {
+			if err := w.send.retryOpenHELLO(ctx, uint64(now.UnixMilli())); err != nil {
 				return err
 			}
 		}

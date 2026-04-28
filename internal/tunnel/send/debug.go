@@ -79,16 +79,17 @@ func debugLaneState(key laneKey, lane *laneRuntime) string {
 	if lane == nil {
 		return fmt.Sprintf("session=%d lane=%d nil=true", key.sessionID, key.laneID)
 	}
+	snap := lane.snapshot()
 	return fmt.Sprintf(
 		"session=%d lane=%d weight=%d udp_ready=%t tcp_ready=%t fallback_dialing=%t udp={%s} tcp={%s}",
 		key.sessionID,
 		key.laneID,
-		lane.weight,
-		lane.udpReady,
-		lane.tcpReady,
-		lane.fallbackDialing,
-		debugLeg(lane.udpLeg),
-		debugLeg(lane.tcpLeg),
+		lane.Weight(),
+		snap.udpReady,
+		snap.tcpReady,
+		snap.fallbackDialing,
+		debugLeg(snap.udpLeg),
+		debugLeg(snap.tcpLeg),
 	)
 }
 

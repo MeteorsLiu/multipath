@@ -12,10 +12,11 @@ import (
 )
 
 func (i *Send) acceptHello(ctx context.Context, sessionID uint64, laneID uint8, leg transport.LegRef, body protocol.HelloBody) error {
+	localFEC := uint8(i.fecProfile.Load())
 	caps := uint16(0)
 	fecProfile := protocol.FECProfileOff
 	if laneID != protocol.SessionControlLaneID {
-		caps, fecProfile = negotiateCapabilities(body.Caps, body.FECProfile, i.fecProfile)
+		caps, fecProfile = negotiateCapabilities(body.Caps, body.FECProfile, localFEC)
 	}
 	debuglog.Printf("send/control", "accept_hello session=%d lane=%d leg={%s} caps=%#x fec_profile=%d negotiated_caps=%#x negotiated_fec_profile=%d", sessionID, laneID, debugLeg(leg), body.Caps, body.FECProfile, caps, fecProfile)
 
@@ -29,18 +30,14 @@ func (i *Send) acceptHello(ctx context.Context, sessionID uint64, laneID uint8, 
 		debuglog.Printf("send/control", "hello_drop session_create_denied session=%d lane=%d", sessionID, laneID)
 		return i.writeHelloAck(ctx, sessionID, laneID, leg, body.Nonce, false, caps, fecProfile)
 	}
-	if !i.hasActiveSession {
+	if _, active := i.activeSession(); !active {
 		i.activateSession(sessionID)
 	}
-	i.negotiatedCaps = caps
-	i.fecProfile = fecProfile
+	i.negotiatedCaps.Store(uint32(caps))
+	i.fecProfile.Store(uint32(fecProfile))
 
 	key := laneKey{sessionID: sessionID, laneID: laneID}
-	lane := i.lanes[key]
-	if lane == nil {
-		lane = newLaneRuntime(laneID, 1)
-		i.lanes[key] = lane
-	}
+	lane := i.getOrCreateLane(key, 1)
 	lane.observeLeg(leg)
 	i.markRunnableLanesDirty(sessionID)
 	i.trackProbeTarget(ctx, sessionID, laneID, leg)
@@ -57,7 +54,8 @@ func (i *Send) acceptHello(ctx context.Context, sessionID uint64, laneID uint8, 
 }
 
 func (i *Send) acceptHelloAck(ctx context.Context, sessionID uint64, laneID uint8, leg transport.LegRef, body protocol.HelloAckBody) error {
-	caps, fecProfile := negotiateCapabilities(body.Caps, body.FECProfile, i.fecProfile)
+	localFEC := uint8(i.fecProfile.Load())
+	caps, fecProfile := negotiateCapabilities(body.Caps, body.FECProfile, localFEC)
 	debuglog.Printf("send/control", "accept_hello_ack session=%d lane=%d leg={%s} accepted=%d caps=%#x fec_profile=%d negotiated_caps=%#x negotiated_fec_profile=%d", sessionID, laneID, debugLeg(leg), body.Accepted, body.Caps, body.FECProfile, caps, fecProfile)
 
 	sessionState, _, ok := i.getSessionState(sessionID)
@@ -66,25 +64,31 @@ func (i *Send) acceptHelloAck(ctx context.Context, sessionID uint64, laneID uint
 		return nil
 	}
 	key := laneKey{sessionID: sessionID, laneID: laneID}
-	lane := i.lanes[key]
+	lane := i.getLane(key)
 	if lane == nil {
 		debuglog.Printf("send/control", "hello_ack_drop missing_lane session=%d lane=%d", sessionID, laneID)
 		return nil
 	}
+
+	// Remove the route under helloRoutesMu, but only if the nonce matches.
+	i.helloRoutesMu.Lock()
 	route, ok := i.helloRoutes[key]
 	if !ok || !route.matches(body.Nonce) {
+		i.helloRoutesMu.Unlock()
 		debuglog.Printf("send/control", "hello_ack_drop nonce_mismatch session=%d lane=%d nonce=%d", sessionID, laneID, body.Nonce)
 		return nil
 	}
-	accepted := sessionState.Ack(body.Nonce, body.Accepted == 1)
 	delete(i.helloRoutes, key)
+	i.helloRoutesMu.Unlock()
+
+	accepted := sessionState.Ack(body.Nonce, body.Accepted == 1)
 	if !accepted {
 		debuglog.Printf("send/control", "hello_ack_rejected session=%d lane=%d", sessionID, laneID)
 		return nil
 	}
 
-	i.negotiatedCaps = caps
-	i.fecProfile = fecProfile
+	i.negotiatedCaps.Store(uint32(caps))
+	i.fecProfile.Store(uint32(fecProfile))
 	lane.observeLeg(leg)
 	i.markRunnableLanesDirty(sessionID)
 	i.trackProbeTarget(ctx, sessionID, laneID, leg)
@@ -103,7 +107,7 @@ func (i *Send) receivePing(ctx context.Context, sessionID uint64, laneID uint8, 
 		debuglog.Printf("send/control", "ping_drop missing_session session=%d lane=%d ping_id=%d", sessionID, laneID, body.PingID)
 		return nil
 	}
-	lane := i.lanes[laneKey{sessionID: sessionID, laneID: laneID}]
+	lane := i.getLane(laneKey{sessionID: sessionID, laneID: laneID})
 	if lane == nil {
 		debuglog.Printf("send/control", "ping_drop missing_lane session=%d lane=%d ping_id=%d", sessionID, laneID, body.PingID)
 		return nil
@@ -124,11 +128,13 @@ func (i *Send) receivePong(ctx context.Context, sessionID uint64, laneID uint8, 
 		debuglog.Printf("send/control", "pong_drop missing_session session=%d lane=%d ping_id=%d", sessionID, laneID, body.PingID)
 		return nil
 	}
-	if i.lanes[laneKey{sessionID: sessionID, laneID: laneID}] == nil {
+	if i.getLane(laneKey{sessionID: sessionID, laneID: laneID}) == nil {
 		debuglog.Printf("send/control", "pong_drop missing_lane session=%d lane=%d ping_id=%d", sessionID, laneID, body.PingID)
 		return nil
 	}
+	i.probeMu.Lock()
 	target, ok := i.probeKeys[newPingKey(leg)]
+	i.probeMu.Unlock()
 	if !ok {
 		debuglog.Printf("send/control", "pong_drop missing_target session=%d lane=%d ping_id=%d leg={%s}", sessionID, laneID, body.PingID, debugLeg(leg))
 		return nil
@@ -150,15 +156,22 @@ func (i *Send) close(ctx context.Context, sessionID uint64, laneID uint8, scope 
 		i.closeLane(ctx, laneKey{sessionID: sessionID, laneID: laneID})
 	case protocol.CloseScopeSession:
 		i.deleteSessionState(sessionID)
-		delete(i.strategies, sessionID)
-		if i.hasActiveSession && i.activeSessionID == sessionID {
-			i.hasActiveSession = false
-			i.activeSessionID = 0
+		if active, ok := i.activeSession(); ok && active == sessionID {
+			i.hasActiveSession.Store(false)
+			i.activeSessionID.Store(0)
+			i.activeSendState.Store(nil)
 		}
+		// Snapshot lane keys for this session.
+		i.lanesMu.RLock()
+		keys := make([]laneKey, 0, len(i.lanes))
 		for key := range i.lanes {
 			if key.sessionID == sessionID {
-				i.closeLane(ctx, key)
+				keys = append(keys, key)
 			}
+		}
+		i.lanesMu.RUnlock()
+		for _, key := range keys {
+			i.closeLane(ctx, key)
 		}
 		i.deleteRunnableLanesCache(sessionID)
 	}
@@ -166,8 +179,11 @@ func (i *Send) close(ctx context.Context, sessionID uint64, laneID uint8, scope 
 }
 
 func (i *Send) closeLane(ctx context.Context, key laneKey) {
+	i.lanesMu.Lock()
 	lane := i.lanes[key]
 	delete(i.lanes, key)
+	i.lanesMu.Unlock()
+
 	i.markRunnableLanesDirty(key.sessionID)
 	if lane == nil {
 		debuglog.Printf("send/control", "close_lane missing session=%d lane=%d", key.sessionID, key.laneID)
@@ -175,22 +191,29 @@ func (i *Send) closeLane(ctx context.Context, key laneKey) {
 	}
 	i.cancelHelloRoute(key)
 	debuglog.Printf("send/control", "close_lane %s", debugLaneState(key, lane))
-	i.untrackProbeTarget(ctx, lane.udpLeg)
-	i.untrackProbeTarget(ctx, lane.tcpLeg)
-	if i.streamTransport != nil && lane.tcpLeg.ConnID != "" {
-		_ = i.streamTransport.Close(ctx, lane.tcpLeg.ConnID)
+	udpLeg, tcpLeg := lane.legs()
+	i.untrackProbeTarget(ctx, udpLeg)
+	i.untrackProbeTarget(ctx, tcpLeg)
+	if i.streamTransport != nil && tcpLeg.ConnID != "" {
+		_ = i.streamTransport.Close(ctx, tcpLeg.ConnID)
 	}
 }
 
+// cancelHelloRoute removes any pending HELLO route for key and acks the
+// corresponding session nonce as rejected.
 func (i *Send) cancelHelloRoute(key laneKey) {
+	i.helloRoutesMu.Lock()
 	route, ok := i.helloRoutes[key]
 	if !ok || !route.valid() {
+		i.helloRoutesMu.Unlock()
 		return
 	}
+	delete(i.helloRoutes, key)
+	i.helloRoutesMu.Unlock()
+
 	if sessionState, ok := i.sessionManager.Get(key.sessionID); ok {
 		sessionState.Ack(route.nonce(), false)
 	}
-	delete(i.helloRoutes, key)
 }
 
 func (i *Send) writeHelloAck(ctx context.Context, sessionID uint64, laneID uint8, leg transport.LegRef, nonce uint64, accepted bool, caps uint16, fecProfile uint8) error {

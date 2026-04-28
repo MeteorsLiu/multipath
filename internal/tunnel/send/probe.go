@@ -39,12 +39,13 @@ func (l *Send) sendPING(ctx context.Context, sessionID uint64, laneID uint8, leg
 
 func (l *Send) maybeStartFallbackDial(ctx context.Context, key laneKey, lane *laneRuntime) {
 	_, _, ok := l.getSessionState(key.sessionID)
-	if !ok || l.negotiatedCaps&protocol.CapTCPFallback == 0 {
+	caps := uint16(l.negotiatedCaps.Load())
+	if !ok || caps&protocol.CapTCPFallback == 0 {
 		debuglog.Printf("send/probe", "fallback_skip session=%d lane=%d session_nil=%t caps=%#x", key.sessionID, key.laneID, !ok, func() uint16 {
 			if !ok {
 				return 0
 			}
-			return l.negotiatedCaps
+			return caps
 		}())
 		return
 	}
@@ -52,13 +53,13 @@ func (l *Send) maybeStartFallbackDial(ctx context.Context, key laneKey, lane *la
 }
 
 func (l *Send) startFallbackDial(ctx context.Context, key laneKey, lane *laneRuntime) {
-	if l.streamTransport == nil || lane.fallbackDialing || lane.tcpReady || lane.tcpRemote == "" {
-		debuglog.Printf("send/probe", "fallback_dial_skip %s stream_nil=%t", debugLaneState(key, lane), l.streamTransport == nil)
+	streamAvailable := l.streamTransport != nil
+	remote, started := lane.tryStartFallback(streamAvailable)
+	if !started {
+		debuglog.Printf("send/probe", "fallback_dial_skip %s stream_nil=%t", debugLaneState(key, lane), !streamAvailable)
 		return
 	}
 
-	lane.fallbackDialing = true
-	remote := lane.tcpRemote
 	debuglog.Printf("send/probe", "fallback_dial_start session=%d lane=%d remote=%s", key.sessionID, key.laneID, remote)
 	metrics.IncCounter(metrics.LaneEventsTotal,
 		metrics.L("event", "fallback_dial_start"),
@@ -69,22 +70,21 @@ func (l *Send) startFallbackDial(ctx context.Context, key laneKey, lane *laneRun
 	go func() {
 		leg, err := l.streamTransport.Dial(ctx, remote)
 		debuglog.Printf("send/probe", "fallback_dial_done session=%d lane=%d remote=%s leg={%s} err=%v", key.sessionID, key.laneID, remote, debugLeg(leg), err)
-		result := fallbackDialResult{
+		_ = l.handleFallbackDialResult(ctx, fallbackDialResult{
 			key: key,
 			leg: leg,
 			err: err,
-		}
-		_ = l.finishFallbackDial(ctx, result)
+		})
 	}()
 }
 
 func (l *Send) handleFallbackDialResult(ctx context.Context, result fallbackDialResult) error {
-	lane := l.lanes[result.key]
+	lane := l.getLane(result.key)
 	if lane == nil {
 		debuglog.Printf("send/probe", "fallback_result_drop missing_lane session=%d lane=%d err=%v", result.key.sessionID, result.key.laneID, result.err)
 		return nil
 	}
-	lane.fallbackDialing = false
+	lane.clearFallbackDialing()
 	if result.err != nil {
 		debuglog.Printf("send/probe", "fallback_result_err %s err=%v", debugLaneState(result.key, lane), result.err)
 		metrics.IncCounter(metrics.LaneEventsTotal,
@@ -95,17 +95,17 @@ func (l *Send) handleFallbackDialResult(ctx context.Context, result fallbackDial
 		)
 		return nil
 	}
-	_, _, ok := l.getSessionState(result.key.sessionID)
-	if !ok {
+	if _, _, ok := l.getSessionState(result.key.sessionID); !ok {
 		debuglog.Printf("send/probe", "fallback_result_drop missing_session session=%d lane=%d leg={%s}", result.key.sessionID, result.key.laneID, debugLeg(result.leg))
 		return nil
 	}
 
-	caps := l.negotiatedCaps
-	fecProfile := l.fecProfile
-	if caps == 0 && lane.helloCaps != 0 {
-		caps = lane.helloCaps
-		fecProfile = lane.helloFECProfile
+	caps := uint16(l.negotiatedCaps.Load())
+	fecProfile := uint8(l.fecProfile.Load())
+	helloCaps, helloFEC := lane.helloProfile()
+	if caps == 0 && helloCaps != 0 {
+		caps = helloCaps
+		fecProfile = helloFEC
 	}
 	debuglog.Printf("send/probe", "fallback_result_start_lane session=%d lane=%d leg={%s} caps=%#x fec_profile=%d", result.key.sessionID, result.key.laneID, debugLeg(result.leg), caps, fecProfile)
 	metrics.IncCounter(metrics.LaneEventsTotal,
@@ -117,9 +117,9 @@ func (l *Send) handleFallbackDialResult(ctx context.Context, result fallbackDial
 	return l.startLane(ctx, startLaneConfig{
 		SessionID:  result.key.sessionID,
 		LaneID:     result.key.laneID,
-		Weight:     lane.weight,
+		Weight:     lane.Weight(),
 		Leg:        result.leg,
-		TCPRemote:  lane.tcpRemote,
+		TCPRemote:  lane.tcpRemoteSnapshot(),
 		Caps:       caps,
 		FECProfile: fecProfile,
 	})
@@ -155,13 +155,15 @@ func (l *Send) handleProbeEvent(ctx context.Context, event probe.Event) error {
 }
 
 func (l *Send) handleProbeTargetLost(ctx context.Context, target probe.Target) error {
+	l.probeMu.Lock()
 	binding, ok := l.probeTargets[target]
+	l.probeMu.Unlock()
 	if !ok {
 		debuglog.Printf("send/probe", "target_lost_drop missing_target target=%d", target)
 		return nil
 	}
 	key := laneKey{sessionID: binding.sessionID, laneID: binding.laneID}
-	lane := l.lanes[key]
+	lane := l.getLane(key)
 	if lane == nil {
 		debuglog.Printf("send/probe", "target_lost_drop missing_lane target=%d session=%d lane=%d leg={%s}", target, binding.sessionID, binding.laneID, debugLeg(binding.leg))
 		l.untrackProbeTarget(ctx, binding.leg)
@@ -177,11 +179,11 @@ func (l *Send) handleProbeTargetLost(ctx context.Context, target probe.Target) e
 
 	switch binding.leg.Kind {
 	case transport.KindUDP:
-		lane.udpReady = false
+		lane.markUDPNotReady()
 		l.markRunnableLanesDirty(key.sessionID)
 		l.maybeStartFallbackDial(ctx, key, lane)
 	case transport.KindTCP:
-		lane.tcpReady = false
+		lane.markTCPNotReady()
 		l.markRunnableLanesDirty(key.sessionID)
 		if l.streamTransport != nil && binding.leg.ConnID != "" {
 			_ = l.streamTransport.Close(ctx, binding.leg.ConnID)
@@ -193,12 +195,14 @@ func (l *Send) handleProbeTargetLost(ctx context.Context, target probe.Target) e
 }
 
 func (l *Send) handleProbeTargetRecovered(target probe.Target) error {
+	l.probeMu.Lock()
 	binding, ok := l.probeTargets[target]
+	l.probeMu.Unlock()
 	if !ok {
 		debuglog.Printf("send/probe", "target_recovered_drop missing_target target=%d", target)
 		return nil
 	}
-	lane := l.lanes[laneKey{sessionID: binding.sessionID, laneID: binding.laneID}]
+	lane := l.getLane(laneKey{sessionID: binding.sessionID, laneID: binding.laneID})
 	if lane == nil {
 		debuglog.Printf("send/probe", "target_recovered_drop missing_lane target=%d session=%d lane=%d leg={%s}", target, binding.sessionID, binding.laneID, debugLeg(binding.leg))
 		return nil
@@ -220,41 +224,46 @@ func (l *Send) trackProbeTarget(ctx context.Context, sessionID uint64, laneID ui
 		debuglog.Printf("send/probe", "track_skip session=%d lane=%d probe_events_nil=%t leg={%s}", sessionID, laneID, l.probeEvents == nil, debugLeg(leg))
 		return
 	}
-	if l.probeTargets == nil {
-		l.probeTargets = make(map[probe.Target]probeBinding)
-	}
-	if l.probeKeys == nil {
-		l.probeKeys = make(map[pingKey]probe.Target)
-	}
 
-	key := newPingKey(leg)
-	if target, ok := l.probeKeys[key]; ok {
-		l.probeTargets[target] = probeBinding{sessionID: sessionID, laneID: laneID, leg: leg}
+	binding := probeBinding{sessionID: sessionID, laneID: laneID, leg: leg}
+	pkey := newPingKey(leg)
+
+	l.probeMu.Lock()
+	target, existed := l.probeKeys[pkey]
+	if !existed {
+		target = probe.Target(l.nextProbeTarget.Add(1))
+		l.probeKeys[pkey] = target
+	}
+	l.probeTargets[target] = binding
+	l.probeMu.Unlock()
+
+	if existed {
 		debuglog.Printf("send/probe", "track_update target=%d session=%d lane=%d leg={%s}", target, sessionID, laneID, debugLeg(leg))
 		return
 	}
-
-	l.nextProbeTarget++
-	target := l.nextProbeTarget
-	l.probeKeys[key] = target
-	l.probeTargets[target] = probeBinding{sessionID: sessionID, laneID: laneID, leg: leg}
 	debuglog.Printf("send/probe", "track target=%d session=%d lane=%d leg={%s}", target, sessionID, laneID, debugLeg(leg))
 	l.sendProbeEvent(ctx, probe.Event{Type: probe.EventTrack, Target: target})
 }
 
 func (l *Send) untrackProbeTarget(ctx context.Context, leg transport.LegRef) {
-	if l.probeEvents == nil || l.probeKeys == nil {
-		debuglog.Printf("send/probe", "untrack_skip probe_events_nil=%t probe_keys_nil=%t leg={%s}", l.probeEvents == nil, l.probeKeys == nil, debugLeg(leg))
+	if l.probeEvents == nil {
+		debuglog.Printf("send/probe", "untrack_skip probe_events_nil=true leg={%s}", debugLeg(leg))
 		return
 	}
-	key := newPingKey(leg)
-	target, ok := l.probeKeys[key]
+	pkey := newPingKey(leg)
+
+	l.probeMu.Lock()
+	target, ok := l.probeKeys[pkey]
+	if ok {
+		delete(l.probeKeys, pkey)
+		delete(l.probeTargets, target)
+	}
+	l.probeMu.Unlock()
+
 	if !ok {
 		debuglog.Printf("send/probe", "untrack_skip missing_target leg={%s}", debugLeg(leg))
 		return
 	}
-	delete(l.probeKeys, key)
-	delete(l.probeTargets, target)
 	debuglog.Printf("send/probe", "untrack target=%d leg={%s}", target, debugLeg(leg))
 	l.sendProbeEvent(ctx, probe.Event{Type: probe.EventUntrack, Target: target})
 }
