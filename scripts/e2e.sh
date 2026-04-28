@@ -59,6 +59,13 @@ PORT_LEGACY=5002
 PORT_FALLBACK=5003
 PORT_FEC=5004
 PORT_NAT=5005
+PORT_PER_LANE_FALLBACK=5006
+PORT_FEC_TCP_FALLBACK=5007
+PORT_MULTIPATH_FEC=5008
+PORT_CONCURRENT_FALLBACK=5009
+PORT_FALLBACK_DIAL_ERROR=5010
+PORT_WEIGHTED=5011
+PORT_MTU=5012
 
 PATH1_C="10.201.1.1/24"
 PATH1_S="10.201.1.2/24"
@@ -90,6 +97,8 @@ FEC_CASE_RECOVER_ERR=""
 CLIENT_PID=""
 SERVER_PID=""
 CURRENT_LOG_FILE=""
+CURRENT_CLIENT_LOG=""
+CURRENT_SERVER_LOG=""
 
 cleanup() {
   set +e
@@ -204,6 +213,8 @@ write_two_lane_config() {
   local fec_flag="$4"
   local probe_interval_ms="${5:-200}"
   local probe_timeout_ms="${6:-600}"
+  local path1_weight="${7:-1}"
+  local path2_weight="${8:-1}"
 
   cat >"${WORKDIR}/server-${name}.json" <<EOF
 {
@@ -226,8 +237,8 @@ EOF
   "tcp": ${legacy_tcp_flag},
   "client": {
     "remotePaths": [
-      { "remoteAddr": "${PATH1_REMOTE}:${port}", "weight": 1 },
-      { "remoteAddr": "${PATH2_REMOTE}:${port}", "weight": 1 }
+      { "remoteAddr": "${PATH1_REMOTE}:${port}", "weight": ${path1_weight} },
+      { "remoteAddr": "${PATH2_REMOTE}:${port}", "weight": ${path2_weight} }
     ]
   },
   "tun": {
@@ -343,10 +354,15 @@ pass() {
 }
 
 dump_current_log() {
-  if [[ -n "${CURRENT_LOG_FILE}" && -f "${CURRENT_LOG_FILE}" ]]; then
-    echo "---- ${CURRENT_LOG_FILE} tail ----"
-    tail -n 80 "${CURRENT_LOG_FILE}" || true
-    echo "---- end log tail ----"
+  if [[ -n "${CURRENT_CLIENT_LOG}" && -f "${CURRENT_CLIENT_LOG}" ]]; then
+    echo "---- ${CURRENT_CLIENT_LOG} tail ----"
+    tail -n 80 "${CURRENT_CLIENT_LOG}" || true
+    echo "---- end client log tail ----"
+  fi
+  if [[ -n "${CURRENT_SERVER_LOG}" && -f "${CURRENT_SERVER_LOG}" ]]; then
+    echo "---- ${CURRENT_SERVER_LOG} tail ----"
+    tail -n 80 "${CURRENT_SERVER_LOG}" || true
+    echo "---- end server log tail ----"
   fi
 }
 
@@ -424,15 +440,19 @@ start_multipath() {
   local name="$1"
   local server_config="${WORKDIR}/server-${name}.json"
   local client_config="${WORKDIR}/client-${name}.json"
-  local log_file="${WORKDIR}/${name}.multipath.log"
+  local server_log="${WORKDIR}/${name}.server.log"
+  local client_log="${WORKDIR}/${name}.client.log"
 
-  CURRENT_LOG_FILE="${log_file}"
-  ip netns exec "${NS_S}" env MULTIPATH_DEBUG="${REAL_E2E_DEBUG}" "${BIN}" -config "${server_config}" >>"${log_file}" 2>&1 &
+  CURRENT_LOG_FILE="${client_log}"
+  CURRENT_CLIENT_LOG="${client_log}"
+  CURRENT_SERVER_LOG="${server_log}"
+  ip netns exec "${NS_S}" env MULTIPATH_DEBUG="${REAL_E2E_DEBUG}" "${BIN}" -config "${server_config}" >>"${server_log}" 2>&1 &
   SERVER_PID=$!
-  ip netns exec "${NS_C}" env MULTIPATH_DEBUG="${REAL_E2E_DEBUG}" "${BIN}" -config "${client_config}" >>"${log_file}" 2>&1 &
+  ip netns exec "${NS_C}" env MULTIPATH_DEBUG="${REAL_E2E_DEBUG}" "${BIN}" -config "${client_config}" >>"${client_log}" 2>&1 &
   CLIENT_PID=$!
 
-  echo "[${name}] multipath log: ${log_file} (MULTIPATH_DEBUG=${REAL_E2E_DEBUG})"
+  echo "[${name}] client log: ${client_log}"
+  echo "[${name}] server log: ${server_log} (MULTIPATH_DEBUG=${REAL_E2E_DEBUG})"
 }
 
 stop_multipath() {
@@ -447,6 +467,8 @@ stop_multipath() {
     SERVER_PID=""
   fi
   CURRENT_LOG_FILE=""
+  CURRENT_CLIENT_LOG=""
+  CURRENT_SERVER_LOG=""
 }
 
 clear_loss() {
@@ -458,6 +480,7 @@ clear_loss() {
   ip netns exec "${NS_S}" tc qdisc del dev "${VETHSN}" root >/dev/null 2>&1 || true
   ip netns exec "${NS_N}" tc qdisc del dev "${VETHNC}" root >/dev/null 2>&1 || true
   ip netns exec "${NS_N}" tc qdisc del dev "${VETHNS}" root >/dev/null 2>&1 || true
+  ip netns exec "${NS_S}" iptables -F INPUT >/dev/null 2>&1 || true
 }
 
 setup_prio_qdisc() {
@@ -553,26 +576,66 @@ apply_tcp_client_block_all_paths() {
   add_port_filter "${NS_C}" "${VETHC2}" 1 tcp dport "${port}" 3
 }
 
-apply_udp_tunnel_block_path1() {
-  local port="$1"
-  setup_prio_qdisc "${NS_C}" "${VETHC1}"
-  add_loss_band "${NS_C}" "${VETHC1}" 3 30 100%
-  add_port_filter "${NS_C}" "${VETHC1}" 1 udp dport "${port}" 3
+path_client_dev() {
+  case "$1" in
+  1) printf '%s' "${VETHC1}" ;;
+  2) printf '%s' "${VETHC2}" ;;
+  *)
+    echo "unsupported path: $1"
+    exit 1
+    ;;
+  esac
+}
 
-  setup_prio_qdisc "${NS_S}" "${VETHS1}"
-  add_loss_band "${NS_S}" "${VETHS1}" 3 30 100%
-  add_port_filter "${NS_S}" "${VETHS1}" 1 udp sport "${port}" 3
+path_server_dev() {
+  case "$1" in
+  1) printf '%s' "${VETHS1}" ;;
+  2) printf '%s' "${VETHS2}" ;;
+  *)
+    echo "unsupported path: $1"
+    exit 1
+    ;;
+  esac
+}
+
+apply_udp_tunnel_block_path() {
+  local path="$1"
+  local port="$2"
+  local client_dev server_dev
+  client_dev="$(path_client_dev "${path}")"
+  server_dev="$(path_server_dev "${path}")"
+
+  setup_prio_qdisc "${NS_C}" "${client_dev}"
+  add_loss_band "${NS_C}" "${client_dev}" 3 30 100%
+  add_port_filter "${NS_C}" "${client_dev}" 1 udp dport "${port}" 3
+
+  setup_prio_qdisc "${NS_S}" "${server_dev}"
+  add_loss_band "${NS_S}" "${server_dev}" 3 30 100%
+  add_port_filter "${NS_S}" "${server_dev}" 1 udp sport "${port}" 3
+}
+
+apply_tcp_tunnel_block_path() {
+  local path="$1"
+  local port="$2"
+  local client_dev server_dev
+  client_dev="$(path_client_dev "${path}")"
+  server_dev="$(path_server_dev "${path}")"
+
+  setup_prio_qdisc "${NS_C}" "${client_dev}"
+  add_loss_band "${NS_C}" "${client_dev}" 3 30 100%
+  add_port_filter "${NS_C}" "${client_dev}" 1 tcp dport "${port}" 3
+
+  setup_prio_qdisc "${NS_S}" "${server_dev}"
+  add_loss_band "${NS_S}" "${server_dev}" 3 30 100%
+  add_port_filter "${NS_S}" "${server_dev}" 1 tcp sport "${port}" 3
+}
+
+apply_udp_tunnel_block_path1() {
+  apply_udp_tunnel_block_path 1 "$1"
 }
 
 apply_tcp_tunnel_block_path1() {
-  local port="$1"
-  setup_prio_qdisc "${NS_C}" "${VETHC1}"
-  add_loss_band "${NS_C}" "${VETHC1}" 3 30 100%
-  add_port_filter "${NS_C}" "${VETHC1}" 1 tcp dport "${port}" 3
-
-  setup_prio_qdisc "${NS_S}" "${VETHS1}"
-  add_loss_band "${NS_S}" "${VETHS1}" 3 30 100%
-  add_port_filter "${NS_S}" "${VETHS1}" 1 tcp sport "${port}" 3
+  apply_tcp_tunnel_block_path 1 "$1"
 }
 
 apply_nat_tcp_block() {
@@ -582,13 +645,26 @@ apply_nat_tcp_block() {
   add_port_filter "${NS_C}" "${VETHCN}" 1 tcp dport "${port}" 3
 }
 
-apply_fec_loss() {
+apply_tcp_server_reject() {
   local port="$1"
-  setup_prio_qdisc "${NS_C}" "${VETHC1}"
-  add_loss_band "${NS_C}" "${VETHC1}" 3 30 20%
-  add_port_filter "${NS_C}" "${VETHC1}" 1 udp dport "${port}" 3
-  add_loss_band "${NS_C}" "${VETHC1}" 4 40 100%
-  add_port_filter "${NS_C}" "${VETHC1}" 2 tcp dport "${port}" 4
+  ip netns exec "${NS_S}" iptables -A INPUT -p tcp --dport "${port}" -j REJECT --reject-with tcp-reset
+}
+
+apply_fec_loss_path() {
+  local path="$1"
+  local port="$2"
+  local client_dev
+  client_dev="$(path_client_dev "${path}")"
+
+  setup_prio_qdisc "${NS_C}" "${client_dev}"
+  add_loss_band "${NS_C}" "${client_dev}" 3 30 20%
+  add_port_filter "${NS_C}" "${client_dev}" 1 udp dport "${port}" 3
+  add_loss_band "${NS_C}" "${client_dev}" 4 40 100%
+  add_port_filter "${NS_C}" "${client_dev}" 2 tcp dport "${port}" 4
+}
+
+apply_fec_loss() {
+  apply_fec_loss_path 1 "$1"
 }
 
 apply_fec_loss_high_rtt() {
@@ -737,11 +813,47 @@ count_log_pattern() {
   grep -c "${pattern}" "${log_file}" || true
 }
 
+assert_log_not_contains() {
+  local label="$1"
+  local pattern="$2"
+  local message="$3"
+  if [[ -z "${CURRENT_LOG_FILE}" || ! -f "${CURRENT_LOG_FILE}" ]]; then
+    fail "${label}" "${message}: log file missing"
+    return
+  fi
+  if grep -E -q "${pattern}" "${CURRENT_LOG_FILE}"; then
+    fail "${label}" "${message}: unexpected pattern found: ${pattern}"
+  else
+    pass "${label}" "${message}"
+  fi
+}
+
+wait_log_pattern() {
+  local label="$1"
+  local pattern="$2"
+  local timeout="${3:-15}"
+  local message="$4"
+  local deadline=$((SECONDS + timeout))
+  if [[ -z "${CURRENT_LOG_FILE}" ]]; then
+    fail "${label}" "${message}: log file unset"
+    return 1
+  fi
+  while (( SECONDS < deadline )); do
+    if [[ -f "${CURRENT_LOG_FILE}" ]] && grep -E -q "${pattern}" "${CURRENT_LOG_FILE}"; then
+      pass "${label}" "${message}"
+      return 0
+    fi
+    sleep 0.2
+  done
+  fail "${label}" "${message}: pattern not seen within ${timeout}s: ${pattern}"
+  return 1
+}
+
 run_fec_case() {
   local label="$1"
   local fec_flag="$2"
   local high_rtt_delay="${3:-}"
-  local log_file="${WORKDIR}/${label}.multipath.log"
+  local log_file="${WORKDIR}/${label}.server.log"
 
   clear_loss
   write_one_lane_config "${label}" "${PORT_FEC}" false "${fec_flag}" 200 3000
@@ -829,14 +941,239 @@ run_fec_comparison() {
   echo "==== fec e2e end ===="
 }
 
+run_per_lane_fallback_case() {
+  local name="per-lane-fallback"
+  echo "==== ${name} e2e start ===="
+  clear_loss
+  write_two_lane_config "${name}" "${PORT_PER_LANE_FALLBACK}" false false 200 600
+  expect_ping_fail_for "${name} precheck" 2
+  start_multipath "${name}"
+
+  wait_ping_ok "${name} baseline" 12
+
+  echo "[${name}] block UDP only on path2; lane=2 must fall back to TCP while lane=1 stays on UDP"
+  apply_udp_tunnel_block_path 2 "${PORT_PER_LANE_FALLBACK}"
+
+  wait_ping_ok "${name} mixed-lane-state" 15
+  wait_log_pattern "${name}" "accept_hello_ack session=[0-9]+ lane=2 .*tcp conn=" 15 "lane=2 reached TCP HELLO_ACK after path2 UDP block"
+  assert_log_not_contains "${name}" "accept_hello_ack session=[0-9]+ lane=1 .*tcp conn=" "lane=1 stayed on UDP while only path2 was blocked"
+
+  echo "[${name}] restore UDP; lane=2 must come back to UDP"
+  clear_loss
+  wait_ping_ok "${name} post-recovery" 15
+  wait_log_pattern "${name}" "target_recovered .*lane=2" 15 "lane=2 probe target recovered after UDP restore"
+
+  stop_multipath
+  clear_loss
+  echo "==== ${name} e2e end ===="
+}
+
+run_fec_tcp_fallback_case() {
+  local name="fec-tcp-fallback"
+  echo "==== ${name} e2e start ===="
+  clear_loss
+  write_one_lane_config "${name}" "${PORT_FEC_TCP_FALLBACK}" false true 200 600
+  start_multipath "${name}"
+
+  wait_ping_ok "${name} baseline" 12
+
+  echo "[${name}] block UDP on path1; lane must fall back to TCP while preserving FEC capability"
+  apply_udp_tunnel_block_path 1 "${PORT_FEC_TCP_FALLBACK}"
+
+  wait_ping_ok "${name} tcp-fallback" 20
+  wait_log_pattern "${name}" "accept_hello_ack session=[0-9]+ lane=1 .*tcp conn=.*negotiated_caps=0x3 negotiated_fec_profile=1" 20 "TCP HELLO_ACK preserved FEC capability and profile after fallback"
+
+  stop_multipath
+  clear_loss
+  echo "==== ${name} e2e end ===="
+}
+
+run_multipath_fec_case() {
+  local name="multipath-fec"
+  local log_file="${WORKDIR}/${name}.server.log"
+  local threshold=10
+  echo "==== ${name} e2e start ===="
+  clear_loss
+  write_two_lane_config "${name}" "${PORT_MULTIPATH_FEC}" false true 200 3000
+  start_multipath "${name}"
+
+  wait_ping_ok "${name} baseline" 12
+
+  echo "[${name}] apply 20% UDP loss + TCP block on path1; path2 stays clean"
+  apply_fec_loss_path 1 "${PORT_MULTIPATH_FEC}"
+  sleep 1
+  run_ping_sample "${name}-weak"
+
+  clear_loss
+  stop_multipath
+
+  local recovered
+  local recover_err
+  recovered="$(count_log_pattern "recv: recover_emit" "${log_file}")"
+  recover_err="$(count_log_pattern "recv: recover_err" "${log_file}")"
+  echo "[${name}] observed loss=${PING_SAMPLE_LOSS}% recover_emit=${recovered} recover_err=${recover_err}"
+
+  if (( recover_err > 0 )); then
+    fail "${name}" "FEC recovery errors observed"
+  elif awk -v loss="${PING_SAMPLE_LOSS}" -v threshold="${threshold}" 'BEGIN { exit !(loss < threshold) }'; then
+    pass "${name}" "observed loss ${PING_SAMPLE_LOSS}% < ${threshold}% under multipath + FEC"
+  else
+    fail "${name}" "observed loss ${PING_SAMPLE_LOSS}% >= ${threshold}% under multipath + FEC"
+  fi
+
+  echo "==== ${name} e2e end ===="
+}
+
+run_concurrent_fallback_case() {
+  local name="concurrent-fallback"
+  echo "==== ${name} e2e start ===="
+  clear_loss
+  write_two_lane_config "${name}" "${PORT_CONCURRENT_FALLBACK}" false false 200 600
+  expect_ping_fail_for "${name} precheck" 2
+  start_multipath "${name}"
+
+  wait_ping_ok "${name} baseline" 12
+
+  echo "[${name}] block UDP on both path1 and path2 simultaneously; both lanes must fall back to TCP"
+  apply_udp_tunnel_block_path 1 "${PORT_CONCURRENT_FALLBACK}"
+  apply_udp_tunnel_block_path 2 "${PORT_CONCURRENT_FALLBACK}"
+
+  wait_ping_ok "${name} dual-tcp-fallback" 25
+  wait_log_pattern "${name}" "accept_hello_ack session=[0-9]+ lane=1 .*tcp conn=" 25 "lane=1 reached TCP HELLO_ACK with both UDP paths blocked"
+  wait_log_pattern "${name}" "accept_hello_ack session=[0-9]+ lane=2 .*tcp conn=" 25 "lane=2 reached TCP HELLO_ACK with both UDP paths blocked"
+
+  echo "[${name}] restore UDP; both lanes must come back to UDP"
+  clear_loss
+  wait_ping_ok "${name} post-recovery" 15
+  wait_log_pattern "${name}" "target_recovered .*lane=1" 15 "lane=1 probe target recovered after UDP restore"
+  wait_log_pattern "${name}" "target_recovered .*lane=2" 15 "lane=2 probe target recovered after UDP restore"
+
+  stop_multipath
+  clear_loss
+  echo "==== ${name} e2e end ===="
+}
+
+run_fallback_dial_error_case() {
+  local name="fallback-dial-error"
+  echo "==== ${name} e2e start ===="
+  clear_loss
+  write_one_lane_config "${name}" "${PORT_FALLBACK_DIAL_ERROR}" false false 200 600
+  start_multipath "${name}"
+
+  wait_ping_ok "${name} baseline" 12
+
+  echo "[${name}] block UDP on path1 and REJECT TCP at the server; lane must fail closed"
+  apply_udp_tunnel_block_path 1 "${PORT_FALLBACK_DIAL_ERROR}"
+  apply_tcp_server_reject "${PORT_FALLBACK_DIAL_ERROR}"
+
+  wait_log_pattern "${name}" "fallback_result_err .*lane=1" 15 "client observed fallback_dial_error on lane=1"
+  expect_ping_fail_for "${name} no-runnable" 3
+
+  echo "[${name}] restore UDP and TCP; lane must come back online"
+  clear_loss
+  wait_ping_ok "${name} post-recovery" 15
+
+  stop_multipath
+  clear_loss
+  echo "==== ${name} e2e end ===="
+}
+
+run_weighted_scheduling_case() {
+  local name="weighted-scheduling"
+  local client_log
+  local path1_weight=4
+  local path2_weight=1
+  echo "==== ${name} e2e start ===="
+  clear_loss
+  write_two_lane_config "${name}" "${PORT_WEIGHTED}" false false 200 3000 "${path1_weight}" "${path2_weight}"
+  start_multipath "${name}"
+  client_log="${CURRENT_CLIENT_LOG}"
+
+  wait_ping_ok "${name} baseline" 12
+
+  echo "[${name}] send a ping sample to exercise the weighted scheduler"
+  ip netns exec "${NS_C}" ping -c 200 -i 0.05 -W 1 "${TUN_C_REMOTE}" >/dev/null 2>&1 || true
+
+  stop_multipath
+
+  local lane1_count
+  local lane2_count
+  local total
+  lane1_count="$(grep -E -c "tun_done session=[0-9]+ packet_id=[0-9]+ lane=1 " "${client_log}" 2>/dev/null || true)"
+  lane2_count="$(grep -E -c "tun_done session=[0-9]+ packet_id=[0-9]+ lane=2 " "${client_log}" 2>/dev/null || true)"
+  lane1_count="${lane1_count:-0}"
+  lane2_count="${lane2_count:-0}"
+  total=$((lane1_count + lane2_count))
+  echo "[${name}] lane1_count=${lane1_count} lane2_count=${lane2_count} total=${total}"
+
+  if (( total < 50 )); then
+    fail "${name}" "client emitted only ${total} tun_done lines; expected >=50 (MULTIPATH_DEBUG must be enabled)"
+  elif awk -v l1="${lane1_count}" -v l2="${lane2_count}" -v w1="${path1_weight}" -v w2="${path2_weight}" 'BEGIN {
+        total = l1 + l2;
+        if (total == 0) { exit 1 }
+        observed = l1 / total;
+        target   = w1 / (w1 + w2);
+        diff     = observed - target;
+        if (diff < 0) { diff = -diff }
+        exit !(diff <= 0.15)
+      }'; then
+    pass "${name}" "lane1 fraction ${lane1_count}/${total} matches target ${path1_weight}:${path2_weight} within tolerance"
+  else
+    fail "${name}" "lane1 fraction ${lane1_count}/${total} does not match target ${path1_weight}:${path2_weight}"
+  fi
+
+  clear_loss
+  echo "==== ${name} e2e end ===="
+}
+
+run_mtu_case() {
+  local name="mtu"
+  local payload=1412
+  echo "==== ${name} e2e start ===="
+  clear_loss
+  write_one_lane_config "${name}" "${PORT_MTU}" false false 200 600
+  start_multipath "${name}"
+
+  wait_ping_ok "${name} baseline" 12
+
+  echo "[${name}] send near-MTU ping (-s ${payload} -M do) over UDP"
+  if ip netns exec "${NS_C}" ping -c 5 -W 2 -s "${payload}" -M do "${TUN_C_REMOTE}" >/dev/null 2>&1; then
+    pass "${name}" "near-MTU ping survived UDP transport"
+  else
+    fail "${name}" "near-MTU ping failed over UDP transport"
+  fi
+
+  echo "[${name}] block UDP and force TCP fallback"
+  apply_udp_tunnel_block_path 1 "${PORT_MTU}"
+  wait_ping_ok "${name} tcp-fallback" 20
+
+  echo "[${name}] send near-MTU ping (-s ${payload} -M do) over TCP fallback"
+  if ip netns exec "${NS_C}" ping -c 5 -W 2 -s "${payload}" -M do "${TUN_C_REMOTE}" >/dev/null 2>&1; then
+    pass "${name}" "near-MTU ping survived TCP fallback"
+  else
+    fail "${name}" "near-MTU ping failed over TCP fallback"
+  fi
+
+  stop_multipath
+  clear_loss
+  echo "==== ${name} e2e end ===="
+}
+
 build_bin
 setup_netns
 
 run_multipath_case
+run_per_lane_fallback_case
+run_concurrent_fallback_case
 run_legacy_tcp_flag_case
 run_fallback_case
+run_fallback_dial_error_case
 run_nat_case
 run_fec_comparison
+run_fec_tcp_fallback_case
+run_multipath_fec_case
+run_weighted_scheduling_case
+run_mtu_case
 
 if [[ "${FAIL_COUNT}" -gt 0 ]]; then
   echo "real e2e failed (${FAIL_COUNT} failures)"

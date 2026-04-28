@@ -145,11 +145,15 @@ scripts/e2e.sh
 
 The real E2E builds the current binary, creates two Linux network namespaces,
 connects them with two veth paths, starts client/server with real TUN devices,
-and runs protocol-level cases for multipath scheduling, legacy `tcp` flag
-compatibility, UDP-to-TCP fallback, NAT traversal, and FEC. It requires Linux,
-`go`, root privileges, `ip`, `tc`, `ping`, and `iptables`. Run it as a regular
-user when possible; the script builds the binary before escalating for network
-namespace setup. `iperf3` and `timeout` enable an optional throughput smoke.
+and runs protocol-level cases for multipath scheduling, per-lane fallback
+isolation, concurrent multi-lane fallback, legacy `tcp` flag compatibility,
+UDP-to-TCP fallback, fallback dial error (no runnable lane), NAT traversal,
+FEC weak-net comparison, FEC over TCP fallback, multipath plus FEC, weighted
+scheduling, and near-MTU packet survival. It requires Linux, `go`, root
+privileges, `ip`, `tc`, `ping`, and `iptables`. Run it as a regular user when
+possible; the script builds the binary before escalating for network namespace
+setup. `iperf3` and `timeout` enable an
+optional throughput smoke.
 
 The NAT case adds a router namespace between the client and server namespaces,
 enables IPv4 forwarding, and SNATs the client-side underlay subnet toward the
@@ -168,9 +172,10 @@ also repeats the FEC comparison under added UDP tunnel delay; the default is
 `MULTIPATH_REAL_E2E_FEC_HIGH_RTT_DELAY`.
 
 The script starts client and server with `MULTIPATH_DEBUG=1` by default, so each
-case writes verbose protocol, transport, probe, fallback, and FEC traces to the
-printed `${case}.multipath.log` file in the work directory. Set
-`MULTIPATH_REAL_E2E_DEBUG=0` to keep those logs quiet for routine runs.
+case writes verbose protocol, transport, probe, fallback, and FEC traces to
+per-side `${case}.client.log` and `${case}.server.log` files in the work
+directory. Set `MULTIPATH_REAL_E2E_DEBUG=0` to keep those logs quiet for routine
+runs.
 
 The same script can be invoked through Go's test runner when explicitly
 enabled:

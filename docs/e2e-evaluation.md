@@ -8,11 +8,18 @@ and how to interpret its results.
 | Test | Topology | Fault | Main Signal |
 | --- | --- | --- | --- |
 | Multipath | two UDP-first lanes over two veth paths | path1 100% loss, path2 100% loss, both paths 100% loss, recovery | schedule strategy keeps traffic alive while at least one lane works and fails closed when no lane works |
+| Per-lane fallback | two UDP-first lanes over two veth paths | only path2 UDP tunnel traffic is dropped (TCP and path1 stay clean) | lane=2 falls back to TCP while lane=1 keeps using UDP, and lane=2 returns to UDP after the block clears |
+| Concurrent multi-lane fallback | two UDP-first lanes over two veth paths | UDP tunnel traffic is dropped on path1 and path2 simultaneously | both lanes fall back to TCP independently, ping survives, and both lanes return to UDP after the block clears |
 | Legacy TCP flag | two UDP-first lanes with legacy `tcp: true` config | client TCP dials to the server port are dropped, then path2 is dropped | old configs still parse, but `tcp: true` no longer forces TCP-only bootstrap |
 | Fallback | one UDP-first lane over one veth path | UDP tunnel traffic is dropped while TCP is clean, then TCP traffic is dropped after UDP is restored | a lane falls back to TCP when UDP fails and recovers back to UDP |
+| Fallback dial error | one UDP-first lane over one veth path | UDP tunnel traffic is dropped and the server REJECTs incoming TCP with TCP RST | the client emits `fallback_result_err` for the lane and ping fails closed because no transport leg is runnable |
 | NAT | client namespace behind a router namespace doing SNAT to the server namespace | TCP fallback is blocked | UDP HELLO/ACK, DATA, and probes work through NAT/conntrack using observed source addresses |
 | FEC weak-net comparison | one UDP-first lane over one veth path | 20% client-to-server UDP tunnel loss with TCP fallback blocked | `fec=true` reduces observed tunnel packet loss versus `fec=false` |
 | FEC high-RTT weak-net comparison | one UDP-first lane over one veth path | 20% client-to-server UDP tunnel loss, added UDP tunnel delay in both directions, TCP fallback blocked | FEC loss reduction still holds while ping RTT shows recovery-delay impact |
+| FEC over TCP fallback | one UDP-first lane with `fec=true` | UDP tunnel traffic is dropped while TCP is clean | the lane falls back to TCP and the TCP HELLO_ACK preserves the FEC capability and `fec_profile` |
+| Multipath + FEC | two UDP-first lanes with `fec=true` | path1 has 20% UDP tunnel loss and TCP fallback blocked; path2 stays clean | observed ping packet loss stays under 10%, validating combined multipath spreading and FEC recovery |
+| Weighted scheduling | two UDP-first lanes with `weight: 4` and `weight: 1` | clean network | observed client-side `tun_done` lane=1 fraction tracks `4/(4+1)` within ±0.15, validating per-lane weight handling |
+| MTU | one UDP-first lane over one veth path | clean network, then UDP tunnel traffic dropped to force TCP fallback | near-MTU pings (`ping -s 1412 -M do`) survive both UDP transport and TCP fallback, validating tunnel header overhead math |
 
 The FEC comparison intentionally uses one lane. Multipath failover would hide
 some losses and make it harder to isolate the FEC signal. TCP fallback is also
@@ -112,8 +119,9 @@ it is not a retransmission protocol and does not guarantee delivery.
 This is a functional weak-network smoke test, not a rigorous benchmark.
 `tc netem` random loss and `ping` sampling can vary between runs. If the FEC
 case does not beat the non-FEC case, inspect the ping logs in the script's
-printed work directory plus the `${case}.multipath.log` protocol trace, then
-rerun before drawing a performance conclusion.
+printed work directory plus the per-side `${case}.client.log` and
+`${case}.server.log` protocol traces, then rerun before drawing a performance
+conclusion.
 
 For a real benchmark, run multiple samples per case and record:
 
