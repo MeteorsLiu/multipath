@@ -18,9 +18,12 @@ func TestTxSLCWindowEmitsContiguousGroup(t *testing.T) {
 		t.Fatalf("basePacketID = %d, want 100", group.basePacketID)
 	}
 	for i := 0; i < 4; i++ {
-		if got := group.packets[i][0]; got != byte(100+i) {
+		if got := group.packets[i].Payload[0]; got != byte(100+i) {
 			t.Fatalf("packet[%d] = %d, want %d", i, got, 100+i)
 		}
+	}
+	for _, pkt := range group.packets {
+		pkt.Release()
 	}
 }
 
@@ -39,6 +42,9 @@ func TestTxSLCWindowSkipsNonContiguousStart(t *testing.T) {
 	if group.basePacketID != 102 {
 		t.Fatalf("basePacketID = %d, want 102", group.basePacketID)
 	}
+	for _, pkt := range group.packets {
+		pkt.Release()
+	}
 }
 
 func TestTxSLCWindowCopiesPackets(t *testing.T) {
@@ -52,7 +58,10 @@ func TestTxSLCWindowCopiesPackets(t *testing.T) {
 	if !ok {
 		t.Fatal("expected repair group")
 	}
-	if got := group.packets[0][0]; got != 1 {
+	if got := group.packets[0].Payload[0]; got != 1 {
 		t.Fatalf("packet copy = %d, want 1", got)
+	}
+	for _, pkt := range group.packets {
+		pkt.Release()
 	}
 }

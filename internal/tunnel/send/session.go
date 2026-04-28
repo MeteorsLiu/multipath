@@ -2,6 +2,7 @@ package send
 
 import (
 	"sync"
+	"sync/atomic"
 
 	"github.com/MeteorsLiu/multipath/internal/debuglog"
 	fecpkg "github.com/MeteorsLiu/multipath/internal/fec"
@@ -9,43 +10,39 @@ import (
 	sessionpkg "github.com/MeteorsLiu/multipath/internal/session"
 )
 
-// sendState holds per-session send-side state. Mutators take mu so the state
-// is safe under concurrent access from the data path and control path.
+// sendState holds per-session send-side state. The monotonic counters
+// nextPacketID / nextRepairKey are atomic so the data-path peek+commit pair
+// does not need the mutex; mu is taken only when mutating the FEC tx window.
 type sendState struct {
-	mu            sync.Mutex
-	nextPacketID  uint32
-	nextRepairKey uint16
-	txWindow      *txSLCWindow
+	nextPacketID  atomic.Uint32
+	nextRepairKey atomic.Uint32 // upper 16 bits unused; only low 16 bits encoded
+
+	mu       sync.Mutex
+	txWindow *txSLCWindow
 }
 
 // peekPacketID returns the next packet id without advancing it.
 func (s *sendState) peekPacketID() uint32 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.nextPacketID
+	return s.nextPacketID.Load()
 }
 
 // commitPacket advances nextPacketID past packetID and, if requested, adds the
 // packet to the FEC window. Returns the repair group when a window completes.
 func (s *sendState) commitPacket(packetID uint32, packet []byte, addToWindow bool) (txRepairGroup, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if packetID == s.nextPacketID {
-		s.nextPacketID++
-	}
+	// Atomic CAS preserves the "advance only if matches" contract while
+	// removing the mutex from the FEC-off hot path.
+	s.nextPacketID.CompareAndSwap(packetID, packetID+1)
 	if !addToWindow || s.txWindow == nil {
 		return txRepairGroup{}, false
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.txWindow.add(packetID, packet)
 }
 
 // reserveRepairKey reserves and returns the next repair key.
 func (s *sendState) reserveRepairKey() uint16 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	key := s.nextRepairKey
-	s.nextRepairKey++
-	return key
+	return uint16(s.nextRepairKey.Add(1) - 1)
 }
 
 type fecCodec interface {
@@ -104,9 +101,18 @@ func (l *Send) deleteSessionState(sessionID uint64) {
 	session, ok := l.sessionManager.Get(sessionID)
 	if ok {
 		l.sessionStatesMu.Lock()
+		state := l.sendStates[session]
 		delete(l.sendStates, session)
 		delete(l.strategies, sessionID)
 		l.sessionStatesMu.Unlock()
+
+		if state != nil {
+			state.mu.Lock()
+			if state.txWindow != nil {
+				state.txWindow.releaseAll()
+			}
+			state.mu.Unlock()
+		}
 
 		l.helloRoutesMu.Lock()
 		var pending []uint64

@@ -79,24 +79,34 @@ func (w *rxSLCWindow) addData(packetID uint32, packet []byte) (rxRecoverable, bo
 		debuglog.Printf("recv/fec_window", "rx_data packet_id=%d bytes=%d data=%d repairs=%d", packetID, len(packet), len(w.data), len(w.repairs))
 	}
 
-	for _, repair := range w.repairs {
-		if w.contains(repair, packetID) {
-			recoverable, ok := w.recoverable(repair)
-			if ok {
-				w.prune()
-				if debuglog.Enabled() {
-					debuglog.Printf("recv/fec_window", "rx_data_recoverable base_packet_id=%d key=%d missing_index=%d", recoverable.basePacketID, recoverable.key, recoverable.missingIndex)
-				}
-				return recoverable, true
+	// Only the (at most sourceCount) repair groups whose basePacketID is in
+	// [packetID-sourceCount+1, packetID] can contain packetID. Probe each
+	// candidate with an O(1) map lookup instead of scanning every stored
+	// repair.
+	for offset := 0; offset < w.sourceCount; offset++ {
+		base := packetID - uint32(offset)
+		repair, ok := w.repairs[base]
+		if !ok {
+			continue
+		}
+		if !w.contains(repair, packetID) {
+			// Defensive: handles the unlikely uint32 wraparound where the
+			// stored basePacketID is not actually contiguous with packetID.
+			continue
+		}
+		recoverable, ok := w.recoverable(repair)
+		if ok {
+			w.prune()
+			if debuglog.Enabled() {
+				debuglog.Printf("recv/fec_window", "rx_data_recoverable base_packet_id=%d key=%d missing_index=%d", recoverable.basePacketID, recoverable.key, recoverable.missingIndex)
 			}
-			if w.allKnown(repair) {
-				if r, ok := w.repairs[repair.basePacketID]; ok {
-					r.symbol.Release()
-					delete(w.repairs, repair.basePacketID)
-				}
-				if debuglog.Enabled() {
-					debuglog.Printf("recv/fec_window", "rx_repair_complete_drop base_packet_id=%d key=%d", repair.basePacketID, repair.key)
-				}
+			return recoverable, true
+		}
+		if w.allKnown(repair) {
+			repair.symbol.Release()
+			delete(w.repairs, base)
+			if debuglog.Enabled() {
+				debuglog.Printf("recv/fec_window", "rx_repair_complete_drop base_packet_id=%d key=%d", repair.basePacketID, repair.key)
 			}
 		}
 	}

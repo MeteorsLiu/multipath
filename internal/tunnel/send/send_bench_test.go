@@ -62,9 +62,22 @@ func BenchmarkSendWriteUDP4Lanes(b *testing.B) {
 	benchmarkSendWriteUDP(b, 4, 1436)
 }
 
+// BenchmarkSendWriteUDPFEC exercises the production-default FEC-on path so
+// the tx FEC window's per-packet cost is visible to benchmarks.
+func BenchmarkSendWriteUDPFEC(b *testing.B) {
+	in := newBenchmarkSendWithReadyLanes(1)
+	in.enableFEC()
+	benchmarkSendWriteUDPInstance(b, in, 1436)
+}
+
 func benchmarkSendWriteUDP(b *testing.B, lanes, payloadLen int) {
 	b.Helper()
 	in := newBenchmarkSendWithReadyLanes(lanes)
+	benchmarkSendWriteUDPInstance(b, in, payloadLen)
+}
+
+func benchmarkSendWriteUDPInstance(b *testing.B, in *Send, payloadLen int) {
+	b.Helper()
 	if _, _, ok := in.getOrCreateSessionState(99); !ok {
 		b.Fatal("getOrCreateSessionState failed")
 	}

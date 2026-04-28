@@ -196,6 +196,20 @@ func L(name string, value any) Label {
 	}
 }
 
+// LStr / LU64 / LU8 are typed alternatives to L that avoid boxing the value
+// into `any`, removing one allocation per label on hot paths.
+func LStr(name, value string) Label {
+	return Label{Name: name, Value: value}
+}
+
+func LU64(name string, value uint64) Label {
+	return Label{Name: name, Value: strconv.FormatUint(value, 10)}
+}
+
+func LU8(name string, value uint8) Label {
+	return Label{Name: name, Value: strconv.FormatUint(uint64(value), 10)}
+}
+
 func AddCounter(name string, delta uint64, labels ...Label) {
 	Default.AddCounter(name, delta, labels...)
 }

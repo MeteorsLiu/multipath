@@ -208,15 +208,15 @@ func TestSendWritePacketDoesNotAdvancePacketIDOnFailure(t *testing.T) {
 	if packetID != 0 {
 		t.Fatalf("packetID = %d, want 0", packetID)
 	}
-	if session.nextPacketID != 0 {
-		t.Fatalf("nextPacketID = %d, want 0", session.nextPacketID)
+	if got := session.nextPacketID.Load(); got != 0 {
+		t.Fatalf("nextPacketID = %d, want 0", got)
 	}
 }
 
 func TestSendWritePacketDoesNotHardStopAtMaxPacketID(t *testing.T) {
 	in := New()
 	session := mustSendState(t, in, 99)
-	session.nextPacketID = ^uint32(0)
+	session.nextPacketID.Store(^uint32(0))
 	lane := newLaneRuntime(3, 10)
 	lane.observeLeg(transport.LegRef{
 		Kind:       transport.KindUDP,
@@ -234,8 +234,8 @@ func TestSendWritePacketDoesNotHardStopAtMaxPacketID(t *testing.T) {
 	}
 	written := readSendPayload(t, in)
 	written.Packet.Release()
-	if session.nextPacketID != 0 {
-		t.Fatalf("nextPacketID = %d, want 0 after uint32 wrap", session.nextPacketID)
+	if got := session.nextPacketID.Load(); got != 0 {
+		t.Fatalf("nextPacketID = %d, want 0 after uint32 wrap", got)
 	}
 }
 

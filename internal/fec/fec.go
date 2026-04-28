@@ -86,7 +86,9 @@ func (c *Codec) Encode(shards [][]byte, key uint16) error {
 	}
 
 	shards[c.dataShards] = repair
-	debuglog.Printf("fec", "encode_done key=%d repair_len=%d", key, len(repair))
+	if debuglog.Enabled() {
+		debuglog.Printf("fec", "encode_done key=%d repair_len=%d", key, len(repair))
+	}
 	return nil
 }
 
@@ -155,7 +157,9 @@ func (c *Codec) Reconstruct(shards [][]byte, key uint16) error {
 	c.low.GalMulSlice(reedsolomon.Inv(coeffs[missingIndex]), recovered, recovered)
 
 	shards[missingIndex] = recovered
-	debuglog.Printf("fec", "reconstruct_done key=%d missing_index=%d recovered_len=%d", key, missingIndex, len(recovered))
+	if debuglog.Enabled() {
+		debuglog.Printf("fec", "reconstruct_done key=%d missing_index=%d recovered_len=%d", key, missingIndex, len(recovered))
+	}
 	return nil
 }
 

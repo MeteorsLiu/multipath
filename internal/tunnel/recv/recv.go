@@ -113,11 +113,11 @@ func (o *Recv) WriteTo(ctx context.Context, leg transport.LegRef, packet *packet
 		debuglog.Printf("recv", "frame_in %s leg={%s}", debugFrameSummary(frame), debugLeg(leg))
 	}
 	metrics.IncCounter(metrics.ProtocolFramesTotal,
-		metrics.L("direction", "rx"),
-		metrics.L("type", debugFrameType(frame.Type)),
-		metrics.L("session", frame.SessionID),
-		metrics.L("lane", frame.LaneID),
-		metrics.L("leg", kindMetricLabel(leg.Kind)),
+		metrics.LStr("direction", "rx"),
+		metrics.LStr("type", debugFrameType(frame.Type)),
+		metrics.LU64("session", frame.SessionID),
+		metrics.LU8("lane", frame.LaneID),
+		metrics.LStr("leg", kindMetricLabel(leg.Kind)),
 	)
 
 	switch frame.Type {
@@ -376,10 +376,14 @@ func (o *Recv) emitTransportPacket(ctx context.Context, packet *packetbuf.Packet
 	packet.Payload = payload
 	select {
 	case o.packets <- packet:
-		debuglog.Printf("recv", "packet_emit bytes=%d zero_copy=true", len(payload))
+		if debuglog.Enabled() {
+			debuglog.Printf("recv", "packet_emit bytes=%d zero_copy=true", len(payload))
+		}
 		return true, nil
 	case <-ctx.Done():
-		debuglog.Printf("recv", "packet_emit_drop ctx_done bytes=%d", len(payload))
+		if debuglog.Enabled() {
+			debuglog.Printf("recv", "packet_emit_drop ctx_done bytes=%d", len(payload))
+		}
 		return false, ctx.Err()
 	}
 }
@@ -390,11 +394,15 @@ func (o *Recv) emitCopiedPacket(ctx context.Context, payload []byte) error {
 	packet.SetLen(len(payload))
 	select {
 	case o.packets <- packet:
-		debuglog.Printf("recv", "packet_emit bytes=%d zero_copy=false", len(payload))
+		if debuglog.Enabled() {
+			debuglog.Printf("recv", "packet_emit bytes=%d zero_copy=false", len(payload))
+		}
 		return nil
 	case <-ctx.Done():
 		packet.Release()
-		debuglog.Printf("recv", "packet_emit_drop ctx_done bytes=%d zero_copy=false", len(payload))
+		if debuglog.Enabled() {
+			debuglog.Printf("recv", "packet_emit_drop ctx_done bytes=%d zero_copy=false", len(payload))
+		}
 		return ctx.Err()
 	}
 }

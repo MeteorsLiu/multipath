@@ -384,11 +384,11 @@ func (l *Send) enqueueFrameWithSize(ctx context.Context, leg transport.LegRef, f
 		debuglog.Printf("send", "enqueue_frame frame=%s leg={%s} bytes=%d", debugFrameSummary(frame), debugLeg(leg), written)
 	}
 	metrics.IncCounter(metrics.ProtocolFramesTotal,
-		metrics.L("direction", "tx"),
-		metrics.L("type", debugFrameType(frame.Type)),
-		metrics.L("session", frame.SessionID),
-		metrics.L("lane", frame.LaneID),
-		metrics.L("leg", kindMetricLabel(leg.Kind)),
+		metrics.LStr("direction", "tx"),
+		metrics.LStr("type", debugFrameType(frame.Type)),
+		metrics.LU64("session", frame.SessionID),
+		metrics.LU8("lane", frame.LaneID),
+		metrics.LStr("leg", kindMetricLabel(leg.Kind)),
 	)
 	return written, l.WriteTo(ctx, leg, packet)
 }

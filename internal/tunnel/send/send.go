@@ -144,10 +144,10 @@ func (l *Send) writeScheduledFrame(ctx context.Context, frame protocol.Frame) (l
 		debuglog.Printf("send", "schedule_select %s leg={%s} frame=%s", debugLaneState(laneKey{sessionID: frame.SessionID, laneID: laneID}, lane), debugLeg(leg), debugFrameSummary(frame))
 	}
 	metrics.IncCounter(metrics.SchedulePickTotal,
-		metrics.L("session", frame.SessionID),
-		metrics.L("lane", laneID),
-		metrics.L("frame_type", debugFrameType(frame.Type)),
-		metrics.L("leg", kindMetricLabel(leg.Kind)),
+		metrics.LU64("session", frame.SessionID),
+		metrics.LU8("lane", laneID),
+		metrics.LStr("frame_type", debugFrameType(frame.Type)),
+		metrics.LStr("leg", kindMetricLabel(leg.Kind)),
 	)
 	size, err := l.enqueueFrameWithSize(ctx, leg, frame, sizeHint)
 	if err != nil {
@@ -173,6 +173,12 @@ func (l *Send) maybeSendRepair(ctx context.Context, sessionID uint64, group txRe
 		return
 	}
 
+	defer func() {
+		for _, pkt := range group.packets {
+			pkt.Release()
+		}
+	}()
+
 	var shardBuf [5][]byte
 	var shards [][]byte
 	if len(group.packets)+1 > len(shardBuf) {
@@ -180,9 +186,18 @@ func (l *Send) maybeSendRepair(ctx context.Context, sessionID uint64, group txRe
 	} else {
 		shards = shardBuf[:len(group.packets)+1]
 	}
+	repairLen := 0
 	for i := range group.packets {
-		shards[i] = group.packets[i]
+		shards[i] = group.packets[i].Payload
+		if n := len(shards[i]); n > repairLen {
+			repairLen = n
+		}
 	}
+	// Pre-size the repair shard with a pooled buffer so fec.Encode reuses
+	// existing capacity instead of allocating a fresh ~1500B slice per group.
+	repairPkt := packetbuf.Acquire(repairLen)
+	defer repairPkt.Release()
+	shards[len(shards)-1] = repairPkt.Payload[:repairLen]
 	key := state.reserveRepairKey()
 	if err := l.fecCodec.Encode(shards, key); err != nil {
 		if debuglog.Enabled() {
