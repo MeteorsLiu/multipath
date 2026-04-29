@@ -141,9 +141,24 @@ func (i *Send) receivePong(ctx context.Context, sessionID uint64, laneID uint8, 
 		debuglog.Printf("send/control", "pong_drop missing_target session=%d lane=%d ping_id=%d leg={%s}", sessionID, laneID, body.PingID, debugLeg(leg))
 		return nil
 	}
-	if sample, ok := i.acceptRTTPong(lane, sessionID, laneID, leg, target, body, uint64(time.Now().UnixMilli())); ok {
+
+	// Read deadline before acceptRTTPong consumes the pending entry.
+	nowMS := uint64(time.Now().UnixMilli())
+	var deadlineMS uint64
+	i.rttMu.Lock()
+	if p, ok := i.rttPending[rttPendingKey{target: target, pingID: body.PingID}]; ok {
+		deadlineMS = p.deadlineMS
+	}
+	i.rttMu.Unlock()
+
+	if sample, ok := i.acceptRTTPong(lane, sessionID, laneID, leg, target, body, nowMS); ok {
 		debuglog.Printf("send/control", "rtt_sample session=%d lane=%d leg=%s sample_ms=%d srtt_ms=%d rttvar_ms=%d samples=%d", sessionID, laneID, kindMetricLabel(leg.Kind), sample.sampleMS, sample.srttMS, sample.rttvarMS, sample.samples)
 	}
+
+	// Record delivery for leg quality tracking.
+	arrivedOnTime := deadlineMS == 0 || nowMS <= body.TimeMS+deadlineMS
+	lane.recordDelivery(leg.Kind, arrivedOnTime)
+
 	debuglog.Printf("send/control", "pong session=%d lane=%d target=%d ping_id=%d leg={%s}", sessionID, laneID, target, body.PingID, debugLeg(leg))
 	i.sendProbeEvent(ctx, probe.Event{
 		Type:   probe.EventPongReceived,

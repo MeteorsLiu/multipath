@@ -14,10 +14,11 @@ type rttPendingKey struct {
 }
 
 type rttPendingPing struct {
-	sessionID uint64
-	laneID    uint8
-	legKey    pingKey
-	timeMS    uint64
+	sessionID  uint64
+	laneID     uint8
+	legKey     pingKey
+	timeMS     uint64
+	deadlineMS uint64
 }
 
 type rttObservation struct {
@@ -31,16 +32,36 @@ func (l *Send) recordRTTPing(target probe.Target, pingID uint64, timeMS uint64, 
 	if target == 0 {
 		return
 	}
+
+	// Compute delivery deadline: 2x SRTT, floor 100ms.
+	var deadlineMS uint64
+	lane := l.getLane(laneKey{sessionID: binding.sessionID, laneID: binding.laneID})
+	if lane != nil {
+		lane.mu.Lock()
+		estimator := laneRTTEstimatorLocked(lane, binding.leg.Kind)
+		if estimator != nil {
+			if srtt, ok := estimator.SRTT(); ok && srtt > 0 {
+				d := uint64(srtt) * 2
+				if d < 100 {
+					d = 100
+				}
+				deadlineMS = d
+			}
+		}
+		lane.mu.Unlock()
+	}
+
 	l.rttMu.Lock()
 	if l.rttPending == nil {
 		l.rttPending = make(map[rttPendingKey]rttPendingPing)
 	}
 	l.pruneRTTPendingLocked(target, timeMS)
 	l.rttPending[rttPendingKey{target: target, pingID: pingID}] = rttPendingPing{
-		sessionID: binding.sessionID,
-		laneID:    binding.laneID,
+		sessionID:  binding.sessionID,
+		laneID:     binding.laneID,
 		legKey:    newPingKey(binding.leg),
 		timeMS:    timeMS,
+		deadlineMS: deadlineMS,
 	}
 	l.rttMu.Unlock()
 }
