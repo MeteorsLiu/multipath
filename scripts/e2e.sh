@@ -982,7 +982,7 @@ run_fec_tcp_fallback_case() {
   apply_udp_tunnel_block_path 1 "${PORT_FEC_TCP_FALLBACK}"
 
   wait_ping_ok "${name} tcp-fallback" 20
-  wait_log_pattern "${name}" "accept_hello_ack session=[0-9]+ lane=1 .*tcp conn=.*negotiated_caps=0x3 negotiated_fec_profile=1" 20 "TCP HELLO_ACK preserved FEC capability and profile after fallback"
+  wait_log_pattern "${name}" "accept_hello_ack session=[0-9]+ lane=1 .*tcp conn=.*negotiated_caps=0x3 negotiated_fec_profile=2" 20 "TCP HELLO_ACK preserved FEC capability and variable FEC profile after fallback"
 
   stop_multipath
   clear_loss
