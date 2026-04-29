@@ -21,7 +21,9 @@ const (
 	ScheduleNoRunnableTotal   = "multipath_schedule_no_runnable_total"
 	ScheduleSkipTotal         = "multipath_schedule_skip_total"
 	LaneEventsTotal           = "multipath_lane_events_total"
+	LaneRTTMs                 = "multipath_lane_rtt_ms"
 	FECEventsTotal            = "multipath_fec_events_total"
+	FECFlushTotal             = "multipath_fec_flush_total"
 	ProbeEventsTotal          = "multipath_probe_events_total"
 	RuntimeInfo               = "multipath_runtime_info"
 )
@@ -113,10 +115,20 @@ var specs = map[string]metricSpec{
 		help:   "Total lane lifecycle and fallback events.",
 		labels: []string{"event", "session", "lane", "leg"},
 	},
+	LaneRTTMs: {
+		kind:   metricGauge,
+		help:   "Smoothed RTT in milliseconds by lane and transport leg.",
+		labels: []string{"session", "lane", "leg"},
+	},
 	FECEventsTotal: {
 		kind:   metricCounter,
 		help:   "Total FEC encode, repair, and recovery events.",
-		labels: []string{"event", "session"},
+		labels: []string{"event", "session", "source_span"},
+	},
+	FECFlushTotal: {
+		kind:   metricCounter,
+		help:   "Total FEC flush-triggered repair emissions.",
+		labels: []string{"session", "source_span"},
 	},
 	ProbeEventsTotal: {
 		kind:   metricCounter,

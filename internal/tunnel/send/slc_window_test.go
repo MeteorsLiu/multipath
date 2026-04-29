@@ -65,3 +65,52 @@ func TestTxSLCWindowCopiesPackets(t *testing.T) {
 		pkt.Release()
 	}
 }
+
+func TestTxSLCWindowFlushDrainsContiguousPrefix(t *testing.T) {
+	for _, count := range []int{1, 2, 3} {
+		window := newTxSLCWindow(4)
+		for i := 0; i < count; i++ {
+			if _, ok := window.add(uint32(100+i), []byte{byte(i)}); ok {
+				t.Fatalf("count %d: unexpected full group", count)
+			}
+		}
+
+		group, ok := window.flush()
+		if !ok {
+			t.Fatalf("count %d: flush ok = false", count)
+		}
+		if group.basePacketID != 100 || int(group.sourceSpan) != count || len(group.packets) != count {
+			t.Fatalf("count %d: group = base %d sourceSpan %d packets %d", count, group.basePacketID, group.sourceSpan, len(group.packets))
+		}
+		if len(window.pending) != 0 {
+			t.Fatalf("count %d: pending = %d, want 0", count, len(window.pending))
+		}
+		for _, pkt := range group.packets {
+			pkt.Release()
+		}
+	}
+}
+
+func TestTxSLCWindowFlushLeavesTailAfterGap(t *testing.T) {
+	window := newTxSLCWindow(4)
+	for _, packetID := range []uint32{100, 101, 103} {
+		if _, ok := window.add(packetID, []byte{byte(packetID)}); ok {
+			t.Fatal("unexpected full group")
+		}
+	}
+
+	group, ok := window.flush()
+	if !ok {
+		t.Fatal("flush ok = false")
+	}
+	if int(group.sourceSpan) != 2 {
+		t.Fatalf("sourceSpan = %d, want 2", group.sourceSpan)
+	}
+	for _, pkt := range group.packets {
+		pkt.Release()
+	}
+	if len(window.pending) != 1 || window.pending[0].packetID != 103 {
+		t.Fatalf("pending tail = %+v, want packet 103", window.pending)
+	}
+	window.releaseAll()
+}

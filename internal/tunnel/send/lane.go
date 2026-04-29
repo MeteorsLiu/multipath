@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 
 	"github.com/MeteorsLiu/multipath/internal/transport"
+	"github.com/MeteorsLiu/multipath/internal/tunnel/send/rtt"
 )
 
 var errLaneUnavailable = errors.New("tunnel: lane has no usable transport leg")
@@ -22,6 +23,8 @@ type laneRuntime struct {
 	udpLeg          transport.LegRef
 	tcpReady        bool
 	tcpLeg          transport.LegRef
+	rttUDP          rtt.Estimator
+	rttTCP          rtt.Estimator
 	tcpRemote       string
 	helloCaps       uint16
 	helloFECProfile uint8

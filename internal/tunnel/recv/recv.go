@@ -13,7 +13,10 @@ import (
 	"github.com/MeteorsLiu/multipath/internal/transport"
 )
 
-const defaultPacketQueueSize = 1024
+const (
+	defaultPacketQueueSize = 1024
+	maxFECSourceSpan       = 4
+)
 
 type ControlState interface {
 	OnHello(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error
@@ -39,12 +42,12 @@ type Config struct {
 //   - recvState.mu protects the per-session receive window and closed flag.
 //     It is taken AFTER releasing statesMu, never the other way around.
 type Recv struct {
-	statesMu sync.RWMutex
-	control  ControlState
-	manager  *sessionpkg.Manager
-	fecCodec fecCodec
-	packets  chan *packetbuf.Packet
-	states   map[*sessionpkg.Session]*recvState
+	statesMu  sync.RWMutex
+	control   ControlState
+	manager   *sessionpkg.Manager
+	fecCodecs [maxFECSourceSpan + 1]fecCodec
+	packets   chan *packetbuf.Packet
+	states    map[*sessionpkg.Session]*recvState
 }
 
 type recvState struct {
@@ -68,7 +71,9 @@ func New(configs ...Config) *Recv {
 		packets: make(chan *packetbuf.Packet, defaultPacketQueueSize),
 		manager: &sessionpkg.Manager{},
 	}
-	out.fecCodec, _ = fecpkg.NewCodec(4, 1)
+	for sourceSpan := 1; sourceSpan <= maxFECSourceSpan; sourceSpan++ {
+		out.fecCodecs[sourceSpan], _ = fecpkg.NewCodec(sourceSpan, 1)
+	}
 	for _, cfg := range configs {
 		if cfg.Control != nil {
 			out.control = cfg.Control
@@ -257,36 +262,42 @@ func (o *Recv) handleREPAIR(ctx context.Context, frame protocol.Frame) error {
 		debuglog.Printf("recv", "repair_invalid_body session=%d lane=%d", frame.SessionID, frame.LaneID)
 		return protocol.ErrInvalidFrame
 	}
+	if body.SourceSpan == 0 || body.SourceSpan > maxFECSourceSpan {
+		debuglog.Printf("recv", "repair_drop invalid_source_span session=%d lane=%d base_packet_id=%d key=%d source_span=%d", frame.SessionID, frame.LaneID, body.BasePacketID, body.Key, body.SourceSpan)
+		return nil
+	}
 	if debuglog.Enabled() {
-		debuglog.Printf("recv", "repair_accept session=%d lane=%d base_packet_id=%d key=%d symbol_len=%d", frame.SessionID, frame.LaneID, body.BasePacketID, body.Key, len(body.Symbol))
+		debuglog.Printf("recv", "repair_accept session=%d lane=%d base_packet_id=%d key=%d source_span=%d symbol_len=%d", frame.SessionID, frame.LaneID, body.BasePacketID, body.Key, body.SourceSpan, len(body.Symbol))
 	}
 	metrics.IncCounter(metrics.FECEventsTotal,
 		metrics.L("event", "repair_accept"),
 		metrics.L("session", frame.SessionID),
+		metrics.L("source_span", body.SourceSpan),
 	)
 
 	state := o.recvState(frame.SessionID)
 	if state == nil {
-		debuglog.Printf("recv", "repair_drop missing_session session=%d lane=%d base_packet_id=%d key=%d", frame.SessionID, frame.LaneID, body.BasePacketID, body.Key)
+		debuglog.Printf("recv", "repair_drop missing_session session=%d lane=%d base_packet_id=%d key=%d source_span=%d", frame.SessionID, frame.LaneID, body.BasePacketID, body.Key, body.SourceSpan)
 		return nil
 	}
 	state.mu.Lock()
 	if state.closed {
 		state.mu.Unlock()
-		debuglog.Printf("recv", "repair_drop closed_session session=%d lane=%d base_packet_id=%d key=%d", frame.SessionID, frame.LaneID, body.BasePacketID, body.Key)
+		debuglog.Printf("recv", "repair_drop closed_session session=%d lane=%d base_packet_id=%d key=%d source_span=%d", frame.SessionID, frame.LaneID, body.BasePacketID, body.Key, body.SourceSpan)
 		return nil
 	}
-	if recoverable, ok := state.rxWindow.addRepair(body.BasePacketID, body.Key, body.Symbol); ok {
+	if recoverable, ok := state.rxWindow.addRepair(body.BasePacketID, body.Key, int(body.SourceSpan), body.Symbol); ok {
 		state.mu.Unlock()
-		debuglog.Printf("recv", "repair_recoverable session=%d base_packet_id=%d key=%d missing_index=%d", frame.SessionID, recoverable.basePacketID, recoverable.key, recoverable.missingIndex)
+		debuglog.Printf("recv", "repair_recoverable session=%d base_packet_id=%d key=%d source_span=%d missing_index=%d", frame.SessionID, recoverable.basePacketID, recoverable.key, recoverable.sourceSpan, recoverable.missingIndex)
 		metrics.IncCounter(metrics.FECEventsTotal,
 			metrics.L("event", "repair_recoverable"),
 			metrics.L("session", frame.SessionID),
+			metrics.L("source_span", recoverable.sourceSpan),
 		)
 		return o.maybeRecover(ctx, frame.SessionID, state, recoverable)
 	}
 	state.mu.Unlock()
-	debuglog.Printf("recv", "repair_stored session=%d base_packet_id=%d key=%d", frame.SessionID, body.BasePacketID, body.Key)
+	debuglog.Printf("recv", "repair_stored session=%d base_packet_id=%d key=%d source_span=%d", frame.SessionID, body.BasePacketID, body.Key, body.SourceSpan)
 	return nil
 }
 
@@ -314,49 +325,52 @@ func (o *Recv) handleCLOSE(ctx context.Context, leg transport.LegRef, frame prot
 }
 
 func (o *Recv) maybeRecover(ctx context.Context, sessionID uint64, state *recvState, recoverable rxRecoverable) error {
-	if state == nil || o.fecCodec == nil {
-		debuglog.Printf("recv", "recover_skip session_nil=%t fec_nil=%t base_packet_id=%d key=%d missing_index=%d", state == nil, o.fecCodec == nil, recoverable.basePacketID, recoverable.key, recoverable.missingIndex)
+	codec := o.fecCodecForSourceSpan(recoverable.sourceSpan)
+	if state == nil || codec == nil {
+		debuglog.Printf("recv", "recover_skip session_nil=%t fec_nil=%t base_packet_id=%d key=%d source_span=%d missing_index=%d", state == nil, codec == nil, recoverable.basePacketID, recoverable.key, recoverable.sourceSpan, recoverable.missingIndex)
 		return nil
 	}
-	packet, ok := o.recoverPacket(sessionID, state, recoverable)
+	packet, ok := o.recoverPacket(sessionID, state, recoverable, codec)
 	if !ok {
 		return nil
 	}
 	return o.emitCopiedPacket(ctx, packet)
 }
 
-func (o *Recv) recoverPacket(sessionID uint64, state *recvState, recoverable rxRecoverable) ([]byte, bool) {
+func (o *Recv) recoverPacket(sessionID uint64, state *recvState, recoverable rxRecoverable, codec fecCodec) ([]byte, bool) {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	if state.closed {
-		debuglog.Printf("recv", "recover_drop closed_session base_packet_id=%d key=%d missing_index=%d", recoverable.basePacketID, recoverable.key, recoverable.missingIndex)
+		debuglog.Printf("recv", "recover_drop closed_session base_packet_id=%d key=%d source_span=%d missing_index=%d", recoverable.basePacketID, recoverable.key, recoverable.sourceSpan, recoverable.missingIndex)
 		return nil, false
 	}
 	shards, ok := state.rxWindow.buildShardsLocked(recoverable, state.shardScratch[:0])
 	if !ok {
 		// Window state changed (e.g. concurrent close/prune); recovery no
 		// longer applicable.
-		debuglog.Printf("recv", "recover_drop window_stale base_packet_id=%d key=%d missing_index=%d", recoverable.basePacketID, recoverable.key, recoverable.missingIndex)
+		debuglog.Printf("recv", "recover_drop window_stale base_packet_id=%d key=%d source_span=%d missing_index=%d", recoverable.basePacketID, recoverable.key, recoverable.sourceSpan, recoverable.missingIndex)
 		return nil, false
 	}
-	if err := o.fecCodec.Reconstruct(shards, recoverable.key); err != nil {
-		debuglog.Printf("recv", "recover_err base_packet_id=%d key=%d missing_index=%d err=%v", recoverable.basePacketID, recoverable.key, recoverable.missingIndex, err)
+	if err := codec.Reconstruct(shards, recoverable.key); err != nil {
+		debuglog.Printf("recv", "recover_err base_packet_id=%d key=%d source_span=%d missing_index=%d err=%v", recoverable.basePacketID, recoverable.key, recoverable.sourceSpan, recoverable.missingIndex, err)
 		metrics.IncCounter(metrics.FECEventsTotal,
 			metrics.L("event", "recover_err"),
 			metrics.L("session", sessionID),
+			metrics.L("source_span", recoverable.sourceSpan),
 		)
 		return nil, false
 	}
 	metrics.IncCounter(metrics.FECEventsTotal,
 		metrics.L("event", "reconstruct_done"),
 		metrics.L("session", sessionID),
+		metrics.L("source_span", recoverable.sourceSpan),
 	)
 
 	packetID := recoverable.basePacketID + uint32(recoverable.missingIndex)
 	reconstructed := shards[recoverable.missingIndex]
 	packet, ipOK := recoveredIPv4Packet(reconstructed)
 	if !ipOK {
-		debuglog.Printf("recv", "recover_drop invalid_ipv4 packet_id=%d bytes=%d", packetID, len(reconstructed))
+		debuglog.Printf("recv", "recover_drop invalid_ipv4 packet_id=%d source_span=%d bytes=%d", packetID, recoverable.sourceSpan, len(reconstructed))
 		return nil, false
 	}
 	state.rxWindow.addData(packetID, packet)
@@ -364,12 +378,20 @@ func (o *Recv) recoverPacket(sessionID uint64, state *recvState, recoverable rxR
 		debuglog.Printf("recv", "recover_drop duplicate packet_id=%d", packetID)
 		return nil, false
 	}
-	debuglog.Printf("recv", "recover_emit packet_id=%d bytes=%d", packetID, len(packet))
+	debuglog.Printf("recv", "recover_emit packet_id=%d source_span=%d bytes=%d", packetID, recoverable.sourceSpan, len(packet))
 	metrics.IncCounter(metrics.FECEventsTotal,
 		metrics.L("event", "recover_emit"),
 		metrics.L("session", sessionID),
+		metrics.L("source_span", recoverable.sourceSpan),
 	)
 	return append([]byte(nil), packet...), true
+}
+
+func (o *Recv) fecCodecForSourceSpan(sourceSpan int) fecCodec {
+	if sourceSpan <= 0 || sourceSpan > maxFECSourceSpan {
+		return nil
+	}
+	return o.fecCodecs[sourceSpan]
 }
 
 func (o *Recv) emitTransportPacket(ctx context.Context, packet *packetbuf.Packet, payload []byte) (bool, error) {

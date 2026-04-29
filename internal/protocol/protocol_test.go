@@ -59,7 +59,7 @@ func TestCodecRejectsInvalidFrames(t *testing.T) {
 		t.Fatalf("Decode zero vt err = %v, want ErrInvalidFrame", err)
 	}
 	unknownVersion := make([]byte, headerSize)
-	unknownVersion[0] = 2<<4 | uint8(TypeDATA)
+	unknownVersion[0] = 3<<4 | uint8(TypeDATA)
 	if _, err := Decode(unknownVersion); !errors.Is(err, ErrInvalidFrame) {
 		t.Fatalf("Decode unknown version err = %v, want ErrInvalidFrame", err)
 	}
@@ -68,7 +68,7 @@ func TestCodecRejectsInvalidFrames(t *testing.T) {
 	if _, err := Decode(unknownType); !errors.Is(err, ErrInvalidFrame) {
 		t.Fatalf("Decode unknown type err = %v, want ErrInvalidFrame", err)
 	}
-	if _, err := Encode(Frame{Version: 2, Type: TypeDATA}, nil); !errors.Is(err, ErrInvalidFrame) {
+	if _, err := Encode(Frame{Version: 3, Type: TypeDATA}, nil); !errors.Is(err, ErrInvalidFrame) {
 		t.Fatalf("Encode invalid version err = %v, want ErrInvalidFrame", err)
 	}
 	if _, err := Encode(Frame{Type: TypeCLOSE + 1}, nil); !errors.Is(err, ErrInvalidFrame) {

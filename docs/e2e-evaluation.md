@@ -91,18 +91,27 @@ FEC actually emitting recovered packets without recovery errors.
 
 ## FEC Loaded Latency Method
 
-Sparse ping (e.g., one packet every 20ms) is a worst case for the 4+1 SLC FEC
-profile because each repair group needs four DATA frames before the REPAIR is
-emitted. With sparse traffic the group fill time stretches recovery delay to
-multiple inter-packet gaps. Real applications usually carry a steady underlying
-flow that fills the repair group in microseconds, so observed FEC recovery delay
-is much smaller than the sparse-ping case implies.
+Sparse ping (e.g., one packet every 20ms) was a worst case for the fixed 4+1 SLC
+profile because each repair group needed four DATA frames before the REPAIR was
+emitted. The variable-span SLC profile bounds this added recovery delay with the
+sender's FEC flush timer. Under the fixed test knob, expected recovered-packet
+RTT is bounded by:
+
+```text
+baseline_rtt + fecFlushFixedMs + scheduling/jitter slack
+```
+
+With adaptive flushing, replace `fecFlushFixedMs` with:
+
+```text
+clamp(max_session_srtt * fecFlushAlpha, fecFlushMinMs, fecFlushMaxMs)
+```
 
 The loaded-latency case loads the tunnel with an iperf3 UDP background flow at a
 configurable rate, then runs a separate sparse ping concurrently to measure the
 RTT distribution that an interactive flow would observe. The sparse ping is the
-measurement; the iperf3 stream only fills the FEC group fast enough to make the
-measurement realistic.
+measurement; the iperf3 stream verifies the loaded path while the flush timer
+keeps partial FEC groups from stalling under sparse traffic.
 
 Tunable env vars:
 

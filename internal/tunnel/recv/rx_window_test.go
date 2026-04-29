@@ -8,7 +8,7 @@ func TestRxSLCWindowRepairBecomesRecoverable(t *testing.T) {
 	window.addData(102, []byte("c"))
 	window.addData(103, []byte("d"))
 
-	recoverable, ok := window.addRepair(100, 7, []byte("repair"))
+	recoverable, ok := window.addRepair(100, 7, 4, []byte("repair"))
 	if !ok {
 		t.Fatal("expected recoverable group with one missing packet")
 	}
@@ -34,7 +34,7 @@ func TestRxSLCWindowDataCompletesStoredRepair(t *testing.T) {
 	window := newRxSLCWindow(4)
 	window.addData(100, []byte("a"))
 	window.addData(102, []byte("c"))
-	if _, ok := window.addRepair(100, 7, []byte("repair")); ok {
+	if _, ok := window.addRepair(100, 7, 4, []byte("repair")); ok {
 		t.Fatal("repair should not recover with two missing packets")
 	}
 
@@ -54,7 +54,7 @@ func TestRxSLCWindowDropsRepairWhenAllDataKnown(t *testing.T) {
 	window.addData(102, []byte("c"))
 	window.addData(103, []byte("d"))
 
-	if _, ok := window.addRepair(100, 7, []byte("repair")); ok {
+	if _, ok := window.addRepair(100, 7, 4, []byte("repair")); ok {
 		t.Fatal("repair should not recover when all data is known")
 	}
 	if len(window.repairs) != 0 {
@@ -66,7 +66,7 @@ func TestRxSLCWindowDropsStoredRepairWhenDataCompletesWindow(t *testing.T) {
 	window := newRxSLCWindow(4)
 	window.addData(100, []byte("a"))
 	window.addData(101, []byte("b"))
-	if _, ok := window.addRepair(100, 7, []byte("repair")); ok {
+	if _, ok := window.addRepair(100, 7, 4, []byte("repair")); ok {
 		t.Fatal("repair should not recover with two missing packets")
 	}
 	if len(window.repairs) != 1 {
@@ -93,7 +93,7 @@ func TestRxSLCWindowCopiesInputs(t *testing.T) {
 	window.addData(103, []byte("d"))
 	packet[0] = 'x'
 
-	recoverable, ok := window.addRepair(100, 7, repair)
+	recoverable, ok := window.addRepair(100, 7, 4, repair)
 	if !ok {
 		t.Fatal("expected recoverable group")
 	}
@@ -137,9 +137,9 @@ func TestRxSLCWindowPrunesRepairs(t *testing.T) {
 	window := newRxSLCWindow(4)
 	window.maxRepairs = 2
 
-	window.addRepair(100, 1, []byte("a"))
-	window.addRepair(104, 2, []byte("b"))
-	window.addRepair(108, 3, []byte("c"))
+	window.addRepair(100, 1, 4, []byte("a"))
+	window.addRepair(104, 2, 4, []byte("b"))
+	window.addRepair(108, 3, 4, []byte("c"))
 
 	if len(window.repairs) != 2 {
 		t.Fatalf("repair entries = %d, want 2", len(window.repairs))

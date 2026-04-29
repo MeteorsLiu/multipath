@@ -29,8 +29,8 @@ var (
 //
 // Locking convention:
 //
-//   - The five map mutexes (lanesMu, sessionStatesMu, helloRoutesMu, probeMu,
-//     runnableCachesMu) protect the map containers and a hold is released
+//   - The map mutexes (lanesMu, sessionStatesMu, helloRoutesMu, probeMu,
+//     rttMu, runnableCachesMu) protect the map containers and a hold is released
 //     before any further work. They are NEVER held concurrently with each
 //     other except in runnableLanes recompute, which acquires
 //     runnableCachesMu -> lanesMu in a fixed direction.
@@ -43,16 +43,22 @@ var (
 //     fecProfile, negotiatedCaps, nextProbeTarget) need no lock.
 type Send struct {
 	// Immutable after construction.
-	sessionManager  *sessionpkg.Manager
-	streamTransport transport.StreamTransport
-	probeInterval   time.Duration
-	probeTimeout    time.Duration
-	probeEvents     chan probe.Event
-	packets         chan transport.Payload
-	bootstrapLanes  []BootstrapLane
+	sessionManager      *sessionpkg.Manager
+	streamTransport     transport.StreamTransport
+	probeInterval       time.Duration
+	probeTimeout        time.Duration
+	fecFlushAlpha       uint32
+	fecFlushMinMs       uint32
+	fecFlushMaxMs       uint32
+	fecFlushColdStartMs uint32
+	fecFlushFixedMs     uint32
+	probeEvents         chan probe.Event
+	packets             chan transport.Payload
+	bootstrapLanes      []BootstrapLane
 
 	// Mutable but lock-free.
-	fecCodec fecCodec
+	fecCodec  fecCodec
+	fecCodecs [maxFECSourceSpan + 1]fecCodec
 
 	// Atomic flags and counters.
 	activeSessionID  atomic.Uint64
@@ -83,21 +89,29 @@ type Send struct {
 	probeTargets map[probe.Target]probeBinding
 	probeKeys    map[pingKey]probe.Target
 
+	rttMu      sync.Mutex
+	rttPending map[rttPendingKey]rttPendingPing
+
 	runnableCachesMu sync.Mutex
 	runnableCaches   map[uint64]*runnableLaneCache
 }
 
 func New(configs ...Config) *Send {
 	in := &Send{
-		lanes:          make(map[laneKey]*laneRuntime),
-		sendStates:     make(map[*sessionpkg.Session]*sendState),
-		runnableCaches: make(map[uint64]*runnableLaneCache),
-		helloRoutes:    make(map[laneKey]helloRoute),
-		strategies:     make(map[uint64]schedule.Strategy[*laneRuntime]),
-		probeTargets:   make(map[probe.Target]probeBinding),
-		probeKeys:      make(map[pingKey]probe.Target),
-		packets:        make(chan transport.Payload, defaultPacketQueueSize),
-		sessionManager: &sessionpkg.Manager{},
+		lanes:               make(map[laneKey]*laneRuntime),
+		sendStates:          make(map[*sessionpkg.Session]*sendState),
+		runnableCaches:      make(map[uint64]*runnableLaneCache),
+		helloRoutes:         make(map[laneKey]helloRoute),
+		strategies:          make(map[uint64]schedule.Strategy[*laneRuntime]),
+		probeTargets:        make(map[probe.Target]probeBinding),
+		probeKeys:           make(map[pingKey]probe.Target),
+		rttPending:          make(map[rttPendingKey]rttPendingPing),
+		packets:             make(chan transport.Payload, defaultPacketQueueSize),
+		sessionManager:      &sessionpkg.Manager{},
+		fecFlushAlpha:       defaultFECFlushAlpha,
+		fecFlushMinMs:       defaultFECFlushMinMs,
+		fecFlushMaxMs:       defaultFECFlushMaxMs,
+		fecFlushColdStartMs: defaultFECFlushColdStart,
 	}
 	for _, cfg := range configs {
 		in.applyConfig(cfg)
@@ -118,6 +132,19 @@ func (l *Send) applyConfig(cfg Config) {
 	if cfg.ProbeTimeout > 0 {
 		l.probeTimeout = cfg.ProbeTimeout
 	}
+	if cfg.FECFlushAlpha > 0 {
+		l.fecFlushAlpha = cfg.FECFlushAlpha
+	}
+	if cfg.FECFlushMinMs > 0 {
+		l.fecFlushMinMs = cfg.FECFlushMinMs
+	}
+	if cfg.FECFlushMaxMs > 0 {
+		l.fecFlushMaxMs = cfg.FECFlushMaxMs
+	}
+	if cfg.FECFlushColdStartMs > 0 {
+		l.fecFlushColdStartMs = cfg.FECFlushColdStartMs
+	}
+	l.fecFlushFixedMs = cfg.FECFlushFixedMs
 	if cfg.ProbeEvents != nil {
 		l.probeEvents = cfg.ProbeEvents
 	}
@@ -141,7 +168,7 @@ func (l *Send) bootstrap(ctx context.Context) error {
 	for _, lane := range l.bootstrapLanes {
 		caps := protocol.CapTCPFallback
 		fecProfile := uint8(l.fecProfile.Load())
-		if fecProfile == protocol.FECProfileSLC4Plus1 {
+		if fecProfileEnabled(fecProfile) {
 			caps |= protocol.CapFEC
 		}
 		debuglog.Printf("send", "bootstrap_lane session=%d lane=%d weight=%d leg={%s} tcp_remote=%s caps=%#x fec_profile=%d", lane.SessionID, lane.LaneID, lane.Weight, debugLeg(lane.Leg), lane.TCPRemote, caps, fecProfile)
@@ -416,7 +443,7 @@ func frameEncodeCapacity(frame protocol.Frame) (int, error) {
 		if !ok {
 			return 0, protocol.ErrInvalidFrame
 		}
-		return headerSize + 6 + len(body.Symbol), nil
+		return headerSize + 7 + len(body.Symbol), nil
 	case protocol.TypeCLOSE:
 		_, ok := frame.Body.(protocol.CloseBody)
 		return headerSize + 2, validFrameBody(ok)

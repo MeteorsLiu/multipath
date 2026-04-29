@@ -145,6 +145,8 @@ func (l *Send) handleProbeEvent(ctx context.Context, event probe.Event) error {
 				PingID: event.PingID,
 				TimeMS: event.TimeMS,
 			})
+		} else {
+			l.recordRTTPing(event.Target, event.PingID, event.TimeMS, binding)
 		}
 	case probe.EventTargetLost:
 		return l.handleProbeTargetLost(ctx, event.Target)
@@ -162,6 +164,7 @@ func (l *Send) handleProbeTargetLost(ctx context.Context, target probe.Target) e
 		debuglog.Printf("send/probe", "target_lost_drop missing_target target=%d", target)
 		return nil
 	}
+	l.clearRTTPendingTarget(target)
 	key := laneKey{sessionID: binding.sessionID, laneID: binding.laneID}
 	lane := l.getLane(key)
 	if lane == nil {
@@ -264,6 +267,7 @@ func (l *Send) untrackProbeTarget(ctx context.Context, leg transport.LegRef) {
 		debuglog.Printf("send/probe", "untrack_skip missing_target leg={%s}", debugLeg(leg))
 		return
 	}
+	l.clearRTTPendingTarget(target)
 	debuglog.Printf("send/probe", "untrack target=%d leg={%s}", target, debugLeg(leg))
 	l.sendProbeEvent(ctx, probe.Event{Type: probe.EventUntrack, Target: target})
 }

@@ -3,6 +3,7 @@ package send
 import (
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/MeteorsLiu/multipath/internal/debuglog"
 	fecpkg "github.com/MeteorsLiu/multipath/internal/fec"
@@ -17,8 +18,10 @@ type sendState struct {
 	nextPacketID  atomic.Uint32
 	nextRepairKey atomic.Uint32 // upper 16 bits unused; only low 16 bits encoded
 
-	mu       sync.Mutex
-	txWindow *txSLCWindow
+	mu            sync.Mutex
+	txWindow      *txSLCWindow
+	fecFlushTimer *time.Timer
+	fecFlushArmed bool
 }
 
 // peekPacketID returns the next packet id without advancing it.
@@ -28,16 +31,23 @@ func (s *sendState) peekPacketID() uint32 {
 
 // commitPacket advances nextPacketID past packetID and, if requested, adds the
 // packet to the FEC window. Returns the repair group when a window completes.
-func (s *sendState) commitPacket(packetID uint32, packet []byte, addToWindow bool) (txRepairGroup, bool) {
+func (s *sendState) commitPacket(packetID uint32, packet []byte, addToWindow bool) (txRepairGroup, bool, bool) {
 	// Atomic CAS preserves the "advance only if matches" contract while
 	// removing the mutex from the FEC-off hot path.
 	s.nextPacketID.CompareAndSwap(packetID, packetID+1)
 	if !addToWindow || s.txWindow == nil {
-		return txRepairGroup{}, false
+		return txRepairGroup{}, false, false
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.txWindow.add(packetID, packet)
+	wasEmpty := len(s.txWindow.pending) == 0
+	group, ready := s.txWindow.add(packetID, packet)
+	if ready {
+		s.cancelFECFlushTimerLocked()
+		return group, true, false
+	}
+	shouldArmFlush := wasEmpty && len(s.txWindow.pending) > 0
+	return txRepairGroup{}, false, shouldArmFlush
 }
 
 // reserveRepairKey reserves and returns the next repair key.
@@ -108,6 +118,7 @@ func (l *Send) deleteSessionState(sessionID uint64) {
 
 		if state != nil {
 			state.mu.Lock()
+			state.cancelFECFlushTimerLocked()
 			if state.txWindow != nil {
 				state.txWindow.releaseAll()
 			}
@@ -133,8 +144,13 @@ func (l *Send) deleteSessionState(sessionID uint64) {
 }
 
 func (l *Send) enableFEC() {
-	l.fecProfile.Store(uint32(protocol.FECProfileSLC4Plus1))
+	l.fecProfile.Store(uint32(protocol.FECProfileSLCVariablePlus1))
+	for sourceSpan := 1; sourceSpan <= maxFECSourceSpan; sourceSpan++ {
+		if l.fecCodecs[sourceSpan] == nil {
+			l.fecCodecs[sourceSpan], _ = fecpkg.NewCodec(sourceSpan, 1)
+		}
+	}
 	if l.fecCodec == nil {
-		l.fecCodec, _ = fecpkg.NewCodec(4, 1)
+		l.fecCodec = l.fecCodecs[maxFECSourceSpan]
 	}
 }

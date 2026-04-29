@@ -166,6 +166,8 @@ lane runtime data
 per-session Schedule Strategy
 global FEC profile and codec
 HELLO bootstrap and retry data
+per-leg RTT estimator sampled from PONG
+RTT-driven FEC flush timer for variable-span SLC
 transport-bound output queue
 ```
 
@@ -181,6 +183,11 @@ type Config struct {
     ProbeTimeout    time.Duration
     ProbeEvents     chan core.Event
     EnableFEC       bool
+    FECFlushAlpha       uint32
+    FECFlushMinMs       uint32
+    FECFlushMaxMs       uint32
+    FECFlushColdStartMs uint32
+    FECFlushFixedMs     uint32
     BootstrapLanes  []BootstrapLane
 }
 
@@ -217,6 +224,9 @@ RecvState adapter lives in the send package so it can implement
 those hooks methods on `Send`.
 Send does not expose semantic control methods such as AcceptHello,
 AcceptHelloAck, ObserveLane, ReceivePing, ReceivePong, or Close.
+Send arms the FEC flush timer only when the negotiated FEC profile supports
+variable-span REPAIR frames. The timer emits transport-bound REPAIR frames
+through the same scheduling and packet queue path as fill-triggered REPAIR.
 ```
 
 ## Recv
@@ -270,8 +280,10 @@ Recv owns receive-side FEC windows.
 Recv does not own or call a control-plane writer.
 Recv must not call ProbeLoop or Send directly.
 Recv must not expose Result, Respond, or accept-gating plumbing.
-Recv uses one global FEC codec and keeps per-session receive windows because
-packet_id and base_packet_id are session-scoped.
+Recv uses profile-aware FEC codecs and keeps per-session receive windows because
+packet_id and base_packet_id are session-scoped. REPAIR `source_span` is
+interpreted in Recv according to the negotiated FEC profile; Session does not
+own that state.
 Those FEC windows stay in Recv; Session does not own FEC state.
 ```
 
@@ -569,7 +581,7 @@ Protocol behavior is only Encode and Decode.
 Role:
 
 ```text
-4+1 SLC shard encode/decode
+SLC shard encode/decode
 ```
 
 Public behavior:

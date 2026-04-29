@@ -20,7 +20,7 @@ func debugFrameSummary(frame protocol.Frame) string {
 	case protocol.DataBody:
 		return fmt.Sprintf("%s packet_id=%d payload_len=%d", base, body.PacketID, len(body.Packet))
 	case protocol.RepairBody:
-		return fmt.Sprintf("%s base_packet_id=%d key=%d symbol_len=%d", base, body.BasePacketID, body.Key, len(body.Symbol))
+		return fmt.Sprintf("%s base_packet_id=%d key=%d source_span=%d symbol_len=%d", base, body.BasePacketID, body.Key, body.SourceSpan, len(body.Symbol))
 	case protocol.CloseBody:
 		return fmt.Sprintf("%s scope=%d reason=%d", base, body.Scope, body.Reason)
 	default:

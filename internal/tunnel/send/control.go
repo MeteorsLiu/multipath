@@ -2,6 +2,7 @@ package send
 
 import (
 	"context"
+	"time"
 
 	"github.com/MeteorsLiu/multipath/internal/debuglog"
 	"github.com/MeteorsLiu/multipath/internal/metrics"
@@ -128,7 +129,8 @@ func (i *Send) receivePong(ctx context.Context, sessionID uint64, laneID uint8, 
 		debuglog.Printf("send/control", "pong_drop missing_session session=%d lane=%d ping_id=%d", sessionID, laneID, body.PingID)
 		return nil
 	}
-	if i.getLane(laneKey{sessionID: sessionID, laneID: laneID}) == nil {
+	lane := i.getLane(laneKey{sessionID: sessionID, laneID: laneID})
+	if lane == nil {
 		debuglog.Printf("send/control", "pong_drop missing_lane session=%d lane=%d ping_id=%d", sessionID, laneID, body.PingID)
 		return nil
 	}
@@ -138,6 +140,9 @@ func (i *Send) receivePong(ctx context.Context, sessionID uint64, laneID uint8, 
 	if !ok {
 		debuglog.Printf("send/control", "pong_drop missing_target session=%d lane=%d ping_id=%d leg={%s}", sessionID, laneID, body.PingID, debugLeg(leg))
 		return nil
+	}
+	if sample, ok := i.acceptRTTPong(lane, sessionID, laneID, leg, target, body, uint64(time.Now().UnixMilli())); ok {
+		debuglog.Printf("send/control", "rtt_sample session=%d lane=%d leg=%s sample_ms=%d srtt_ms=%d rttvar_ms=%d samples=%d", sessionID, laneID, kindMetricLabel(leg.Kind), sample.sampleMS, sample.srttMS, sample.rttvarMS, sample.samples)
 	}
 	debuglog.Printf("send/control", "pong session=%d lane=%d target=%d ping_id=%d leg={%s}", sessionID, laneID, target, body.PingID, debugLeg(leg))
 	i.sendProbeEvent(ctx, probe.Event{
@@ -274,10 +279,13 @@ func (i *Send) writePayloadOnLeg(ctx context.Context, leg transport.LegRef, payl
 
 func negotiateCapabilities(peerCaps uint16, peerFECProfile uint8, localFECProfile uint8) (uint16, uint8) {
 	caps := peerCaps & protocol.SupportedCaps
-	if caps&protocol.CapFEC == 0 || peerFECProfile != protocol.FECProfileSLC4Plus1 || localFECProfile != protocol.FECProfileSLC4Plus1 {
+	if caps&protocol.CapFEC == 0 || !validFECProfile(peerFECProfile) || !validFECProfile(localFECProfile) || peerFECProfile == protocol.FECProfileOff || localFECProfile == protocol.FECProfileOff {
 		return caps &^ protocol.CapFEC, protocol.FECProfileOff
 	}
-	return caps, protocol.FECProfileSLC4Plus1
+	if peerFECProfile < localFECProfile {
+		return caps, peerFECProfile
+	}
+	return caps, localFECProfile
 }
 
 func boolByte(ok bool) uint8 {

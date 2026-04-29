@@ -51,7 +51,7 @@ func TestTypedFramesRoundTrip(t *testing.T) {
 			Type:      TypeREPAIR,
 			SessionID: 11,
 			LaneID:    1,
-			Body:      RepairBody{BasePacketID: 10, Key: 7, Symbol: []byte("repair")},
+			Body:      RepairBody{BasePacketID: 10, Key: 7, SourceSpan: 4, Symbol: []byte("repair")},
 		},
 		{
 			Type:      TypeCLOSE,

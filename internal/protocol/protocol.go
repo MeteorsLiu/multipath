@@ -8,7 +8,7 @@ import (
 )
 
 const (
-	Version uint8 = 1
+	Version uint8 = 2
 
 	headerSize = 10
 )

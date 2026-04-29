@@ -1,6 +1,6 @@
 # Multipath Tunnel Protocol Draft
 
-This document describes the proposed v1 wire protocol for the multipath
+This document describes the proposed v2 wire protocol for the multipath
 tunnel refactor.
 
 ## Scope
@@ -15,7 +15,7 @@ The protocol owns:
 - lane identification
 - UDP-first transport with per-lane TCP fallback
 - keepalive and path health frames
-- optional 4+1 SLC forward erasure correction
+- optional SLC forward erasure correction
 
 The protocol does not own:
 
@@ -37,8 +37,8 @@ arrives late. It is not a general reliable-transport deduplication layer.
 - Fallback: a per-lane decision to use TCP while the same lane's UDP leg is
   unavailable.
 - Frame: one protocol message after the UDP or TCP transport envelope.
-- SLC: the protocol's sliding linear coding layer. The v1 SLC profile uses
-  random linear coding over GF(2^8) with four DATA shards and one REPAIR shard.
+- SLC: the protocol's sliding linear coding layer. SLC profiles use random
+  linear coding over GF(2^8) with DATA shards and one REPAIR shard.
 - DATA symbol: the FEC-protected representation of one tunnel IP packet.
 - REPAIR symbol: one FEC parity symbol generated from DATA symbols.
 - packet_id: a session-scoped DATA identifier used by the SLC window.
@@ -117,9 +117,10 @@ DATA overhead = 14 bytes
 REPAIR frame header = 10 bytes common header
                     + 4 bytes base_packet_id
                     + 2 bytes key
-                    = 16 bytes
+                    + 1 byte source_span
+                    = 17 bytes
 
-REPAIR-protected IP packet overhead = 16 bytes
+REPAIR-protected IP packet overhead = 17 bytes
 ```
 
 For UDP:
@@ -127,7 +128,7 @@ For UDP:
 ```text
 udp_payload_budget = path_mtu - outer_ip_header - udp_header
 udp_data_tun_mtu   = udp_payload_budget - 14
-udp_fec_tun_mtu    = udp_payload_budget - 16
+udp_fec_tun_mtu    = udp_payload_budget - 17
 ```
 
 For TCP:
@@ -135,7 +136,7 @@ For TCP:
 ```text
 tcp_payload_budget = effective_tcp_mss
 tcp_data_tun_mtu   = tcp_payload_budget - 2 - 14
-tcp_fec_tun_mtu    = tcp_payload_budget - 2 - 16
+tcp_fec_tun_mtu    = tcp_payload_budget - 2 - 17
 ```
 
 The extra `2` bytes for TCP are the `frame_len` prefix.
@@ -146,7 +147,7 @@ Operationally, round the calculated TUN MTU down to a multiple of 10:
 aligned_tun_mtu = floor(calculated_tun_mtu / 10) * 10
 ```
 
-For v1, only IPv4 underlay is considered. With `path_mtu = 1500` and a minimum
+For v2, only IPv4 underlay is considered. With `path_mtu = 1500` and a minimum
 TCP header:
 
 ```text
@@ -154,19 +155,19 @@ UDP payload budget = 1500 - 20 - 8  = 1472
 TCP payload budget = 1500 - 20 - 20 = 1460
 
 UDP, FEC off       = 1472 - 14 = 1458 -> 1450 aligned
-UDP, 4+1 FEC       = 1472 - 16 = 1456 -> 1450 aligned
+UDP, FEC on        = 1472 - 17 = 1455 -> 1450 aligned
 
 TCP, FEC off       = 1460 - 2 - 14 = 1444 -> 1440 aligned
-TCP, 4+1 FEC       = 1460 - 2 - 16 = 1442 -> 1440 aligned
+TCP, FEC on        = 1460 - 2 - 17 = 1441 -> 1440 aligned
 ```
 
 Recommended TUN MTU is the minimum value across all enabled transport legs and
 enabled protocol features after alignment:
 
 ```text
-UDP only + 4+1 FEC = 1450
-TCP only + 4+1 FEC = 1440
-UDP/TCP auto fallback + 4+1 FEC = 1440
+UDP only + FEC = 1450
+TCP only + FEC = 1440
+UDP/TCP auto fallback + FEC = 1440
 ```
 
 If TCP options reduce the effective TCP MSS, use the actual MSS in the formula
@@ -175,7 +176,7 @@ instead of assuming `1460`.
 Version:
 
 ```text
-1 = this protocol draft
+2 = this protocol draft
 ```
 
 Frame types:
@@ -212,9 +213,12 @@ bit 1 = FEC supported
 ```text
 0 = off
 1 = slc_4_plus_1
+2 = slc_variable_plus_1
 ```
 
-For v1, both peers use the capability intersection returned in HELLO_ACK.
+Both peers use the capability intersection returned in HELLO_ACK. If both peers
+support FEC, the negotiated `fec_profile` is the highest profile supported by
+both peers.
 
 ## Type 0x1: HELLO
 
@@ -351,7 +355,8 @@ to TUN.
 
 `packet_id` maps a DATA frame into the SLC repair window. For the fixed 4+1
 profile, the source-symbol position is `packet_id - base_packet_id` inside a
-REPAIR window, and valid positions are `0..3`.
+REPAIR window, and valid positions are `0..3`. For the variable profile, valid
+positions are `0..source_span-1`.
 
 `packet_id` should not wrap inside one live session once session rotation is
 defined. The exact exhaustion threshold and graceful rotation behavior are an
@@ -389,25 +394,41 @@ Body:
 ```text
 base_packet_id uint32
 key            uint16
+source_span    uint8
 repair_symbol bytes[repair_symbol_size]
 ```
 
-For `fec_profile = slc_4_plus_1`:
+`source_span` is the number of contiguous DATA symbols protected by this REPAIR
+frame. It defines the protected range:
 
 ```text
-source count    = 4
+base_packet_id .. base_packet_id + source_span - 1
+```
+
+Rules:
+
+```text
+fec_profile = slc_4_plus_1:
+  source_span = 4
+
+fec_profile = slc_variable_plus_1:
+  source_span = 1..4
+```
+
+For both SLC profiles:
+
+```text
 repair count    = 1
-repair interval = one REPAIR after every four successfully sent DATA symbols
 field           = GF(2^8)
 ```
 
-The four protected source symbols are:
+The protected source symbols are:
 
 ```text
 base_packet_id
 base_packet_id + 1
-base_packet_id + 2
-base_packet_id + 3
+...
+base_packet_id + source_span - 1
 ```
 
 The DATA symbol used for FEC is the IP packet itself:
@@ -420,21 +441,19 @@ DATA frames never carry padding. For repair calculation only, packets shorter
 than the repair symbol length are treated as if bytes beyond `len(ip_packet)`
 were zero. This is a virtual zero extension, not bytes sent on the wire.
 
-The repair symbol length is the largest IP packet length in the four-symbol
-repair window:
+The repair symbol length is the largest IP packet length in the protected repair
+window:
 
 ```text
-repair_symbol_size = max(len(P0), len(P1), len(P2), len(P3))
+repair_symbol_size = max(len(P0), ..., len(P[source_span-1]))
 ```
 
-`repair_symbol_size` is not carried as an explicit field. The receiver derives
-it from the received frame length:
+The `4` bytes are `base_packet_id`, the `2` bytes are `key`, and the `1` byte is
+`source_span`:
 
 ```text
-repair_symbol_size = frame_body_len - 4 - 2
+repair_symbol_size = frame_body_len - 4 - 2 - 1
 ```
-
-The `4` bytes are `base_packet_id`, and the `2` bytes are `key`.
 
 Repair calculation:
 
@@ -442,16 +461,16 @@ Repair calculation:
 repair_symbol[i] =
   coeff[0] * source[0][i] +
   coeff[1] * source[1][i] +
-  coeff[2] * source[2][i] +
-  coeff[3] * source[3][i]
+  ... +
+  coeff[source_span-1] * source[source_span-1][i]
 ```
 
 The arithmetic is over `GF(2^8)` using the irreducible polynomial
 `x^8 + x^4 + x^3 + x^2 + 1`. Coefficients are generated deterministically from
 `key` using the RFC 8681 RLC coefficient generation function with TinyMT32 from
-RFC 8682. V1 fixes `DT = 15`, so all four coefficients are nonzero.
+RFC 8682. This protocol fixes `DT = 15`, so all coefficients are nonzero.
 
-Sender behavior:
+Sender behavior for `slc_4_plus_1`:
 
 1. After a DATA frame is written successfully, add its DATA symbol to the SLC
    transmit window.
@@ -459,30 +478,60 @@ Sender behavior:
    REPAIR.
 3. Set `base_packet_id` to the first protected DATA symbol.
 4. Increment or otherwise vary `key` for each REPAIR.
-5. Set the repair symbol length to the largest IP packet length in this repair
+5. Set `source_span = 4`.
+6. Set the repair symbol length to the largest IP packet length in this repair
    window.
-6. Compute the REPAIR symbol with RFC 8681 coefficients derived from `key`.
+7. Compute the REPAIR symbol with coefficients derived from `key`.
    Source bytes beyond the end of a shorter IP packet are treated as zero.
-7. Send REPAIR on any healthy lane.
+8. Send REPAIR on any healthy lane.
 
-If fewer than four contiguous DATA symbols are available, v1 does not emit
-REPAIR. This avoids the one-DATA case where repair is only duplication with
-extra header cost. It also avoids adding bitmap/count fields to the REPAIR
-body.
+If fewer than four contiguous DATA symbols are available, `slc_4_plus_1` does
+not emit REPAIR.
+
+Sender behavior for `slc_variable_plus_1`:
+
+1. After a DATA frame is written successfully, add its DATA symbol to the SLC
+   transmit window.
+2. Arm a flush timer when the pending SLC transmit window transitions from zero
+   symbols to one symbol.
+3. If four contiguous successfully written DATA symbols become available before
+   the timer fires, cancel the timer and emit one full REPAIR with
+   `source_span = 4`.
+4. If the timer fires with one to three contiguous DATA symbols pending, emit
+   one partial REPAIR with `source_span` set to the number of protected symbols.
+5. Set `base_packet_id` to the first protected DATA symbol.
+6. Increment or otherwise vary `key` for each REPAIR.
+7. Set the repair symbol length to the largest IP packet length in this repair
+   window.
+8. Compute the REPAIR symbol with coefficients derived from `key`.
+   Source bytes beyond the end of a shorter IP packet are treated as zero.
+9. Send REPAIR on any healthy lane.
+
+For `slc_variable_plus_1`, the flush interval is derived from the sender's
+per-leg RTT estimator:
+
+```text
+flush_ms = clamp(max_session_srtt * alpha, min_ms, max_ms)
+```
+
+If no RTT sample exists for the session, the sender uses a configured
+cold-start RTT value in the same formula. A configured fixed flush interval may
+override the RTT-derived value for deterministic tests.
 
 Receiver behavior:
 
 1. Validate session and lane.
-2. Use `base_packet_id` and fixed source count `4` to identify the protected
-   DATA symbols.
-3. Store the REPAIR symbol while the protected window is still alive.
-4. If all protected DATA symbols are already known, drop the REPAIR.
-5. If exactly one protected DATA symbol is missing, recover it using the REPAIR
+2. Validate `source_span` for the negotiated `fec_profile`.
+3. Use `base_packet_id` and `source_span` to identify the protected DATA
+   symbols.
+4. Store the REPAIR symbol while the protected window is still alive.
+5. If all protected DATA symbols are already known, drop the REPAIR.
+6. If exactly one protected DATA symbol is missing, recover it using the REPAIR
    symbol and coefficients derived from `key`.
-6. If multiple protected DATA symbols are missing, keep the REPAIR until more
-   DATA arrives or the window expires. A single 4+1 REPAIR cannot recover two
+7. If multiple protected DATA symbols are missing, keep the REPAIR until more
+   DATA arrives or the window expires. A single SLC REPAIR cannot recover two
    missing DATA symbols.
-7. For each recovered DATA symbol, parse the IP header to obtain the packet
+8. For each recovered DATA symbol, parse the IP header to obtain the packet
    total length, truncate to that length, and write the recovered IP packet to
    TUN if it has not already been emitted.
 
@@ -565,7 +614,7 @@ TUN packet -> DATA packet_id=100 -> lane 1 UDP
 TUN packet -> DATA packet_id=101 -> lane 2 UDP
 TUN packet -> DATA packet_id=102 -> lane 1 UDP
 TUN packet -> DATA packet_id=103 -> lane 2 UDP
-             REPAIR base_packet_id=100 key=7 -> any healthy lane
+             REPAIR base_packet_id=100 key=7 source_span=4 -> any healthy lane
 ```
 
 `lane_id` on REPAIR describes the lane that carries the REPAIR frame. It does

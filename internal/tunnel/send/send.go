@@ -99,12 +99,15 @@ func (l *Send) writeTUNPacket(ctx context.Context, sessionID uint64, packet []by
 		return packetID, laneID, charge, err
 	}
 
-	addToWindow := fecProfile == protocol.FECProfileSLC4Plus1
-	if group, ready := state.commitPacket(packetID, packet, addToWindow); ready {
+	addToWindow := fecProfileEnabled(fecProfile)
+	group, ready, armFlush := state.commitPacket(packetID, packet, addToWindow)
+	if ready {
 		if debuglog.Enabled() {
-			debuglog.Printf("send", "fec_group_ready session=%d base_packet_id=%d shards=%d", sessionID, group.basePacketID, len(group.packets))
+			debuglog.Printf("send", "fec_group_ready session=%d base_packet_id=%d source_span=%d shards=%d", sessionID, group.basePacketID, group.sourceSpan, len(group.packets))
 		}
 		l.maybeSendRepair(ctx, sessionID, group)
+	} else if armFlush && fecProfile == protocol.FECProfileSLCVariablePlus1 {
+		l.armFECFlushTimer(sessionID, state)
 	}
 	return packetID, laneID, charge, nil
 }
@@ -165,21 +168,23 @@ func (l *Send) writeScheduledFrame(ctx context.Context, frame protocol.Frame) (l
 }
 
 func (l *Send) maybeSendRepair(ctx context.Context, sessionID uint64, group txRepairGroup) {
-	_, state, ok := l.getSessionState(sessionID)
-	if !ok || l.fecCodec == nil {
-		if debuglog.Enabled() {
-			debuglog.Printf("send", "repair_skip session=%d session_nil=%t fec_nil=%t", sessionID, !ok, !ok || l.fecCodec == nil)
-		}
-		return
-	}
-
 	defer func() {
 		for _, pkt := range group.packets {
 			pkt.Release()
 		}
 	}()
 
-	var shardBuf [5][]byte
+	_, state, ok := l.getSessionState(sessionID)
+	sourceSpan := len(group.packets)
+	codec := l.fecCodecForSourceSpan(sourceSpan)
+	if !ok || codec == nil {
+		if debuglog.Enabled() {
+			debuglog.Printf("send", "repair_skip session=%d session_nil=%t fec_nil=%t source_span=%d", sessionID, !ok, codec == nil, sourceSpan)
+		}
+		return
+	}
+
+	var shardBuf [maxFECSourceSpan + 1][]byte
 	var shards [][]byte
 	if len(group.packets)+1 > len(shardBuf) {
 		shards = make([][]byte, len(group.packets)+1)
@@ -199,22 +204,24 @@ func (l *Send) maybeSendRepair(ctx context.Context, sessionID uint64, group txRe
 	defer repairPkt.Release()
 	shards[len(shards)-1] = repairPkt.Payload[:repairLen]
 	key := state.reserveRepairKey()
-	if err := l.fecCodec.Encode(shards, key); err != nil {
+	if err := codec.Encode(shards, key); err != nil {
 		if debuglog.Enabled() {
-			debuglog.Printf("send", "repair_encode_err session=%d base_packet_id=%d key=%d err=%v", sessionID, group.basePacketID, key, err)
+			debuglog.Printf("send", "repair_encode_err session=%d base_packet_id=%d key=%d source_span=%d err=%v", sessionID, group.basePacketID, key, sourceSpan, err)
 		}
 		metrics.IncCounter(metrics.FECEventsTotal,
 			metrics.L("event", "repair_encode_err"),
 			metrics.L("session", sessionID),
+			metrics.L("source_span", sourceSpan),
 		)
 		return
 	}
 	if debuglog.Enabled() {
-		debuglog.Printf("send", "repair_encode session=%d base_packet_id=%d key=%d symbol_len=%d", sessionID, group.basePacketID, key, len(shards[len(shards)-1]))
+		debuglog.Printf("send", "repair_encode session=%d base_packet_id=%d key=%d source_span=%d symbol_len=%d", sessionID, group.basePacketID, key, sourceSpan, len(shards[len(shards)-1]))
 	}
 	metrics.IncCounter(metrics.FECEventsTotal,
 		metrics.L("event", "repair_encode"),
 		metrics.L("session", sessionID),
+		metrics.L("source_span", sourceSpan),
 	)
 
 	laneID, charge, err := l.writeScheduledFrame(ctx, protocol.Frame{
@@ -223,11 +230,12 @@ func (l *Send) maybeSendRepair(ctx context.Context, sessionID uint64, group txRe
 		Body: protocol.RepairBody{
 			BasePacketID: group.basePacketID,
 			Key:          key,
+			SourceSpan:   uint8(sourceSpan),
 			Symbol:       shards[len(shards)-1],
 		},
 	})
 	if debuglog.Enabled() {
-		debuglog.Printf("send", "repair_send session=%d base_packet_id=%d key=%d lane=%d charge=%d err=%v", sessionID, group.basePacketID, key, laneID, charge, err)
+		debuglog.Printf("send", "repair_send session=%d base_packet_id=%d key=%d source_span=%d lane=%d charge=%d err=%v", sessionID, group.basePacketID, key, sourceSpan, laneID, charge, err)
 	}
 }
 

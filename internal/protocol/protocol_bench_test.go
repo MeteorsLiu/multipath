@@ -33,10 +33,11 @@ func BenchmarkEncodeREPAIR(b *testing.B) {
 		Body: RepairBody{
 			BasePacketID: 3,
 			Key:          4,
+			SourceSpan:   4,
 			Symbol:       symbol,
 		},
 	}
-	dst := make([]byte, 0, headerSize+6+len(symbol))
+	dst := make([]byte, 0, headerSize+7+len(symbol))
 
 	b.ReportAllocs()
 	b.SetBytes(int64(len(symbol)))

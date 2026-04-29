@@ -282,11 +282,53 @@ func TestSendWritePacketSendsRepairAfterFECGroup(t *testing.T) {
 	if !ok {
 		t.Fatalf("body type = %T, want RepairBody", frame.Body)
 	}
-	if repair.BasePacketID != 0 || repair.Key != 0 || string(repair.Symbol) != "repair" {
-		t.Fatalf("REPAIR = base %d key %d symbol %q", repair.BasePacketID, repair.Key, repair.Symbol)
+	if repair.BasePacketID != 0 || repair.Key != 0 || repair.SourceSpan != 4 || string(repair.Symbol) != "repair" {
+		t.Fatalf("REPAIR = base %d key %d sourceSpan %d symbol %q", repair.BasePacketID, repair.Key, repair.SourceSpan, repair.Symbol)
 	}
 	if len(session.txWindow.pending) != 0 {
 		t.Fatalf("txWindow pending = %d, want 0", len(session.txWindow.pending))
+	}
+}
+
+func TestSendFECFlushTimerSendsPartialRepair(t *testing.T) {
+	in := New(Config{FECFlushFixedMs: 1})
+	in.enableFEC()
+	in.fecCodecs[1] = &fakeFECCodec{
+		encodeFunc: func(shards [][]byte, key uint16) error {
+			if len(shards) != 2 {
+				t.Fatalf("shards = %d, want 2", len(shards))
+			}
+			shards[len(shards)-1] = []byte("repair")
+			return nil
+		},
+	}
+	mustSendState(t, in, 99)
+	lane := newLaneRuntime(3, 10)
+	lane.observeLeg(transport.LegRef{
+		Kind:       transport.KindUDP,
+		EndpointID: "udp0",
+		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
+	})
+	in.lanes[laneKey{sessionID: 99, laneID: 3}] = lane
+
+	if _, _, _, err := in.writeTUNPacket(context.Background(), 99, []byte("a")); err != nil {
+		t.Fatalf("writeTUNPacket failed: %v", err)
+	}
+	data := readSendPayload(t, in)
+	data.Packet.Release()
+
+	written := readSendPayload(t, in)
+	defer written.Packet.Release()
+	frame, err := protocol.Decode(written.Packet.Payload)
+	if err != nil {
+		t.Fatalf("Decode REPAIR: %v", err)
+	}
+	repair, ok := frame.Body.(protocol.RepairBody)
+	if frame.Type != protocol.TypeREPAIR || !ok {
+		t.Fatalf("frame = type %d body %T, want REPAIR", frame.Type, frame.Body)
+	}
+	if repair.BasePacketID != 0 || repair.Key != 0 || repair.SourceSpan != 1 || string(repair.Symbol) != "repair" {
+		t.Fatalf("REPAIR = base %d key %d sourceSpan %d symbol %q", repair.BasePacketID, repair.Key, repair.SourceSpan, repair.Symbol)
 	}
 }
 
@@ -1122,7 +1164,7 @@ func TestRecvHandleREPAIRDoesNotTouchSendControlState(t *testing.T) {
 		Type:      protocol.TypeREPAIR,
 		SessionID: 99,
 		LaneID:    3,
-		Body:      protocol.RepairBody{BasePacketID: 100, Key: 7, Symbol: []byte("repair")},
+		Body:      protocol.RepairBody{BasePacketID: 100, Key: 7, SourceSpan: 4, Symbol: []byte("repair")},
 	}, nil)
 	if err != nil {
 		t.Fatalf("Encode: %v", err)
@@ -1207,7 +1249,7 @@ func TestSendHandleREPAIRRecoversMissingPacket(t *testing.T) {
 		Type:      protocol.TypeREPAIR,
 		SessionID: 99,
 		LaneID:    3,
-		Body:      protocol.RepairBody{BasePacketID: 100, Key: 7, Symbol: shards[4]},
+		Body:      protocol.RepairBody{BasePacketID: 100, Key: 7, SourceSpan: 4, Symbol: shards[4]},
 	}, nil)
 	if err != nil {
 		t.Fatalf("Encode REPAIR: %v", err)

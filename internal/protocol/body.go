@@ -11,8 +11,9 @@ const (
 	CapTCPFallback uint16 = 1 << 0
 	CapFEC         uint16 = 1 << 1
 
-	FECProfileOff       uint8 = 0
-	FECProfileSLC4Plus1 uint8 = 1
+	FECProfileOff              uint8 = 0
+	FECProfileSLC4Plus1        uint8 = 1
+	FECProfileSLCVariablePlus1 uint8 = 2
 
 	SupportedCaps        = CapTCPFallback | CapFEC
 	SessionControlLaneID = 0xff
@@ -59,6 +60,7 @@ func (DataBody) protocolBody() {}
 type RepairBody struct {
 	BasePacketID uint32
 	Key          uint16
+	SourceSpan   uint8
 	Symbol       []byte
 }
 
@@ -93,7 +95,10 @@ func encodedBodySize(frame Frame) (int, error) {
 		if !ok {
 			return 0, ErrInvalidFrame
 		}
-		return 6 + len(repair.Symbol), nil
+		if repair.SourceSpan == 0 || repair.SourceSpan > 4 {
+			return 0, ErrInvalidFrame
+		}
+		return 7 + len(repair.Symbol), nil
 	case TypeCLOSE:
 		_, ok := frame.Body.(CloseBody)
 		return 2, validBody(ok)
@@ -134,7 +139,8 @@ func encodeBodyInto(frame Frame, out []byte) error {
 		repair := frame.Body.(RepairBody)
 		binary.BigEndian.PutUint32(out[:4], repair.BasePacketID)
 		binary.BigEndian.PutUint16(out[4:6], repair.Key)
-		copy(out[6:], repair.Symbol)
+		out[6] = repair.SourceSpan
+		copy(out[7:], repair.Symbol)
 	case TypeCLOSE:
 		body := frame.Body.(CloseBody)
 		out[0] = body.Scope
@@ -183,13 +189,17 @@ func decodeBody(frame *Frame, body []byte) error {
 			Packet:   body[4:],
 		}
 	case TypeREPAIR:
-		if len(body) < 6 {
+		if len(body) < 7 {
 			return ErrBodyTooShort
+		}
+		if body[6] == 0 || body[6] > 4 {
+			return ErrInvalidFrame
 		}
 		frame.Body = RepairBody{
 			BasePacketID: binary.BigEndian.Uint32(body[:4]),
 			Key:          binary.BigEndian.Uint16(body[4:6]),
-			Symbol:       body[6:],
+			SourceSpan:   body[6],
+			Symbol:       body[7:],
 		}
 	case TypeCLOSE:
 		if len(body) != 2 {

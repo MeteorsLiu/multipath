@@ -21,6 +21,7 @@ type txSymbol struct {
 // enqueued).
 type txRepairGroup struct {
 	basePacketID uint32
+	sourceSpan   uint8
 	packets      []*packetbuf.Packet
 }
 
@@ -65,6 +66,7 @@ func (w *txSLCWindow) add(packetID uint32, packet []byte) (txRepairGroup, bool) 
 
 	group := txRepairGroup{
 		basePacketID: w.pending[0].packetID,
+		sourceSpan:   uint8(w.sourceCount),
 		packets:      make([]*packetbuf.Packet, w.sourceCount),
 	}
 	for i := 0; i < w.sourceCount; i++ {
@@ -78,6 +80,31 @@ func (w *txSLCWindow) add(packetID uint32, packet []byte) (txRepairGroup, bool) 
 	return group, true
 }
 
+func (w *txSLCWindow) flush() (txRepairGroup, bool) {
+	if w.sourceCount <= 0 || len(w.pending) == 0 {
+		return txRepairGroup{}, false
+	}
+
+	count := contiguousPendingPrefix(w.pending, w.sourceCount)
+	if count == 0 {
+		return txRepairGroup{}, false
+	}
+	group := txRepairGroup{
+		basePacketID: w.pending[0].packetID,
+		sourceSpan:   uint8(count),
+		packets:      make([]*packetbuf.Packet, count),
+	}
+	for i := 0; i < count; i++ {
+		group.packets[i] = w.pending[i].packet
+	}
+	copy(w.pending, w.pending[count:])
+	w.pending = w.pending[:len(w.pending)-count]
+	if debuglog.Enabled() {
+		debuglog.Printf("send/fec_window", "tx_flush base_packet_id=%d shards=%d pending=%d", group.basePacketID, len(group.packets), len(w.pending))
+	}
+	return group, true
+}
+
 func (w *txSLCWindow) firstGroupContiguous() bool {
 	base := w.pending[0].packetID
 	for i := 1; i < w.sourceCount; i++ {
@@ -86,6 +113,22 @@ func (w *txSLCWindow) firstGroupContiguous() bool {
 		}
 	}
 	return true
+}
+
+func contiguousPendingPrefix(pending []txSymbol, max int) int {
+	if len(pending) == 0 || max <= 0 {
+		return 0
+	}
+	if max > len(pending) {
+		max = len(pending)
+	}
+	base := pending[0].packetID
+	for i := 1; i < max; i++ {
+		if pending[i].packetID != base+uint32(i) {
+			return i
+		}
+	}
+	return max
 }
 
 // releaseAll returns every pooled buffer still in pending back to the

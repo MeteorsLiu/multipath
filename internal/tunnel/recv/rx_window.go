@@ -30,6 +30,7 @@ type rxSLCWindow struct {
 type rxRepair struct {
 	basePacketID uint32
 	key          uint16
+	sourceSpan   int
 	symbol       *packetbuf.Packet
 }
 
@@ -39,6 +40,7 @@ type rxRepair struct {
 type rxRecoverable struct {
 	basePacketID uint32
 	key          uint16
+	sourceSpan   int
 	missingIndex int
 }
 
@@ -114,22 +116,23 @@ func (w *rxSLCWindow) addData(packetID uint32, packet []byte) (rxRecoverable, bo
 	return rxRecoverable{}, false
 }
 
-func (w *rxSLCWindow) addRepair(basePacketID uint32, key uint16, symbol []byte) (rxRecoverable, bool) {
-	if w.sourceCount <= 0 {
+func (w *rxSLCWindow) addRepair(basePacketID uint32, key uint16, sourceSpan int, symbol []byte) (rxRecoverable, bool) {
+	if w.sourceCount <= 0 || sourceSpan <= 0 || sourceSpan > w.sourceCount {
 		if debuglog.Enabled() {
-			debuglog.Printf("recv/fec_window", "rx_repair_drop invalid_source_count source_count=%d base_packet_id=%d key=%d", w.sourceCount, basePacketID, key)
+			debuglog.Printf("recv/fec_window", "rx_repair_drop invalid_source_span source_count=%d source_span=%d base_packet_id=%d key=%d", w.sourceCount, sourceSpan, basePacketID, key)
 		}
 		return rxRecoverable{}, false
 	}
 	repair := rxRepair{
 		basePacketID: basePacketID,
 		key:          key,
+		sourceSpan:   sourceSpan,
 		symbol:       storePacket(symbol),
 	}
 	if w.allKnown(repair) {
 		repair.symbol.Release()
 		if debuglog.Enabled() {
-			debuglog.Printf("recv/fec_window", "rx_repair_drop all_known base_packet_id=%d key=%d", basePacketID, key)
+			debuglog.Printf("recv/fec_window", "rx_repair_drop all_known base_packet_id=%d key=%d source_span=%d", basePacketID, key, sourceSpan)
 		}
 		return rxRecoverable{}, false
 	}
@@ -142,7 +145,7 @@ func (w *rxSLCWindow) addRepair(basePacketID uint32, key uint16, symbol []byte) 
 	recoverable, ok := w.recoverable(repair)
 	w.prune()
 	if debuglog.Enabled() {
-		debuglog.Printf("recv/fec_window", "rx_repair base_packet_id=%d key=%d symbol_len=%d recoverable=%t data=%d repairs=%d", basePacketID, key, len(symbol), ok, len(w.data), len(w.repairs))
+		debuglog.Printf("recv/fec_window", "rx_repair base_packet_id=%d key=%d source_span=%d symbol_len=%d recoverable=%t data=%d repairs=%d", basePacketID, key, sourceSpan, len(symbol), ok, len(w.data), len(w.repairs))
 	}
 	return recoverable, ok
 }
@@ -159,15 +162,19 @@ func (w *rxSLCWindow) buildShardsLocked(r rxRecoverable, dst [][]byte) ([][]byte
 	if !ok {
 		return nil, false
 	}
-	if cap(dst) < w.sourceCount+1 {
-		dst = make([][]byte, w.sourceCount+1)
+	sourceSpan := r.sourceSpan
+	if sourceSpan <= 0 || sourceSpan > w.sourceCount || repair.sourceSpan != sourceSpan {
+		return nil, false
+	}
+	if cap(dst) < sourceSpan+1 {
+		dst = make([][]byte, sourceSpan+1)
 	} else {
-		dst = dst[:w.sourceCount+1]
+		dst = dst[:sourceSpan+1]
 		for i := range dst {
 			dst[i] = nil
 		}
 	}
-	for i := 0; i < w.sourceCount; i++ {
+	for i := 0; i < sourceSpan; i++ {
 		if i == r.missingIndex {
 			continue
 		}
@@ -178,7 +185,7 @@ func (w *rxSLCWindow) buildShardsLocked(r rxRecoverable, dst [][]byte) ([][]byte
 		}
 		dst[i] = pkt.Payload
 	}
-	dst[w.sourceCount] = repair.symbol.Payload
+	dst[sourceSpan] = repair.symbol.Payload
 	return dst, true
 }
 
@@ -199,14 +206,14 @@ func (w *rxSLCWindow) markEmitted(packetID uint32) bool {
 func (w *rxSLCWindow) contains(repair rxRepair, packetID uint32) bool {
 	packet := uint64(packetID)
 	base := uint64(repair.basePacketID)
-	return packet >= base && packet < base+uint64(w.sourceCount)
+	return packet >= base && packet < base+uint64(repair.sourceSpan)
 }
 
 func (w *rxSLCWindow) allKnown(repair rxRepair) bool {
-	if w.sourceCount <= 0 {
+	if repair.sourceSpan <= 0 || repair.sourceSpan > w.sourceCount {
 		return false
 	}
-	for i := 0; i < w.sourceCount; i++ {
+	for i := 0; i < repair.sourceSpan; i++ {
 		packetID := repair.basePacketID + uint32(i)
 		if w.data[packetID] == nil {
 			return false
@@ -220,7 +227,10 @@ func (w *rxSLCWindow) allKnown(repair rxRepair) bool {
 func (w *rxSLCWindow) recoverable(repair rxRepair) (rxRecoverable, bool) {
 	missing := -1
 	missingCount := 0
-	for i := 0; i < w.sourceCount; i++ {
+	if repair.sourceSpan <= 0 || repair.sourceSpan > w.sourceCount {
+		return rxRecoverable{}, false
+	}
+	for i := 0; i < repair.sourceSpan; i++ {
 		packetID := repair.basePacketID + uint32(i)
 		if w.data[packetID] == nil {
 			missing = i
@@ -233,6 +243,7 @@ func (w *rxSLCWindow) recoverable(repair rxRepair) (rxRecoverable, bool) {
 	return rxRecoverable{
 		basePacketID: repair.basePacketID,
 		key:          repair.key,
+		sourceSpan:   repair.sourceSpan,
 		missingIndex: missing,
 	}, true
 }

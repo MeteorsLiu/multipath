@@ -33,6 +33,11 @@ by the host OS for TUN and route changes.
     "mtu": 1440
   },
   "fec": true,
+  "fecFlushAlpha": 2,
+  "fecFlushMinMs": 2,
+  "fecFlushMaxMs": 30,
+  "fecFlushColdStartMs": 20,
+  "fecFlushFixedMs": 0,
   "probeIntervalMS": 1000,
   "probeTimeoutMS": 3000
 }
@@ -65,6 +70,11 @@ lane traffic. TCP is used by a lane only when that lane falls back.
     "mtu": 1440
   },
   "fec": true,
+  "fecFlushAlpha": 2,
+  "fecFlushMinMs": 2,
+  "fecFlushMaxMs": 30,
+  "fecFlushColdStartMs": 20,
+  "fecFlushFixedMs": 0,
   "probeIntervalMS": 1000,
   "probeTimeoutMS": 3000
 }
@@ -107,10 +117,34 @@ per lane when UDP becomes unhealthy.
 TUN MTU           1440
 TUN name          empty, OS auto-selects
 FEC               enabled
+FEC flush alpha   2, SRTT multiplier
+FEC flush min     2 ms
+FEC flush max     30 ms
+FEC cold start    20 ms RTT input
+FEC fixed flush   0, disabled
 probe interval   1000 ms
 probe timeout    3000 ms
 path weight      1
 promListenAddr    127.0.0.1:0
+```
+
+When FEC negotiates the variable-span SLC profile, the sender arms a flush timer
+for partial repair groups. The default interval is:
+
+```text
+flush_ms = clamp(max_session_srtt * fecFlushAlpha, fecFlushMinMs, fecFlushMaxMs)
+```
+
+Before a session has RTT samples, `fecFlushColdStartMs` is used as the RTT input
+to that formula. `fecFlushFixedMs > 0` overrides the adaptive calculation and is
+intended for deterministic latency tests.
+
+Relevant metrics:
+
+```text
+multipath_lane_rtt_ms{session,lane,leg}
+multipath_fec_events_total{event,session,source_span}
+multipath_fec_flush_total{session,source_span}
 ```
 
 Set `"fec": false` explicitly to disable FEC.
