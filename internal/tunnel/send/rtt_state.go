@@ -140,11 +140,7 @@ func (l *Send) sessionMaxRTTMs(sessionID uint64) (uint32, bool) {
 	ok := false
 	for _, lane := range l.runnableLanes(sessionID) {
 		lane.mu.Lock()
-		leg, legOK := lane.selectLegLocked()
-		srtt, sampleOK := uint32(0), false
-		if legOK {
-			srtt, sampleOK = laneSRTTLocked(lane, leg.Kind)
-		}
+		srtt, sampleOK := laneActiveLegMaxRTTLocked(lane)
 		lane.mu.Unlock()
 		if !sampleOK {
 			continue
@@ -162,11 +158,7 @@ func (l *Send) sessionMinRTTMs(sessionID uint64) (uint32, bool) {
 	ok := false
 	for _, lane := range l.runnableLanes(sessionID) {
 		lane.mu.Lock()
-		leg, legOK := lane.selectLegLocked()
-		srtt, sampleOK := uint32(0), false
-		if legOK {
-			srtt, sampleOK = laneSRTTLocked(lane, leg.Kind)
-		}
+		srtt, sampleOK := laneActiveLegMaxRTTLocked(lane)
 		lane.mu.Unlock()
 		if !sampleOK {
 			continue
@@ -177,6 +169,22 @@ func (l *Send) sessionMinRTTMs(sessionID uint64) (uint32, bool) {
 		}
 	}
 	return min, ok
+}
+
+func laneActiveLegMaxRTTLocked(lane *laneRuntime) (uint32, bool) {
+	var max uint32
+	var ok bool
+	if lane.udpReady && lane.udpLeg.EndpointID != "" && lane.udpLeg.RemoteAddr != nil {
+		if srtt, sampleOK := lane.rttUDP.SRTT(); sampleOK {
+			max, ok = srtt, true
+		}
+	}
+	if lane.tcpReady && lane.tcpLeg.ConnID != "" {
+		if srtt, sampleOK := lane.rttTCP.SRTT(); sampleOK && (!ok || srtt > max) {
+			max, ok = srtt, true
+		}
+	}
+	return max, ok
 }
 
 func laneSRTTLocked(lane *laneRuntime, kind transport.Kind) (uint32, bool) {

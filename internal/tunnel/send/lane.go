@@ -4,6 +4,7 @@ import (
 	"errors"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/MeteorsLiu/multipath/internal/transport"
 	"github.com/MeteorsLiu/multipath/internal/tunnel/send/rtt"
@@ -29,6 +30,9 @@ type laneRuntime struct {
 	helloCaps       uint16
 	helloFECProfile uint8
 	fallbackDialing bool
+
+	udpQuality legQualityTracker
+	tcpQuality legQualityTracker
 }
 
 // laneSnapshot is a value-copy of laneRuntime mutable fields, returned by
@@ -70,27 +74,39 @@ func (l *laneRuntime) ready() bool {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	_, ok := l.selectLegLocked()
-	return ok
+	return (l.udpReady && l.udpLeg.EndpointID != "" && l.udpLeg.RemoteAddr != nil) ||
+		(l.tcpReady && l.tcpLeg.ConnID != "")
 }
 
-func (l *laneRuntime) selectLeg() (transport.LegRef, bool) {
-	if l == nil {
-		return transport.LegRef{}, false
-	}
+func (l *laneRuntime) legQualities() (udpLeg transport.LegRef, udpQ LegQuality, tcpLeg transport.LegRef, tcpQ LegQuality) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.selectLegLocked()
+	udpLeg = l.udpLeg
+	udpQ = LegQuality{
+		Active:       l.udpReady && l.udpLeg.EndpointID != "" && l.udpLeg.RemoteAddr != nil,
+		DeliveryRate: l.udpQuality.deliveryRate(),
+		SmoothedRTT:  durationOrZero(l.rttUDP.SRTT()),
+		RTTVariance:  durationOrZero(l.rttUDP.RTTVAR()),
+	}
+	tcpLeg = l.tcpLeg
+	tcpQ = LegQuality{
+		Active:       l.tcpReady && l.tcpLeg.ConnID != "",
+		DeliveryRate: l.tcpQuality.deliveryRate(),
+		SmoothedRTT:  durationOrZero(l.rttTCP.SRTT()),
+		RTTVariance:  durationOrZero(l.rttTCP.RTTVAR()),
+	}
+	return
 }
 
-func (l *laneRuntime) selectLegLocked() (transport.LegRef, bool) {
-	if l.udpReady && l.udpLeg.EndpointID != "" && l.udpLeg.RemoteAddr != nil {
-		return l.udpLeg, true
+func (l *laneRuntime) recordDelivery(kind transport.Kind, onTime bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	switch kind {
+	case transport.KindUDP:
+		l.udpQuality.recordDelivery(onTime)
+	case transport.KindTCP:
+		l.tcpQuality.recordDelivery(onTime)
 	}
-	if l.tcpReady && l.tcpLeg.ConnID != "" {
-		return l.tcpLeg, true
-	}
-	return transport.LegRef{}, false
 }
 
 func legCharge(leg transport.LegRef, payloadLen int) uint32 {
@@ -98,6 +114,13 @@ func legCharge(leg transport.LegRef, payloadLen int) uint32 {
 		return uint32(payloadLen + 2)
 	}
 	return uint32(payloadLen)
+}
+
+func durationOrZero(ms uint32, ok bool) time.Duration {
+	if !ok {
+		return 0
+	}
+	return time.Duration(ms) * time.Millisecond
 }
 
 // observeLeg records the latest leg observed for this lane and marks readiness

@@ -8,7 +8,7 @@ import (
 	"github.com/MeteorsLiu/multipath/internal/transport"
 )
 
-func TestLaneRuntimePrefersUDP(t *testing.T) {
+func TestLaneRuntimeLegQualitiesUDP(t *testing.T) {
 	lane := newLaneRuntime(1, 10)
 	lane.observeLeg(transport.LegRef{
 		Kind:       transport.KindUDP,
@@ -20,44 +20,54 @@ func TestLaneRuntimePrefersUDP(t *testing.T) {
 		ConnID: "tcp0",
 	})
 
-	leg, ok := lane.selectLeg()
-	if !ok {
-		t.Fatal("selectLeg failed")
+	udpLeg, udpQ, tcpLeg, tcpQ := lane.legQualities()
+	if !udpQ.Active {
+		t.Fatal("UDP leg should be active")
 	}
-	if charge := legCharge(leg, len("payload")); charge != uint32(len("payload")) {
+	if !tcpQ.Active {
+		t.Fatal("TCP leg should be active")
+	}
+	if charge := legCharge(udpLeg, len("payload")); charge != uint32(len("payload")) {
 		t.Fatalf("charge = %d, want %d", charge, len("payload"))
 	}
-	if leg.Kind != transport.KindUDP || leg.EndpointID != "udp0" {
-		t.Fatalf("leg = %+v, want UDP udp0", leg)
+	if udpLeg.Kind != transport.KindUDP || udpLeg.EndpointID != "udp0" {
+		t.Fatalf("udpLeg = %+v, want UDP udp0", udpLeg)
 	}
-	if leg.RemoteAddr.String() != "127.0.0.1:1234" {
-		t.Fatalf("remote = %s, want 127.0.0.1:1234", leg.RemoteAddr)
+	if udpLeg.RemoteAddr.String() != "127.0.0.1:1234" {
+		t.Fatalf("remote = %s, want 127.0.0.1:1234", udpLeg.RemoteAddr)
+	}
+	if tcpLeg.Kind != transport.KindTCP || tcpLeg.ConnID != "tcp0" {
+		t.Fatalf("tcpLeg = %+v, want TCP tcp0", tcpLeg)
 	}
 }
 
-func TestLaneRuntimeFallsBackToTCP(t *testing.T) {
+func TestLaneRuntimeLegQualitiesOnlyTCP(t *testing.T) {
 	lane := newLaneRuntime(1, 10)
 	lane.observeLeg(transport.LegRef{
 		Kind:   transport.KindTCP,
 		ConnID: "tcp0",
 	})
 
-	leg, ok := lane.selectLeg()
-	if !ok {
-		t.Fatal("selectLeg failed")
+	_, udpQ, tcpLeg, tcpQ := lane.legQualities()
+	if udpQ.Active {
+		t.Fatal("UDP leg should not be active")
 	}
-	if charge := legCharge(leg, len("payload")); charge != uint32(len("payload")+2) {
+	if !tcpQ.Active {
+		t.Fatal("TCP leg should be active")
+	}
+	if charge := legCharge(tcpLeg, len("payload")); charge != uint32(len("payload")+2) {
 		t.Fatalf("charge = %d, want %d", charge, len("payload")+2)
 	}
-	if leg.Kind != transport.KindTCP || leg.ConnID != "tcp0" {
-		t.Fatalf("leg = %+v, want TCP tcp0", leg)
+	if tcpLeg.Kind != transport.KindTCP || tcpLeg.ConnID != "tcp0" {
+		t.Fatalf("tcpLeg = %+v, want TCP tcp0", tcpLeg)
 	}
 }
 
-func TestLaneRuntimeUnavailable(t *testing.T) {
+func TestLaneRuntimeLegQualitiesUnavailable(t *testing.T) {
 	lane := newLaneRuntime(1, 10)
-	if _, ok := lane.selectLeg(); ok {
-		t.Fatal("selectLeg succeeded for unavailable lane")
+	_, udpQ, _, tcpQ := lane.legQualities()
+	if udpQ.Active || tcpQ.Active {
+		t.Fatal("Neither leg should be active for unavailable lane")
 	}
 }
 

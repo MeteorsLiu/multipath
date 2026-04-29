@@ -131,7 +131,9 @@ func (l *Send) writeScheduledFrame(ctx context.Context, frame protocol.Frame) (l
 
 	laneID = lane.id
 	frame.LaneID = laneID
-	leg, ok := lane.selectLeg()
+
+	udpLeg, udpQ, tcpLeg, tcpQ := lane.legQualities()
+	useUDP, ok := l.legSelector(frame.SessionID).Pick(udpQ, tcpQ)
 	if !ok {
 		if debuglog.Enabled() {
 			debuglog.Printf("send", "schedule_skip no_leg %s", debugLaneState(laneKey{sessionID: frame.SessionID, laneID: laneID}, lane))
@@ -142,6 +144,13 @@ func (l *Send) writeScheduledFrame(ctx context.Context, frame protocol.Frame) (l
 			metrics.L("reason", "no_leg"),
 		)
 		return 0, 0, errNoRunnableLane
+	}
+
+	var leg transport.LegRef
+	if useUDP {
+		leg = udpLeg
+	} else {
+		leg = tcpLeg
 	}
 	if debuglog.Enabled() {
 		debuglog.Printf("send", "schedule_select %s leg={%s} frame=%s", debugLaneState(laneKey{sessionID: frame.SessionID, laneID: laneID}, lane), debugLeg(leg), debugFrameSummary(frame))
