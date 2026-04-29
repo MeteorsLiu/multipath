@@ -67,6 +67,7 @@ PORT_FALLBACK_DIAL_ERROR=5010
 PORT_WEIGHTED=5011
 PORT_MTU=5012
 PORT_FEC_LOADED_LATENCY=5013
+PORT_LEG_SELECTOR=5014
 
 PATH1_C="10.201.1.1/24"
 PATH1_S="10.201.1.2/24"
@@ -639,6 +640,23 @@ apply_tcp_tunnel_block_path1() {
   apply_tcp_tunnel_block_path 1 "$1"
 }
 
+apply_udp_partial_loss() {
+  local path="$1"
+  local port="$2"
+  local loss="$3"
+  local client_dev server_dev
+  client_dev="$(path_client_dev "${path}")"
+  server_dev="$(path_server_dev "${path}")"
+
+  setup_prio_qdisc "${NS_C}" "${client_dev}"
+  add_loss_band "${NS_C}" "${client_dev}" 3 30 "${loss}"
+  add_port_filter "${NS_C}" "${client_dev}" 1 udp dport "${port}" 3
+
+  setup_prio_qdisc "${NS_S}" "${server_dev}"
+  add_loss_band "${NS_S}" "${server_dev}" 3 30 "${loss}"
+  add_port_filter "${NS_S}" "${server_dev}" 1 udp sport "${port}" 3
+}
+
 apply_nat_tcp_block() {
   local port="$1"
   setup_prio_qdisc "${NS_C}" "${VETHCN}"
@@ -763,6 +781,30 @@ run_fallback_case() {
 
   clear_loss
   wait_ping_ok "${name} final-clean" 12
+  stop_multipath
+  clear_loss
+  echo "==== ${name} e2e end ===="
+}
+
+run_leg_selector_case() {
+  local name="leg-selector"
+  echo "==== ${name} e2e start ===="
+  clear_loss
+  write_one_lane_config "${name}" "${PORT_LEG_SELECTOR}" false false 200 600
+  start_multipath "${name}"
+
+  wait_ping_ok "${name} baseline" 12
+
+  echo "[${name}] apply 30% UDP loss; leg selector should prefer TCP for data despite UDP remaining active"
+  apply_udp_partial_loss 1 "${PORT_LEG_SELECTOR}" 30%
+  sleep 6
+  wait_log_pattern "${name}" "schedule_select.*leg={tcp" 15 "leg selector chose TCP for data frame after UDP degradation"
+
+  echo "[${name}] clear loss; leg selector should return to UDP"
+  clear_loss
+  sleep 4
+  wait_log_pattern "${name}" "schedule_select.*leg={udp" 15 "leg selector chose UDP for data frame after loss cleared"
+
   stop_multipath
   clear_loss
   echo "==== ${name} e2e end ===="
@@ -1228,6 +1270,7 @@ run_concurrent_fallback_case
 run_legacy_tcp_flag_case
 run_fallback_case
 run_fallback_dial_error_case
+run_leg_selector_case
 run_nat_case
 run_fec_comparison
 run_fec_tcp_fallback_case
