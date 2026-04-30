@@ -26,11 +26,12 @@ var (
 type Stream struct {
 	listener net.Listener
 
-	mu     sync.RWMutex
-	conns  map[string]net.Conn
-	writer PacketWriter
-	runCtx context.Context
-	nextID atomic.Uint64
+	mu      sync.RWMutex
+	conns   map[string]net.Conn
+	writer  PacketWriter
+	failure LegFailureHandler
+	runCtx  context.Context
+	nextID  atomic.Uint64
 }
 
 func NewStream(listener net.Listener) *Stream {
@@ -38,6 +39,12 @@ func NewStream(listener net.Listener) *Stream {
 		listener: listener,
 		conns:    make(map[string]net.Conn),
 	}
+}
+
+func (s *Stream) SetFailureHandler(handler LegFailureHandler) {
+	s.mu.Lock()
+	s.failure = handler
+	s.mu.Unlock()
 }
 
 func (s *Stream) Run(ctx context.Context, writer PacketWriter) error {
@@ -106,6 +113,7 @@ func (s *Stream) Write(ctx context.Context, connID string, payload []byte) (int,
 			metrics.L("transport", "tcp"),
 			metrics.L("operation", "write_unknown_conn"),
 		)
+		s.notifyLegFailure(ctx, connID, ErrUnknownConn)
 		return 0, ErrUnknownConn
 	}
 
@@ -135,6 +143,8 @@ func (s *Stream) Write(ctx context.Context, connID string, payload []byte) (int,
 			metrics.L("transport", "tcp"),
 			metrics.L("operation", "write"),
 		)
+		s.deleteConn(connID, conn)
+		s.notifyLegFailure(ctx, connID, err)
 		return payloadBytesWritten(n), err
 	}
 	written := payloadBytesWritten(n)
@@ -205,16 +215,15 @@ func (s *Stream) acceptLoop(ctx context.Context, writer PacketWriter) error {
 func (s *Stream) readLoop(ctx context.Context, connID string, conn net.Conn, writer PacketWriter) {
 	var exitErr error
 	defer func() {
-		s.mu.Lock()
-		if s.conns[connID] == conn {
-			delete(s.conns, connID)
-		}
-		s.mu.Unlock()
+		current := s.deleteConn(connID, conn)
 		_ = conn.Close()
 		if exitErr == nil {
 			exitErr = ctx.Err()
 		}
 		debuglog.Printf("transport/tcp", "read_loop exit conn=%s remote=%v err=%v", connID, debugRemoteAddr(conn), exitErr)
+		if current && exitErr != nil && !errors.Is(exitErr, context.Canceled) {
+			s.notifyLegFailure(ctx, connID, exitErr)
+		}
 	}()
 
 	for {
@@ -318,6 +327,26 @@ func (s *Stream) currentRuntime() (PacketWriter, context.Context) {
 		runCtx = context.Background()
 	}
 	return writer, runCtx
+}
+
+func (s *Stream) deleteConn(connID string, conn net.Conn) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.conns[connID] != conn {
+		return false
+	}
+	delete(s.conns, connID)
+	return true
+}
+
+func (s *Stream) notifyLegFailure(ctx context.Context, connID string, err error) {
+	s.mu.RLock()
+	handler := s.failure
+	s.mu.RUnlock()
+	if handler == nil || connID == "" {
+		return
+	}
+	handler.OnLegFailure(ctx, LegRef{Kind: KindTCP, ConnID: connID}, err)
 }
 
 func writeBuffersFull(conn net.Conn, buffers net.Buffers) (int64, error) {

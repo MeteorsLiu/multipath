@@ -486,6 +486,10 @@ type PacketWriter interface {
     WriteTo(ctx context.Context, leg LegRef, packet *packetbuf.Packet) error
 }
 
+type LegFailureHandler interface {
+    OnLegFailure(ctx context.Context, leg LegRef, err error)
+}
+
 type PacketTransport interface {
     Run(ctx context.Context, writer PacketWriter) error
     WriteTo(ctx context.Context, endpointID string, remote net.Addr, payload []byte) (int, error)
@@ -512,6 +516,9 @@ Rules:
 Transport does not know sessions, Schedule Strategy, FEC, Protocol, or Frame.
 Transport reads complete UDP payloads or TCP length-prefixed payloads and calls
 PacketWriter.WriteTo with the observed transport leg.
+Transport reports concrete transport-leg failures through LegFailureHandler
+when one is registered. The failure event carries only LegRef and error; Send
+maps the leg to lane state through its existing probe target bindings.
 PacketWriter.WriteTo takes ownership of packet. It must release packet before
 returning or transfer ownership to its own output channel before returning.
 After WriteTo returns, Transport must not read or release packet.

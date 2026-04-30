@@ -215,6 +215,23 @@ func (l *Send) handleProbeTargetLost(ctx context.Context, target probe.Target) e
 	return nil
 }
 
+func (l *Send) OnLegFailure(ctx context.Context, leg transport.LegRef, err error) {
+	if leg.Kind == 0 {
+		return
+	}
+	l.probeMu.Lock()
+	target, ok := l.probeKeys[newPingKey(leg)]
+	l.probeMu.Unlock()
+	if !ok {
+		debuglog.Printf("send/probe", "leg_failure_drop missing_target leg={%s} err=%v", debugLeg(leg), err)
+		return
+	}
+	debuglog.Printf("send/probe", "leg_failure target=%d leg={%s} err=%v", target, debugLeg(leg), err)
+	if lostErr := l.handleProbeTargetLost(ctx, target); lostErr != nil {
+		debuglog.Printf("send/probe", "leg_failure_err target=%d leg={%s} err=%v", target, debugLeg(leg), lostErr)
+	}
+}
+
 func (l *Send) handleProbeTargetRecovered(target probe.Target) error {
 	l.probeMu.Lock()
 	binding, ok := l.probeTargets[target]

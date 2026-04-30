@@ -292,6 +292,11 @@ func runE2ERuntime(ctx context.Context, in *Send, tunReader tunio.PacketReader, 
 	if err := in.bootstrap(ctx); err != nil {
 		return err
 	}
+	if setter, ok := streamTransport.(interface {
+		SetFailureHandler(transport.LegFailureHandler)
+	}); ok {
+		setter.SetFailureHandler(in)
+	}
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()

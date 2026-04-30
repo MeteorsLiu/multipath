@@ -124,6 +124,50 @@ func TestStreamRejectsOversizedFrame(t *testing.T) {
 	}
 }
 
+func TestStreamWriteUnknownConnNotifiesFailure(t *testing.T) {
+	stream := NewStream(nil)
+	failures := make(chan LegRef, 1)
+	stream.SetFailureHandler(legFailureHandlerFunc(func(ctx context.Context, leg LegRef, err error) {
+		failures <- leg
+	}))
+
+	if _, err := stream.Write(context.Background(), "missing", []byte("payload")); err != ErrUnknownConn {
+		t.Fatalf("Write err = %v, want ErrUnknownConn", err)
+	}
+	select {
+	case leg := <-failures:
+		if leg.Kind != KindTCP || leg.ConnID != "missing" {
+			t.Fatalf("failure leg = %+v, want tcp missing", leg)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("missing failure callback")
+	}
+}
+
+func TestStreamReadLoopExitNotifiesFailure(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+
+	stream := NewStream(nil)
+	connID := stream.addConn(client)
+	failures := make(chan LegRef, 1)
+	stream.SetFailureHandler(legFailureHandlerFunc(func(ctx context.Context, leg LegRef, err error) {
+		failures <- leg
+	}))
+
+	go stream.readLoop(context.Background(), connID, client, eventChanWriter{events: make(chan Payload, 1)})
+	_ = server.Close()
+
+	select {
+	case leg := <-failures:
+		if leg.Kind != KindTCP || leg.ConnID != connID {
+			t.Fatalf("failure leg = %+v, want tcp %s", leg, connID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("missing failure callback")
+	}
+}
+
 func TestStreamWriteCompletesPartialConnWrites(t *testing.T) {
 	conn := &partialWriteConn{maxChunk: 2}
 	stream := NewStream(nil)
@@ -153,6 +197,12 @@ type partialWriteConn struct {
 	net.Conn
 	buf      bytes.Buffer
 	maxChunk int
+}
+
+type legFailureHandlerFunc func(context.Context, LegRef, error)
+
+func (f legFailureHandlerFunc) OnLegFailure(ctx context.Context, leg LegRef, err error) {
+	f(ctx, leg, err)
 }
 
 func (c *partialWriteConn) SetWriteDeadline(t time.Time) error {

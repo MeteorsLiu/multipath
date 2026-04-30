@@ -37,6 +37,10 @@ type PacketWriter interface {
 	WriteTo(ctx context.Context, leg LegRef, packet *packetbuf.Packet) error
 }
 
+type LegFailureHandler interface {
+	OnLegFailure(ctx context.Context, leg LegRef, err error)
+}
+
 type PacketTransport interface {
 	Run(ctx context.Context, writer PacketWriter) error
 	WriteTo(ctx context.Context, endpointID string, remote net.Addr, payload []byte) (int, error)

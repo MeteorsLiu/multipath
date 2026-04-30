@@ -28,6 +28,14 @@ func (r *appRuntime) Run(ctx context.Context) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	if r.send != nil {
+		if setter, ok := r.streamTransport.(interface {
+			SetFailureHandler(transport.LegFailureHandler)
+		}); ok {
+			setter.SetFailureHandler(r.send)
+		}
+	}
+
 	if r.probeLoop != nil {
 		debuglog.Printf("runtime", "bootstrap")
 		if err := r.probeLoop.Bootstrap(runCtx); err != nil {

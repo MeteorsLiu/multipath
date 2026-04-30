@@ -1380,6 +1380,45 @@ func TestSendProbeTimeoutDoesNotRestartFallbackDialInFlight(t *testing.T) {
 	}
 }
 
+func TestSendLegFailureMarksTCPNotReadyAndStartsFallback(t *testing.T) {
+	streamTransport := &fakeStreamTransport{
+		dialLeg: transport.LegRef{
+			Kind:   transport.KindTCP,
+			ConnID: "tcp-new",
+		},
+	}
+	in := New()
+	in.streamTransport = streamTransport
+	in.probeEvents = make(chan probe.Event, 4)
+	mustSendState(t, in, 99)
+	in.negotiatedCaps.Store(uint32(protocol.CapTCPFallback))
+	oldLeg := transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp-old"}
+	lane := newLaneRuntime(3, 1)
+	lane.bindLeg(oldLeg)
+	lane.tcpRemote = "127.0.0.1:4321"
+	in.lanes[laneKey{sessionID: 99, laneID: 3}] = lane
+	in.trackProbeTarget(context.Background(), 99, 3, oldLeg)
+	readProbeEvent(t, in.probeEvents)
+
+	in.OnLegFailure(context.Background(), oldLeg, transport.ErrUnknownConn)
+	waitForDialCount(t, streamTransport, 1)
+	written := readSendPayload(t, in)
+	written.Packet.Release()
+
+	if lane.tcpReady {
+		t.Fatal("tcpReady = true after TCP leg failure")
+	}
+	if !lane.fallbackDialing {
+		t.Fatal("fallbackDialing = false after fallback dial result")
+	}
+	if got := streamTransport.closed["tcp-old"]; got != 1 {
+		t.Fatalf("closed tcp-old count = %d, want 1", got)
+	}
+	if got := streamTransport.dialed[0]; got != "127.0.0.1:4321" {
+		t.Fatalf("dialed remote = %q, want 127.0.0.1:4321", got)
+	}
+}
+
 func TestSendHandleCLOSELane(t *testing.T) {
 	streamTransport := &fakeStreamTransport{}
 	in := New()
@@ -1909,6 +1948,17 @@ func readSendPayload(t *testing.T, in *Send) transport.Payload {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for send payload")
 		return transport.Payload{}
+	}
+}
+
+func readProbeEvent(t *testing.T, events <-chan probe.Event) probe.Event {
+	t.Helper()
+	select {
+	case event := <-events:
+		return event
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for probe event")
+		return probe.Event{}
 	}
 }
 
