@@ -204,7 +204,7 @@ func (l *laneRuntime) helloProfile() (uint16, uint8) {
 func (l *laneRuntime) tryStartFallback(streamAvailable bool) (string, bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if !streamAvailable || l.fallbackDialing || l.tcpReady || l.tcpRemote == "" {
+	if !streamAvailable || l.fallbackDialing || l.udpReady || l.tcpReady || l.tcpRemote == "" {
 		return "", false
 	}
 	l.fallbackDialing = true

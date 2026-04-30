@@ -132,6 +132,7 @@ func (l *ProbeLoop) run(ctx context.Context, events <-chan core.Event) error {
 				debuglog.Printf("probe/loop", "retry_hello err=%v", err)
 				return err
 			}
+			l.sender.retryFallbackDials(ctx)
 		}
 	}
 }

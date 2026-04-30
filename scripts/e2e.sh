@@ -815,13 +815,21 @@ run_server_restart_reconnect_case() {
 
   wait_ping_ok "${name} baseline" 12
 
-  echo "[${name}] restart server; client must receive unknown_session CLOSE and open a fresh session"
-  restart_server_process "${name}"
+  echo "[${name}] block UDP and stop server; first TCP fallback dial should fail"
+  apply_udp_tunnel_block_path 1 "${PORT_SERVER_RESTART}"
+  if [[ -n "${SERVER_PID}" ]]; then
+    kill "${SERVER_PID}" >/dev/null 2>&1 || true
+    wait "${SERVER_PID}" >/dev/null 2>&1 || true
+    SERVER_PID=""
+  fi
+  sleep 2
+  wait_log_file_pattern "${name}" "${CURRENT_CLIENT_LOG}" "fallback_result_err .*lane=1" 20 "client observed TCP fallback dial failure while server was down"
 
-  wait_log_file_pattern "${name}" "${CURRENT_SERVER_LOG}" "close_unknown_session session=[0-9]+ lane=[0-9]+" 20 "server replied CLOSE for unknown old session"
-  wait_log_file_pattern "${name}" "${CURRENT_CLIENT_LOG}" "close session=[0-9]+ lane=255 scope=2 reason=1" 20 "client received unknown_session CLOSE"
-  wait_log_file_pattern "${name}" "${CURRENT_CLIENT_LOG}" "rebootstrap session=[0-9]+ lanes=1" 20 "client opened a fresh session after CLOSE"
-  wait_ping_ok "${name} post-restart" 20
+  echo "[${name}] restart server with UDP still blocked; client must retry TCP fallback and reconnect"
+  start_server_process "${name}"
+  wait_log_file_pattern "${name}" "${CURRENT_CLIENT_LOG}" "fallback_result_start_lane session=[0-9]+ lane=1 leg=\\{tcp conn=" 20 "client retried TCP fallback after server restart"
+  wait_log_file_pattern "${name}" "${CURRENT_CLIENT_LOG}" "accept_hello_ack session=[0-9]+ lane=1 .*tcp conn=" 20 "client accepted TCP HELLO_ACK after server restart"
+  wait_ping_ok "${name} post-restart-tcp" 20
 
   stop_multipath
   clear_loss

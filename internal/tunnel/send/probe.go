@@ -224,6 +224,33 @@ func (l *Send) handleProbeTargetRecovered(target probe.Target) error {
 	return nil
 }
 
+func (l *Send) retryFallbackDials(ctx context.Context) {
+	sessionID, ok := l.activeSession()
+	if !ok {
+		return
+	}
+	if uint16(l.negotiatedCaps.Load())&protocol.CapTCPFallback == 0 {
+		return
+	}
+
+	type candidate struct {
+		key  laneKey
+		lane *laneRuntime
+	}
+	var candidates []candidate
+	l.lanesMu.RLock()
+	for key, lane := range l.lanes {
+		if key.sessionID == sessionID {
+			candidates = append(candidates, candidate{key: key, lane: lane})
+		}
+	}
+	l.lanesMu.RUnlock()
+
+	for _, item := range candidates {
+		l.startFallbackDial(ctx, item.key, item.lane)
+	}
+}
+
 func (l *Send) trackProbeTarget(ctx context.Context, sessionID uint64, laneID uint8, leg transport.LegRef) {
 	if l.probeEvents == nil || leg.Kind == 0 {
 		debuglog.Printf("send/probe", "track_skip session=%d lane=%d probe_events_nil=%t leg={%s}", sessionID, laneID, l.probeEvents == nil, debugLeg(leg))

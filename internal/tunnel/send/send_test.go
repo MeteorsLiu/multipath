@@ -510,6 +510,28 @@ func TestSendHELLOTimeoutStartsTCPFallback(t *testing.T) {
 	}
 }
 
+func TestSendRetryFallbackDialsAfterDialError(t *testing.T) {
+	dialErr := errors.New("dial failed")
+	streamTransport := &fakeStreamTransport{dialErr: dialErr}
+	in := New()
+	in.streamTransport = streamTransport
+	in.negotiatedCaps.Store(uint32(protocol.CapTCPFallback))
+	mustSendState(t, in, 99)
+	in.activateSession(99)
+	lane := newLaneRuntime(3, 10)
+	lane.setTCPRemote("127.0.0.1:4321")
+	in.lanes[laneKey{sessionID: 99, laneID: 3}] = lane
+
+	in.retryFallbackDials(context.Background())
+	waitForDialCount(t, streamTransport, 1)
+	if lane.fallbackDialing {
+		t.Fatal("fallbackDialing = true after failed dial result")
+	}
+
+	in.retryFallbackDials(context.Background())
+	waitForDialCount(t, streamTransport, 2)
+}
+
 func TestSendStartLaneRejectsZeroWeight(t *testing.T) {
 	in := New()
 	err := in.startLane(context.Background(), startLaneConfig{
@@ -1715,6 +1737,18 @@ func startTestHELLORoute(t *testing.T, in *Send, sessionID uint64, laneID uint8)
 	route.set(hello, transport.LegRef{}, []byte("hello"))
 	in.helloRoutes[laneKey{sessionID: sessionID, laneID: laneID}] = route
 	return nonce
+}
+
+func waitForDialCount(t *testing.T, stream *fakeStreamTransport, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if len(stream.dialed) >= want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("dial count = %d, want at least %d", len(stream.dialed), want)
 }
 
 func readSendPayload(t *testing.T, in *Send) transport.Payload {
