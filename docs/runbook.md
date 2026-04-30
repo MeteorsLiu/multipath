@@ -38,8 +38,8 @@ by the host OS for TUN and route changes.
   "fecFlushMaxMs": 30,
   "fecFlushColdStartMs": 20,
   "fecFlushFixedMs": 0,
-  "probeIntervalMS": 1000,
-  "probeTimeoutMS": 3000
+  "probeIntervalMS": 200,
+  "probeTimeoutMS": 600
 }
 ```
 
@@ -75,8 +75,8 @@ lane traffic. TCP is used by a lane only when that lane falls back.
   "fecFlushMaxMs": 30,
   "fecFlushColdStartMs": 20,
   "fecFlushFixedMs": 0,
-  "probeIntervalMS": 1000,
-  "probeTimeoutMS": 3000
+  "probeIntervalMS": 200,
+  "probeTimeoutMS": 600
 }
 ```
 
@@ -122,8 +122,8 @@ FEC flush min     2 ms
 FEC flush max     30 ms
 FEC cold start    20 ms RTT input
 FEC fixed flush   0, disabled
-probe interval   1000 ms
-probe timeout    3000 ms
+probe interval   200 ms
+probe timeout    600 ms
 path weight      1
 promListenAddr    127.0.0.1:0
 ```

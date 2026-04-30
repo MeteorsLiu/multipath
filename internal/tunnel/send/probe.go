@@ -2,6 +2,7 @@ package send
 
 import (
 	"context"
+	"time"
 
 	"github.com/MeteorsLiu/multipath/internal/debuglog"
 	"github.com/MeteorsLiu/multipath/internal/metrics"
@@ -9,6 +10,8 @@ import (
 	"github.com/MeteorsLiu/multipath/internal/transport"
 	probe "github.com/MeteorsLiu/multipath/internal/tunnel/probe/core"
 )
+
+const maxFallbackDialTimeout = time.Second
 
 type pingKey struct {
 	kind       transport.Kind
@@ -60,7 +63,8 @@ func (l *Send) startFallbackDial(ctx context.Context, key laneKey, lane *laneRun
 		return
 	}
 
-	debuglog.Printf("send/probe", "fallback_dial_start session=%d lane=%d remote=%s", key.sessionID, key.laneID, remote)
+	timeout := l.fallbackDialTimeout()
+	debuglog.Printf("send/probe", "fallback_dial_start session=%d lane=%d remote=%s timeout=%s", key.sessionID, key.laneID, remote, timeout)
 	metrics.IncCounter(metrics.LaneEventsTotal,
 		metrics.L("event", "fallback_dial_start"),
 		metrics.L("session", key.sessionID),
@@ -68,7 +72,9 @@ func (l *Send) startFallbackDial(ctx context.Context, key laneKey, lane *laneRun
 		metrics.L("leg", "tcp"),
 	)
 	go func() {
-		leg, err := l.streamTransport.Dial(ctx, remote)
+		dialCtx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		leg, err := l.streamTransport.Dial(dialCtx, remote)
 		debuglog.Printf("send/probe", "fallback_dial_done session=%d lane=%d remote=%s leg={%s} err=%v", key.sessionID, key.laneID, remote, debugLeg(leg), err)
 		_ = l.handleFallbackDialResult(ctx, fallbackDialResult{
 			key: key,
@@ -76,6 +82,13 @@ func (l *Send) startFallbackDial(ctx context.Context, key laneKey, lane *laneRun
 			err: err,
 		})
 	}()
+}
+
+func (l *Send) fallbackDialTimeout() time.Duration {
+	if l.probeTimeout > 0 && l.probeTimeout < maxFallbackDialTimeout {
+		return l.probeTimeout
+	}
+	return maxFallbackDialTimeout
 }
 
 func (l *Send) handleFallbackDialResult(ctx context.Context, result fallbackDialResult) error {

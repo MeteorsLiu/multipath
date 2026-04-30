@@ -9,8 +9,8 @@ import (
 const (
 	defaultTunMTU        = 1440
 	defaultPromListen    = "127.0.0.1:0"
-	defaultProbeInterval = 1 * time.Second
-	defaultProbeTimeout  = 3 * time.Second
+	defaultProbeInterval = 200 * time.Millisecond
+	defaultProbeTimeout  = 600 * time.Millisecond
 )
 
 type PathConfig struct {
