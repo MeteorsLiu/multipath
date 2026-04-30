@@ -50,6 +50,11 @@ func Open(name string, mtu int) (*Device, error) {
 		return nil, err
 	}
 
+	if err := unix.SetNonblock(fd, true); err != nil {
+		_ = unix.Close(fd)
+		return nil, err
+	}
+
 	file := os.NewFile(uintptr(fd), ifName)
 	return newDevice(newDarwinUTUN(file), mtu, ifName), nil
 }

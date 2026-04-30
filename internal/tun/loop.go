@@ -2,6 +2,7 @@ package tun
 
 import (
 	"context"
+	"io"
 
 	"github.com/MeteorsLiu/multipath/internal/debuglog"
 	"github.com/MeteorsLiu/multipath/internal/metrics"
@@ -21,6 +22,13 @@ type PacketSink interface {
 }
 
 func Run(ctx context.Context, reader PacketReader, writer PacketWriter) error {
+	if closer, ok := reader.(io.Closer); ok {
+		go func() {
+			<-ctx.Done()
+			closer.Close()
+		}()
+	}
+
 	for {
 		packet, err := reader.ReadPacket(ctx)
 		if err != nil {

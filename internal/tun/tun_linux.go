@@ -13,7 +13,7 @@ import (
 const linuxCloneDevicePath = "/dev/net/tun"
 
 func Open(name string, mtu int) (*Device, error) {
-	fd, err := unix.Open(linuxCloneDevicePath, unix.O_RDWR|unix.O_CLOEXEC, 0)
+	fd, err := unix.Open(linuxCloneDevicePath, unix.O_RDWR|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -29,7 +29,7 @@ func Open(name string, mtu int) (*Device, error) {
 		return nil, err
 	}
 
-	if err := unix.SetNonblock(fd, false); err != nil {
+	if err := unix.SetNonblock(fd, true); err != nil {
 		_ = unix.Close(fd)
 		return nil, err
 	}
