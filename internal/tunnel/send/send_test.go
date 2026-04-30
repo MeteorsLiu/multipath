@@ -510,6 +510,116 @@ func TestSendHELLOTimeoutStartsTCPFallback(t *testing.T) {
 	}
 }
 
+func TestSendTCPHELLOTimeoutUsesInitialRTO(t *testing.T) {
+	streamTransport := &fakeStreamTransport{}
+	in := New()
+	in.streamTransport = streamTransport
+	in.probeInterval = 200 * time.Millisecond
+	in.probeTimeout = 100 * time.Millisecond
+
+	err := in.startLane(context.Background(), startLaneConfig{
+		Session: mustSession(t, in, 99),
+		LaneID:  3,
+		Weight:  10,
+		Leg: transport.LegRef{
+			Kind:   transport.KindTCP,
+			ConnID: "tcp0",
+		},
+		Caps:       protocol.CapTCPFallback,
+		FECProfile: protocol.FECProfileOff,
+	})
+	if err != nil {
+		t.Fatalf("startLane failed: %v", err)
+	}
+	readSendPayload(t, in).Packet.Release()
+
+	if err := in.retryOpenHELLO(context.Background(), 1000); err != nil {
+		t.Fatalf("retryOpenHELLO failed: %v", err)
+	}
+	readSendPayload(t, in).Packet.Release()
+	if err := in.retryOpenHELLO(context.Background(), 1099); err != nil {
+		t.Fatalf("retryOpenHELLO before TCP RTO failed: %v", err)
+	}
+	if _, ok := in.helloRoutes[laneKey{sessionID: 99, laneID: 3}]; !ok {
+		t.Fatal("TCP HELLO route timed out using probeTimeout instead of initial RTO")
+	}
+
+	if err := in.retryOpenHELLO(context.Background(), 2000); err != nil {
+		t.Fatalf("retryOpenHELLO timeout failed: %v", err)
+	}
+	if _, ok := in.helloRoutes[laneKey{sessionID: 99, laneID: 3}]; ok {
+		t.Fatal("TCP HELLO route still exists after initial RTO")
+	}
+	if got := streamTransport.closed["tcp0"]; got != 1 {
+		t.Fatalf("closed tcp0 count = %d, want 1", got)
+	}
+}
+
+func TestSendTCPHELLOTimeoutUsesRTTEstimate(t *testing.T) {
+	in := New()
+	in.probeTimeout = 600 * time.Millisecond
+	key := laneKey{sessionID: 99, laneID: 3}
+	lane := newLaneRuntime(3, 10)
+	lane.rttTCP.Add(800)
+	in.lanes[key] = lane
+
+	err := in.startLane(context.Background(), startLaneConfig{
+		Session: mustSession(t, in, 99),
+		LaneID:  3,
+		Weight:  10,
+		Leg: transport.LegRef{
+			Kind:   transport.KindTCP,
+			ConnID: "tcp0",
+		},
+		Caps:       protocol.CapTCPFallback,
+		FECProfile: protocol.FECProfileOff,
+	})
+	if err != nil {
+		t.Fatalf("startLane failed: %v", err)
+	}
+	readSendPayload(t, in).Packet.Release()
+
+	route := in.helloRoutes[key]
+	if route.timeout != 2400*time.Millisecond {
+		t.Fatalf("TCP HELLO timeout = %s, want 2.4s", route.timeout)
+	}
+}
+
+func TestSendTCPHELLOTimeoutUsesSessionRTTEstimate(t *testing.T) {
+	in := New()
+	in.probeTimeout = 600 * time.Millisecond
+	udpLane := newLaneRuntime(1, 10)
+	udpLane.observeLeg(transport.LegRef{
+		Kind:       transport.KindUDP,
+		EndpointID: "udp0",
+		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
+	})
+	udpLane.rttUDP.Add(1500)
+	in.lanes[laneKey{sessionID: 99, laneID: 1}] = udpLane
+
+	tcpKey := laneKey{sessionID: 99, laneID: 3}
+	err := in.startLane(context.Background(), startLaneConfig{
+		Session: mustSession(t, in, 99),
+		LaneID:  3,
+		Weight:  10,
+		Leg: transport.LegRef{
+			Kind:   transport.KindTCP,
+			ConnID: "tcp0",
+		},
+		Caps:       protocol.CapTCPFallback,
+		FECProfile: protocol.FECProfileOff,
+	})
+	if err != nil {
+		t.Fatalf("startLane failed: %v", err)
+	}
+	readSendPayload(t, in).Packet.Release()
+
+	route := in.helloRoutes[tcpKey]
+	if route.timeout != 1600*time.Millisecond {
+		t.Fatalf("TCP HELLO timeout = %s, want 1.6s", route.timeout)
+	}
+}
+
 func TestSendRetryFallbackDialsAfterDialError(t *testing.T) {
 	dialErr := errors.New("dial failed")
 	streamTransport := &fakeStreamTransport{dialErr: dialErr}
@@ -1230,6 +1340,46 @@ func TestSendProbeTimeoutStartsTCPFallbackHELLO(t *testing.T) {
 	}
 }
 
+func TestSendProbeTimeoutDoesNotRestartFallbackDialInFlight(t *testing.T) {
+	streamTransport := &fakeStreamTransport{
+		dialLeg: transport.LegRef{
+			Kind:   transport.KindTCP,
+			ConnID: "tcp0",
+		},
+	}
+	in := New()
+	in.streamTransport = streamTransport
+	mustSendState(t, in, 99)
+	in.negotiatedCaps.Store(uint32(protocol.CapTCPFallback))
+	udpLeg := transport.LegRef{
+		Kind:       transport.KindUDP,
+		EndpointID: "udp0",
+		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
+	}
+	lane := newLaneRuntime(3, 1)
+	lane.bindLeg(udpLeg)
+	lane.tcpRemote = "127.0.0.1:4321"
+	lane.fallbackDialing = true
+	in.lanes[laneKey{sessionID: 99, laneID: 3}] = lane
+	target := probe.Target(1)
+	in.probeTargets = map[probe.Target]probeBinding{
+		target: {sessionID: 99, laneID: 3, leg: udpLeg},
+	}
+
+	if err := in.handleProbeEvent(context.Background(), probe.Event{Type: probe.EventTargetLost, Target: target}); err != nil {
+		t.Fatalf("handleProbeEvent failed: %v", err)
+	}
+	if lane.udpReady {
+		t.Fatal("udpReady = true, want false after timeout")
+	}
+	if !lane.fallbackDialing {
+		t.Fatal("fallbackDialing = false; in-flight fallback dial was cleared")
+	}
+	if len(streamTransport.dialed) != 0 {
+		t.Fatalf("fallback dials = %d, want 0 while previous dial is in flight", len(streamTransport.dialed))
+	}
+}
+
 func TestSendHandleCLOSELane(t *testing.T) {
 	streamTransport := &fakeStreamTransport{}
 	in := New()
@@ -1734,7 +1884,7 @@ func startTestHELLORoute(t *testing.T, in *Send, sessionID uint64, laneID uint8)
 		t.Fatalf("Hello.Do: %v", err)
 	}
 	var route helloRoute
-	route.set(hello, transport.LegRef{}, []byte("hello"))
+	route.set(hello, transport.LegRef{}, []byte("hello"), in.probeTimeout)
 	in.helloRoutes[laneKey{sessionID: sessionID, laneID: laneID}] = route
 	return nonce
 }

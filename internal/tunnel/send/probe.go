@@ -200,7 +200,6 @@ func (l *Send) handleProbeTargetLost(ctx context.Context, target probe.Target) e
 	case transport.KindUDP:
 		lane.markUDPNotReady()
 		l.markRunnableLanesDirty(key.sessionID)
-		lane.clearFallbackDialing()
 		l.maybeStartFallbackDial(ctx, key, lane)
 	case transport.KindTCP:
 		lane.markTCPNotReady()

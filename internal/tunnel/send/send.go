@@ -317,7 +317,7 @@ func (l *Send) startLane(ctx context.Context, cfg startLaneConfig) error {
 	// on the outbound channel see a coherent map state. If WriteTo fails the
 	// retry tick will re-send the same payload using the route.
 	var route helloRoute
-	route.set(hello, cfg.Leg, retryPayload)
+	route.set(hello, cfg.Leg, retryPayload, l.helloTimeoutForRoute(sessionID, lane, cfg.Leg))
 	l.helloRoutesMu.Lock()
 	l.helloRoutes[key] = route
 	l.helloRoutesMu.Unlock()

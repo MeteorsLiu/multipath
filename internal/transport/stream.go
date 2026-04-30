@@ -203,6 +203,7 @@ func (s *Stream) acceptLoop(ctx context.Context, writer PacketWriter) error {
 }
 
 func (s *Stream) readLoop(ctx context.Context, connID string, conn net.Conn, writer PacketWriter) {
+	var exitErr error
 	defer func() {
 		s.mu.Lock()
 		if s.conns[connID] == conn {
@@ -210,11 +211,15 @@ func (s *Stream) readLoop(ctx context.Context, connID string, conn net.Conn, wri
 		}
 		s.mu.Unlock()
 		_ = conn.Close()
-		debuglog.Printf("transport/tcp", "read_loop exit conn=%s remote=%v", connID, debugRemoteAddr(conn))
+		if exitErr == nil {
+			exitErr = ctx.Err()
+		}
+		debuglog.Printf("transport/tcp", "read_loop exit conn=%s remote=%v err=%v", connID, debugRemoteAddr(conn), exitErr)
 	}()
 
 	for {
 		if err := conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+			exitErr = err
 			debuglog.Printf("transport/tcp", "read deadline conn=%s err=%v", connID, err)
 			metrics.IncCounter(metrics.TransportErrorsTotal,
 				metrics.L("transport", "tcp"),
@@ -228,11 +233,13 @@ func (s *Stream) readLoop(ctx context.Context, connID string, conn net.Conn, wri
 			if isTimeout(err) {
 				select {
 				case <-ctx.Done():
+					exitErr = ctx.Err()
 					return
 				default:
 					continue
 				}
 			}
+			exitErr = err
 			debuglog.Printf("transport/tcp", "read header conn=%s err=%v", connID, err)
 			metrics.IncCounter(metrics.TransportErrorsTotal,
 				metrics.L("transport", "tcp"),
@@ -243,6 +250,7 @@ func (s *Stream) readLoop(ctx context.Context, connID string, conn net.Conn, wri
 
 		frameLen := int(binary.BigEndian.Uint16(header[:]))
 		if frameLen == 0 || frameLen > maxStreamFrameLen {
+			exitErr = fmt.Errorf("invalid frame_len=%d", frameLen)
 			debuglog.Printf("transport/tcp", "invalid frame_len conn=%s frame_len=%d", connID, frameLen)
 			metrics.IncCounter(metrics.TransportErrorsTotal,
 				metrics.L("transport", "tcp"),
@@ -254,6 +262,7 @@ func (s *Stream) readLoop(ctx context.Context, connID string, conn net.Conn, wri
 		packet := packetbuf.Acquire(frameLen)
 		if _, err := io.ReadFull(conn, packet.Payload); err != nil {
 			packet.Release()
+			exitErr = err
 			debuglog.Printf("transport/tcp", "read frame conn=%s frame_len=%d err=%v", connID, frameLen, err)
 			metrics.IncCounter(metrics.TransportErrorsTotal,
 				metrics.L("transport", "tcp"),
@@ -280,6 +289,7 @@ func (s *Stream) readLoop(ctx context.Context, connID string, conn net.Conn, wri
 			metrics.L("endpoint", ""),
 		)
 		if err := writer.WriteTo(ctx, leg, packet); err != nil {
+			exitErr = err
 			debuglog.Printf("transport/tcp", "deliver conn=%s bytes=%d err=%v", connID, frameLen, err)
 			metrics.IncCounter(metrics.TransportErrorsTotal,
 				metrics.L("transport", "tcp"),

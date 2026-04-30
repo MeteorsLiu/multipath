@@ -166,6 +166,7 @@ lane runtime data
 per-session Schedule Strategy
 global FEC profile and codec
 HELLO bootstrap and retry data
+per-route HELLO timeout policy
 per-leg RTT estimator sampled from PONG
 RTT-driven FEC flush timer for variable-span SLC
 transport-bound output queue

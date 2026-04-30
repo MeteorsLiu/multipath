@@ -237,7 +237,9 @@ Sender behavior:
 1. Choose or reuse the session id for the tunnel.
 2. Choose the lane id for this configured path.
 3. Send HELLO on the transport leg being established.
-4. Retry HELLO until HELLO_ACK arrives or the attempt times out.
+4. Retry HELLO until HELLO_ACK arrives or the attempt times out. TCP fallback
+   HELLO timeout should use an RTO-style budget derived from existing RTT
+   estimates when available; UDP HELLO may use the probe timeout policy.
 
 Receiver behavior:
 

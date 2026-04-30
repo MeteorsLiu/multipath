@@ -14,14 +14,16 @@ type helloRoute struct {
 	hello        *sessionpkg.Hello
 	leg          transport.LegRef
 	payload      []byte
+	timeout      time.Duration
 	firstRetryMS uint64
 	lastRetryMS  uint64
 }
 
-func (r *helloRoute) set(hello *sessionpkg.Hello, leg transport.LegRef, payload []byte) {
+func (r *helloRoute) set(hello *sessionpkg.Hello, leg transport.LegRef, payload []byte, timeout time.Duration) {
 	r.hello = hello
 	r.leg = leg
 	r.payload = append(r.payload[:0], payload...)
+	r.timeout = timeout
 	r.firstRetryMS = 0
 	r.lastRetryMS = 0
 }
@@ -79,9 +81,9 @@ func (l *Send) retryOpenHELLO(ctx context.Context, nowMS uint64) error {
 				route = cur
 			}
 			l.helloRoutesMu.Unlock()
-			debuglog.Printf("send/retry", "hello_retry_start session=%d lane=%d nonce=%d leg={%s}", key.sessionID, key.laneID, nonce, debugLeg(route.leg))
+			debuglog.Printf("send/retry", "hello_retry_start session=%d lane=%d nonce=%d leg={%s} timeout=%s", key.sessionID, key.laneID, nonce, debugLeg(route.leg), route.timeout)
 		}
-		if l.probeTimeout > 0 && elapsedMS(nowMS, route.firstRetryMS) >= l.probeTimeout {
+		if route.timeout > 0 && elapsedMS(nowMS, route.firstRetryMS) >= route.timeout {
 			l.cancelHelloRoute(key)
 			lane := l.getLane(key)
 			if lane == nil {
@@ -89,7 +91,7 @@ func (l *Send) retryOpenHELLO(ctx context.Context, nowMS uint64) error {
 				continue
 			}
 			leg := route.leg
-			debuglog.Printf("send/retry", "hello_retry_timeout session=%d lane=%d nonce=%d leg={%s}", key.sessionID, key.laneID, nonce, debugLeg(leg))
+			debuglog.Printf("send/retry", "hello_retry_timeout session=%d lane=%d nonce=%d leg={%s} timeout=%s", key.sessionID, key.laneID, nonce, debugLeg(leg), route.timeout)
 			switch leg.Kind {
 			case transport.KindUDP:
 				lane.markUDPNotReady()
