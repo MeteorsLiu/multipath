@@ -35,6 +35,20 @@ func TestQualityLegSelectorFallsBackToTCPWhenUDPDegraded(t *testing.T) {
 	}
 }
 
+func TestQualityLegSelectorFallsBackToTCPWhenUDPJitterHigh(t *testing.T) {
+	sel := QualityLegSelector{}
+	udp := LegQuality{Active: true, DeliveryRate: 0.95, SmoothedRTT: 50 * time.Millisecond, RTTVariance: 60 * time.Millisecond}
+	tcp := LegQuality{Active: true, DeliveryRate: 0.95, SmoothedRTT: 100 * time.Millisecond}
+
+	useUDP, ok := sel.Pick(udp, tcp)
+	if !ok {
+		t.Fatal("Pick returned false, want true")
+	}
+	if useUDP {
+		t.Fatal("Pick returned UDP, want TCP (UDP jitter exceeds mean)")
+	}
+}
+
 func TestQualityLegSelectorStaysOnUDPWhenTCPAlsoDegraded(t *testing.T) {
 	sel := QualityLegSelector{}
 	udp := LegQuality{Active: true, DeliveryRate: 0.70, SmoothedRTT: 100 * time.Millisecond}

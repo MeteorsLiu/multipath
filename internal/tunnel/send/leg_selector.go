@@ -30,9 +30,17 @@ func (QualityLegSelector) Pick(udp, tcp LegQuality) (useUDP bool, ok bool) {
 	const minUDPDelivery = 0.80
 	const minTCPDelivery = 0.90
 
+	// Delivery rate below threshold: token-bucket policer (drops excess).
 	if udp.DeliveryRate < minUDPDelivery && tcp.DeliveryRate >= minTCPDelivery {
 		return false, true
 	}
+
+	// RTT variance exceeds mean: shaper (bufferbloat, jitter).
+	if udp.RTTVariance > 0 && udp.RTTVariance >= udp.SmoothedRTT &&
+		tcp.DeliveryRate >= minTCPDelivery {
+		return false, true
+	}
+
 	return true, true
 }
 
