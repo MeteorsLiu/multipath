@@ -29,6 +29,7 @@ type Stream struct {
 	mu     sync.RWMutex
 	conns  map[string]net.Conn
 	writer PacketWriter
+	runCtx context.Context
 	nextID atomic.Uint64
 }
 
@@ -42,6 +43,7 @@ func NewStream(listener net.Listener) *Stream {
 func (s *Stream) Run(ctx context.Context, writer PacketWriter) error {
 	s.mu.Lock()
 	s.writer = writer
+	s.runCtx = ctx
 	for connID, conn := range s.conns {
 		debuglog.Printf("transport/tcp", "start existing read_loop conn=%s remote=%v", connID, debugRemoteAddr(conn))
 		go s.readLoop(ctx, connID, conn, writer)
@@ -79,9 +81,9 @@ func (s *Stream) Dial(ctx context.Context, remote string) (LegRef, error) {
 
 	connID := s.addConn(conn)
 	debuglog.Printf("transport/tcp", "dial ok remote=%s conn=%s local=%v", remote, connID, debugLocalAddr(conn))
-	writer := s.currentWriter()
+	writer, runCtx := s.currentRuntime()
 	if writer != nil {
-		go s.readLoop(ctx, connID, conn, writer)
+		go s.readLoop(runCtx, connID, conn, writer)
 	}
 
 	return LegRef{
@@ -297,11 +299,15 @@ func (s *Stream) addConn(conn net.Conn) string {
 	return connID
 }
 
-func (s *Stream) currentWriter() PacketWriter {
+func (s *Stream) currentRuntime() (PacketWriter, context.Context) {
 	s.mu.RLock()
 	writer := s.writer
+	runCtx := s.runCtx
 	s.mu.RUnlock()
-	return writer
+	if runCtx == nil {
+		runCtx = context.Background()
+	}
+	return writer, runCtx
 }
 
 func writeBuffersFull(conn net.Conn, buffers net.Buffers) (int64, error) {
