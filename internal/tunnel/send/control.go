@@ -40,8 +40,16 @@ func (i *Send) acceptHello(ctx context.Context, sessionID uint64, laneID uint8, 
 
 	key := laneKey{sessionID: sessionID, laneID: laneID}
 	lane := i.getOrCreateLane(key, 1)
+
+	oldUDP, oldTCP := lane.legs()
 	lane.observeLeg(leg)
 	i.markRunnableLanesDirty(sessionID)
+	if oldUDP.Kind != 0 && newPingKey(oldUDP) != newPingKey(leg) {
+		i.untrackProbeTarget(ctx, oldUDP)
+	}
+	if oldTCP.Kind != 0 && newPingKey(oldTCP) != newPingKey(leg) {
+		i.untrackProbeTarget(ctx, oldTCP)
+	}
 	i.trackProbeTarget(ctx, sessionID, laneID, leg)
 	metrics.IncCounter(metrics.LaneEventsTotal,
 		metrics.L("event", "hello_accept"),
