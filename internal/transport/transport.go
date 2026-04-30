@@ -106,7 +106,7 @@ func writePayload(ctx context.Context, payload Payload, packet PacketTransport, 
 			return ErrInvalidLeg
 		}
 		_, err := stream.Write(ctx, payload.Leg.ConnID, payload.Packet.Payload)
-		if errors.Is(err, ErrUnknownConn) || errors.Is(err, net.ErrClosed) {
+		if err != nil && !errors.Is(err, context.Canceled) {
 			if debuglog.Enabled() {
 				debuglog.Printf("transport", "drop stale tcp payload conn=%s bytes=%d err=%v", payload.Leg.ConnID, len(payload.Packet.Payload), err)
 			}
