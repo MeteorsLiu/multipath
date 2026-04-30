@@ -260,6 +260,9 @@ func (l *Send) retryFallbackDials(ctx context.Context) {
 	l.lanesMu.RUnlock()
 
 	for _, item := range candidates {
+		if item.lane.tcpRemoteSnapshot() == "" {
+			continue
+		}
 		l.startFallbackDial(ctx, item.key, item.lane)
 	}
 }

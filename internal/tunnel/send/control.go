@@ -31,9 +31,10 @@ func (i *Send) acceptHello(ctx context.Context, sessionID uint64, laneID uint8, 
 		debuglog.Printf("send/control", "hello_drop session_create_denied session=%d lane=%d", sessionID, laneID)
 		return i.writeHelloAck(ctx, sessionID, laneID, leg, body.Nonce, false, caps, fecProfile)
 	}
-	if _, active := i.activeSession(); !active {
-		i.activateSession(sessionID)
+	if oldID, active := i.activeSession(); active && oldID != sessionID {
+		i.deleteSessionState(oldID)
 	}
+	i.activateSession(sessionID)
 	i.negotiatedCaps.Store(uint32(caps))
 	i.fecProfile.Store(uint32(fecProfile))
 

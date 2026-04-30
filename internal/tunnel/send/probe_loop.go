@@ -81,7 +81,7 @@ func (l *ProbeLoop) Run(ctx context.Context) error {
 		runner := core.New(core.Config{
 			Interval:       l.interval,
 			Timeout:        l.timeout,
-			MaxLoss:        1,
+			MaxLoss:        2,
 			RecoverSuccess: 1,
 		})
 		start("core", func() error { return runner.Run(runCtx, l.events, runnerOut) })
