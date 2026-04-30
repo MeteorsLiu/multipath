@@ -330,14 +330,20 @@ func (o *Recv) maybeRecover(ctx context.Context, sessionID uint64, state *recvSt
 		debuglog.Printf("recv", "recover_skip session_nil=%t fec_nil=%t base_packet_id=%d key=%d source_span=%d missing_index=%d", state == nil, codec == nil, recoverable.basePacketID, recoverable.key, recoverable.sourceSpan, recoverable.missingIndex)
 		return nil
 	}
-	packet, ok := o.recoverPacket(sessionID, state, recoverable, codec)
+	pkt, ok := o.recoverPacket(sessionID, state, recoverable, codec)
 	if !ok {
 		return nil
 	}
-	return o.emitCopiedPacket(ctx, packet)
+	select {
+	case o.packets <- pkt:
+		return nil
+	case <-ctx.Done():
+		pkt.Release()
+		return ctx.Err()
+	}
 }
 
-func (o *Recv) recoverPacket(sessionID uint64, state *recvState, recoverable rxRecoverable, codec fecCodec) ([]byte, bool) {
+func (o *Recv) recoverPacket(sessionID uint64, state *recvState, recoverable rxRecoverable, codec fecCodec) (*packetbuf.Packet, bool) {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	if state.closed {
@@ -346,8 +352,6 @@ func (o *Recv) recoverPacket(sessionID uint64, state *recvState, recoverable rxR
 	}
 	shards, ok := state.rxWindow.buildShardsLocked(recoverable, state.shardScratch[:0])
 	if !ok {
-		// Window state changed (e.g. concurrent close/prune); recovery no
-		// longer applicable.
 		debuglog.Printf("recv", "recover_drop window_stale base_packet_id=%d key=%d source_span=%d missing_index=%d", recoverable.basePacketID, recoverable.key, recoverable.sourceSpan, recoverable.missingIndex)
 		return nil, false
 	}
@@ -384,7 +388,9 @@ func (o *Recv) recoverPacket(sessionID uint64, state *recvState, recoverable rxR
 		metrics.L("session", sessionID),
 		metrics.L("source_span", recoverable.sourceSpan),
 	)
-	return append([]byte(nil), packet...), true
+	pkt := packetbuf.Acquire(len(packet))
+	copy(pkt.Payload, packet)
+	return pkt, true
 }
 
 func (o *Recv) fecCodecForSourceSpan(sourceSpan int) fecCodec {
@@ -410,24 +416,7 @@ func (o *Recv) emitTransportPacket(ctx context.Context, packet *packetbuf.Packet
 	}
 }
 
-func (o *Recv) emitCopiedPacket(ctx context.Context, payload []byte) error {
-	packet := packetbuf.Acquire(len(payload))
-	copy(packet.Payload, payload)
-	packet.SetLen(len(payload))
-	select {
-	case o.packets <- packet:
-		if debuglog.Enabled() {
-			debuglog.Printf("recv", "packet_emit bytes=%d zero_copy=false", len(payload))
-		}
-		return nil
-	case <-ctx.Done():
-		packet.Release()
-		if debuglog.Enabled() {
-			debuglog.Printf("recv", "packet_emit_drop ctx_done bytes=%d zero_copy=false", len(payload))
-		}
-		return ctx.Err()
-	}
-}
+
 
 func (o *Recv) recvState(sessionID uint64) *recvState {
 	// Fast path: read-locked lookup. The Get/lookup pair stays inside
