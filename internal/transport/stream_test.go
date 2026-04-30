@@ -109,6 +109,10 @@ type partialWriteConn struct {
 	maxChunk int
 }
 
+func (c *partialWriteConn) SetWriteDeadline(t time.Time) error {
+	return nil
+}
+
 func (c *partialWriteConn) Write(payload []byte) (int, error) {
 	n := len(payload)
 	if c.maxChunk > 0 && n > c.maxChunk {

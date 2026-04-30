@@ -116,8 +116,18 @@ func (s *Stream) Write(ctx context.Context, connID string, payload []byte) (int,
 		return 0, ctx.Err()
 	default:
 	}
+	if err := conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return 0, err
+	}
 	n, err := writeBuffersFull(conn, buffers)
 	if err != nil {
+		if isTimeout(err) {
+			select {
+			case <-ctx.Done():
+				return 0, ctx.Err()
+			default:
+			}
+		}
 		debuglog.Printf("transport/tcp", "write conn=%s bytes=%d err=%v", connID, len(payload), err)
 		metrics.IncCounter(metrics.TransportErrorsTotal,
 			metrics.L("transport", "tcp"),
