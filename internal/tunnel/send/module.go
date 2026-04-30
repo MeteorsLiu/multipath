@@ -20,9 +20,10 @@ import (
 )
 
 var (
-	errNoRunnableLane = errors.New("tunnel: no runnable lane")
-	errUnknownLane    = errors.New("tunnel: unknown lane")
-	errInvalidLane    = errors.New("tunnel: invalid lane")
+	errNoRunnableLane    = errors.New("tunnel: no runnable lane")
+	errUnknownLane       = errors.New("tunnel: unknown lane")
+	errInvalidLane       = errors.New("tunnel: invalid lane")
+	errSessionIDConflict = errors.New("tunnel: session id conflict")
 )
 
 // Send owns the send-side runtime state for the multipath tunnel.
@@ -165,7 +166,23 @@ func (l *Send) bootstrap(ctx context.Context) error {
 		debuglog.Printf("send", "bootstrap_skip already_bootstrapped")
 		return nil
 	}
-	debuglog.Printf("send", "bootstrap lanes=%d", len(l.bootstrapLanes))
+	return l.bootstrapNewSession(ctx, "bootstrap")
+}
+
+func (l *Send) bootstrapNewSession(ctx context.Context, event string) error {
+	if len(l.bootstrapLanes) == 0 {
+		debuglog.Printf("send", "%s_skip no_bootstrap_lanes", event)
+		return nil
+	}
+	session, err := l.newLocalSession()
+	if err != nil {
+		return err
+	}
+	sessionID, ok := sessionIDOf(session)
+	if !ok {
+		return errSessionIDConflict
+	}
+	debuglog.Printf("send", "%s session=%d lanes=%d", event, sessionID, len(l.bootstrapLanes))
 
 	for _, lane := range l.bootstrapLanes {
 		caps := protocol.CapTCPFallback
@@ -173,9 +190,9 @@ func (l *Send) bootstrap(ctx context.Context) error {
 		if fecProfileEnabled(fecProfile) {
 			caps |= protocol.CapFEC
 		}
-		debuglog.Printf("send", "bootstrap_lane session=%d lane=%d weight=%d leg={%s} tcp_remote=%s caps=%#x fec_profile=%d", lane.SessionID, lane.LaneID, lane.Weight, debugLeg(lane.Leg), lane.TCPRemote, caps, fecProfile)
+		debuglog.Printf("send", "bootstrap_lane session=%d lane=%d weight=%d leg={%s} tcp_remote=%s caps=%#x fec_profile=%d", sessionID, lane.LaneID, lane.Weight, debugLeg(lane.Leg), lane.TCPRemote, caps, fecProfile)
 		if err := l.startLane(ctx, startLaneConfig{
-			SessionID:  lane.SessionID,
+			Session:    session,
 			LaneID:     lane.LaneID,
 			Weight:     lane.Weight,
 			Leg:        lane.Leg,
@@ -183,11 +200,38 @@ func (l *Send) bootstrap(ctx context.Context) error {
 			Caps:       caps,
 			FECProfile: fecProfile,
 		}); err != nil {
-			debuglog.Printf("send", "bootstrap_lane_err session=%d lane=%d err=%v", lane.SessionID, lane.LaneID, err)
+			debuglog.Printf("send", "bootstrap_lane_err session=%d lane=%d err=%v", sessionID, lane.LaneID, err)
 			return err
 		}
 	}
 	return nil
+}
+
+func (l *Send) newLocalSession() (*sessionpkg.Session, error) {
+	for attempt := 0; attempt < 16; attempt++ {
+		session, err := sessionpkg.New()
+		if err != nil {
+			return nil, err
+		}
+		if l.sessionManager.Add(session) {
+			return session, nil
+		}
+	}
+	return nil, errSessionIDConflict
+}
+
+func sessionIDOf(session *sessionpkg.Session) (uint64, bool) {
+	if session == nil {
+		return 0, false
+	}
+	var sessionID uint64
+	if err := session.Do(func(v sessionpkg.View) error {
+		sessionID = v.SessionID()
+		return nil
+	}); err != nil {
+		return 0, false
+	}
+	return sessionID, sessionID != 0
 }
 
 // activateSession records that this Send is bound to sessionID. The

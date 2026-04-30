@@ -95,7 +95,8 @@ func (l *Send) handleFallbackDialResult(ctx context.Context, result fallbackDial
 		)
 		return nil
 	}
-	if _, _, ok := l.getSessionState(result.key.sessionID); !ok {
+	session, _, ok := l.getSessionState(result.key.sessionID)
+	if !ok {
 		debuglog.Printf("send/probe", "fallback_result_drop missing_session session=%d lane=%d leg={%s}", result.key.sessionID, result.key.laneID, debugLeg(result.leg))
 		return nil
 	}
@@ -115,7 +116,7 @@ func (l *Send) handleFallbackDialResult(ctx context.Context, result fallbackDial
 		metrics.L("leg", kindMetricLabel(result.leg.Kind)),
 	)
 	return l.startLane(ctx, startLaneConfig{
-		SessionID:  result.key.sessionID,
+		Session:    session,
 		LaneID:     result.key.laneID,
 		Weight:     lane.Weight(),
 		Leg:        result.leg,

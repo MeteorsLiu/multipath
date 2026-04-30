@@ -249,7 +249,7 @@ func (l *Send) maybeSendRepair(ctx context.Context, sessionID uint64, group txRe
 }
 
 type startLaneConfig struct {
-	SessionID  uint64
+	Session    *sessionpkg.Session
 	LaneID     uint8
 	Weight     uint32
 	Leg        transport.LegRef
@@ -259,18 +259,22 @@ type startLaneConfig struct {
 }
 
 func (l *Send) startLane(ctx context.Context, cfg startLaneConfig) error {
+	sessionID, ok := sessionIDOf(cfg.Session)
+	if !ok {
+		return errSessionIDConflict
+	}
 	if cfg.Weight == 0 || cfg.LaneID == protocol.SessionControlLaneID {
-		debuglog.Printf("send", "start_lane_invalid session=%d lane=%d weight=%d", cfg.SessionID, cfg.LaneID, cfg.Weight)
+		debuglog.Printf("send", "start_lane_invalid session=%d lane=%d weight=%d", sessionID, cfg.LaneID, cfg.Weight)
 		return errInvalidLane
 	}
 
-	sessionState, _, ok := l.getOrCreateSessionState(cfg.SessionID)
+	_, ok = l.getOrCreateSendState(cfg.Session)
 	if !ok {
 		return nil
 	}
-	l.activateSession(cfg.SessionID)
+	l.activateSession(sessionID)
 
-	key := laneKey{sessionID: cfg.SessionID, laneID: cfg.LaneID}
+	key := laneKey{sessionID: sessionID, laneID: cfg.LaneID}
 	lane := l.getOrCreateLane(key, cfg.Weight)
 	lane.setWeight(cfg.Weight)
 	lane.rememberLeg(cfg.Leg)
@@ -278,10 +282,10 @@ func (l *Send) startLane(ctx context.Context, cfg startLaneConfig) error {
 		lane.setTCPRemote(cfg.TCPRemote)
 	}
 	lane.setHelloProfile(cfg.Caps, cfg.FECProfile)
-	l.markRunnableLanesDirty(cfg.SessionID)
+	l.markRunnableLanesDirty(sessionID)
 	l.cancelHelloRoute(key)
 
-	hello := sessionState.Open(0)
+	hello := cfg.Session.Open(0)
 	var nonce uint64
 	var retryPayload []byte
 	var packet *packetbuf.Packet
@@ -317,10 +321,10 @@ func (l *Send) startLane(ctx context.Context, cfg startLaneConfig) error {
 	l.helloRoutesMu.Lock()
 	l.helloRoutes[key] = route
 	l.helloRoutesMu.Unlock()
-	debuglog.Printf("send", "start_lane_hello session=%d lane=%d nonce=%d bytes=%d", cfg.SessionID, cfg.LaneID, nonce, len(retryPayload))
+	debuglog.Printf("send", "start_lane_hello session=%d lane=%d nonce=%d bytes=%d", sessionID, cfg.LaneID, nonce, len(retryPayload))
 
 	if err := l.WriteTo(ctx, cfg.Leg, packet); err != nil {
-		debuglog.Printf("send", "start_lane_write_err session=%d lane=%d leg={%s} err=%v", cfg.SessionID, cfg.LaneID, debugLeg(cfg.Leg), err)
+		debuglog.Printf("send", "start_lane_write_err session=%d lane=%d leg={%s} err=%v", sessionID, cfg.LaneID, debugLeg(cfg.Leg), err)
 		return err
 	}
 	return nil

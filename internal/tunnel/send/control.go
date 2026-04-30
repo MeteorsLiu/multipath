@@ -106,7 +106,7 @@ func (i *Send) acceptHelloAck(ctx context.Context, sessionID uint64, laneID uint
 func (i *Send) receivePing(ctx context.Context, sessionID uint64, laneID uint8, leg transport.LegRef, body protocol.PingBody) error {
 	if _, _, ok := i.getSessionState(sessionID); !ok {
 		debuglog.Printf("send/control", "ping_drop missing_session session=%d lane=%d ping_id=%d", sessionID, laneID, body.PingID)
-		return nil
+		return i.writeUnknownSessionClose(ctx, sessionID, laneID, leg)
 	}
 	lane := i.getLane(laneKey{sessionID: sessionID, laneID: laneID})
 	if lane == nil {
@@ -127,7 +127,7 @@ func (i *Send) receivePing(ctx context.Context, sessionID uint64, laneID uint8, 
 func (i *Send) receivePong(ctx context.Context, sessionID uint64, laneID uint8, leg transport.LegRef, body protocol.PingBody) error {
 	if _, _, ok := i.getSessionState(sessionID); !ok {
 		debuglog.Printf("send/control", "pong_drop missing_session session=%d lane=%d ping_id=%d", sessionID, laneID, body.PingID)
-		return nil
+		return i.writeUnknownSessionClose(ctx, sessionID, laneID, leg)
 	}
 	lane := i.getLane(laneKey{sessionID: sessionID, laneID: laneID})
 	if lane == nil {
@@ -169,8 +169,8 @@ func (i *Send) receivePong(ctx context.Context, sessionID uint64, laneID uint8, 
 	return nil
 }
 
-func (i *Send) close(ctx context.Context, sessionID uint64, laneID uint8, scope uint8) error {
-	debuglog.Printf("send/control", "close session=%d lane=%d scope=%d", sessionID, laneID, scope)
+func (i *Send) close(ctx context.Context, sessionID uint64, laneID uint8, scope uint8, reason uint8) error {
+	debuglog.Printf("send/control", "close session=%d lane=%d scope=%d reason=%d", sessionID, laneID, scope, reason)
 	switch scope {
 	case protocol.CloseScopeLane:
 		i.closeLane(ctx, laneKey{sessionID: sessionID, laneID: laneID})
@@ -194,8 +194,24 @@ func (i *Send) close(ctx context.Context, sessionID uint64, laneID uint8, scope 
 			i.closeLane(ctx, key)
 		}
 		i.deleteRunnableLanesCache(sessionID)
+		if reason == protocol.CloseReasonUnknownSession {
+			return i.bootstrapNewSession(ctx, "rebootstrap")
+		}
 	}
 	return nil
+}
+
+func (i *Send) writeUnknownSessionClose(ctx context.Context, sessionID uint64, laneID uint8, leg transport.LegRef) error {
+	debuglog.Printf("send/control", "close_unknown_session session=%d lane=%d leg={%s}", sessionID, laneID, debugLeg(leg))
+	return i.writeControlFrameOnLeg(ctx, leg, protocol.Frame{
+		Type:      protocol.TypeCLOSE,
+		SessionID: sessionID,
+		LaneID:    protocol.SessionControlLaneID,
+		Body: protocol.CloseBody{
+			Scope:  protocol.CloseScopeSession,
+			Reason: protocol.CloseReasonUnknownSession,
+		},
+	})
 }
 
 func (i *Send) closeLane(ctx context.Context, key laneKey) {

@@ -192,7 +192,6 @@ type Config struct {
 }
 
 type BootstrapLane struct {
-    SessionID uint64
     LaneID    uint8
     Weight    uint32
     Leg       transport.LegRef
@@ -302,7 +301,10 @@ package session
 
 type Manager struct{}
 
+func New() (*Session, error)
+
 func (m *Manager) Get(id uint64) (*Session, bool)
+func (m *Manager) Add(s *Session) bool
 func (m *Manager) Create(id uint64) (*Session, bool)
 func (m *Manager) GetOrCreate(id uint64) (*Session, bool)
 func (m *Manager) Delete(id uint64)
@@ -327,6 +329,7 @@ func (v View) Nonce() uint64
 Rules:
 
 ```text
+New creates a local outbound Session with a fresh opaque random session id.
 Manager only owns session lifetime and creation admission.
 Manager does not know protocol frames, lanes, legs, transport, FEC, schedule
 strategy, caps, or fallback.

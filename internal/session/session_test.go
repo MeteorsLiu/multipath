@@ -26,6 +26,48 @@ func TestManagerLifecycle(t *testing.T) {
 	}
 }
 
+func TestNewGeneratesSessionID(t *testing.T) {
+	s, err := New()
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	if s == nil {
+		t.Fatal("New returned nil session")
+	}
+	if err := s.Do(func(v View) error {
+		if v.SessionID() == 0 {
+			t.Fatal("SessionID = 0, want generated non-zero id")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("Session.Do: %v", err)
+	}
+}
+
+func TestManagerAdd(t *testing.T) {
+	var manager Manager
+	s, err := New()
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	var id uint64
+	if err := s.Do(func(v View) error {
+		id = v.SessionID()
+		return nil
+	}); err != nil {
+		t.Fatalf("Session.Do: %v", err)
+	}
+	if !manager.Add(s) {
+		t.Fatal("Add = false, want true")
+	}
+	if got, ok := manager.Get(id); !ok || got != s {
+		t.Fatalf("Get after Add = (%v,%v), want original,true", got, ok)
+	}
+	if manager.Add(s) {
+		t.Fatal("duplicate Add = true, want false")
+	}
+}
+
 func TestSessionOpenAckAndRetry(t *testing.T) {
 	var manager Manager
 	s, ok := manager.GetOrCreate(99)

@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -127,15 +125,6 @@ func buildClientRuntime(cfg Config, device *tun.Device) (*appRuntime, []io.Close
 		return nil, nil, errTooManyRemotePaths
 	}
 
-	sessionID := cfg.SessionID
-	if sessionID == 0 {
-		var err error
-		sessionID, err = randomSessionID()
-		if err != nil {
-			return nil, nil, err
-		}
-	}
-
 	var closers []io.Closer
 	var endpoints []transport.PacketEndpoint
 	var bootstrap []send.BootstrapLane
@@ -159,9 +148,8 @@ func buildClientRuntime(cfg Config, device *tun.Device) (*appRuntime, []io.Close
 			return nil, nil, err
 		}
 		bootstrap = append(bootstrap, send.BootstrapLane{
-			SessionID: sessionID,
-			LaneID:    laneID,
-			Weight:    uint32(path.Weight),
+			LaneID: laneID,
+			Weight: uint32(path.Weight),
 			Leg: transport.LegRef{
 				Kind:       transport.KindUDP,
 				EndpointID: endpointID,
@@ -244,14 +232,6 @@ func appendClosers(closers []io.Closer, extra io.Closer) []io.Closer {
 		return closers
 	}
 	return append(closers, extra)
-}
-
-func randomSessionID() (uint64, error) {
-	var b [8]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return 0, err
-	}
-	return binary.BigEndian.Uint64(b[:]), nil
 }
 
 func closeAll(closers []io.Closer) {

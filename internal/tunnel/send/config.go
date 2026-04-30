@@ -24,7 +24,6 @@ type Config struct {
 }
 
 type BootstrapLane struct {
-	SessionID uint64
 	LaneID    uint8
 	Weight    uint32
 	Leg       transport.LegRef

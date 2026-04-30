@@ -73,5 +73,5 @@ func (s *RecvState) OnClose(ctx context.Context, leg transport.LegRef, frame pro
 		debuglog.Printf("send/control", "invalid_body type=CLOSE")
 		return protocol.ErrInvalidFrame
 	}
-	return s.sender.close(ctx, frame.SessionID, frame.LaneID, body.Scope)
+	return s.sender.close(ctx, frame.SessionID, frame.LaneID, body.Scope, body.Reason)
 }

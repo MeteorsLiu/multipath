@@ -47,7 +47,6 @@ type Config struct {
 	FECFlushMaxMs       uint32       `json:"fecFlushMaxMs,omitempty"`
 	FECFlushColdStartMs uint32       `json:"fecFlushColdStartMs,omitempty"`
 	FECFlushFixedMs     uint32       `json:"fecFlushFixedMs,omitempty"`
-	SessionID           uint64       `json:"sessionID"`
 	ProbeIntervalMS     int          `json:"probeIntervalMS"`
 	ProbeTimeoutMS      int          `json:"probeTimeoutMS"`
 }

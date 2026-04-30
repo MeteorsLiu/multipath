@@ -146,7 +146,6 @@ func TestBuildClientRuntime(t *testing.T) {
 				{RemoteAddr: "127.0.0.1:9000", Weight: 2},
 			},
 		},
-		SessionID: 7,
 	}
 	cfg.setDefaults()
 
@@ -169,7 +168,6 @@ func TestBuildClientRuntimeIgnoresLegacyTCPFlag(t *testing.T) {
 				{RemoteAddr: "127.0.0.1:9000", Weight: 1},
 			},
 		},
-		SessionID: 7,
 	}
 	cfg.setDefaults()
 
@@ -196,7 +194,6 @@ func TestBuildRuntimeMetricsServer(t *testing.T) {
 			},
 		},
 		PromListenAddr: "127.0.0.1:0",
-		SessionID:      7,
 	}
 	cfg.setDefaults()
 

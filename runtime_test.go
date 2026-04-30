@@ -62,9 +62,8 @@ func TestRuntimeBootstrapFailureDoesNotStartLoops(t *testing.T) {
 	sender := send.New(send.Config{
 		BootstrapLanes: []send.BootstrapLane{
 			{
-				SessionID: 1,
-				LaneID:    protocol.SessionControlLaneID,
-				Weight:    1,
+				LaneID: protocol.SessionControlLaneID,
+				Weight: 1,
 			},
 		},
 	})

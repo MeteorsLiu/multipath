@@ -20,6 +20,8 @@ const (
 
 	CloseScopeLane    uint8 = 1
 	CloseScopeSession uint8 = 2
+
+	CloseReasonUnknownSession uint8 = 1
 )
 
 type Body interface {

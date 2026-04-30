@@ -85,24 +85,41 @@ func (l *Send) getOrCreateSessionState(sessionID uint64) (*sessionpkg.Session, *
 			return nil, nil, false
 		}
 	}
+	state, ok := l.getOrCreateSendState(session)
+	return session, state, ok
+}
+
+func (l *Send) getOrCreateSendState(session *sessionpkg.Session) (*sendState, bool) {
+	sessionID, ok := sessionIDOf(session)
+	if !ok {
+		return nil, false
+	}
+	if existing, ok := l.sessionManager.Get(sessionID); ok {
+		if existing != session {
+			return nil, false
+		}
+	} else if !l.sessionManager.Add(session) {
+		return nil, false
+	}
+
 	l.sessionStatesMu.RLock()
 	state := l.sendStates[session]
 	l.sessionStatesMu.RUnlock()
 	if state != nil {
-		return session, state, true
+		return state, true
 	}
 
 	l.sessionStatesMu.Lock()
 	defer l.sessionStatesMu.Unlock()
 	if state := l.sendStates[session]; state != nil {
-		return session, state, true
+		return state, true
 	}
 	state = &sendState{
 		txWindow: newTxSLCWindow(4),
 	}
 	l.sendStates[session] = state
 	debuglog.Printf("send", "session_create session=%d", sessionID)
-	return session, state, true
+	return state, true
 }
 
 // deleteSessionState removes the send-side state for a session, cancels any

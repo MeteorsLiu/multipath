@@ -336,9 +336,9 @@ func TestSendStartLaneSendsHELLOWithoutEnqueue(t *testing.T) {
 	in := New()
 
 	err := in.startLane(context.Background(), startLaneConfig{
-		SessionID: 99,
-		LaneID:    3,
-		Weight:    10,
+		Session: mustSession(t, in, 99),
+		LaneID:  3,
+		Weight:  10,
 		Leg: transport.LegRef{
 			Kind:       transport.KindUDP,
 			EndpointID: "udp0",
@@ -402,9 +402,9 @@ func TestSendRetriesHELLOOnProbeTick(t *testing.T) {
 	in.probeTimeout = 3 * time.Second
 
 	err := in.startLane(context.Background(), startLaneConfig{
-		SessionID: 99,
-		LaneID:    3,
-		Weight:    10,
+		Session: mustSession(t, in, 99),
+		LaneID:  3,
+		Weight:  10,
 		Leg: transport.LegRef{
 			Kind:       transport.KindUDP,
 			EndpointID: "udp0",
@@ -447,9 +447,9 @@ func TestSendHELLOTimeoutStartsTCPFallback(t *testing.T) {
 	in.probeEvents = probeEvents
 
 	err := in.startLane(context.Background(), startLaneConfig{
-		SessionID: 99,
-		LaneID:    3,
-		Weight:    10,
+		Session: mustSession(t, in, 99),
+		LaneID:  3,
+		Weight:  10,
 		Leg: transport.LegRef{
 			Kind:       transport.KindUDP,
 			EndpointID: "udp0",
@@ -513,8 +513,8 @@ func TestSendHELLOTimeoutStartsTCPFallback(t *testing.T) {
 func TestSendStartLaneRejectsZeroWeight(t *testing.T) {
 	in := New()
 	err := in.startLane(context.Background(), startLaneConfig{
-		SessionID: 99,
-		LaneID:    3,
+		Session: mustSession(t, in, 99),
+		LaneID:  3,
 	})
 	if !errors.Is(err, errInvalidLane) {
 		t.Fatalf("err = %v, want errInvalidLane", err)
@@ -524,9 +524,9 @@ func TestSendStartLaneRejectsZeroWeight(t *testing.T) {
 func TestSendStartLaneRejectsSessionControlLaneID(t *testing.T) {
 	in := New()
 	err := in.startLane(context.Background(), startLaneConfig{
-		SessionID: 99,
-		LaneID:    protocol.SessionControlLaneID,
-		Weight:    1,
+		Session: mustSession(t, in, 99),
+		LaneID:  protocol.SessionControlLaneID,
+		Weight:  1,
 	})
 	if !errors.Is(err, errInvalidLane) {
 		t.Fatalf("err = %v, want errInvalidLane", err)
@@ -539,9 +539,8 @@ func TestSendConfigBootstrapsLanes(t *testing.T) {
 		ProbeTimeout:  2 * time.Second,
 		BootstrapLanes: []BootstrapLane{
 			{
-				SessionID: 99,
-				LaneID:    3,
-				Weight:    10,
+				LaneID: 3,
+				Weight: 10,
 				Leg: transport.LegRef{
 					Kind:       transport.KindUDP,
 					EndpointID: "udp0",
@@ -560,7 +559,14 @@ func TestSendConfigBootstrapsLanes(t *testing.T) {
 	if in.probeInterval != time.Second || in.probeTimeout != 2*time.Second {
 		t.Fatalf("probe config = interval %s timeout %s", in.probeInterval, in.probeTimeout)
 	}
-	lane := in.lanes[laneKey{sessionID: 99, laneID: 3}]
+	frame, err := protocol.Decode(written.Packet.Payload)
+	if err != nil {
+		t.Fatalf("Decode HELLO: %v", err)
+	}
+	if frame.Type != protocol.TypeHELLO || frame.SessionID == 0 || frame.LaneID != 3 {
+		t.Fatalf("bootstrap frame route = type %d session %d lane %d", frame.Type, frame.SessionID, frame.LaneID)
+	}
+	lane := in.lanes[laneKey{sessionID: frame.SessionID, laneID: 3}]
 	if lane == nil {
 		t.Fatal("bootstrap lane was not created")
 	}
@@ -568,18 +574,100 @@ func TestSendConfigBootstrapsLanes(t *testing.T) {
 		t.Fatalf("tcpRemote = %q, want 127.0.0.1:4321", lane.tcpRemote)
 	}
 
-	frame, err := protocol.Decode(written.Packet.Payload)
-	if err != nil {
-		t.Fatalf("Decode HELLO: %v", err)
-	}
-	if frame.Type != protocol.TypeHELLO || frame.SessionID != 99 || frame.LaneID != 3 {
-		t.Fatalf("bootstrap frame route = type %d session %d lane %d", frame.Type, frame.SessionID, frame.LaneID)
-	}
-
 	if err := in.bootstrap(context.Background()); err != nil {
 		t.Fatalf("second bootstrap failed: %v", err)
 	}
 	assertNoSendPayload(t, in)
+}
+
+func TestSendRepliesCloseForUnknownSessionPING(t *testing.T) {
+	in := New()
+	leg := transport.LegRef{
+		Kind:       transport.KindUDP,
+		EndpointID: "udp0",
+		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
+	}
+	if err := in.receivePing(context.Background(), 99, 3, leg, protocol.PingBody{PingID: 7, TimeMS: 1000}); err != nil {
+		t.Fatalf("receivePing failed: %v", err)
+	}
+	written := readSendPayload(t, in)
+	defer written.Packet.Release()
+	frame, err := protocol.Decode(written.Packet.Payload)
+	if err != nil {
+		t.Fatalf("Decode CLOSE: %v", err)
+	}
+	body, ok := frame.Body.(protocol.CloseBody)
+	if frame.Type != protocol.TypeCLOSE || !ok {
+		t.Fatalf("frame = type %d body %T, want CLOSE", frame.Type, frame.Body)
+	}
+	if frame.SessionID != 99 || frame.LaneID != protocol.SessionControlLaneID {
+		t.Fatalf("CLOSE route = session %d lane %d", frame.SessionID, frame.LaneID)
+	}
+	if body.Scope != protocol.CloseScopeSession || body.Reason != protocol.CloseReasonUnknownSession {
+		t.Fatalf("CLOSE body = %+v", body)
+	}
+}
+
+func TestSendRebootstrapsOnUnknownSessionCLOSE(t *testing.T) {
+	in := New(Config{
+		BootstrapLanes: []BootstrapLane{
+			{
+				LaneID: 3,
+				Weight: 10,
+				Leg: transport.LegRef{
+					Kind:       transport.KindUDP,
+					EndpointID: "udp0",
+					RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
+				},
+			},
+		},
+	})
+	if err := in.bootstrap(context.Background()); err != nil {
+		t.Fatalf("bootstrap failed: %v", err)
+	}
+	first := readSendPayload(t, in)
+	defer first.Packet.Release()
+	firstFrame, err := protocol.Decode(first.Packet.Payload)
+	if err != nil {
+		t.Fatalf("Decode first HELLO: %v", err)
+	}
+	if firstFrame.SessionID == 0 {
+		t.Fatal("first HELLO session = 0")
+	}
+
+	payload, err := protocol.Encode(protocol.Frame{
+		Type:      protocol.TypeCLOSE,
+		SessionID: firstFrame.SessionID,
+		LaneID:    protocol.SessionControlLaneID,
+		Body: protocol.CloseBody{
+			Scope:  protocol.CloseScopeSession,
+			Reason: protocol.CloseReasonUnknownSession,
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("Encode CLOSE: %v", err)
+	}
+	if err := writeTestControl(context.Background(), in, testEvent(transport.LegRef{}, payload)); err != nil {
+		t.Fatalf("recv Write CLOSE session failed: %v", err)
+	}
+	second := readSendPayload(t, in)
+	defer second.Packet.Release()
+	secondFrame, err := protocol.Decode(second.Packet.Payload)
+	if err != nil {
+		t.Fatalf("Decode second HELLO: %v", err)
+	}
+	if secondFrame.Type != protocol.TypeHELLO || secondFrame.LaneID != 3 {
+		t.Fatalf("second frame = type %d lane %d, want HELLO lane 3", secondFrame.Type, secondFrame.LaneID)
+	}
+	if secondFrame.SessionID == 0 || secondFrame.SessionID == firstFrame.SessionID {
+		t.Fatalf("second session = %d, first = %d; want fresh non-zero session", secondFrame.SessionID, firstFrame.SessionID)
+	}
+	if getSendState(in, firstFrame.SessionID) != nil {
+		t.Fatal("old session still exists after unknown_session CLOSE")
+	}
+	if getSendState(in, secondFrame.SessionID) == nil {
+		t.Fatal("new session was not created after unknown_session CLOSE")
+	}
 }
 
 func TestRecvHandleDATAWritesTUN(t *testing.T) {
@@ -1598,6 +1686,15 @@ func mustSendState(t *testing.T, in *Send, sessionID uint64) *sendState {
 		t.Fatalf("missing session %d", sessionID)
 	}
 	return state
+}
+
+func mustSession(t *testing.T, in *Send, sessionID uint64) *sessionpkg.Session {
+	t.Helper()
+	sessionState, ok := in.sessionManager.GetOrCreate(sessionID)
+	if !ok {
+		t.Fatalf("missing session %d", sessionID)
+	}
+	return sessionState
 }
 
 func startTestHELLORoute(t *testing.T, in *Send, sessionID uint64, laneID uint8) uint64 {

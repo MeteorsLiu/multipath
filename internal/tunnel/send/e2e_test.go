@@ -39,9 +39,8 @@ func TestEndToEndUDPDataAcrossTwoLanes(t *testing.T) {
 		ProbeTimeout:  time.Second,
 		BootstrapLanes: []BootstrapLane{
 			{
-				SessionID: 101,
-				LaneID:    1,
-				Weight:    1,
+				LaneID: 1,
+				Weight: 1,
 				Leg: transport.LegRef{
 					Kind:       transport.KindUDP,
 					EndpointID: "lane-1",
@@ -49,9 +48,8 @@ func TestEndToEndUDPDataAcrossTwoLanes(t *testing.T) {
 				},
 			},
 			{
-				SessionID: 101,
-				LaneID:    2,
-				Weight:    1,
+				LaneID: 2,
+				Weight: 1,
 				Leg: transport.LegRef{
 					Kind:       transport.KindUDP,
 					EndpointID: "lane-2",
@@ -75,8 +73,12 @@ func TestEndToEndUDPDataAcrossTwoLanes(t *testing.T) {
 	if len(serverIn.lanes) != 2 {
 		t.Fatalf("server lanes = %d, want 2", len(serverIn.lanes))
 	}
+	sessionID, ok := clientIn.activeSession()
+	if !ok || sessionID == 0 {
+		t.Fatalf("client active session = (%d,%v), want generated session", sessionID, ok)
+	}
 	for laneID := uint8(1); laneID <= 2; laneID++ {
-		lane := serverIn.lanes[laneKey{sessionID: 101, laneID: laneID}]
+		lane := serverIn.lanes[laneKey{sessionID: sessionID, laneID: laneID}]
 		if lane == nil || !lane.udpReady {
 			t.Fatalf("server lane %d ready = %v, lane=%+v", laneID, lane != nil && lane.udpReady, lane)
 		}
@@ -107,9 +109,8 @@ func TestEndToEndFECRecoversOneDroppedUDPPacket(t *testing.T) {
 		EnableFEC:     true,
 		BootstrapLanes: []BootstrapLane{
 			{
-				SessionID: 202,
-				LaneID:    1,
-				Weight:    1,
+				LaneID: 1,
+				Weight: 1,
 				Leg: transport.LegRef{
 					Kind:       transport.KindUDP,
 					EndpointID: "lane-1",
@@ -164,9 +165,8 @@ func TestEndToEndTCPFallbackAfterUDPHELLOTimeout(t *testing.T) {
 		ProbeTimeout:    60 * time.Millisecond,
 		BootstrapLanes: []BootstrapLane{
 			{
-				SessionID: 303,
-				LaneID:    1,
-				Weight:    1,
+				LaneID: 1,
+				Weight: 1,
 				Leg: transport.LegRef{
 					Kind:       transport.KindUDP,
 					EndpointID: "lane-1",
@@ -187,7 +187,11 @@ func TestEndToEndTCPFallbackAfterUDPHELLOTimeout(t *testing.T) {
 	waitE2ERuntime(t, serverErr)
 	waitE2ERuntime(t, clientErr)
 
-	lane := serverIn.lanes[laneKey{sessionID: 303, laneID: 1}]
+	sessionID, ok := clientIn.activeSession()
+	if !ok || sessionID == 0 {
+		t.Fatalf("client active session = (%d,%v), want generated session", sessionID, ok)
+	}
+	lane := serverIn.lanes[laneKey{sessionID: sessionID, laneID: 1}]
 	if lane == nil || !lane.tcpReady {
 		t.Fatalf("server TCP fallback lane ready = %v, lane=%+v", lane != nil && lane.tcpReady, lane)
 	}

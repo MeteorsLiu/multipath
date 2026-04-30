@@ -1,10 +1,29 @@
 package session
 
-import "sync"
+import (
+	"crypto/rand"
+	"encoding/binary"
+	"errors"
+	"sync"
+)
+
+var errZeroSessionID = errors.New("session: generated zero session id")
 
 type Manager struct {
 	mu       sync.RWMutex
 	sessions map[uint64]*Session
+}
+
+func New() (*Session, error) {
+	var buf [8]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return nil, err
+	}
+	id := binary.BigEndian.Uint64(buf[:])
+	if id == 0 {
+		return nil, errZeroSessionID
+	}
+	return &Session{id: id}, nil
 }
 
 func (m *Manager) Get(id uint64) (*Session, bool) {
@@ -18,6 +37,22 @@ func (m *Manager) Get(id uint64) (*Session, bool) {
 	}
 	s, ok := m.sessions[id]
 	return s, ok
+}
+
+func (m *Manager) Add(s *Session) bool {
+	if m == nil || s == nil || s.id == 0 {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.sessions == nil {
+		m.sessions = make(map[uint64]*Session)
+	}
+	if existing := m.sessions[s.id]; existing != nil {
+		return false
+	}
+	m.sessions[s.id] = s
+	return true
 }
 
 func (m *Manager) Create(id uint64) (*Session, bool) {

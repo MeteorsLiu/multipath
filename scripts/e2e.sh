@@ -68,6 +68,7 @@ PORT_WEIGHTED=5011
 PORT_MTU=5012
 PORT_FEC_LOADED_LATENCY=5013
 PORT_LEG_SELECTOR=5014
+PORT_SERVER_RESTART=5015
 
 PATH1_C="10.201.1.1/24"
 PATH1_S="10.201.1.2/24"
@@ -448,13 +449,32 @@ start_multipath() {
   CURRENT_LOG_FILE="${client_log}"
   CURRENT_CLIENT_LOG="${client_log}"
   CURRENT_SERVER_LOG="${server_log}"
-  ip netns exec "${NS_S}" env MULTIPATH_DEBUG="${REAL_E2E_DEBUG}" "${BIN}" -config "${server_config}" >>"${server_log}" 2>&1 &
-  SERVER_PID=$!
+  start_server_process "${name}"
   ip netns exec "${NS_C}" env MULTIPATH_DEBUG="${REAL_E2E_DEBUG}" "${BIN}" -config "${client_config}" >>"${client_log}" 2>&1 &
   CLIENT_PID=$!
 
   echo "[${name}] client log: ${client_log}"
   echo "[${name}] server log: ${server_log} (MULTIPATH_DEBUG=${REAL_E2E_DEBUG})"
+}
+
+start_server_process() {
+  local name="$1"
+  local server_config="${WORKDIR}/server-${name}.json"
+  local server_log="${WORKDIR}/${name}.server.log"
+
+  CURRENT_SERVER_LOG="${server_log}"
+  ip netns exec "${NS_S}" env MULTIPATH_DEBUG="${REAL_E2E_DEBUG}" "${BIN}" -config "${server_config}" >>"${server_log}" 2>&1 &
+  SERVER_PID=$!
+}
+
+restart_server_process() {
+  local name="$1"
+  if [[ -n "${SERVER_PID}" ]]; then
+    kill "${SERVER_PID}" >/dev/null 2>&1 || true
+    wait "${SERVER_PID}" >/dev/null 2>&1 || true
+    SERVER_PID=""
+  fi
+  start_server_process "${name}"
 }
 
 stop_multipath() {
@@ -786,6 +806,28 @@ run_fallback_case() {
   echo "==== ${name} e2e end ===="
 }
 
+run_server_restart_reconnect_case() {
+  local name="server-restart-reconnect"
+  echo "==== ${name} e2e start ===="
+  clear_loss
+  write_one_lane_config "${name}" "${PORT_SERVER_RESTART}" false false 200 600
+  start_multipath "${name}"
+
+  wait_ping_ok "${name} baseline" 12
+
+  echo "[${name}] restart server; client must receive unknown_session CLOSE and open a fresh session"
+  restart_server_process "${name}"
+
+  wait_log_file_pattern "${name}" "${CURRENT_SERVER_LOG}" "close_unknown_session session=[0-9]+ lane=[0-9]+" 20 "server replied CLOSE for unknown old session"
+  wait_log_file_pattern "${name}" "${CURRENT_CLIENT_LOG}" "close session=[0-9]+ lane=255 scope=2 reason=1" 20 "client received unknown_session CLOSE"
+  wait_log_file_pattern "${name}" "${CURRENT_CLIENT_LOG}" "rebootstrap session=[0-9]+ lanes=1" 20 "client opened a fresh session after CLOSE"
+  wait_ping_ok "${name} post-restart" 20
+
+  stop_multipath
+  clear_loss
+  echo "==== ${name} e2e end ===="
+}
+
 run_leg_selector_case() {
   local name="leg-selector"
   echo "==== ${name} e2e start ===="
@@ -876,13 +918,22 @@ wait_log_pattern() {
   local pattern="$2"
   local timeout="${3:-15}"
   local message="$4"
-  local deadline=$((SECONDS + timeout))
   if [[ -z "${CURRENT_LOG_FILE}" ]]; then
     fail "${label}" "${message}: log file unset"
     return 1
   fi
+  wait_log_file_pattern "${label}" "${CURRENT_LOG_FILE}" "${pattern}" "${timeout}" "${message}"
+}
+
+wait_log_file_pattern() {
+  local label="$1"
+  local log_file="$2"
+  local pattern="$3"
+  local timeout="${4:-15}"
+  local message="$5"
+  local deadline=$((SECONDS + timeout))
   while (( SECONDS < deadline )); do
-    if [[ -f "${CURRENT_LOG_FILE}" ]] && grep -E -q "${pattern}" "${CURRENT_LOG_FILE}"; then
+    if [[ -f "${log_file}" ]] && grep -E -q "${pattern}" "${log_file}"; then
       pass "${label}" "${message}"
       return 0
     fi
@@ -1269,6 +1320,7 @@ run_per_lane_fallback_case
 run_concurrent_fallback_case
 run_legacy_tcp_flag_case
 run_fallback_case
+run_server_restart_reconnect_case
 run_fallback_dial_error_case
 run_leg_selector_case
 run_nat_case
