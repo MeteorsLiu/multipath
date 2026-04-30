@@ -423,9 +423,10 @@ type laneKey struct {
 }
 
 type fallbackDialResult struct {
-	key laneKey
-	leg transport.LegRef
-	err error
+	key    laneKey
+	leg    transport.LegRef
+	remote string
+	err    error
 }
 
 type probeBinding struct {

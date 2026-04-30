@@ -91,16 +91,24 @@ func (l *Send) retryOpenHELLO(ctx context.Context, nowMS uint64) error {
 				continue
 			}
 			leg := route.leg
+			before := lane.snapshot()
 			debuglog.Printf("send/retry", "hello_retry_timeout session=%d lane=%d nonce=%d leg={%s} timeout=%s", key.sessionID, key.laneID, nonce, debugLeg(leg), route.timeout)
+			logLaneHandshakeTimeout(key.sessionID, key.laneID, leg, route.timeout.String())
 			switch leg.Kind {
 			case transport.KindUDP:
 				lane.markUDPNotReady()
+				if shouldLogLaneDown(before, leg) {
+					logLaneDown(key.sessionID, key.laneID, leg, "hello_timeout", nil)
+				}
 				l.markRunnableLanesDirty(key.sessionID)
 				l.trackProbeTarget(ctx, key.sessionID, key.laneID, leg)
 				lane.clearFallbackDialing()
 				l.startFallbackDial(ctx, key, lane)
 			case transport.KindTCP:
 				lane.markTCPNotReady()
+				if shouldLogLaneDown(before, leg) {
+					logLaneDown(key.sessionID, key.laneID, leg, "hello_timeout", nil)
+				}
 				l.markRunnableLanesDirty(key.sessionID)
 				if l.streamTransport != nil && leg.ConnID != "" {
 					_ = l.streamTransport.Close(ctx, leg.ConnID)

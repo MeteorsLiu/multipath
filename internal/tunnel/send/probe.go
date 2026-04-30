@@ -65,6 +65,7 @@ func (l *Send) startFallbackDial(ctx context.Context, key laneKey, lane *laneRun
 
 	timeout := l.fallbackDialTimeout()
 	debuglog.Printf("send/probe", "fallback_dial_start session=%d lane=%d remote=%s timeout=%s", key.sessionID, key.laneID, remote, timeout)
+	logTCPReconnectStart(key.sessionID, key.laneID, remote)
 	metrics.IncCounter(metrics.LaneEventsTotal,
 		metrics.L("event", "fallback_dial_start"),
 		metrics.L("session", key.sessionID),
@@ -77,9 +78,10 @@ func (l *Send) startFallbackDial(ctx context.Context, key laneKey, lane *laneRun
 		leg, err := l.streamTransport.Dial(dialCtx, remote)
 		debuglog.Printf("send/probe", "fallback_dial_done session=%d lane=%d remote=%s leg={%s} err=%v", key.sessionID, key.laneID, remote, debugLeg(leg), err)
 		_ = l.handleFallbackDialResult(ctx, fallbackDialResult{
-			key: key,
-			leg: leg,
-			err: err,
+			key:    key,
+			leg:    leg,
+			remote: remote,
+			err:    err,
 		})
 	}()
 }
@@ -100,6 +102,7 @@ func (l *Send) handleFallbackDialResult(ctx context.Context, result fallbackDial
 	if result.err != nil {
 		lane.clearFallbackDialing()
 		debuglog.Printf("send/probe", "fallback_result_err %s err=%v", debugLaneState(result.key, lane), result.err)
+		logTCPReconnectFailed(result.key.sessionID, result.key.laneID, result.remote, result.err)
 		metrics.IncCounter(metrics.LaneEventsTotal,
 			metrics.L("event", "fallback_dial_error"),
 			metrics.L("session", result.key.sessionID),
@@ -123,6 +126,7 @@ func (l *Send) handleFallbackDialResult(ctx context.Context, result fallbackDial
 		fecProfile = helloFEC
 	}
 	debuglog.Printf("send/probe", "fallback_result_start_lane session=%d lane=%d leg={%s} caps=%#x fec_profile=%d", result.key.sessionID, result.key.laneID, debugLeg(result.leg), caps, fecProfile)
+	logTCPReconnectConnected(result.key.sessionID, result.key.laneID, result.remote, result.leg)
 	metrics.IncCounter(metrics.LaneEventsTotal,
 		metrics.L("event", "fallback_dial_success"),
 		metrics.L("session", result.key.sessionID),
@@ -173,6 +177,10 @@ func (l *Send) handleProbeEvent(ctx context.Context, event probe.Event) error {
 }
 
 func (l *Send) handleProbeTargetLost(ctx context.Context, target probe.Target) error {
+	return l.handleProbeTargetLostWithReason(ctx, target, "probe_timeout", nil)
+}
+
+func (l *Send) handleProbeTargetLostWithReason(ctx context.Context, target probe.Target, reason string, err error) error {
 	l.probeMu.Lock()
 	binding, ok := l.probeTargets[target]
 	l.probeMu.Unlock()
@@ -189,6 +197,7 @@ func (l *Send) handleProbeTargetLost(ctx context.Context, target probe.Target) e
 		return nil
 	}
 	debuglog.Printf("send/probe", "target_lost target=%d leg={%s} before=%s", target, debugLeg(binding.leg), debugLaneState(key, lane))
+	before := lane.snapshot()
 	metrics.IncCounter(metrics.LaneEventsTotal,
 		metrics.L("event", "target_lost"),
 		metrics.L("session", key.sessionID),
@@ -199,10 +208,16 @@ func (l *Send) handleProbeTargetLost(ctx context.Context, target probe.Target) e
 	switch binding.leg.Kind {
 	case transport.KindUDP:
 		lane.markUDPNotReady()
+		if shouldLogLaneDown(before, binding.leg) {
+			logLaneDown(key.sessionID, key.laneID, binding.leg, reason, err)
+		}
 		l.markRunnableLanesDirty(key.sessionID)
 		l.maybeStartFallbackDial(ctx, key, lane)
 	case transport.KindTCP:
 		lane.markTCPNotReady()
+		if shouldLogLaneDown(before, binding.leg) {
+			logLaneDown(key.sessionID, key.laneID, binding.leg, reason, err)
+		}
 		l.markRunnableLanesDirty(key.sessionID)
 		if l.streamTransport != nil && binding.leg.ConnID != "" {
 			_ = l.streamTransport.Close(ctx, binding.leg.ConnID)
@@ -227,7 +242,7 @@ func (l *Send) OnLegFailure(ctx context.Context, leg transport.LegRef, err error
 		return
 	}
 	debuglog.Printf("send/probe", "leg_failure target=%d leg={%s} err=%v", target, debugLeg(leg), err)
-	if lostErr := l.handleProbeTargetLost(ctx, target); lostErr != nil {
+	if lostErr := l.handleProbeTargetLostWithReason(ctx, target, "leg_failure", err); lostErr != nil {
 		debuglog.Printf("send/probe", "leg_failure_err target=%d leg={%s} err=%v", target, debugLeg(leg), lostErr)
 	}
 }
@@ -245,6 +260,7 @@ func (l *Send) handleProbeTargetRecovered(target probe.Target) error {
 		debuglog.Printf("send/probe", "target_recovered_drop missing_lane target=%d session=%d lane=%d leg={%s}", target, binding.sessionID, binding.laneID, debugLeg(binding.leg))
 		return nil
 	}
+	before := lane.snapshot()
 	lane.observeLeg(binding.leg)
 	l.markRunnableLanesDirty(binding.sessionID)
 	metrics.IncCounter(metrics.LaneEventsTotal,
@@ -253,6 +269,9 @@ func (l *Send) handleProbeTargetRecovered(target probe.Target) error {
 		metrics.L("lane", binding.laneID),
 		metrics.L("leg", kindMetricLabel(binding.leg.Kind)),
 	)
+	if shouldLogLaneUp(before, binding.leg) {
+		logLaneUp(binding.sessionID, binding.laneID, binding.leg, "probe")
+	}
 	debuglog.Printf("send/probe", "target_recovered target=%d %s", target, debugLaneState(laneKey{sessionID: binding.sessionID, laneID: binding.laneID}, lane))
 	return nil
 }

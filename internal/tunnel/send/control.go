@@ -41,7 +41,8 @@ func (i *Send) acceptHello(ctx context.Context, sessionID uint64, laneID uint8, 
 	key := laneKey{sessionID: sessionID, laneID: laneID}
 	lane := i.getOrCreateLane(key, 1)
 
-	oldUDP, oldTCP := lane.legs()
+	before := lane.snapshot()
+	oldUDP, oldTCP := before.udpLeg, before.tcpLeg
 	lane.observeLeg(leg)
 	i.markRunnableLanesDirty(sessionID)
 	if oldUDP.Kind != 0 && newPingKey(oldUDP) != newPingKey(leg) {
@@ -57,6 +58,9 @@ func (i *Send) acceptHello(ctx context.Context, sessionID uint64, laneID uint8, 
 		metrics.L("lane", laneID),
 		metrics.L("leg", kindMetricLabel(leg.Kind)),
 	)
+	if shouldLogLaneUp(before, leg) {
+		logLaneUp(sessionID, laneID, leg, "hello")
+	}
 	debuglog.Printf("send/control", "hello_accepted %s", debugLaneState(key, lane))
 	return sessionState.Do(func(v sessionpkg.View) error {
 		return i.writeHelloAck(ctx, v.SessionID(), laneID, leg, body.Nonce, true, caps, fecProfile)
@@ -99,6 +103,7 @@ func (i *Send) acceptHelloAck(ctx context.Context, sessionID uint64, laneID uint
 
 	i.negotiatedCaps.Store(uint32(caps))
 	i.fecProfile.Store(uint32(fecProfile))
+	before := lane.snapshot()
 	lane.observeLeg(leg)
 	lane.clearFallbackDialing()
 	i.markRunnableLanesDirty(sessionID)
@@ -109,6 +114,9 @@ func (i *Send) acceptHelloAck(ctx context.Context, sessionID uint64, laneID uint
 		metrics.L("lane", laneID),
 		metrics.L("leg", kindMetricLabel(leg.Kind)),
 	)
+	if shouldLogLaneUp(before, leg) {
+		logLaneUp(sessionID, laneID, leg, "hello_ack")
+	}
 	debuglog.Printf("send/control", "hello_ack_accepted %s", debugLaneState(laneKey{sessionID: sessionID, laneID: laneID}, lane))
 	return nil
 }
