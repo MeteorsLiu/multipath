@@ -100,6 +100,7 @@ func (i *Send) acceptHelloAck(ctx context.Context, sessionID uint64, laneID uint
 	i.negotiatedCaps.Store(uint32(caps))
 	i.fecProfile.Store(uint32(fecProfile))
 	lane.observeLeg(leg)
+	lane.clearFallbackDialing()
 	i.markRunnableLanesDirty(sessionID)
 	i.trackProbeTarget(ctx, sessionID, laneID, leg)
 	metrics.IncCounter(metrics.LaneEventsTotal,

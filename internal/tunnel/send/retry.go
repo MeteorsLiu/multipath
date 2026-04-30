@@ -95,6 +95,7 @@ func (l *Send) retryOpenHELLO(ctx context.Context, nowMS uint64) error {
 				lane.markUDPNotReady()
 				l.markRunnableLanesDirty(key.sessionID)
 				l.trackProbeTarget(ctx, key.sessionID, key.laneID, leg)
+				lane.clearFallbackDialing()
 				l.startFallbackDial(ctx, key, lane)
 			case transport.KindTCP:
 				lane.markTCPNotReady()
@@ -102,6 +103,7 @@ func (l *Send) retryOpenHELLO(ctx context.Context, nowMS uint64) error {
 				if l.streamTransport != nil && leg.ConnID != "" {
 					_ = l.streamTransport.Close(ctx, leg.ConnID)
 				}
+				lane.clearFallbackDialing()
 			}
 			continue
 		}

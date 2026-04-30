@@ -97,8 +97,8 @@ func (l *Send) handleFallbackDialResult(ctx context.Context, result fallbackDial
 		debuglog.Printf("send/probe", "fallback_result_drop missing_lane session=%d lane=%d err=%v", result.key.sessionID, result.key.laneID, result.err)
 		return nil
 	}
-	lane.clearFallbackDialing()
 	if result.err != nil {
+		lane.clearFallbackDialing()
 		debuglog.Printf("send/probe", "fallback_result_err %s err=%v", debugLaneState(result.key, lane), result.err)
 		metrics.IncCounter(metrics.LaneEventsTotal,
 			metrics.L("event", "fallback_dial_error"),
@@ -110,6 +110,7 @@ func (l *Send) handleFallbackDialResult(ctx context.Context, result fallbackDial
 	}
 	session, _, ok := l.getSessionState(result.key.sessionID)
 	if !ok {
+		lane.clearFallbackDialing()
 		debuglog.Printf("send/probe", "fallback_result_drop missing_session session=%d lane=%d leg={%s}", result.key.sessionID, result.key.laneID, debugLeg(result.leg))
 		return nil
 	}
@@ -128,7 +129,7 @@ func (l *Send) handleFallbackDialResult(ctx context.Context, result fallbackDial
 		metrics.L("lane", result.key.laneID),
 		metrics.L("leg", kindMetricLabel(result.leg.Kind)),
 	)
-	return l.startLane(ctx, startLaneConfig{
+	err := l.startLane(ctx, startLaneConfig{
 		Session:    session,
 		LaneID:     result.key.laneID,
 		Weight:     lane.Weight(),
@@ -137,6 +138,7 @@ func (l *Send) handleFallbackDialResult(ctx context.Context, result fallbackDial
 		Caps:       caps,
 		FECProfile: fecProfile,
 	})
+	return err
 }
 
 func (l *Send) handleProbeEvent(ctx context.Context, event probe.Event) error {
@@ -198,6 +200,7 @@ func (l *Send) handleProbeTargetLost(ctx context.Context, target probe.Target) e
 	case transport.KindUDP:
 		lane.markUDPNotReady()
 		l.markRunnableLanesDirty(key.sessionID)
+		lane.clearFallbackDialing()
 		l.maybeStartFallbackDial(ctx, key, lane)
 	case transport.KindTCP:
 		lane.markTCPNotReady()
@@ -206,6 +209,7 @@ func (l *Send) handleProbeTargetLost(ctx context.Context, target probe.Target) e
 			_ = l.streamTransport.Close(ctx, binding.leg.ConnID)
 		}
 		l.untrackProbeTarget(ctx, binding.leg)
+		lane.clearFallbackDialing()
 		l.maybeStartFallbackDial(ctx, key, lane)
 	}
 	debuglog.Printf("send/probe", "target_lost_done %s", debugLaneState(key, lane))

@@ -1205,8 +1205,8 @@ func TestSendProbeTimeoutStartsTCPFallbackHELLO(t *testing.T) {
 		t.Fatalf("dialed remote = %q, want 127.0.0.1:4321", got)
 	}
 
-	if lane.fallbackDialing {
-		t.Fatal("fallbackDialing = true after dial result")
+	if !lane.fallbackDialing {
+		t.Fatal("fallbackDialing = false after dial result; must stay true until HELLO_ACK")
 	}
 	if lane.tcpReady {
 		t.Fatal("tcpReady = true before TCP HELLO_ACK")
