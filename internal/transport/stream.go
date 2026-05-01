@@ -126,9 +126,6 @@ func (s *Stream) Write(ctx context.Context, connID string, payload []byte) (int,
 		return 0, ctx.Err()
 	default:
 	}
-	if err := conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		return 0, err
-	}
 	n, err := writeBuffersFull(conn, buffers)
 	if err != nil {
 		if isTimeout(err) {
@@ -227,16 +224,6 @@ func (s *Stream) readLoop(ctx context.Context, connID string, conn net.Conn, wri
 	}()
 
 	for {
-		if err := conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
-			exitErr = err
-			debuglog.Printf("transport/tcp", "read deadline conn=%s err=%v", connID, err)
-			metrics.IncCounter(metrics.TransportErrorsTotal,
-				metrics.L("transport", "tcp"),
-				metrics.L("operation", "read_deadline"),
-			)
-			return
-		}
-
 		var header [2]byte
 		if _, err := io.ReadFull(conn, header[:]); err != nil {
 			if isTimeout(err) {
