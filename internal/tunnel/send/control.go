@@ -104,9 +104,13 @@ func (i *Send) acceptHelloAck(ctx context.Context, sessionID uint64, laneID uint
 	i.negotiatedCaps.Store(uint32(caps))
 	i.fecProfile.Store(uint32(fecProfile))
 	before := lane.snapshot()
+	oldLeg := currentLegFromSnapshot(before, leg.Kind)
 	lane.observeLeg(leg)
 	lane.clearFallbackDialing()
 	i.markRunnableLanesDirty(sessionID)
+	if oldLeg.Kind != 0 && newPingKey(oldLeg) != newPingKey(leg) {
+		i.untrackProbeTarget(ctx, oldLeg)
+	}
 	i.trackProbeTarget(ctx, sessionID, laneID, leg)
 	metrics.IncCounter(metrics.LaneEventsTotal,
 		metrics.L("event", "hello_ack_accept"),

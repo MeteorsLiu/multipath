@@ -1026,6 +1026,44 @@ func TestSendHandleHELLOACKMarksLaneReady(t *testing.T) {
 	}
 }
 
+func TestSendHandleHELLOACKUntracksReplacedTCPTarget(t *testing.T) {
+	in := New()
+	in.probeEvents = make(chan probe.Event, 8)
+	mustSendState(t, in, 99)
+
+	oldLeg := transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp-old"}
+	newLeg := transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp-new"}
+	lane := newLaneRuntime(3, 1)
+	lane.bindLeg(oldLeg)
+	startTestHELLORoute(t, in, 99, 3)
+	in.lanes[laneKey{sessionID: 99, laneID: 3}] = lane
+	in.trackProbeTarget(context.Background(), 99, 3, oldLeg)
+	readProbeEvent(t, in.probeEvents)
+
+	payload, err := protocol.Encode(protocol.Frame{
+		Type:      protocol.TypeHELLOACK,
+		SessionID: 99,
+		LaneID:    3,
+		Body:      protocol.HelloAckBody{Nonce: 0, Accepted: 1, Caps: protocol.CapTCPFallback},
+	}, nil)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	if err := writeTestControl(context.Background(), in, testEvent(newLeg, payload)); err != nil {
+		t.Fatalf("recv Write HELLO_ACK failed: %v", err)
+	}
+
+	if _, ok := in.probeKeys[newPingKey(oldLeg)]; ok {
+		t.Fatal("old TCP probe target still tracked")
+	}
+	if _, ok := in.probeKeys[newPingKey(newLeg)]; !ok {
+		t.Fatal("new TCP probe target was not tracked")
+	}
+	if !lane.tcpReady || lane.tcpLeg.ConnID != "tcp-new" {
+		t.Fatalf("tcp leg = ready %t leg %+v, want tcp-new ready", lane.tcpReady, lane.tcpLeg)
+	}
+}
+
 func TestSendHandleHELLOACKDropsNonceMismatch(t *testing.T) {
 	in := New()
 	mustSendState(t, in, 99)
@@ -1416,6 +1454,43 @@ func TestSendLegFailureMarksTCPNotReadyAndStartsFallback(t *testing.T) {
 	}
 	if got := streamTransport.dialed[0]; got != "127.0.0.1:4321" {
 		t.Fatalf("dialed remote = %q, want 127.0.0.1:4321", got)
+	}
+}
+
+func TestSendProbeTargetLostIgnoresStaleLeg(t *testing.T) {
+	streamTransport := &fakeStreamTransport{
+		dialLeg: transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp-next"},
+	}
+	in := New()
+	in.streamTransport = streamTransport
+	in.probeEvents = make(chan probe.Event, 8)
+	mustSendState(t, in, 99)
+	in.negotiatedCaps.Store(uint32(protocol.CapTCPFallback))
+
+	oldLeg := transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp-old"}
+	newLeg := transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp-new"}
+	lane := newLaneRuntime(3, 1)
+	lane.bindLeg(newLeg)
+	lane.tcpRemote = "127.0.0.1:4321"
+	in.lanes[laneKey{sessionID: 99, laneID: 3}] = lane
+	in.trackProbeTarget(context.Background(), 99, 3, oldLeg)
+	readProbeEvent(t, in.probeEvents)
+	target := in.probeKeys[newPingKey(oldLeg)]
+
+	if err := in.handleProbeEvent(context.Background(), probe.Event{Type: probe.EventTargetLost, Target: target}); err != nil {
+		t.Fatalf("handleProbeEvent failed: %v", err)
+	}
+	if !lane.tcpReady || lane.tcpLeg.ConnID != "tcp-new" {
+		t.Fatalf("tcp leg = ready %t leg %+v, want tcp-new ready", lane.tcpReady, lane.tcpLeg)
+	}
+	if lane.fallbackDialing {
+		t.Fatal("fallbackDialing = true after stale target loss")
+	}
+	if len(streamTransport.dialed) != 0 {
+		t.Fatalf("fallback dials = %d, want 0 for stale target loss", len(streamTransport.dialed))
+	}
+	if _, ok := in.probeKeys[newPingKey(oldLeg)]; ok {
+		t.Fatal("stale TCP probe target still tracked")
 	}
 }
 

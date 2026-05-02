@@ -23,6 +23,11 @@ type ProbeLoop struct {
 	timeout  time.Duration
 }
 
+const (
+	probeMaxLoss        = 5
+	probeRecoverSuccess = 3
+)
+
 func NewProbeLoop(sender *Send, configs ...ProbeLoopConfig) *ProbeLoop {
 	loop := &ProbeLoop{sender: sender}
 	for _, cfg := range configs {
@@ -81,8 +86,8 @@ func (l *ProbeLoop) Run(ctx context.Context) error {
 		runner := core.New(core.Config{
 			Interval:       l.interval,
 			Timeout:        l.timeout,
-			MaxLoss:        2,
-			RecoverSuccess: 1,
+			MaxLoss:        probeMaxLoss,
+			RecoverSuccess: probeRecoverSuccess,
 		})
 		start("core", func() error { return runner.Run(runCtx, l.events, runnerOut) })
 	}

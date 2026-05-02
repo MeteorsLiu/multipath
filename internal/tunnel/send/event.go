@@ -33,6 +33,17 @@ func logLaneHandshakeTimeout(sessionID uint64, laneID uint8, leg transport.LegRe
 	eventlog.Printf("lane_handshake_timeout", "session=%d lane=%d leg=%s timeout=%s ref={%s}", sessionID, laneID, kindMetricLabel(leg.Kind), timeout, debugLeg(leg))
 }
 
+func currentLegFromSnapshot(snap laneSnapshot, kind transport.Kind) transport.LegRef {
+	switch kind {
+	case transport.KindUDP:
+		return snap.udpLeg
+	case transport.KindTCP:
+		return snap.tcpLeg
+	default:
+		return transport.LegRef{}
+	}
+}
+
 func shouldLogLaneUp(before laneSnapshot, leg transport.LegRef) bool {
 	return !laneSnapshotReadyOnLeg(before, leg) || !sameLaneSnapshotLeg(before, leg)
 }

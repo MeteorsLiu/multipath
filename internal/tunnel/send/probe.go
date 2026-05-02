@@ -198,6 +198,11 @@ func (l *Send) handleProbeTargetLostWithReason(ctx context.Context, target probe
 	}
 	debuglog.Printf("send/probe", "target_lost target=%d leg={%s} before=%s", target, debugLeg(binding.leg), debugLaneState(key, lane))
 	before := lane.snapshot()
+	if !sameLaneSnapshotLeg(before, binding.leg) {
+		debuglog.Printf("send/probe", "target_lost_drop stale_leg target=%d session=%d lane=%d leg={%s}", target, binding.sessionID, binding.laneID, debugLeg(binding.leg))
+		l.untrackProbeTarget(ctx, binding.leg)
+		return nil
+	}
 	metrics.IncCounter(metrics.LaneEventsTotal,
 		metrics.L("event", "target_lost"),
 		metrics.L("session", key.sessionID),
