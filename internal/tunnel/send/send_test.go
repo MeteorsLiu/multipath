@@ -811,6 +811,59 @@ func TestSendRebootstrapsOnUnknownSessionCLOSE(t *testing.T) {
 	}
 }
 
+func TestSendIgnoresDuplicateUnknownSessionCLOSE(t *testing.T) {
+	in := New(Config{
+		BootstrapLanes: []BootstrapLane{
+			{
+				LaneID: 3,
+				Weight: 10,
+				Leg: transport.LegRef{
+					Kind:       transport.KindUDP,
+					EndpointID: "udp0",
+					RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
+				},
+			},
+		},
+	})
+	if err := in.bootstrap(context.Background()); err != nil {
+		t.Fatalf("bootstrap failed: %v", err)
+	}
+	first := readSendPayload(t, in)
+	firstFrame, err := protocol.Decode(first.Packet.Payload)
+	first.Packet.Release()
+	if err != nil {
+		t.Fatalf("Decode first HELLO: %v", err)
+	}
+
+	payload, err := protocol.Encode(protocol.Frame{
+		Type:      protocol.TypeCLOSE,
+		SessionID: firstFrame.SessionID,
+		LaneID:    protocol.SessionControlLaneID,
+		Body: protocol.CloseBody{
+			Scope:  protocol.CloseScopeSession,
+			Reason: protocol.CloseReasonUnknownSession,
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("Encode CLOSE: %v", err)
+	}
+	if err := writeTestControl(context.Background(), in, testEvent(transport.LegRef{}, payload)); err != nil {
+		t.Fatalf("first CLOSE failed: %v", err)
+	}
+	second := readSendPayload(t, in)
+	second.Packet.Release()
+
+	if err := writeTestControl(context.Background(), in, testEvent(transport.LegRef{}, payload)); err != nil {
+		t.Fatalf("duplicate CLOSE failed: %v", err)
+	}
+	select {
+	case payload := <-in.Packets():
+		payload.Packet.Release()
+		t.Fatalf("duplicate unknown-session CLOSE emitted extra payload on leg %+v", payload.Leg)
+	default:
+	}
+}
+
 func TestRecvHandleDATAWritesTUN(t *testing.T) {
 	tun := &recordTUNWriter{}
 	out := newTestRecv(t, nil)

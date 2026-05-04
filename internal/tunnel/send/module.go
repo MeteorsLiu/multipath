@@ -253,6 +253,15 @@ func (l *Send) activateSession(sessionID uint64) {
 	}
 }
 
+func (l *Send) deactivateSessionIfActive(sessionID uint64) bool {
+	if !l.activeSessionID.CompareAndSwap(sessionID, 0) {
+		return false
+	}
+	l.hasActiveSession.Store(false)
+	l.activeSendState.Store(nil)
+	return true
+}
+
 // activeSession returns the active session id and whether it is set.
 func (l *Send) activeSession() (uint64, bool) {
 	return l.activeSessionID.Load(), l.hasActiveSession.Load()

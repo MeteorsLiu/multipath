@@ -199,12 +199,8 @@ func (i *Send) close(ctx context.Context, sessionID uint64, laneID uint8, scope 
 	case protocol.CloseScopeLane:
 		i.closeLane(ctx, laneKey{sessionID: sessionID, laneID: laneID})
 	case protocol.CloseScopeSession:
+		wasActive := i.deactivateSessionIfActive(sessionID)
 		i.deleteSessionState(sessionID)
-		if active, ok := i.activeSession(); ok && active == sessionID {
-			i.hasActiveSession.Store(false)
-			i.activeSessionID.Store(0)
-			i.activeSendState.Store(nil)
-		}
 		// Snapshot lane keys for this session.
 		i.lanesMu.RLock()
 		keys := make([]laneKey, 0, len(i.lanes))
@@ -218,7 +214,7 @@ func (i *Send) close(ctx context.Context, sessionID uint64, laneID uint8, scope 
 			i.closeLane(ctx, key)
 		}
 		i.deleteRunnableLanesCache(sessionID)
-		if reason == protocol.CloseReasonUnknownSession {
+		if reason == protocol.CloseReasonUnknownSession && wasActive {
 			return i.bootstrapNewSession(ctx, "rebootstrap")
 		}
 	}
