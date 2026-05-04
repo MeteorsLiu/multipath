@@ -1074,6 +1074,59 @@ func TestSendHandleHELLOCreatesLaneAndRepliesOnObservedLeg(t *testing.T) {
 	}
 }
 
+func TestSendHandleHELLOPreservesOtherLegProbeTarget(t *testing.T) {
+	in := New()
+	in.probeEvents = make(chan probe.Event, 8)
+	mustSendState(t, in, 99)
+
+	udpLeg := transport.LegRef{
+		Kind:       transport.KindUDP,
+		EndpointID: "udp0",
+		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
+	}
+	oldTCP := transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp-old"}
+	newTCP := transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp-new"}
+
+	lane := newLaneRuntime(3, 1)
+	lane.bindLeg(udpLeg)
+	lane.bindLeg(oldTCP)
+	in.lanes[laneKey{sessionID: 99, laneID: 3}] = lane
+	in.trackProbeTarget(context.Background(), 99, 3, udpLeg)
+	in.trackProbeTarget(context.Background(), 99, 3, oldTCP)
+
+	payload, err := protocol.Encode(protocol.Frame{
+		Type:      protocol.TypeHELLO,
+		SessionID: 99,
+		LaneID:    3,
+		Body: protocol.HelloBody{
+			Nonce: 123,
+			Caps:  protocol.CapTCPFallback,
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+
+	if err := writeTestControl(context.Background(), in, testEvent(newTCP, payload)); err != nil {
+		t.Fatalf("recv Write HELLO failed: %v", err)
+	}
+	written := readSendPayload(t, in)
+	written.Packet.Release()
+
+	if _, ok := in.probeKeys[newPingKey(udpLeg)]; !ok {
+		t.Fatal("UDP probe target was untracked by TCP HELLO")
+	}
+	if _, ok := in.probeKeys[newPingKey(oldTCP)]; ok {
+		t.Fatal("old TCP probe target still tracked")
+	}
+	if _, ok := in.probeKeys[newPingKey(newTCP)]; !ok {
+		t.Fatal("new TCP probe target was not tracked")
+	}
+	if !lane.udpReady || !lane.tcpReady {
+		t.Fatalf("lane readiness = udp %t tcp %t, want both ready", lane.udpReady, lane.tcpReady)
+	}
+}
+
 func TestSendHandleHELLORejectsSessionControlLaneID(t *testing.T) {
 	in := New()
 
