@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -861,6 +862,79 @@ func TestSendIgnoresDuplicateUnknownSessionCLOSE(t *testing.T) {
 		payload.Packet.Release()
 		t.Fatalf("duplicate unknown-session CLOSE emitted extra payload on leg %+v", payload.Leg)
 	default:
+	}
+}
+
+func TestSendDeduplicatesConcurrentUnknownSessionCLOSE(t *testing.T) {
+	in := New(Config{
+		BootstrapLanes: []BootstrapLane{
+			{
+				LaneID: 3,
+				Weight: 10,
+				Leg: transport.LegRef{
+					Kind:       transport.KindUDP,
+					EndpointID: "udp0",
+					RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
+				},
+			},
+		},
+	})
+	if err := in.bootstrap(context.Background()); err != nil {
+		t.Fatalf("bootstrap failed: %v", err)
+	}
+	first := readSendPayload(t, in)
+	firstFrame, err := protocol.Decode(first.Packet.Payload)
+	first.Packet.Release()
+	if err != nil {
+		t.Fatalf("Decode first HELLO: %v", err)
+	}
+
+	payload, err := protocol.Encode(protocol.Frame{
+		Type:      protocol.TypeCLOSE,
+		SessionID: firstFrame.SessionID,
+		LaneID:    protocol.SessionControlLaneID,
+		Body: protocol.CloseBody{
+			Scope:  protocol.CloseScopeSession,
+			Reason: protocol.CloseReasonUnknownSession,
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("Encode CLOSE: %v", err)
+	}
+
+	const workers = 16
+	start := make(chan struct{})
+	errCh := make(chan error, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			errCh <- writeTestControl(context.Background(), in, testEvent(transport.LegRef{}, payload))
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("concurrent CLOSE failed: %v", err)
+		}
+	}
+
+	var bootstraps int
+	for {
+		select {
+		case payload := <-in.Packets():
+			bootstraps++
+			payload.Packet.Release()
+		default:
+			if bootstraps != 1 {
+				t.Fatalf("rebootstrap payloads = %d, want 1", bootstraps)
+			}
+			return
+		}
 	}
 }
 
