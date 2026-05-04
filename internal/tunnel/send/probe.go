@@ -11,7 +11,11 @@ import (
 	probe "github.com/MeteorsLiu/multipath/internal/tunnel/probe/core"
 )
 
-const maxFallbackDialTimeout = time.Second
+const (
+	maxFallbackDialTimeout     = time.Second
+	fallbackDialInitialBackoff = 5 * time.Second
+	fallbackDialMaxBackoff     = 30 * time.Second
+)
 
 type pingKey struct {
 	kind       transport.Kind
@@ -57,7 +61,7 @@ func (l *Send) maybeStartFallbackDial(ctx context.Context, key laneKey, lane *la
 
 func (l *Send) startFallbackDial(ctx context.Context, key laneKey, lane *laneRuntime) {
 	streamAvailable := l.streamTransport != nil
-	remote, started := lane.tryStartFallback(streamAvailable)
+	remote, started := lane.tryStartFallback(streamAvailable, time.Now())
 	if !started {
 		debuglog.Printf("send/probe", "fallback_dial_skip %s stream_nil=%t", debugLaneState(key, lane), !streamAvailable)
 		return
@@ -100,7 +104,7 @@ func (l *Send) handleFallbackDialResult(ctx context.Context, result fallbackDial
 		return nil
 	}
 	if result.err != nil {
-		lane.clearFallbackDialing()
+		lane.recordFallbackFailure(time.Now())
 		debuglog.Printf("send/probe", "fallback_result_err %s err=%v", debugLaneState(result.key, lane), result.err)
 		logTCPReconnectFailed(result.key.sessionID, result.key.laneID, result.remote, result.err)
 		metrics.IncCounter(metrics.LaneEventsTotal,
@@ -142,6 +146,9 @@ func (l *Send) handleFallbackDialResult(ctx context.Context, result fallbackDial
 		Caps:       caps,
 		FECProfile: fecProfile,
 	})
+	if err != nil {
+		lane.recordFallbackFailure(time.Now())
+	}
 	return err
 }
 

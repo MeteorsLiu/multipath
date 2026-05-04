@@ -30,6 +30,8 @@ type laneRuntime struct {
 	helloCaps       uint16
 	helloFECProfile uint8
 	fallbackDialing bool
+	fallbackBackoff time.Duration
+	fallbackRetryAt time.Time
 
 	udpQuality legQualityTracker
 	tcpQuality legQualityTracker
@@ -46,6 +48,7 @@ type laneSnapshot struct {
 	helloCaps       uint16
 	helloFECProfile uint8
 	fallbackDialing bool
+	fallbackRetryAt time.Time
 }
 
 func newLaneRuntime(id uint8, weight uint32) *laneRuntime {
@@ -201,10 +204,11 @@ func (l *laneRuntime) helloProfile() (uint16, uint8) {
 // tryStartFallback atomically checks the lane is eligible for a TCP fallback
 // dial and, if so, marks the lane as currently dialing. It returns the
 // remembered tcp remote and true on success, or empty/false otherwise.
-func (l *laneRuntime) tryStartFallback(streamAvailable bool) (string, bool) {
+func (l *laneRuntime) tryStartFallback(streamAvailable bool, now time.Time) (string, bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if !streamAvailable || l.fallbackDialing || l.udpReady || l.tcpReady || l.tcpRemote == "" {
+	if !streamAvailable || l.fallbackDialing || l.udpReady || l.tcpReady || l.tcpRemote == "" ||
+		(!l.fallbackRetryAt.IsZero() && now.Before(l.fallbackRetryAt)) {
 		return "", false
 	}
 	l.fallbackDialing = true
@@ -214,6 +218,31 @@ func (l *laneRuntime) tryStartFallback(streamAvailable bool) (string, bool) {
 func (l *laneRuntime) clearFallbackDialing() {
 	l.mu.Lock()
 	l.fallbackDialing = false
+	l.mu.Unlock()
+}
+
+func (l *laneRuntime) recordFallbackFailure(now time.Time) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.fallbackDialing = false
+	backoff := l.fallbackBackoff
+	if backoff <= 0 {
+		backoff = fallbackDialInitialBackoff
+	} else {
+		backoff *= 2
+		if backoff > fallbackDialMaxBackoff {
+			backoff = fallbackDialMaxBackoff
+		}
+	}
+	l.fallbackBackoff = backoff
+	l.fallbackRetryAt = now.Add(backoff)
+}
+
+func (l *laneRuntime) resetFallbackFailure() {
+	l.mu.Lock()
+	l.fallbackDialing = false
+	l.fallbackBackoff = 0
+	l.fallbackRetryAt = time.Time{}
 	l.mu.Unlock()
 }
 
@@ -236,5 +265,6 @@ func (l *laneRuntime) snapshot() laneSnapshot {
 		helloCaps:       l.helloCaps,
 		helloFECProfile: l.helloFECProfile,
 		fallbackDialing: l.fallbackDialing,
+		fallbackRetryAt: l.fallbackRetryAt,
 	}
 }

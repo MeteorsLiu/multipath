@@ -639,6 +639,15 @@ func TestSendRetryFallbackDialsAfterDialError(t *testing.T) {
 	}
 
 	in.retryFallbackDials(context.Background())
+	time.Sleep(10 * time.Millisecond)
+	if len(streamTransport.dialed) != 1 {
+		t.Fatalf("fallback dials = %d, want 1 during backoff", len(streamTransport.dialed))
+	}
+
+	lane.mu.Lock()
+	lane.fallbackRetryAt = time.Now().Add(-time.Millisecond)
+	lane.mu.Unlock()
+	in.retryFallbackDials(context.Background())
 	waitForDialCount(t, streamTransport, 2)
 }
 
@@ -1128,6 +1137,12 @@ func TestSendHandlePINGRepliesWithPONGOnObservedLeg(t *testing.T) {
 	defer written.Packet.Release()
 	if written.Leg.EndpointID != "udp0" || written.Leg.RemoteAddr.String() != "127.0.0.1:1234" {
 		t.Fatalf("reply leg = %+v, want udp0/127.0.0.1:1234", written.Leg)
+	}
+	if lane.udpReady {
+		t.Fatal("PING marked UDP ready; readiness must be driven by HELLO_ACK or probe recovery")
+	}
+	if got := in.runnableLanes(99); len(got) != 0 {
+		t.Fatalf("runnable lanes after PING = %d, want 0", len(got))
 	}
 
 	frame, err := protocol.Decode(written.Packet.Payload)

@@ -106,7 +106,11 @@ func (i *Send) acceptHelloAck(ctx context.Context, sessionID uint64, laneID uint
 	before := lane.snapshot()
 	oldLeg := currentLegFromSnapshot(before, leg.Kind)
 	lane.observeLeg(leg)
-	lane.clearFallbackDialing()
+	if leg.Kind == transport.KindTCP {
+		lane.resetFallbackFailure()
+	} else {
+		lane.clearFallbackDialing()
+	}
 	i.markRunnableLanesDirty(sessionID)
 	if oldLeg.Kind != 0 && newPingKey(oldLeg) != newPingKey(leg) {
 		i.untrackProbeTarget(ctx, oldLeg)
@@ -135,8 +139,6 @@ func (i *Send) receivePing(ctx context.Context, sessionID uint64, laneID uint8, 
 		debuglog.Printf("send/control", "ping_drop missing_lane session=%d lane=%d ping_id=%d", sessionID, laneID, body.PingID)
 		return nil
 	}
-	lane.observeLeg(leg)
-	i.markRunnableLanesDirty(sessionID)
 	debuglog.Printf("send/control", "ping session=%d lane=%d ping_id=%d leg={%s}", sessionID, laneID, body.PingID, debugLeg(leg))
 	return i.writeControlFrameOnLeg(ctx, leg, protocol.Frame{
 		Type:      protocol.TypePONG,

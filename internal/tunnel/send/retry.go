@@ -113,7 +113,7 @@ func (l *Send) retryOpenHELLO(ctx context.Context, nowMS uint64) error {
 				if l.streamTransport != nil && leg.ConnID != "" {
 					_ = l.streamTransport.Close(ctx, leg.ConnID)
 				}
-				lane.clearFallbackDialing()
+				lane.recordFallbackFailure(time.Now())
 			}
 			continue
 		}
