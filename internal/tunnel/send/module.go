@@ -56,6 +56,7 @@ type Send struct {
 	probeEvents         chan probe.Event
 	packets             chan transport.Payload
 	bootstrapLanes      []BootstrapLane
+	legController       legController
 
 	// Mutable but lock-free.
 	fecCodec  fecCodec

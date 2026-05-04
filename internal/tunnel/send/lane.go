@@ -204,10 +204,10 @@ func (l *laneRuntime) helloProfile() (uint16, uint8) {
 // tryStartFallback atomically checks the lane is eligible for a TCP fallback
 // dial and, if so, marks the lane as currently dialing. It returns the
 // remembered tcp remote and true on success, or empty/false otherwise.
-func (l *laneRuntime) tryStartFallback(streamAvailable bool, now time.Time) (string, bool) {
+func (l *laneRuntime) tryStartFallback(streamAvailable bool, now time.Time, allowUDPReady bool) (string, bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if !streamAvailable || l.fallbackDialing || l.udpReady || l.tcpReady || l.tcpRemote == "" ||
+	if !streamAvailable || l.fallbackDialing || (!allowUDPReady && l.udpReady) || l.tcpReady || l.tcpRemote == "" ||
 		(!l.fallbackRetryAt.IsZero() && now.Before(l.fallbackRetryAt)) {
 		return "", false
 	}

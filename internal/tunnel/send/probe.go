@@ -11,12 +11,6 @@ import (
 	probe "github.com/MeteorsLiu/multipath/internal/tunnel/probe/core"
 )
 
-const (
-	maxFallbackDialTimeout     = time.Second
-	fallbackDialInitialBackoff = 5 * time.Second
-	fallbackDialMaxBackoff     = 30 * time.Second
-)
-
 type pingKey struct {
 	kind       transport.Kind
 	endpointID string
@@ -47,7 +41,7 @@ func (l *Send) sendPING(ctx context.Context, sessionID uint64, laneID uint8, leg
 func (l *Send) maybeStartFallbackDial(ctx context.Context, key laneKey, lane *laneRuntime) {
 	_, _, ok := l.getSessionState(key.sessionID)
 	caps := uint16(l.negotiatedCaps.Load())
-	if !ok || caps&protocol.CapTCPFallback == 0 {
+	if !l.legController.fallbackEnabled(ok, caps) {
 		debuglog.Printf("send/probe", "fallback_skip session=%d lane=%d session_nil=%t caps=%#x", key.sessionID, key.laneID, !ok, func() uint16 {
 			if !ok {
 				return 0
@@ -61,13 +55,13 @@ func (l *Send) maybeStartFallbackDial(ctx context.Context, key laneKey, lane *la
 
 func (l *Send) startFallbackDial(ctx context.Context, key laneKey, lane *laneRuntime) {
 	streamAvailable := l.streamTransport != nil
-	remote, started := lane.tryStartFallback(streamAvailable, time.Now())
+	remote, started := l.legController.tryStartFallback(lane, streamAvailable, time.Now())
 	if !started {
 		debuglog.Printf("send/probe", "fallback_dial_skip %s stream_nil=%t", debugLaneState(key, lane), !streamAvailable)
 		return
 	}
 
-	timeout := l.fallbackDialTimeout()
+	timeout := l.legController.fallbackDialTimeout(l.probeTimeout)
 	debuglog.Printf("send/probe", "fallback_dial_start session=%d lane=%d remote=%s timeout=%s", key.sessionID, key.laneID, remote, timeout)
 	logTCPReconnectStart(key.sessionID, key.laneID, remote)
 	metrics.IncCounter(metrics.LaneEventsTotal,
@@ -88,13 +82,6 @@ func (l *Send) startFallbackDial(ctx context.Context, key laneKey, lane *laneRun
 			err:    err,
 		})
 	}()
-}
-
-func (l *Send) fallbackDialTimeout() time.Duration {
-	if l.probeTimeout > 0 && l.probeTimeout < maxFallbackDialTimeout {
-		return l.probeTimeout
-	}
-	return maxFallbackDialTimeout
 }
 
 func (l *Send) handleFallbackDialResult(ctx context.Context, result fallbackDialResult) error {
@@ -293,7 +280,7 @@ func (l *Send) retryFallbackDials(ctx context.Context) {
 	if !ok {
 		return
 	}
-	if uint16(l.negotiatedCaps.Load())&protocol.CapTCPFallback == 0 {
+	if !l.legController.fallbackEnabled(true, uint16(l.negotiatedCaps.Load())) {
 		return
 	}
 

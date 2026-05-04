@@ -652,6 +652,71 @@ func TestSendRetryFallbackDialsAfterDialError(t *testing.T) {
 	waitForDialCount(t, streamTransport, 2)
 }
 
+func TestSendRetryFallbackDialsSkipsHealthyUDP(t *testing.T) {
+	streamTransport := &fakeStreamTransport{
+		dialLeg: transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp0"},
+	}
+	in := New()
+	in.streamTransport = streamTransport
+	in.negotiatedCaps.Store(uint32(protocol.CapTCPFallback))
+	mustSendState(t, in, 99)
+	in.activateSession(99)
+
+	lane := newLaneRuntime(3, 10)
+	lane.bindLeg(transport.LegRef{
+		Kind:       transport.KindUDP,
+		EndpointID: "udp0",
+		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
+	})
+	lane.setTCPRemote("127.0.0.1:4321")
+	in.lanes[laneKey{sessionID: 99, laneID: 3}] = lane
+
+	in.retryFallbackDials(context.Background())
+	time.Sleep(10 * time.Millisecond)
+	if len(streamTransport.dialed) != 0 {
+		t.Fatalf("fallback dials = %d, want 0 while UDP is healthy", len(streamTransport.dialed))
+	}
+}
+
+func TestSendRetryFallbackDialsWarmsTCPWhenUDPDegraded(t *testing.T) {
+	streamTransport := &fakeStreamTransport{
+		dialLeg: transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp0"},
+	}
+	in := New()
+	in.streamTransport = streamTransport
+	in.negotiatedCaps.Store(uint32(protocol.CapTCPFallback))
+	mustSendState(t, in, 99)
+	in.activateSession(99)
+
+	lane := newLaneRuntime(3, 10)
+	udpLeg := transport.LegRef{
+		Kind:       transport.KindUDP,
+		EndpointID: "udp0",
+		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
+	}
+	lane.bindLeg(udpLeg)
+	lane.recordDelivery(transport.KindUDP, false)
+	lane.setTCPRemote("127.0.0.1:4321")
+	in.lanes[laneKey{sessionID: 99, laneID: 3}] = lane
+
+	in.retryFallbackDials(context.Background())
+	waitForDialCount(t, streamTransport, 1)
+	written := readSendPayload(t, in)
+	defer written.Packet.Release()
+	if got := streamTransport.dialed[0]; got != "127.0.0.1:4321" {
+		t.Fatalf("dialed remote = %q, want 127.0.0.1:4321", got)
+	}
+	if written.Leg.Kind != transport.KindTCP || written.Leg.ConnID != "tcp0" {
+		t.Fatalf("warm fallback HELLO leg = %+v, want TCP tcp0", written.Leg)
+	}
+	if !lane.udpReady {
+		t.Fatal("warm fallback marked UDP not ready")
+	}
+	if lane.tcpReady {
+		t.Fatal("TCP ready before warm fallback HELLO_ACK")
+	}
+}
+
 func TestSendStartLaneRejectsZeroWeight(t *testing.T) {
 	in := New()
 	err := in.startLane(context.Background(), startLaneConfig{
