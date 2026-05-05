@@ -70,6 +70,7 @@ PORT_FEC_LOADED_LATENCY=5013
 PORT_LEG_SELECTOR=5014
 PORT_SERVER_RESTART=5015
 PORT_BW_PROBE_CONVERGENCE=5016
+PORT_BW_PROBE_GUARD=5017
 
 PATH1_C="10.201.1.1/24"
 PATH1_S="10.201.1.2/24"
@@ -922,6 +923,72 @@ run_bandwidth_probe_convergence_case() {
   echo "==== ${name} e2e end ===="
 }
 
+read_netdev_counters() {
+  local ns="$1"
+  local dev="$2"
+  ip netns exec "${ns}" awk -v dev="${dev}:" '
+    $1 == dev {
+      print $10, $11
+      exit
+    }
+  ' /proc/net/dev
+}
+
+assert_bandwidth_probe_egress_below() {
+  local label="$1"
+  local ns="$2"
+  local dev="$3"
+  local seconds="$4"
+  local max_mbps="$5"
+  local max_kpps="$6"
+  local before after before_bytes before_packets after_bytes after_packets
+
+  before="$(read_netdev_counters "${ns}" "${dev}")"
+  read -r before_bytes before_packets <<<"${before}"
+  sleep "${seconds}"
+  after="$(read_netdev_counters "${ns}" "${dev}")"
+  read -r after_bytes after_packets <<<"${after}"
+
+  if [[ -z "${before_bytes}" || -z "${before_packets}" || -z "${after_bytes}" || -z "${after_packets}" ]]; then
+    fail "${label}" "could not read egress counters for ${ns}/${dev}"
+    return 1
+  fi
+
+  local delta_bytes=$((after_bytes - before_bytes))
+  local delta_packets=$((after_packets - before_packets))
+  if (( delta_bytes < 0 || delta_packets < 0 )); then
+    fail "${label}" "egress counters went backwards for ${ns}/${dev}"
+    return 1
+  fi
+
+  local mbps kpps
+  mbps="$(awk -v bytes="${delta_bytes}" -v seconds="${seconds}" 'BEGIN { printf "%.2f", bytes * 8 / seconds / 1000000 }')"
+  kpps="$(awk -v packets="${delta_packets}" -v seconds="${seconds}" 'BEGIN { printf "%.2f", packets / seconds / 1000 }')"
+  echo "[${label}] egress sample dev=${dev} seconds=${seconds} bytes=${delta_bytes} packets=${delta_packets} mbps=${mbps} kpps=${kpps}"
+
+  if awk -v mbps="${mbps}" -v kpps="${kpps}" -v max_mbps="${max_mbps}" -v max_kpps="${max_kpps}" 'BEGIN { exit !(mbps <= max_mbps && kpps <= max_kpps) }'; then
+    pass "${label}" "bandwidth probe egress stayed below ${max_mbps}Mbps/${max_kpps}Kpps"
+  else
+    fail "${label}" "bandwidth probe egress ${mbps}Mbps/${kpps}Kpps exceeded ${max_mbps}Mbps/${max_kpps}Kpps"
+    return 1
+  fi
+}
+
+run_bandwidth_probe_egress_guard_case() {
+  local name="bandwidth-probe-egress-guard"
+  echo "==== ${name} e2e start ===="
+  clear_loss
+  write_one_lane_config "${name}" "${PORT_BW_PROBE_GUARD}" false false 200 1000
+  start_multipath "${name}"
+  wait_ping_ok "${name} baseline" 12
+  wait_bandwidth_probe_additive_ramp "${name}" "${CURRENT_CLIENT_LOG}" 0 8 "client UDP bandwidth probe used additive ramp"
+  assert_bandwidth_probe_egress_below "${name}" "${NS_C}" "${VETHC1}" 3 200 30
+
+  stop_multipath
+  clear_loss
+  echo "==== ${name} e2e end ===="
+}
+
 run_nat_case() {
   local name="nat"
   echo "==== ${name} e2e start ===="
@@ -1595,6 +1662,7 @@ run_server_restart_reconnect_case
 run_fallback_dial_error_case
 run_leg_selector_case
 run_bandwidth_probe_convergence_case
+run_bandwidth_probe_egress_guard_case
 run_nat_case
 run_fec_comparison
 run_fec_tcp_fallback_case
