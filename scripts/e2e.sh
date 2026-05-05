@@ -1030,8 +1030,16 @@ wait_log_file_pattern_while_ping() {
       return 1
     fi
     ping_once || true
+    if [[ -f "${log_file}" ]] && tail -n "+$((start_line + 1))" "${log_file}" | grep -E -q "${pattern}"; then
+      pass "${label}" "${message}"
+      return 0
+    fi
     sleep 0.2
   done
+  if [[ -f "${log_file}" ]] && tail -n "+$((start_line + 1))" "${log_file}" | grep -E -q "${pattern}"; then
+    pass "${label}" "${message}"
+    return 0
+  fi
   fail "${label}" "${message}: pattern not seen within ${timeout}s: ${pattern}"
   return 1
 }
