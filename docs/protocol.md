@@ -602,11 +602,15 @@ Sender behavior:
    bandwidth sampling.
 2. Use `seq = 0..count-1` inside one `probe_id`.
 3. Pace probe frames according to the current probe rate. Do not send a large
-   unpaced burst.
+   unpaced burst. UDP probe payloads should remain data-plane/MTU sized; TCP
+   probe payloads may be larger stream frames so the ramp can put enough bytes
+   in flight to measure stream capacity.
 4. Increase the next probe rate multiplicatively after low-loss rounds and
    immediately schedule the next round.
 5. Complete the ramp when loss or delay inflation becomes significant, or when
    delivered bandwidth stops increasing meaningfully across higher-rate rounds.
+   TCP should not complete on an early plateau before enough successful ramp
+   rounds have been sent to exercise the stream.
 6. Do not keep sending periodic bandwidth probes after a leg's ramp completes.
    A new concrete leg may start a new ramp.
 
@@ -644,8 +648,8 @@ Sender behavior:
    bandwidth sample.
 5. Feed the sample into per-leg bandwidth EWMA and leg selection policy.
 6. When both UDP and TCP legs for a lane have completed their bandwidth-probe
-   ramps, emit a lane-level decision describing whether UDP is QoS-limited and
-   which leg should carry DATA.
+   ramps, emit a lane-level decision describing whether UDP showed QoS/limit
+   evidence, whether TCP measured better, and which leg should carry DATA.
 
 Receiver behavior:
 
@@ -756,8 +760,8 @@ Recommended sender behavior:
 5. Record the last stable UDP bandwidth sample into an EWMA.
 6. Record a TCP bandwidth EWMA from TCP probing or transport TCP_INFO where
    available.
-7. Treat UDP as QoS-limited only when TCP bandwidth is materially higher than
-   UDP bandwidth and the UDP sample has loss or delay-inflation evidence.
+7. Treat UDP as QoS-limited when the UDP sample has loss or delay-inflation
+   evidence. Select TCP only when TCP's measured bandwidth is better than UDP's.
 
 The bandwidth probe is an initial capacity classification, not a continuous
 monitor. A QoS decision requires bandwidth samples for both UDP and TCP. Once a

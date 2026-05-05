@@ -264,7 +264,7 @@ func TestEndToEndBandwidthProbeSelectsTCPWhenUDPQoSLimited(t *testing.T) {
 
 	waitForE2ELane(t, clientIn, key, func(lane *laneRuntime) bool {
 		_, udpQ, _, tcpQ := lane.legQualities()
-		return udpQ.BandwidthQoSLimited && tcpQ.ProbeSamples >= minBandwidthProbeSamples
+		return udpQ.BandwidthQoSLimited && udpQ.BandwidthPreferTCP && tcpQ.ProbeSamples >= minBandwidthProbeSamples
 	}, 5*time.Second)
 
 	serverConn.dropData.Store(true)
@@ -272,7 +272,7 @@ func TestEndToEndBandwidthProbeSelectsTCPWhenUDPQoSLimited(t *testing.T) {
 
 	waitForE2ELane(t, serverIn, key, func(lane *laneRuntime) bool {
 		_, udpQ, _, tcpQ := lane.legQualities()
-		return udpQ.BandwidthQoSLimited && tcpQ.ProbeSamples >= minBandwidthProbeSamples
+		return udpQ.BandwidthQoSLimited && udpQ.BandwidthPreferTCP && tcpQ.ProbeSamples >= minBandwidthProbeSamples
 	}, 5*time.Second)
 
 	clientConn.dropData.Store(true)

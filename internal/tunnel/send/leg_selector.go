@@ -13,6 +13,7 @@ type LegQuality struct {
 	ProbeLoss           float64
 	ProbeSamples        uint32
 	BandwidthQoSLimited bool
+	BandwidthPreferTCP  bool
 }
 
 type LegSelector interface {
@@ -47,7 +48,7 @@ func (QualityLegSelector) Pick(udp, tcp LegQuality) (useUDP bool, ok bool) {
 		return false, true
 	}
 
-	if udp.BandwidthQoSLimited && tcp.ProbeSamples >= minBandwidthProbeSamples {
+	if udp.BandwidthPreferTCP && tcp.ProbeSamples >= minBandwidthProbeSamples {
 		return false, true
 	}
 

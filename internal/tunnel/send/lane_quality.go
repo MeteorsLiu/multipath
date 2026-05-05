@@ -8,8 +8,7 @@ import (
 
 const (
 	minBandwidthProbeSamples    = 1
-	bandwidthProbeLossThreshold = 0.05
-	bandwidthProbeTCPRatio      = 2
+	bandwidthProbeLossThreshold = 0.01
 )
 
 type laneQualityState struct {
@@ -38,6 +37,7 @@ func (q *laneQualityState) legQualities(input laneQualityInput) (LegQuality, Leg
 			ProbeLoss:           udpBW.ProbeLoss,
 			ProbeSamples:        udpBW.ProbeSamples,
 			BandwidthQoSLimited: udpBW.BandwidthQoSLimited,
+			BandwidthPreferTCP:  udpBW.BandwidthPreferTCP,
 		}, LegQuality{
 			Active:       input.tcpActive,
 			DeliveryRate: q.tcpDelivery.deliveryRate(),
@@ -70,6 +70,7 @@ type bandwidthQualityState struct {
 	tcpProbeLoss    float64
 	tcpProbeSamples uint32
 	qosLimited      bool
+	preferTCP       bool
 }
 
 func (q *bandwidthQualityState) legQualities() (LegQuality, LegQuality) {
@@ -78,6 +79,7 @@ func (q *bandwidthQualityState) legQualities() (LegQuality, LegQuality) {
 			ProbeLoss:           q.udpProbeLoss,
 			ProbeSamples:        q.udpProbeSamples,
 			BandwidthQoSLimited: q.qosLimited,
+			BandwidthPreferTCP:  q.preferTCP,
 		}, LegQuality{
 			BandwidthBps: q.tcpBandwidthBps,
 			ProbeLoss:    q.tcpProbeLoss,
@@ -106,8 +108,8 @@ func (q *bandwidthQualityState) updateQoSState() {
 		q.udpBandwidthBps == 0 || q.tcpBandwidthBps == 0 {
 		return
 	}
-	q.qosLimited = q.udpProbeLoss >= bandwidthProbeLossThreshold &&
-		q.tcpBandwidthBps/bandwidthProbeTCPRatio >= q.udpBandwidthBps
+	q.qosLimited = q.udpProbeLoss >= bandwidthProbeLossThreshold
+	q.preferTCP = q.qosLimited && q.tcpBandwidthBps > q.udpBandwidthBps
 }
 
 func bandwidthLossEWMA(old, sample float64, samples uint32) float64 {

@@ -12,13 +12,15 @@ import (
 )
 
 const (
-	bandwidthProbeTimeout     = time.Second
-	bandwidthProbeRoundWindow = 200 * time.Millisecond
-	bandwidthProbePayloadSize = 1200
-	bandwidthProbeMinRateBps  = uint64(1_000_000)
-	bandwidthProbeMaxFrames   = 64
-	bandwidthProbePlateauGain = 10
-	bandwidthProbePlateauNeed = 2
+	bandwidthProbeTimeout        = time.Second
+	bandwidthProbeRoundWindow    = 200 * time.Millisecond
+	bandwidthProbeUDPPayloadSize = 1200
+	bandwidthProbeTCPPayloadSize = 32 * 1024
+	bandwidthProbeMinRateBps     = uint64(1_000_000)
+	bandwidthProbeMaxFrames      = 64
+	bandwidthProbePlateauGain    = 10
+	bandwidthProbePlateauNeed    = 2
+	bandwidthProbeTCPMinRounds   = 8
 )
 
 type bandwidthLegState struct {
@@ -28,6 +30,7 @@ type bandwidthLegState struct {
 	inFlight     bool
 	complete     bool
 	plateauCount uint8
+	sampleCount  uint8
 	lastLoss     float64
 }
 
@@ -119,14 +122,18 @@ func (l *Send) maybeStartBandwidthProbe(ctx context.Context, key laneKey, leg tr
 	if rateBps == 0 {
 		rateBps = bandwidthProbeMinRateBps
 	}
-	count := probeFrameCount(rateBps)
+	payloadBytes := bandwidthProbeUDPPayloadSize
+	if leg.Kind == transport.KindTCP {
+		payloadBytes = bandwidthProbeTCPPayloadSize
+	}
+	count := probeFrameCount(rateBps, payloadBytes)
 	round := &bandwidthProbeRound{
 		key:          key,
 		leg:          leg,
 		legKey:       legKey,
 		probeID:      probeID,
 		count:        count,
-		payloadBytes: bandwidthProbePayloadSize,
+		payloadBytes: payloadBytes,
 		rateBps:      rateBps,
 		startedAt:    now,
 	}
@@ -134,13 +141,13 @@ func (l *Send) maybeStartBandwidthProbe(ctx context.Context, key laneKey, leg tr
 	l.bandwidthPending[probeID] = round
 	l.bandwidthMu.Unlock()
 
-	debuglog.Printf("send/bw_probe", "start session=%d lane=%d leg={%s} probe_id=%d rate_bps=%d count=%d payload=%d", key.sessionID, key.laneID, debugLeg(leg), probeID, rateBps, count, bandwidthProbePayloadSize)
+	debuglog.Printf("send/bw_probe", "start session=%d lane=%d leg={%s} probe_id=%d rate_bps=%d count=%d payload=%d", key.sessionID, key.laneID, debugLeg(leg), probeID, rateBps, count, payloadBytes)
 	go l.runBandwidthProbeRound(ctx, round)
 }
 
-func probeFrameCount(rateBps uint64) uint16 {
+func probeFrameCount(rateBps uint64, payloadBytes int) uint16 {
 	bytesPerRound := rateBps * uint64(bandwidthProbeRoundWindow) / uint64(time.Second) / 8
-	count := bytesPerRound / bandwidthProbePayloadSize
+	count := bytesPerRound / uint64(payloadBytes)
 	if count < 2 {
 		count = 2
 	}
@@ -301,6 +308,7 @@ func (l *Send) finishBandwidthProbe(probeID uint64) {
 	state.ewmaBps = ewmaBandwidth(state.ewmaBps, sampleBps)
 	state.lastLoss = loss
 	state.inFlight = false
+	state.sampleCount++
 	if acked > 0 && loss < 0.05 {
 		if samplePlateau(state.bestSample, sampleBps) {
 			state.plateauCount++
@@ -311,7 +319,8 @@ func (l *Send) finishBandwidthProbe(probeID uint64) {
 			state.bestSample = sampleBps
 			state.plateauCount = 0
 		}
-		if state.plateauCount >= bandwidthProbePlateauNeed {
+		canCompleteOnPlateau := round.leg.Kind != transport.KindTCP || state.sampleCount >= bandwidthProbeTCPMinRounds
+		if state.plateauCount >= bandwidthProbePlateauNeed && canCompleteOnPlateau {
 			state.complete = true
 		} else {
 			next := state.nextRateBps * 2
@@ -335,6 +344,7 @@ func (l *Send) finishBandwidthProbe(probeID uint64) {
 	ewmaBps := state.ewmaBps
 	nextRateBps := state.nextRateBps
 	complete := state.complete
+	sampleCount := state.sampleCount
 	l.bandwidthMu.Unlock()
 
 	if lane := l.getLane(round.key); lane != nil {
@@ -359,7 +369,7 @@ func (l *Send) finishBandwidthProbe(probeID uint64) {
 	if complete {
 		l.logBandwidthProbeDecisionIfReady(round.key)
 	}
-	debuglog.Printf("send/bw_probe", "finish session=%d lane=%d leg={%s} probe_id=%d acked=%d count=%d loss=%.3f sample_bps=%d ewma_bps=%d next_rate_bps=%d complete=%t", round.key.sessionID, round.key.laneID, debugLeg(round.leg), probeID, acked, round.count, loss, sampleBps, ewmaBps, nextRateBps, complete)
+	debuglog.Printf("send/bw_probe", "finish session=%d lane=%d leg={%s} probe_id=%d acked=%d count=%d loss=%.3f sample_bps=%d ewma_bps=%d next_rate_bps=%d samples=%d complete=%t", round.key.sessionID, round.key.laneID, debugLeg(round.leg), probeID, acked, round.count, loss, sampleBps, ewmaBps, nextRateBps, sampleCount, complete)
 }
 
 func (l *Send) logBandwidthProbeDecisionIfReady(key laneKey) {

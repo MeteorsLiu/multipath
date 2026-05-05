@@ -849,9 +849,9 @@ run_leg_selector_case() {
   client_qos_start_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
   server_qos_start_line="$(current_log_file_line_count "${CURRENT_SERVER_LOG}")"
   wait_log_pattern "${name}" "accept_hello_ack session=[0-9]+ lane=1 .*tcp conn=" 20 "warm TCP fallback leg reached HELLO_ACK"
-  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "bandwidth_probe_decision .*lane=1 .*udp_qos_limited=true selected_leg=tcp" 45 "client produced bandwidth-probe QoS decision" "${client_qos_start_line}"
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "bandwidth_probe_decision .*lane=1 .*udp_qos_limited=true .*tcp_better=true selected_leg=tcp" 45 "client produced bandwidth-probe QoS decision" "${client_qos_start_line}"
   wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "schedule_select.*leg=\\{tcp" 45 "client leg selector chose TCP for data frame after UDP QoS detection" "${client_qos_start_line}"
-  wait_log_file_pattern_while_ping "${name}" "${CURRENT_SERVER_LOG}" "bandwidth_probe_decision .*lane=1 .*udp_qos_limited=true selected_leg=tcp" 45 "server produced bandwidth-probe QoS decision" "${server_qos_start_line}"
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_SERVER_LOG}" "bandwidth_probe_decision .*lane=1 .*udp_qos_limited=true .*tcp_better=true selected_leg=tcp" 45 "server produced bandwidth-probe QoS decision" "${server_qos_start_line}"
   wait_log_file_pattern_while_ping "${name}" "${CURRENT_SERVER_LOG}" "schedule_select.*leg=\\{tcp" 45 "server leg selector chose TCP for data frame after UDP QoS detection" "${server_qos_start_line}"
 
   stop_multipath

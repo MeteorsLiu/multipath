@@ -65,7 +65,7 @@ func TestQualityLegSelectorStaysOnUDPWhenTCPAlsoDegraded(t *testing.T) {
 
 func TestQualityLegSelectorFallsBackToTCPWhenUDPBandwidthQoS(t *testing.T) {
 	sel := QualityLegSelector{}
-	udp := LegQuality{Active: true, DeliveryRate: 1.0, BandwidthBps: 20_000_000, ProbeLoss: 0.10, BandwidthQoSLimited: true}
+	udp := LegQuality{Active: true, DeliveryRate: 1.0, BandwidthBps: 20_000_000, ProbeLoss: 0.10, BandwidthQoSLimited: true, BandwidthPreferTCP: true}
 	tcp := LegQuality{Active: true, DeliveryRate: 1.0, BandwidthBps: 120_000_000, ProbeSamples: 3}
 
 	useUDP, ok := sel.Pick(udp, tcp)
@@ -79,7 +79,7 @@ func TestQualityLegSelectorFallsBackToTCPWhenUDPBandwidthQoS(t *testing.T) {
 
 func TestQualityLegSelectorKeepsUDPWhenQoSConfidenceLow(t *testing.T) {
 	sel := QualityLegSelector{}
-	udp := LegQuality{Active: true, DeliveryRate: 1.0, BandwidthBps: 20_000_000, ProbeLoss: 0.10, BandwidthQoSLimited: false}
+	udp := LegQuality{Active: true, DeliveryRate: 1.0, BandwidthBps: 20_000_000, ProbeLoss: 0.10, BandwidthQoSLimited: true, BandwidthPreferTCP: false}
 	tcp := LegQuality{Active: true, DeliveryRate: 1.0, BandwidthBps: 120_000_000, ProbeSamples: 3}
 
 	useUDP, ok := sel.Pick(udp, tcp)
@@ -87,7 +87,7 @@ func TestQualityLegSelectorKeepsUDPWhenQoSConfidenceLow(t *testing.T) {
 		t.Fatal("Pick returned false, want true")
 	}
 	if !useUDP {
-		t.Fatal("Pick returned TCP, want UDP while QoS confidence is low")
+		t.Fatal("Pick returned TCP, want UDP when TCP is not preferred")
 	}
 }
 

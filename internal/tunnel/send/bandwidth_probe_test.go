@@ -118,23 +118,29 @@ func TestSendBandwidthProbeAckUpdatesLaneQuality(t *testing.T) {
 
 func TestLaneBandwidthQoSClassification(t *testing.T) {
 	lane := newLaneRuntime(3, 10)
-	lane.recordBandwidthSample(transport.KindUDP, 20_000_000, 0.50)
-	lane.recordBandwidthSample(transport.KindTCP, 120_000_000, 0)
+	lane.recordBandwidthSample(transport.KindUDP, 59_000_000, 0.041)
+	lane.recordBandwidthSample(transport.KindTCP, 81_000_000, 0)
 
 	_, udpQ, _, _ := lane.legQualities()
 	if !udpQ.BandwidthQoSLimited {
-		t.Fatal("UDP bandwidth QoS was not marked after UDP loss and higher TCP bandwidth")
+		t.Fatal("UDP bandwidth QoS was not marked after UDP probe loss")
+	}
+	if !udpQ.BandwidthPreferTCP {
+		t.Fatal("TCP was not preferred when UDP had loss and TCP bandwidth was higher")
 	}
 }
 
-func TestLaneBandwidthQoSNotMarkedWhenUDPRecoversBeforeTCP(t *testing.T) {
+func TestLaneBandwidthQoSLimitedButKeepsUDPWhenTCPIsSlower(t *testing.T) {
 	lane := newLaneRuntime(3, 10)
-	lane.recordBandwidthSample(transport.KindUDP, 120_000_000, 0)
-	lane.recordBandwidthSample(transport.KindTCP, 120_000_000, 0)
+	lane.recordBandwidthSample(transport.KindUDP, 115_000_000, 0.021)
+	lane.recordBandwidthSample(transport.KindTCP, 35_000_000, 0)
 
 	_, udpQ, _, _ := lane.legQualities()
-	if udpQ.BandwidthQoSLimited {
-		t.Fatal("UDP bandwidth QoS was marked when UDP bandwidth matched TCP")
+	if !udpQ.BandwidthQoSLimited {
+		t.Fatal("UDP bandwidth QoS was not marked after UDP probe loss")
+	}
+	if udpQ.BandwidthPreferTCP {
+		t.Fatal("TCP was preferred even though TCP bandwidth was lower than UDP")
 	}
 }
 
@@ -147,5 +153,59 @@ func TestBandwidthSamplePlateau(t *testing.T) {
 	}
 	if samplePlateau(1000, 1101) {
 		t.Fatal("sample gain above 10% should continue probing")
+	}
+}
+
+func TestTCPBandwidthProbeDoesNotCompleteBeforeMinimumRounds(t *testing.T) {
+	in := New()
+	key := laneKey{sessionID: 99, laneID: 3}
+	tcpLeg := transport.LegRef{
+		Kind:   transport.KindTCP,
+		ConnID: "tcp-1",
+	}
+	lane := newLaneRuntime(3, 10)
+	lane.bindLeg(tcpLeg)
+	in.lanes[key] = lane
+
+	legKey := newPingKey(tcpLeg)
+	state := &bandwidthLegState{nextRateBps: bandwidthProbeMinRateBps}
+	in.bandwidthLegs[legKey] = state
+
+	for i := 0; i < bandwidthProbeTCPMinRounds-1; i++ {
+		probeID := uint64(i + 1)
+		state.inFlight = true
+		in.bandwidthPending[probeID] = &bandwidthProbeRound{
+			key:          key,
+			leg:          tcpLeg,
+			legKey:       legKey,
+			probeID:      probeID,
+			count:        4,
+			payloadBytes: 1000,
+			received:     0x0f,
+			firstRXMS:    1000,
+			lastRXMS:     1032,
+		}
+		in.finishBandwidthProbe(probeID)
+		if state.complete {
+			t.Fatalf("tcp probe completed after %d rounds, want at least %d", i+1, bandwidthProbeTCPMinRounds)
+		}
+	}
+
+	probeID := uint64(bandwidthProbeTCPMinRounds)
+	state.inFlight = true
+	in.bandwidthPending[probeID] = &bandwidthProbeRound{
+		key:          key,
+		leg:          tcpLeg,
+		legKey:       legKey,
+		probeID:      probeID,
+		count:        4,
+		payloadBytes: 1000,
+		received:     0x0f,
+		firstRXMS:    1000,
+		lastRXMS:     1032,
+	}
+	in.finishBandwidthProbe(probeID)
+	if !state.complete {
+		t.Fatalf("tcp probe did not complete after %d plateau rounds", bandwidthProbeTCPMinRounds)
 	}
 }
