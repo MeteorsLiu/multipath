@@ -979,6 +979,7 @@ wait_bandwidth_probe_additive_ramp() {
   local output status
 
   while (( SECONDS < deadline )); do
+    set +e
     output="$(awk \
       -v start="${start_line}" \
       -v min_rate=16000000 \
@@ -1000,6 +1001,7 @@ wait_bandwidth_probe_additive_ramp() {
           }
           if (rate < min_rate || ((rate - min_rate) % step_rate) != 0) {
             printf("bad %d\n", rate)
+            bad = 1
             exit 1
           }
           if (!(rate in seen)) {
@@ -1012,11 +1014,15 @@ wait_bandwidth_probe_additive_ramp() {
             printf("ok %d\n", distinct)
             exit 0
           }
+          if (bad) {
+            exit 1
+          }
           printf("need %d\n", distinct)
           exit 2
         }
       ' "${log_file}" 2>/dev/null)"
     status=$?
+    set -e
     case "${status}" in
     0)
       pass "${label}" "${message}"
