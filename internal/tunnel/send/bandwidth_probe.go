@@ -14,14 +14,14 @@ import (
 
 const (
 	bandwidthProbeAckGrace             = 500 * time.Millisecond
-	bandwidthProbeWindow               = 5 * time.Second
+	bandwidthProbeWindow               = 10 * time.Second
 	bandwidthProbeRoundWindow          = 500 * time.Millisecond
 	bandwidthProbeUDPPayloadSize       = 1200
 	bandwidthProbeTCPPayloadSize       = 32 * 1024
 	bandwidthProbeMinRateBps           = uint64(16_000_000)
-	bandwidthProbeAdditiveStepBps      = uint64(25_000_000)
+	bandwidthProbeAdditiveStepBps      = uint64(10_000_000)
 	bandwidthProbeMaxFrames            = 64
-	bandwidthProbeMultiplicativeChunks = 3
+	bandwidthProbeMultiplicativeChunks = 2
 	bandwidthProbeAckEvery             = 16
 )
 
