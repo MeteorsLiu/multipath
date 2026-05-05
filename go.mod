@@ -6,6 +6,7 @@ require (
 	github.com/klauspost/reedsolomon v1.12.6
 	github.com/prometheus/client_golang v1.23.2
 	golang.org/x/sys v0.35.0
+	golang.org/x/time v0.12.0
 )
 
 require (

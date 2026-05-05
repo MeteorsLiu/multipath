@@ -10,18 +10,20 @@ import (
 	"github.com/MeteorsLiu/multipath/internal/metrics"
 	"github.com/MeteorsLiu/multipath/internal/protocol"
 	"github.com/MeteorsLiu/multipath/internal/transport"
+	"golang.org/x/time/rate"
 )
 
 const (
 	bandwidthProbeAckGrace             = 500 * time.Millisecond
 	bandwidthProbeWindow               = 10 * time.Second
 	bandwidthProbeRoundWindow          = 500 * time.Millisecond
+	bandwidthProbeBurstWindow          = 2 * time.Millisecond
 	bandwidthProbeUDPPayloadSize       = 1200
 	bandwidthProbeTCPPayloadSize       = 32 * 1024
 	bandwidthProbeMinRateBps           = uint64(16_000_000)
 	bandwidthProbeAdditiveStepBps      = uint64(10_000_000)
-	bandwidthProbePacingGainNum        = uint64(3)
-	bandwidthProbePacingGainDen        = uint64(2)
+	bandwidthProbePacingGainNum        = uint64(2)
+	bandwidthProbePacingGainDen        = uint64(1)
 	bandwidthProbeMaxFrames            = 64
 	bandwidthProbeMultiplicativeChunks = 0
 	bandwidthProbeAckEvery             = 16
@@ -312,18 +314,14 @@ func (l *Send) startBandwidthProbeRound(key laneKey, leg transport.LegRef, legKe
 
 func (l *Send) runBandwidthProbeRound(ctx context.Context, round *bandwidthProbeRound, deadline time.Time) uint16 {
 	payload := make([]byte, round.payloadBytes)
-	interval := probeFrameInterval(round.rateBps, round.payloadBytes)
+	limiter := newBandwidthProbeLimiter(round.rateBps, round.payloadBytes)
 	for seq := uint16(0); seq < round.count; seq++ {
 		if !time.Now().Before(deadline) {
 			return seq
 		}
-		if seq > 0 && interval > 0 {
-			timer := time.NewTimer(interval)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
+		if limiter != nil {
+			if err := limiter.WaitN(ctx, round.payloadBytes); err != nil {
 				return seq
-			case <-timer.C:
 			}
 		}
 		if !time.Now().Before(deadline) {
@@ -350,15 +348,16 @@ func (l *Send) runBandwidthProbeRound(ctx context.Context, round *bandwidthProbe
 	return round.count
 }
 
-func probeFrameInterval(rateBps uint64, payloadBytes int) time.Duration {
-	if rateBps == 0 || payloadBytes <= 0 {
-		return 0
+func newBandwidthProbeLimiter(rateBps uint64, payloadBytes int) *rate.Limiter {
+	bytesPerSecond := rateBps / 8
+	if bytesPerSecond == 0 || payloadBytes <= 0 {
+		return nil
 	}
-	nanos := uint64(payloadBytes) * 8 * uint64(time.Second) / rateBps
-	if nanos == 0 {
-		return 0
+	burst := int(bytesPerSecond * uint64(bandwidthProbeBurstWindow) / uint64(time.Second))
+	if burst < payloadBytes {
+		burst = payloadBytes
 	}
-	return time.Duration(nanos)
+	return rate.NewLimiter(rate.Limit(bytesPerSecond), burst)
 }
 
 func (l *Send) receiveBandwidthProbe(ctx context.Context, sessionID uint64, laneID uint8, leg transport.LegRef, body protocol.BandwidthProbeBody) error {

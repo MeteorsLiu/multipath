@@ -284,7 +284,7 @@ func TestBandwidthProbeAckAttributesBytesToOriginalStep(t *testing.T) {
 	}
 }
 
-func TestBandwidthProbeRateAdvancesByConservativeGain(t *testing.T) {
+func TestBandwidthProbeRateAdvancesByPacingGain(t *testing.T) {
 	in := New()
 	udpLeg := transport.LegRef{
 		Kind:       transport.KindUDP,
@@ -301,8 +301,21 @@ func TestBandwidthProbeRateAdvancesByConservativeGain(t *testing.T) {
 	in.advanceBandwidthProbeRate(legKey)
 
 	state := in.bandwidthLegs[legKey]
-	if state.nextRateBps != 30_000_000 {
-		t.Fatalf("next rate = %d, want 30Mbps from 1.5x pacing gain", state.nextRateBps)
+	if state.nextRateBps != 40_000_000 {
+		t.Fatalf("next rate = %d, want 40Mbps from 2x pacing gain", state.nextRateBps)
+	}
+}
+
+func TestBandwidthProbeLimiterUsesByteRateAndShortBurst(t *testing.T) {
+	limiter := newBandwidthProbeLimiter(bandwidthProbeMinRateBps, bandwidthProbeUDPPayloadSize)
+	if limiter == nil {
+		t.Fatal("missing limiter")
+	}
+	if got := limiter.Burst(); got != 4000 {
+		t.Fatalf("burst = %d, want 4000 bytes for 16Mbps over 2ms", got)
+	}
+	if got := limiter.Limit(); got != 2_000_000 {
+		t.Fatalf("limit = %v, want 2000000 bytes/s", got)
 	}
 }
 
