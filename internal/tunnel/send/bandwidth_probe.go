@@ -13,13 +13,16 @@ import (
 )
 
 const (
-	bandwidthProbeTimeout        = time.Second
-	bandwidthProbeWindow         = 10 * time.Second
-	bandwidthProbeRoundWindow    = 200 * time.Millisecond
-	bandwidthProbeUDPPayloadSize = 1200
-	bandwidthProbeTCPPayloadSize = 32 * 1024
-	bandwidthProbeMinRateBps     = uint64(1_000_000)
-	bandwidthProbeMaxFrames      = 64
+	bandwidthProbeAckGrace             = 500 * time.Millisecond
+	bandwidthProbeWindow               = 5 * time.Second
+	bandwidthProbeRoundWindow          = 200 * time.Millisecond
+	bandwidthProbeUDPPayloadSize       = 1200
+	bandwidthProbeTCPPayloadSize       = 32 * 1024
+	bandwidthProbeMinRateBps           = uint64(1_000_000)
+	bandwidthProbeAdditiveStepBps      = uint64(10_000_000)
+	bandwidthProbeMaxFrames            = 64
+	bandwidthProbeMultiplicativeChunks = 7
+	bandwidthProbeAckEvery             = 16
 )
 
 type bandwidthLegState struct {
@@ -29,7 +32,9 @@ type bandwidthLegState struct {
 	inFlight      bool
 	complete      bool
 	startedAt     time.Time
+	endedAt       time.Time
 	sampleCount   uint32
+	rampChunks    uint32
 	sentFrames    uint64
 	ackedFrames   uint64
 	ackedBytes    uint64
@@ -49,7 +54,6 @@ type bandwidthProbeRound struct {
 	received     uint64
 	firstRXMS    uint64
 	lastRXMS     uint64
-	done         chan struct{}
 }
 
 type bandwidthRXKey struct {
@@ -179,6 +183,18 @@ func (l *Send) maybeStartBandwidthProbe(ctx context.Context, key laneKey, leg tr
 	}
 	state.inFlight = true
 	state.startedAt = now
+	state.endedAt = time.Time{}
+	state.sampleCount = 0
+	state.rampChunks = 0
+	state.sentFrames = 0
+	state.ackedFrames = 0
+	state.ackedBytes = 0
+	state.lastLoss = 0
+	state.lastRoundLoss = 0
+	state.ewmaBps = 0
+	if state.nextRateBps == 0 {
+		state.nextRateBps = bandwidthProbeMinRateBps
+	}
 	l.bandwidthMu.Unlock()
 
 	debuglog.Printf("send/bw_probe", "train_start session=%d lane=%d leg={%s} window=%s", key.sessionID, key.laneID, debugLeg(leg), bandwidthProbeWindow)
@@ -198,26 +214,38 @@ func probeFrameCount(rateBps uint64, payloadBytes int) uint16 {
 }
 
 func (l *Send) runBandwidthProbeTrain(ctx context.Context, key laneKey, leg transport.LegRef, legKey pingKey) {
+	deadline := time.Now().Add(bandwidthProbeWindow)
 	for {
-		round := l.startBandwidthProbeRound(key, leg, legKey, time.Now())
+		now := time.Now()
+		if !now.Before(deadline) {
+			break
+		}
+		round := l.startBandwidthProbeRound(key, leg, legKey, now)
 		if round == nil {
 			return
 		}
-		l.runBandwidthProbeRound(ctx, round)
-		timer := time.NewTimer(bandwidthProbeTimeout)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			l.abortBandwidthProbeTrain(legKey)
-			return
-		case <-round.done:
-			timer.Stop()
-		case <-timer.C:
-		}
-		if l.finishBandwidthProbe(round.probeID) {
-			return
+		sent := l.runBandwidthProbeRound(ctx, round, deadline)
+		l.recordBandwidthProbeSent(round, sent)
+		l.advanceBandwidthProbeRate(legKey)
+		if sent < round.count {
+			if ctx.Err() != nil || time.Now().Before(deadline) {
+				l.abortBandwidthProbeTrain(legKey)
+				return
+			}
+			break
 		}
 	}
+	l.markBandwidthProbeSendComplete(legKey, deadline)
+
+	timer := time.NewTimer(bandwidthProbeAckGrace)
+	select {
+	case <-ctx.Done():
+		timer.Stop()
+		l.abortBandwidthProbeTrain(legKey)
+		return
+	case <-timer.C:
+	}
+	l.completeBandwidthProbeTrain(key, leg, legKey)
 }
 
 func (l *Send) startBandwidthProbeRound(key laneKey, leg transport.LegRef, legKey pingKey, now time.Time) *bandwidthProbeRound {
@@ -245,7 +273,6 @@ func (l *Send) startBandwidthProbeRound(key laneKey, leg transport.LegRef, legKe
 		payloadBytes: payloadBytes,
 		rateBps:      rateBps,
 		startedAt:    now,
-		done:         make(chan struct{}),
 	}
 	l.bandwidthPending[probeID] = round
 	l.bandwidthMu.Unlock()
@@ -254,18 +281,24 @@ func (l *Send) startBandwidthProbeRound(key laneKey, leg transport.LegRef, legKe
 	return round
 }
 
-func (l *Send) runBandwidthProbeRound(ctx context.Context, round *bandwidthProbeRound) {
+func (l *Send) runBandwidthProbeRound(ctx context.Context, round *bandwidthProbeRound, deadline time.Time) uint16 {
 	payload := make([]byte, round.payloadBytes)
 	interval := probeFrameInterval(round.rateBps, round.payloadBytes)
 	for seq := uint16(0); seq < round.count; seq++ {
+		if !time.Now().Before(deadline) {
+			return seq
+		}
 		if seq > 0 && interval > 0 {
 			timer := time.NewTimer(interval)
 			select {
 			case <-ctx.Done():
 				timer.Stop()
-				return
+				return seq
 			case <-timer.C:
 			}
+		}
+		if !time.Now().Before(deadline) {
+			return seq
 		}
 		nowMS := uint64(time.Now().UnixMilli())
 		frame := protocol.Frame{
@@ -282,9 +315,10 @@ func (l *Send) runBandwidthProbeRound(ctx context.Context, round *bandwidthProbe
 		}
 		if err := l.writeControlFrameOnLeg(ctx, round.leg, frame); err != nil {
 			debuglog.Printf("send/bw_probe", "send_err session=%d lane=%d leg={%s} probe_id=%d seq=%d err=%v", round.key.sessionID, round.key.laneID, debugLeg(round.leg), round.probeID, seq, err)
-			break
+			return seq
 		}
 	}
+	return round.count
 }
 
 func probeFrameInterval(rateBps uint64, payloadBytes int) time.Duration {
@@ -328,6 +362,7 @@ func (l *Send) receiveBandwidthProbe(ctx context.Context, sessionID uint64, lane
 		rx.lastRXMS = nowMS
 	}
 	full := rx.count == 64 && rx.received == ^uint64(0) || rx.count < 64 && rx.received == (uint64(1)<<rx.count)-1
+	shouldAck := full || body.Seq+1 == rx.count || (body.Seq+1)%bandwidthProbeAckEvery == 0
 	ack := protocol.BandwidthProbeAckBody{
 		ProbeID:   body.ProbeID,
 		Count:     rx.count,
@@ -340,6 +375,9 @@ func (l *Send) receiveBandwidthProbe(ctx context.Context, sessionID uint64, lane
 	}
 	l.bandwidthMu.Unlock()
 
+	if !shouldAck {
+		return nil
+	}
 	return l.writeControlFrameOnLeg(ctx, leg, protocol.Frame{
 		Type:      protocol.TypeBandwidthProbeAck,
 		SessionID: sessionID,
@@ -357,6 +395,7 @@ func (l *Send) receiveBandwidthProbeAck(sessionID uint64, laneID uint8, leg tran
 		debuglog.Printf("send/bw_probe", "ack_drop stale session=%d lane=%d leg={%s} probe_id=%d count=%d", sessionID, laneID, debugLeg(leg), body.ProbeID, body.Count)
 		return nil
 	}
+	prev := round.received
 	round.received |= body.Received
 	if body.FirstRXMS != 0 && (round.firstRXMS == 0 || body.FirstRXMS < round.firstRXMS) {
 		round.firstRXMS = body.FirstRXMS
@@ -371,99 +410,129 @@ func (l *Send) receiveBandwidthProbeAck(sessionID uint64, laneID uint8, leg tran
 	} else {
 		full = (uint64(1) << round.count) - 1
 	}
-	l.bandwidthMu.Unlock()
 	if received == full {
-		l.finishBandwidthProbe(body.ProbeID)
+		delete(l.bandwidthPending, body.ProbeID)
 	}
+	newBits := received &^ prev
+	if newBits != 0 {
+		if state := l.bandwidthLegs[legKey]; state != nil && !state.complete {
+			acked := bits.OnesCount64(newBits)
+			state.ackedFrames += uint64(acked)
+			state.ackedBytes += uint64(acked) * uint64(round.payloadBytes)
+			state.lastRoundLoss = float64(int(round.count)-bits.OnesCount64(received)) / float64(round.count)
+			if state.lastRoundLoss < 0 {
+				state.lastRoundLoss = 0
+			}
+		}
+	}
+	l.bandwidthMu.Unlock()
 	return nil
 }
 
-func (l *Send) finishBandwidthProbe(probeID uint64) bool {
+func (l *Send) recordBandwidthProbeSent(round *bandwidthProbeRound, sent uint16) {
 	l.bandwidthMu.Lock()
-	round := l.bandwidthPending[probeID]
-	if round == nil {
-		l.bandwidthMu.Unlock()
-		return false
-	}
-	delete(l.bandwidthPending, probeID)
-	if round.done != nil {
-		close(round.done)
+	defer l.bandwidthMu.Unlock()
+
+	if sent == 0 {
+		delete(l.bandwidthPending, round.probeID)
+		return
 	}
 	state := l.bandwidthLegs[round.legKey]
 	if state == nil {
 		state = &bandwidthLegState{}
 		l.bandwidthLegs[round.legKey] = state
 	}
-	acked := bits.OnesCount64(round.received)
-	loss := 1.0
-	if round.count > 0 {
-		loss = float64(int(round.count)-acked) / float64(round.count)
+	state.sentFrames += uint64(sent)
+}
+
+func (l *Send) advanceBandwidthProbeRate(legKey pingKey) {
+	l.bandwidthMu.Lock()
+	defer l.bandwidthMu.Unlock()
+
+	state := l.bandwidthLegs[legKey]
+	if state == nil || state.complete {
+		return
 	}
-	now := time.Now()
-	if state.startedAt.IsZero() {
-		state.startedAt = round.startedAt
+	if state.nextRateBps == 0 {
+		state.nextRateBps = bandwidthProbeMinRateBps
 	}
-	state.sentFrames += uint64(round.count)
-	state.ackedFrames += uint64(acked)
-	state.ackedBytes += uint64(acked) * uint64(round.payloadBytes)
-	sampleBps := bandwidthWindowSampleBps(state.ackedBytes, state.startedAt, now)
-	state.ewmaBps = sampleBps
-	state.lastRoundLoss = loss
-	state.lastLoss = bandwidthAggregateLoss(state.sentFrames, state.ackedFrames)
-	state.sampleCount++
-	if loss < 0.05 {
+	if state.rampChunks < bandwidthProbeMultiplicativeChunks {
 		next := state.nextRateBps * 2
 		if next < state.nextRateBps {
 			next = state.nextRateBps
 		}
-		if next < bandwidthProbeMinRateBps {
-			next = bandwidthProbeMinRateBps
-		}
 		state.nextRateBps = next
 	} else {
-		next := state.nextRateBps / 2
-		if next < bandwidthProbeMinRateBps {
-			next = bandwidthProbeMinRateBps
+		next := state.nextRateBps + bandwidthProbeAdditiveStepBps
+		if next < state.nextRateBps {
+			next = state.nextRateBps
 		}
 		state.nextRateBps = next
 	}
-	if now.Sub(state.startedAt) >= bandwidthProbeWindow {
-		state.complete = true
-		state.inFlight = false
+	state.rampChunks++
+}
+
+func (l *Send) markBandwidthProbeSendComplete(legKey pingKey, endedAt time.Time) {
+	l.bandwidthMu.Lock()
+	if state := l.bandwidthLegs[legKey]; state != nil && state.inFlight && state.endedAt.IsZero() {
+		state.endedAt = endedAt
+	}
+	l.bandwidthMu.Unlock()
+}
+
+func (l *Send) completeBandwidthProbeTrain(key laneKey, leg transport.LegRef, legKey pingKey) bool {
+	l.bandwidthMu.Lock()
+	state := l.bandwidthLegs[legKey]
+	if state == nil {
+		l.bandwidthMu.Unlock()
+		return false
+	}
+	now := time.Now()
+	if state.startedAt.IsZero() {
+		state.startedAt = now.Add(-bandwidthProbeWindow)
+	}
+	if state.endedAt.IsZero() {
+		state.endedAt = now
+	}
+	sampleBps := bandwidthWindowSampleBps(state.ackedBytes, state.startedAt, state.endedAt)
+	state.ewmaBps = sampleBps
+	state.lastLoss = bandwidthAggregateLoss(state.sentFrames, state.ackedFrames)
+	state.sampleCount = 1
+	state.complete = true
+	state.inFlight = false
+	for probeID, round := range l.bandwidthPending {
+		if round.legKey == legKey {
+			delete(l.bandwidthPending, probeID)
+		}
 	}
 	ewmaBps := state.ewmaBps
 	nextRateBps := state.nextRateBps
-	complete := state.complete
 	sampleCount := state.sampleCount
 	aggregateLoss := state.lastLoss
 	l.bandwidthMu.Unlock()
 
-	if complete {
-		if lane := l.getLane(round.key); lane != nil {
-			lane.recordBandwidthSample(round.leg.Kind, ewmaBps, aggregateLoss)
-		}
-		metrics.SetGauge(metrics.LaneBandwidthBps, float64(ewmaBps),
-			metrics.L("session", round.key.sessionID),
-			metrics.L("lane", round.key.laneID),
-			metrics.L("leg", kindMetricLabel(round.leg.Kind)),
-		)
-		metrics.SetGauge(metrics.LaneProbeLossRatio, aggregateLoss,
-			metrics.L("session", round.key.sessionID),
-			metrics.L("lane", round.key.laneID),
-			metrics.L("leg", kindMetricLabel(round.leg.Kind)),
-		)
+	if lane := l.getLane(key); lane != nil {
+		lane.recordBandwidthSample(leg.Kind, ewmaBps, aggregateLoss)
 	}
+	metrics.SetGauge(metrics.LaneBandwidthBps, float64(ewmaBps),
+		metrics.L("session", key.sessionID),
+		metrics.L("lane", key.laneID),
+		metrics.L("leg", kindMetricLabel(leg.Kind)),
+	)
+	metrics.SetGauge(metrics.LaneProbeLossRatio, aggregateLoss,
+		metrics.L("session", key.sessionID),
+		metrics.L("lane", key.laneID),
+		metrics.L("leg", kindMetricLabel(leg.Kind)),
+	)
 	metrics.IncCounter(metrics.BandwidthProbeEventsTotal,
 		metrics.L("event", "finish"),
-		metrics.L("session", round.key.sessionID),
-		metrics.L("lane", round.key.laneID),
-		metrics.L("leg", kindMetricLabel(round.leg.Kind)),
+		metrics.L("session", key.sessionID),
+		metrics.L("lane", key.laneID),
+		metrics.L("leg", kindMetricLabel(leg.Kind)),
 	)
-	if complete {
-		l.logBandwidthProbeDecisionIfReady(round.key)
-	}
-	debuglog.Printf("send/bw_probe", "round_finish session=%d lane=%d leg={%s} probe_id=%d acked=%d count=%d round_loss=%.3f window_loss=%.3f window_bps=%d next_rate_bps=%d samples=%d complete=%t", round.key.sessionID, round.key.laneID, debugLeg(round.leg), probeID, acked, round.count, loss, aggregateLoss, ewmaBps, nextRateBps, sampleCount, complete)
-	return complete
+	l.logBandwidthProbeDecisionIfReady(key)
+	debuglog.Printf("send/bw_probe", "train_finish session=%d lane=%d leg={%s} window_loss=%.3f window_bps=%d next_rate_bps=%d samples=%d", key.sessionID, key.laneID, debugLeg(leg), aggregateLoss, ewmaBps, nextRateBps, sampleCount)
+	return true
 }
 
 func (l *Send) abortBandwidthProbeTrain(legKey pingKey) {
@@ -474,9 +543,6 @@ func (l *Send) abortBandwidthProbeTrain(legKey pingKey) {
 	for probeID, round := range l.bandwidthPending {
 		if round.legKey == legKey {
 			delete(l.bandwidthPending, probeID)
-			if round.done != nil {
-				close(round.done)
-			}
 		}
 	}
 	l.bandwidthMu.Unlock()
@@ -517,9 +583,6 @@ func (l *Send) clearBandwidthLeg(leg transport.LegRef) {
 	for probeID, round := range l.bandwidthPending {
 		if round.legKey == legKey {
 			delete(l.bandwidthPending, probeID)
-			if round.done != nil {
-				close(round.done)
-			}
 		}
 	}
 	for key := range l.bandwidthRX {

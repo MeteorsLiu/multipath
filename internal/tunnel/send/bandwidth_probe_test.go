@@ -107,18 +107,11 @@ func TestSendReceiveBandwidthProbeRepliesWithBitmap(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("receiveBandwidthProbe seq0 failed: %v", err)
 	}
-	first := readSendPayload(t, in)
-	defer first.Packet.Release()
-	firstFrame, err := protocol.Decode(first.Packet.Payload)
-	if err != nil {
-		t.Fatalf("Decode first ack: %v", err)
-	}
-	firstAck, ok := firstFrame.Body.(protocol.BandwidthProbeAckBody)
-	if !ok || firstFrame.Type != protocol.TypeBandwidthProbeAck {
-		t.Fatalf("first frame = type %d body %T, want BW_PROBE_ACK", firstFrame.Type, firstFrame.Body)
-	}
-	if firstAck.ProbeID != 7 || firstAck.Count != 2 || firstAck.Received != 0x01 {
-		t.Fatalf("first ack = %+v, want probe 7 count 2 received 0x01", firstAck)
+	select {
+	case payload := <-in.Packets():
+		payload.Packet.Release()
+		t.Fatal("unexpected BW_PROBE_ACK before chunk boundary")
+	default:
 	}
 
 	if err := in.receiveBandwidthProbe(context.Background(), 99, 3, leg, protocol.BandwidthProbeBody{
@@ -161,6 +154,8 @@ func TestSendBandwidthProbeAckUpdatesLaneQuality(t *testing.T) {
 		nextRateBps: bandwidthProbeMinRateBps,
 		inFlight:    true,
 		startedAt:   time.Now().Add(-bandwidthProbeWindow),
+		endedAt:     time.Now(),
+		sentFrames:  4,
 	}
 	in.bandwidthPending[7] = &bandwidthProbeRound{
 		key:          key,
@@ -180,7 +175,7 @@ func TestSendBandwidthProbeAckUpdatesLaneQuality(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("receiveBandwidthProbeAck failed: %v", err)
 	}
-	in.finishBandwidthProbe(7)
+	in.completeBandwidthProbeTrain(key, udpLeg, legKey)
 
 	_, udpQ, _, _ := lane.legQualities()
 	if udpQ.BandwidthBps == 0 {
@@ -236,7 +231,7 @@ func TestLaneBandwidthQoSLimitedButKeepsUDPWhenTCPIsSlower(t *testing.T) {
 	}
 }
 
-func TestBandwidthProbeDoesNotUpdateLaneQualityBeforeWindowElapsed(t *testing.T) {
+func TestBandwidthProbeDoesNotUpdateLaneQualityBeforeTrainCompletes(t *testing.T) {
 	in := New()
 	key := laneKey{sessionID: 99, laneID: 3}
 	udpLeg := transport.LegRef{
@@ -265,9 +260,6 @@ func TestBandwidthProbeDoesNotUpdateLaneQualityBeforeWindowElapsed(t *testing.T)
 		received:     0x0f,
 	}
 
-	if in.finishBandwidthProbe(7) {
-		t.Fatal("probe completed before bandwidth window elapsed")
-	}
 	_, udpQ, _, _ := lane.legQualities()
 	if udpQ.ProbeSamples != 0 || udpQ.BandwidthBps != 0 {
 		t.Fatalf("udp quality updated before completion: samples=%d bps=%d", udpQ.ProbeSamples, udpQ.BandwidthBps)
