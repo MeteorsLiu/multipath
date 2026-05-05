@@ -37,22 +37,38 @@ func (QualityLegSelector) Pick(udp, tcp LegQuality) (useUDP bool, ok bool) {
 		return false, true
 	}
 
-	// Delivery rate below threshold: token-bucket policer (drops excess).
-	if udp.DeliveryRate < minUDPDelivery && tcp.DeliveryRate >= minTCPDelivery {
+	if deliveryPrefersTCP(udp, tcp) {
 		return false, true
 	}
 
-	// RTT variance exceeds mean: shaper (bufferbloat, jitter).
-	if udp.RTTVariance > 0 && udp.RTTVariance >= udp.SmoothedRTT &&
-		tcp.DeliveryRate >= minTCPDelivery {
+	if rttPrefersTCP(udp, tcp) {
 		return false, true
 	}
 
-	if udp.BandwidthPreferTCP && tcp.ProbeSamples >= minBandwidthProbeSamples {
+	if bandwidthPrefersTCP(udp, tcp) {
 		return false, true
 	}
 
 	return true, true
+}
+
+func deliveryPrefersTCP(udp, tcp LegQuality) bool {
+	// Delivery rate below threshold: token-bucket policer (drops excess).
+	return udp.DeliveryRate < minUDPDelivery && tcp.DeliveryRate >= minTCPDelivery
+}
+
+func rttPrefersTCP(udp, tcp LegQuality) bool {
+	// RTT variance exceeds mean: shaper (bufferbloat, jitter).
+	return udp.RTTVariance > 0 && udp.RTTVariance >= udp.SmoothedRTT &&
+		tcp.DeliveryRate >= minTCPDelivery
+}
+
+func bandwidthPrefersTCP(udp, tcp LegQuality) bool {
+	return udp.BandwidthPreferTCP && tcp.ProbeSamples >= minBandwidthProbeSamples
+}
+
+func bandwidthOnlyPrefersTCP(udp, tcp LegQuality) bool {
+	return bandwidthPrefersTCP(udp, tcp) && !deliveryPrefersTCP(udp, tcp) && !rttPrefersTCP(udp, tcp)
 }
 
 type UDPPreferssSelector struct{}

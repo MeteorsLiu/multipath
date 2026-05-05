@@ -112,6 +112,44 @@ func TestSendWriteScheduledFrameSkipsUnavailableLaneAndUsesNext(t *testing.T) {
 	}
 }
 
+func TestSendPreservesBestUDPWhenBandwidthFallbackWouldSelectAllTCP(t *testing.T) {
+	in := New()
+	lane1 := newLaneRuntime(1, 1)
+	lane1.bindLeg(transport.LegRef{Kind: transport.KindUDP, EndpointID: "udp1", RemoteAddr: mustUDPAddr(t, "127.0.0.1:1001")})
+	lane1.bindLeg(transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp1"})
+	lane1.recordBandwidthSample(transport.KindUDP, 2_000_000, 0.10)
+	lane1.recordBandwidthSample(transport.KindTCP, 40_000_000, 0)
+	in.lanes[laneKey{sessionID: 99, laneID: 1}] = lane1
+
+	lane2 := newLaneRuntime(2, 1)
+	lane2.bindLeg(transport.LegRef{Kind: transport.KindUDP, EndpointID: "udp2", RemoteAddr: mustUDPAddr(t, "127.0.0.1:1002")})
+	lane2.bindLeg(transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp2"})
+	lane2.recordBandwidthSample(transport.KindUDP, 4_000_000, 0.10)
+	lane2.recordBandwidthSample(transport.KindTCP, 40_000_000, 0)
+	in.lanes[laneKey{sessionID: 99, laneID: 2}] = lane2
+
+	if in.preserveUDPForBandwidthFallback(99, 1) {
+		t.Fatal("lane 1 preserved UDP, want TCP because lane 2 has better UDP bandwidth")
+	}
+	if !in.preserveUDPForBandwidthFallback(99, 2) {
+		t.Fatal("lane 2 did not preserve UDP as best UDP lane")
+	}
+}
+
+func TestSendDoesNotPreserveUDPForSingleBandwidthFallbackLane(t *testing.T) {
+	in := New()
+	lane := newLaneRuntime(1, 1)
+	lane.bindLeg(transport.LegRef{Kind: transport.KindUDP, EndpointID: "udp1", RemoteAddr: mustUDPAddr(t, "127.0.0.1:1001")})
+	lane.bindLeg(transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp1"})
+	lane.recordBandwidthSample(transport.KindUDP, 2_000_000, 0.10)
+	lane.recordBandwidthSample(transport.KindTCP, 40_000_000, 0)
+	in.lanes[laneKey{sessionID: 99, laneID: 1}] = lane
+
+	if in.preserveUDPForBandwidthFallback(99, 1) {
+		t.Fatal("single lane preserved UDP, want TCP fallback to remain available")
+	}
+}
+
 func TestSendRunnableLanesCacheInvalidatesWhenDirty(t *testing.T) {
 	in := New()
 	lane1 := newLaneRuntime(1, 1)
