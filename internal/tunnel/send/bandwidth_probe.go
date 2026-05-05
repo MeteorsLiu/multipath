@@ -95,8 +95,8 @@ func (l *Send) probeBandwidth(ctx context.Context, now time.Time) {
 	selectedLane, ok := l.activeBandwidthLane(sessionID)
 	if !ok {
 		for _, item := range lanes {
-			_, udpQ, _, tcpQ := item.lane.legQualities()
-			if udpQ.Active || tcpQ.Active {
+			udpLeg, udpQ, tcpLeg, tcpQ := item.lane.legQualities()
+			if l.bandwidthProbeNeeded(udpLeg, udpQ) || l.bandwidthProbeNeeded(tcpLeg, tcpQ) {
 				selectedLane = item.key
 				break
 			}
@@ -112,10 +112,10 @@ func (l *Send) probeBandwidth(ctx context.Context, now time.Time) {
 		}
 		lane := item.lane
 		udpLeg, udpQ, tcpLeg, tcpQ := lane.legQualities()
-		if udpQ.Active {
+		if l.bandwidthProbeNeeded(udpLeg, udpQ) {
 			candidates = append(candidates, candidate{key: item.key, leg: udpLeg})
 		}
-		if tcpQ.Active {
+		if l.bandwidthProbeNeeded(tcpLeg, tcpQ) {
 			candidates = append(candidates, candidate{key: item.key, leg: tcpLeg})
 		}
 		break
@@ -143,6 +143,21 @@ func (l *Send) activeBandwidthLane(sessionID uint64) (laneKey, bool) {
 		return laneKey{}, false
 	}
 	return selected, true
+}
+
+func (l *Send) bandwidthProbeNeeded(leg transport.LegRef, quality LegQuality) bool {
+	if !quality.Active {
+		return false
+	}
+	legKey := newPingKey(leg)
+	if legKey.kind == 0 {
+		return false
+	}
+	l.bandwidthMu.Lock()
+	state := l.bandwidthLegs[legKey]
+	needed := state == nil || !state.complete
+	l.bandwidthMu.Unlock()
+	return needed
 }
 
 func (l *Send) maybeStartBandwidthProbe(ctx context.Context, key laneKey, leg transport.LegRef, now time.Time) {

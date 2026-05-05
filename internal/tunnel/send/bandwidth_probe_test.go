@@ -47,6 +47,44 @@ func TestBandwidthProbeStartsOneLaneAtATime(t *testing.T) {
 	}
 }
 
+func TestBandwidthProbeSkipsCompletedLane(t *testing.T) {
+	in := New()
+	mustSendState(t, in, 99)
+	in.activateSession(99)
+
+	key1 := laneKey{sessionID: 99, laneID: 1}
+	key2 := laneKey{sessionID: 99, laneID: 2}
+	udp1 := transport.LegRef{Kind: transport.KindUDP, EndpointID: "udp1", RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234")}
+	tcp1 := transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp1"}
+	udp2 := transport.LegRef{Kind: transport.KindUDP, EndpointID: "udp2", RemoteAddr: mustUDPAddr(t, "127.0.0.1:1235")}
+	tcp2 := transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp2"}
+
+	lane1 := newLaneRuntime(1, 1)
+	lane1.bindLeg(udp1)
+	lane1.bindLeg(tcp1)
+	in.lanes[key1] = lane1
+
+	lane2 := newLaneRuntime(2, 1)
+	lane2.bindLeg(udp2)
+	lane2.bindLeg(tcp2)
+	in.lanes[key2] = lane2
+
+	in.bandwidthLegs[newPingKey(udp1)] = &bandwidthLegState{key: key1, complete: true}
+	in.bandwidthLegs[newPingKey(tcp1)] = &bandwidthLegState{key: key1, complete: true}
+
+	in.probeBandwidth(context.Background(), time.Now())
+
+	in.bandwidthMu.Lock()
+	defer in.bandwidthMu.Unlock()
+
+	for _, leg := range []transport.LegRef{udp2, tcp2} {
+		state := in.bandwidthLegs[newPingKey(leg)]
+		if state == nil || !state.inFlight || state.key != key2 {
+			t.Fatalf("lane 2 leg %v state = %+v, want in-flight lane 2 probe", leg, state)
+		}
+	}
+}
+
 func TestSendReceiveBandwidthProbeRepliesWithBitmap(t *testing.T) {
 	in := New()
 	mustSendState(t, in, 99)
