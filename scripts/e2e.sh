@@ -923,66 +923,92 @@ run_bandwidth_probe_convergence_case() {
   echo "==== ${name} e2e end ===="
 }
 
-read_netdev_counters() {
-  local ns="$1"
-  local dev="$2"
-  ip netns exec "${ns}" awk -v dev="${dev}:" '
-    $1 == dev {
-      print $10, $11
-      exit
-    }
-  ' /proc/net/dev
-}
-
-assert_bandwidth_probe_egress_below() {
+wait_bandwidth_probe_ceiling_sample() {
   local label="$1"
-  local ns="$2"
-  local dev="$3"
-  local seconds="$4"
-  local max_mbps="$5"
-  local max_kpps="$6"
-  local before after before_bytes before_packets after_bytes after_packets
+  local log_file="$2"
+  local start_line="$3"
+  local timeout="${4:-35}"
+  local message="$5"
+  local min_bps="${6:-120000000}"
+  local max_bps="${7:-260000000}"
+  local deadline=$((SECONDS + timeout))
+  local output status
 
-  before="$(read_netdev_counters "${ns}" "${dev}")"
-  read -r before_bytes before_packets <<<"${before}"
-  sleep "${seconds}"
-  after="$(read_netdev_counters "${ns}" "${dev}")"
-  read -r after_bytes after_packets <<<"${after}"
-
-  if [[ -z "${before_bytes}" || -z "${before_packets}" || -z "${after_bytes}" || -z "${after_packets}" ]]; then
-    fail "${label}" "could not read egress counters for ${ns}/${dev}"
-    return 1
-  fi
-
-  local delta_bytes=$((after_bytes - before_bytes))
-  local delta_packets=$((after_packets - before_packets))
-  if (( delta_bytes < 0 || delta_packets < 0 )); then
-    fail "${label}" "egress counters went backwards for ${ns}/${dev}"
-    return 1
-  fi
-
-  local mbps kpps
-  mbps="$(awk -v bytes="${delta_bytes}" -v seconds="${seconds}" 'BEGIN { printf "%.2f", bytes * 8 / seconds / 1000000 }')"
-  kpps="$(awk -v packets="${delta_packets}" -v seconds="${seconds}" 'BEGIN { printf "%.2f", packets / seconds / 1000 }')"
-  echo "[${label}] egress sample dev=${dev} seconds=${seconds} bytes=${delta_bytes} packets=${delta_packets} mbps=${mbps} kpps=${kpps}"
-
-  if awk -v mbps="${mbps}" -v kpps="${kpps}" -v max_mbps="${max_mbps}" -v max_kpps="${max_kpps}" 'BEGIN { exit !(mbps <= max_mbps && kpps <= max_kpps) }'; then
-    pass "${label}" "bandwidth probe egress stayed below ${max_mbps}Mbps/${max_kpps}Kpps"
-  else
-    fail "${label}" "bandwidth probe egress ${mbps}Mbps/${kpps}Kpps exceeded ${max_mbps}Mbps/${max_kpps}Kpps"
-    return 1
-  fi
+  while (( SECONDS < deadline )); do
+    set +e
+    output="$(awk \
+      -v start="${start_line}" \
+      -v min_bps="${min_bps}" \
+      -v max_bps="${max_bps}" '
+        NR <= start { next }
+        /rate_ceiling .*kind=udp/ {
+          rate = prev = acked = 0
+          for (i = 1; i <= NF; i++) {
+            if ($i ~ /^rate_bps=/) { split($i, p, "="); rate = p[2] + 0 }
+            if ($i ~ /^prev_acked_bytes=/) { split($i, p, "="); prev = p[2] + 0 }
+            if ($i ~ /^acked_bytes=/) { split($i, p, "="); acked = p[2] + 0 }
+          }
+          if (rate > 0 && prev > 0 && acked > 0 && acked * 10 < prev * 11) {
+            ceiling = rate
+          }
+        }
+        /train_finish .*leg=\{udp / {
+          bps = 0
+          for (i = 1; i <= NF; i++) {
+            if ($i ~ /^window_bps=/) { split($i, p, "="); bps = p[2] + 0 }
+          }
+          if (bps > 0) {
+            sample = bps
+          }
+        }
+        END {
+          if (ceiling == 0) {
+            print "need ceiling"
+            exit 2
+          }
+          if (sample == 0) {
+            print "need sample"
+            exit 2
+          }
+          if (sample < min_bps || sample > max_bps) {
+            printf("bad sample=%d ceiling=%d\n", sample, ceiling)
+            exit 1
+          }
+          printf("ok sample=%d ceiling=%d\n", sample, ceiling)
+          exit 0
+        }
+      ' "${log_file}" 2>/dev/null)"
+    status=$?
+    set -e
+    case "${status}" in
+    0)
+      pass "${label}" "${message}: ${output#ok }"
+      return 0
+      ;;
+    1)
+      fail "${label}" "${message}: ACK-derived bandwidth outside [${min_bps}, ${max_bps}] bps: ${output#bad }"
+      return 1
+      ;;
+    esac
+    sleep 0.2
+  done
+  fail "${label}" "${message}: ACK-derived ceiling sample not observed within ${timeout}s"
+  return 1
 }
 
-run_bandwidth_probe_egress_guard_case() {
-  local name="bandwidth-probe-egress-guard"
+run_bandwidth_probe_ceiling_case() {
+  local name="bandwidth-probe-ceiling"
   echo "==== ${name} e2e start ===="
   clear_loss
   write_one_lane_config "${name}" "${PORT_BW_PROBE_GUARD}" false false 200 1000
+  echo "[${name}] apply 200mbit UDP tunnel bottleneck; bandwidth probe should lock ACK-derived dynamic ceiling"
+  apply_udp_tunnel_rate_path 1 "${PORT_BW_PROBE_GUARD}" 200mbit
   start_multipath "${name}"
+  local client_start_line
+  client_start_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
   wait_ping_ok "${name} baseline" 12
-  wait_bandwidth_probe_additive_ramp "${name}" "${CURRENT_CLIENT_LOG}" 0 8 "client UDP bandwidth probe used additive ramp"
-  assert_bandwidth_probe_egress_below "${name}" "${NS_C}" "${VETHC1}" 3 200 30
+  wait_bandwidth_probe_additive_ramp "${name}" "${CURRENT_CLIENT_LOG}" "${client_start_line}" 8 "client UDP bandwidth probe used additive ramp"
+  wait_bandwidth_probe_ceiling_sample "${name}" "${CURRENT_CLIENT_LOG}" "${client_start_line}" 35 "client bandwidth probe locked 200mbit ACK ceiling"
 
   stop_multipath
   clear_loss
@@ -1662,7 +1688,7 @@ run_server_restart_reconnect_case
 run_fallback_dial_error_case
 run_leg_selector_case
 run_bandwidth_probe_convergence_case
-run_bandwidth_probe_egress_guard_case
+run_bandwidth_probe_ceiling_case
 run_nat_case
 run_fec_comparison
 run_fec_tcp_fallback_case
