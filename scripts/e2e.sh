@@ -911,6 +911,7 @@ run_bandwidth_probe_convergence_case() {
   client_start_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
 
   wait_ping_ok "${name} baseline-under-rate-limit" 12
+  wait_bandwidth_probe_additive_ramp "${name}" "${CURRENT_CLIENT_LOG}" "${client_start_line}" 8 "client UDP bandwidth probe used additive ramp"
   wait_log_file_any_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" 35 "client bandwidth probe converged under UDP rate limit without static cap" "${client_start_line}" \
     "rate_ceiling session=[0-9]+ lane=1 kind=udp rate_bps=[0-9]+ prev_acked_bytes=[0-9]+ acked_bytes=[0-9]+" \
     "bandwidth_probe_decision .*lane=1 .*udp_qos_limited=true .*tcp_better=true selected_leg=tcp"
@@ -965,6 +966,71 @@ count_log_pattern() {
     return 0
   fi
   grep -c "${pattern}" "${log_file}" || true
+}
+
+wait_bandwidth_probe_additive_ramp() {
+  local label="$1"
+  local log_file="$2"
+  local start_line="$3"
+  local timeout="${4:-8}"
+  local message="$5"
+  local min_distinct="${6:-3}"
+  local deadline=$((SECONDS + timeout))
+  local output status
+
+  while (( SECONDS < deadline )); do
+    output="$(awk \
+      -v start="${start_line}" \
+      -v min_rate=16000000 \
+      -v step_rate=10000000 \
+      -v min_distinct="${min_distinct}" '
+        NR <= start { next }
+        $0 !~ /send\/bw_probe/ || $0 !~ /round_start/ || $0 !~ /leg=\{udp / { next }
+        {
+          rate = 0
+          for (i = 1; i <= NF; i++) {
+            if ($i ~ /^rate_bps=/) {
+              split($i, parts, "=")
+              rate = parts[2] + 0
+              break
+            }
+          }
+          if (rate == 0) {
+            next
+          }
+          if (rate < min_rate || ((rate - min_rate) % step_rate) != 0) {
+            printf("bad %d\n", rate)
+            exit 1
+          }
+          if (!(rate in seen)) {
+            seen[rate] = 1
+            distinct++
+          }
+        }
+        END {
+          if (distinct >= min_distinct) {
+            printf("ok %d\n", distinct)
+            exit 0
+          }
+          printf("need %d\n", distinct)
+          exit 2
+        }
+      ' "${log_file}" 2>/dev/null)"
+    status=$?
+    case "${status}" in
+    0)
+      pass "${label}" "${message}"
+      return 0
+      ;;
+    1)
+      fail "${label}" "${message}: non-additive UDP probe rate observed: ${output#bad }"
+      return 1
+      ;;
+    esac
+    sleep 0.2
+  done
+  fail "${label}" "${message}: additive UDP probe sequence not observed within ${timeout}s"
+  return 1
 }
 
 assert_log_not_contains() {

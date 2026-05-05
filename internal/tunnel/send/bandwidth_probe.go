@@ -633,10 +633,11 @@ func (l *Send) advanceBandwidthProbeRate(legKey pingKey) {
 		debuglog.Printf("send/bw_probe", "rate_ceiling session=%d lane=%d kind=%s rate_bps=%d prev_acked_bytes=%d acked_bytes=%d", state.key.sessionID, state.key.laneID, kindMetricLabel(legKey.kind), state.rateCeilingBps, state.prevStepBytes, state.lastStepBytes)
 	} else if state.lastStepBps > 0 {
 		next := uint64(0)
-		if bandwidthProbeLossIncreased(state.prevStepLoss, state.lastStepLoss) {
-			next = state.nextRateBps + bandwidthProbeAdditiveStepBps
-		} else {
+		if state.rampChunks < bandwidthProbeMultiplicativeChunks &&
+			!bandwidthProbeLossIncreased(state.prevStepLoss, state.lastStepLoss) {
 			next = state.lastStepBps * bandwidthProbePacingGainNum / bandwidthProbePacingGainDen
+		} else {
+			next = state.nextRateBps + bandwidthProbeAdditiveStepBps
 		}
 		if next < bandwidthProbeMinRateBps {
 			next = bandwidthProbeMinRateBps
@@ -662,9 +663,6 @@ func bandwidthProbeGrowthStalled(prevBytes, currentBytes uint64) bool {
 }
 
 func bandwidthProbeLossIncreased(prevLoss, currentLoss float64) bool {
-	if prevLoss == 0 {
-		return false
-	}
 	return currentLoss > prevLoss+bandwidthProbeLossIncreaseEpsilon
 }
 

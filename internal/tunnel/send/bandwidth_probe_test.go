@@ -318,7 +318,7 @@ func TestBandwidthProbeAckAttributesBytesToOriginalStep(t *testing.T) {
 	}
 }
 
-func TestBandwidthProbeRateAdvancesByPacingGain(t *testing.T) {
+func TestBandwidthProbeRateAdvancesAdditivelyAfterStartup(t *testing.T) {
 	in := New()
 	udpLeg := transport.LegRef{
 		Kind:       transport.KindUDP,
@@ -335,8 +335,8 @@ func TestBandwidthProbeRateAdvancesByPacingGain(t *testing.T) {
 	in.advanceBandwidthProbeRate(legKey)
 
 	state := in.bandwidthLegs[legKey]
-	if state.nextRateBps != 30_000_000 {
-		t.Fatalf("next rate = %d, want 30Mbps from 1.5x pacing gain", state.nextRateBps)
+	if state.nextRateBps != 26_000_000 {
+		t.Fatalf("next rate = %d, want additive increase to 26Mbps", state.nextRateBps)
 	}
 }
 
@@ -375,7 +375,7 @@ func TestBandwidthProbeRateAdvanceLocksDynamicCeilingWhenAckBytesStopGrowing(t *
 	}
 }
 
-func TestBandwidthProbeRateKeepsRampingWhenAckBytesGrowEnough(t *testing.T) {
+func TestBandwidthProbeRateUsesAdditiveIncreaseWhenAckBytesGrowEnough(t *testing.T) {
 	in := New()
 	udpLeg := transport.LegRef{
 		Kind:       transport.KindUDP,
@@ -397,8 +397,8 @@ func TestBandwidthProbeRateKeepsRampingWhenAckBytesGrowEnough(t *testing.T) {
 	if state.rateCeilingBps != 0 {
 		t.Fatalf("rate ceiling = %d, want none", state.rateCeilingBps)
 	}
-	if state.nextRateBps != 120_000_000 {
-		t.Fatalf("next rate = %d, want 120Mbps from 1.5x pacing gain", state.nextRateBps)
+	if state.nextRateBps != 100_000_000 {
+		t.Fatalf("next rate = %d, want additive increase to 100Mbps", state.nextRateBps)
 	}
 }
 
@@ -428,6 +428,32 @@ func TestBandwidthProbeRateAdvanceUsesAdditiveStepWhenLossIncreases(t *testing.T
 	}
 	if state.rateCeilingBps != 0 {
 		t.Fatalf("dynamic ceiling = %d, want none before ack plateau", state.rateCeilingBps)
+	}
+}
+
+func TestBandwidthProbeRateAdvanceTreatsFirstLossAsIncrease(t *testing.T) {
+	in := New()
+	udpLeg := transport.LegRef{
+		Kind:       transport.KindUDP,
+		EndpointID: "udp0",
+		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
+	}
+	legKey := newPingKey(udpLeg)
+	in.bandwidthLegs[legKey] = &bandwidthLegState{
+		nextRateBps:   90_000_000,
+		inFlight:      true,
+		lastStepBps:   100_000_000,
+		lastStepBytes: 6_000_000,
+		prevStepBytes: 4_000_000,
+		prevStepLoss:  0,
+		lastStepLoss:  bandwidthProbeLossIncreaseEpsilon + 0.001,
+	}
+
+	in.advanceBandwidthProbeRate(legKey)
+
+	state := in.bandwidthLegs[legKey]
+	if state.nextRateBps != 100_000_000 {
+		t.Fatalf("next rate = %d, want additive increase after first loss", state.nextRateBps)
 	}
 }
 
