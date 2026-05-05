@@ -145,9 +145,6 @@ func (l *Send) writeScheduledFrame(ctx context.Context, frame protocol.Frame) (l
 		)
 		return 0, 0, errNoRunnableLane
 	}
-	if !useUDP && bandwidthOnlyPrefersTCP(udpQ, tcpQ) && l.preserveUDPForBandwidthFallback(frame.SessionID, laneID) {
-		useUDP = true
-	}
 
 	var leg transport.LegRef
 	if useUDP {
@@ -177,35 +174,6 @@ func (l *Send) writeScheduledFrame(ctx context.Context, frame protocol.Frame) (l
 		debuglog.Printf("send", "schedule_done session=%d lane=%d leg={%s} frame_bytes=%d charge=%d", frame.SessionID, laneID, debugLeg(leg), size, charge)
 	}
 	return laneID, charge, nil
-}
-
-func (l *Send) preserveUDPForBandwidthFallback(sessionID uint64, laneID uint8) bool {
-	type candidate struct {
-		id  uint8
-		bps uint64
-	}
-	var candidates []candidate
-	l.lanesMu.RLock()
-	for key, lane := range l.lanes {
-		if key.sessionID != sessionID {
-			continue
-		}
-		_, udpQ, _, tcpQ := lane.legQualities()
-		if udpQ.Active && tcpQ.Active && bandwidthOnlyPrefersTCP(udpQ, tcpQ) {
-			candidates = append(candidates, candidate{id: key.laneID, bps: udpQ.BandwidthBps})
-		}
-	}
-	l.lanesMu.RUnlock()
-	if len(candidates) < 2 {
-		return false
-	}
-	best := candidates[0]
-	for _, item := range candidates[1:] {
-		if item.bps > best.bps || item.bps == best.bps && item.id < best.id {
-			best = item
-		}
-	}
-	return best.id == laneID
 }
 
 func (l *Send) maybeSendRepair(ctx context.Context, sessionID uint64, group txRepairGroup) {

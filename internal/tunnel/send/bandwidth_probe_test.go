@@ -104,8 +104,7 @@ func TestSendBandwidthProbeAckUpdatesLaneQuality(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("receiveBandwidthProbeAck failed: %v", err)
 	}
-	in.finishBandwidthProbeRound(7)
-	in.finishBandwidthProbeTrain(key, legKey)
+	in.finishBandwidthProbe(7)
 
 	_, udpQ, _, _ := lane.legQualities()
 	if udpQ.BandwidthBps == 0 {
@@ -190,7 +189,9 @@ func TestBandwidthProbeDoesNotUpdateLaneQualityBeforeWindowElapsed(t *testing.T)
 		received:     0x0f,
 	}
 
-	in.finishBandwidthProbeRound(7)
+	if in.finishBandwidthProbe(7) {
+		t.Fatal("probe completed before bandwidth window elapsed")
+	}
 	_, udpQ, _, _ := lane.legQualities()
 	if udpQ.ProbeSamples != 0 || udpQ.BandwidthBps != 0 {
 		t.Fatalf("udp quality updated before completion: samples=%d bps=%d", udpQ.ProbeSamples, udpQ.BandwidthBps)

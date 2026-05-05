@@ -610,10 +610,7 @@ Sender behavior:
 5. Run the probe as a sustained window. A short burst only measures transient
    delivery rate; it does not prove sustainable goodput on links with periodic
    shaping or stalls.
-6. Do not block the send loop on one round's ACK. The `count <= 64` bitmap
-   limit is an ACK chunk size, not a send-window size; senders may pipeline
-   multiple `probe_id` rounds while ACKs arrive asynchronously.
-7. Do not keep sending periodic bandwidth probes after a leg's ramp completes.
+6. Do not keep sending periodic bandwidth probes after a leg's ramp completes.
    A new concrete leg may start a new ramp.
 
 Receiver behavior:
@@ -647,8 +644,7 @@ Sender behavior:
 3. Finish the round early when the ACK bitmap covers all expected probe frames;
    otherwise finish it after the round timeout.
 4. Compute received count and loss for the round.
-5. Accumulate round results into the sustained-window sample. Feed the final
-   window sample into per-leg bandwidth EWMA and leg selection policy.
+5. Feed the sample into per-leg bandwidth EWMA and leg selection policy.
 6. When both UDP and TCP legs for a lane have completed their bandwidth-probe
    ramps, emit a lane-level decision describing whether UDP showed QoS/limit
    evidence, whether TCP measured better, and which leg should carry DATA.
@@ -765,9 +761,6 @@ Recommended sender behavior:
 7. Treat UDP as QoS-limited when the UDP sample has loss or delay-inflation
    evidence. Select TCP only when TCP's measured bandwidth is materially better
    than UDP's, so small probe differences do not override UDP preference.
-8. When multiple lanes in the same session would all select TCP only because of
-   bandwidth QoS, keep at least one active UDP lane selected so UDP remains
-   available for traffic that benefits from avoiding TCP head-of-line blocking.
 
 The bandwidth probe is an initial capacity classification, not a continuous
 monitor. A QoS decision requires bandwidth samples for both UDP and TCP. Once a
