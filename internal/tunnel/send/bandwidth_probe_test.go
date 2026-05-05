@@ -121,14 +121,28 @@ func TestSendBandwidthProbeAckUpdatesLaneQuality(t *testing.T) {
 func TestLaneBandwidthQoSClassification(t *testing.T) {
 	lane := newLaneRuntime(3, 10)
 	lane.recordBandwidthSample(transport.KindUDP, 59_000_000, 0.041)
-	lane.recordBandwidthSample(transport.KindTCP, 81_000_000, 0)
+	lane.recordBandwidthSample(transport.KindTCP, 100_000_000, 0)
 
 	_, udpQ, _, _ := lane.legQualities()
 	if !udpQ.BandwidthQoSLimited {
 		t.Fatal("UDP bandwidth QoS was not marked after UDP probe loss")
 	}
 	if !udpQ.BandwidthPreferTCP {
-		t.Fatal("TCP was not preferred when UDP had loss and TCP bandwidth was higher")
+		t.Fatal("TCP was not preferred when UDP had loss and TCP bandwidth was materially higher")
+	}
+}
+
+func TestLaneBandwidthQoSLimitedKeepsUDPWhenTCPGainIsSmall(t *testing.T) {
+	lane := newLaneRuntime(3, 10)
+	lane.recordBandwidthSample(transport.KindUDP, 59_000_000, 0.041)
+	lane.recordBandwidthSample(transport.KindTCP, 81_000_000, 0)
+
+	_, udpQ, _, _ := lane.legQualities()
+	if !udpQ.BandwidthQoSLimited {
+		t.Fatal("UDP bandwidth QoS was not marked after UDP probe loss")
+	}
+	if udpQ.BandwidthPreferTCP {
+		t.Fatal("TCP was preferred without a material bandwidth gain")
 	}
 }
 

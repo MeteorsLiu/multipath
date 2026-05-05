@@ -759,7 +759,8 @@ Recommended sender behavior:
 6. Record a sustained TCP bandwidth EWMA from TCP probing or transport TCP_INFO
    where available.
 7. Treat UDP as QoS-limited when the UDP sample has loss or delay-inflation
-   evidence. Select TCP only when TCP's measured bandwidth is better than UDP's.
+   evidence. Select TCP only when TCP's measured bandwidth is materially better
+   than UDP's, so small probe differences do not override UDP preference.
 
 The bandwidth probe is an initial capacity classification, not a continuous
 monitor. A QoS decision requires bandwidth samples for both UDP and TCP. Once a

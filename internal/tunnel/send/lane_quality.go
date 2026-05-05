@@ -9,6 +9,7 @@ import (
 const (
 	minBandwidthProbeSamples    = 1
 	bandwidthProbeLossThreshold = 0.01
+	tcpBandwidthPreferRatio     = 3.0 / 2.0
 )
 
 type laneQualityState struct {
@@ -109,7 +110,7 @@ func (q *bandwidthQualityState) updateQoSState() {
 		return
 	}
 	q.qosLimited = q.udpProbeLoss >= bandwidthProbeLossThreshold
-	q.preferTCP = q.qosLimited && q.tcpBandwidthBps > q.udpBandwidthBps
+	q.preferTCP = q.qosLimited && float64(q.tcpBandwidthBps) >= float64(q.udpBandwidthBps)*tcpBandwidthPreferRatio
 }
 
 func bandwidthLossEWMA(old, sample float64, samples uint32) float64 {
