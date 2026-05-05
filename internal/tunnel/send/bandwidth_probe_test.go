@@ -1,6 +1,7 @@
 package send
 
 import (
+	"bytes"
 	"context"
 	"testing"
 	"time"
@@ -301,13 +302,13 @@ func TestBandwidthProbeRateAdvancesByPacingGain(t *testing.T) {
 	in.advanceBandwidthProbeRate(legKey)
 
 	state := in.bandwidthLegs[legKey]
-	if state.nextRateBps != 40_000_000 {
-		t.Fatalf("next rate = %d, want 40Mbps from 2x pacing gain", state.nextRateBps)
+	if state.nextRateBps != 30_000_000 {
+		t.Fatalf("next rate = %d, want 30Mbps from 1.5x pacing gain", state.nextRateBps)
 	}
 }
 
 func TestBandwidthProbeLimiterUsesByteRateAndShortBurst(t *testing.T) {
-	limiter := newBandwidthProbeLimiter(bandwidthProbeMinRateBps, bandwidthProbeUDPPayloadSize)
+	limiter := newBandwidthProbeLimiter(bandwidthProbeMinRateBps, bandwidthProbeUDPMinPayloadSize)
 	if limiter == nil {
 		t.Fatal("missing limiter")
 	}
@@ -316,6 +317,43 @@ func TestBandwidthProbeLimiterUsesByteRateAndShortBurst(t *testing.T) {
 	}
 	if got := limiter.Limit(); got != 2_000_000 {
 		t.Fatalf("limit = %v, want 2000000 bytes/s", got)
+	}
+}
+
+func TestBandwidthProbeUDPPayloadSizeIsJittered(t *testing.T) {
+	key := laneKey{sessionID: 99, laneID: 1}
+	sawDifferent := false
+	first := bandwidthProbeUDPPayloadSize(key, 1, bandwidthProbeMinRateBps)
+	for probeID := uint64(1); probeID <= 16; probeID++ {
+		got := bandwidthProbeUDPPayloadSize(key, probeID, bandwidthProbeMinRateBps)
+		if got < bandwidthProbeUDPMinPayloadSize || got > bandwidthProbeUDPMaxPayloadSize {
+			t.Fatalf("payload size = %d, want [%d,%d]", got, bandwidthProbeUDPMinPayloadSize, bandwidthProbeUDPMaxPayloadSize)
+		}
+		if got != first {
+			sawDifferent = true
+		}
+	}
+	if !sawDifferent {
+		t.Fatal("payload size did not jitter across probe ids")
+	}
+}
+
+func TestBandwidthProbePayloadFillIsNotZero(t *testing.T) {
+	round := &bandwidthProbeRound{
+		key:          laneKey{sessionID: 99, laneID: 1},
+		probeID:      7,
+		payloadBytes: 128,
+		rateBps:      bandwidthProbeMinRateBps,
+	}
+	payload := make([]byte, round.payloadBytes)
+	fillBandwidthProbePayload(payload, round)
+	if bytes.Equal(payload, make([]byte, len(payload))) {
+		t.Fatal("payload is all zero")
+	}
+	again := make([]byte, round.payloadBytes)
+	fillBandwidthProbePayload(again, round)
+	if !bytes.Equal(payload, again) {
+		t.Fatal("payload fill is not deterministic")
 	}
 }
 

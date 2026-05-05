@@ -2,7 +2,9 @@ package send
 
 import (
 	"context"
+	"encoding/binary"
 	"math/bits"
+	randv2 "math/rand/v2"
 	"slices"
 	"time"
 
@@ -18,12 +20,13 @@ const (
 	bandwidthProbeWindow               = 10 * time.Second
 	bandwidthProbeRoundWindow          = 500 * time.Millisecond
 	bandwidthProbeBurstWindow          = 2 * time.Millisecond
-	bandwidthProbeUDPPayloadSize       = 1200
+	bandwidthProbeUDPMinPayloadSize    = 1200
+	bandwidthProbeUDPMaxPayloadSize    = 1400
 	bandwidthProbeTCPPayloadSize       = 32 * 1024
 	bandwidthProbeMinRateBps           = uint64(16_000_000)
 	bandwidthProbeAdditiveStepBps      = uint64(10_000_000)
-	bandwidthProbePacingGainNum        = uint64(2)
-	bandwidthProbePacingGainDen        = uint64(1)
+	bandwidthProbePacingGainNum        = uint64(3)
+	bandwidthProbePacingGainDen        = uint64(2)
 	bandwidthProbeMaxFrames            = 64
 	bandwidthProbeMultiplicativeChunks = 0
 	bandwidthProbeAckEvery             = 16
@@ -288,12 +291,12 @@ func (l *Send) startBandwidthProbeRound(key laneKey, leg transport.LegRef, legKe
 	if rateBps == 0 {
 		rateBps = bandwidthProbeMinRateBps
 	}
-	payloadBytes := bandwidthProbeUDPPayloadSize
+	probeID := l.nextBWProbeID.Add(1)
+	payloadBytes := bandwidthProbeUDPPayloadSize(key, probeID, rateBps)
 	if leg.Kind == transport.KindTCP {
 		payloadBytes = bandwidthProbeTCPPayloadSize
 	}
 	stepID := state.currentStepID
-	probeID := l.nextBWProbeID.Add(1)
 	round := &bandwidthProbeRound{
 		key:          key,
 		leg:          leg,
@@ -314,6 +317,7 @@ func (l *Send) startBandwidthProbeRound(key laneKey, leg transport.LegRef, legKe
 
 func (l *Send) runBandwidthProbeRound(ctx context.Context, round *bandwidthProbeRound, deadline time.Time) uint16 {
 	payload := make([]byte, round.payloadBytes)
+	fillBandwidthProbePayload(payload, round)
 	limiter := newBandwidthProbeLimiter(round.rateBps, round.payloadBytes)
 	for seq := uint16(0); seq < round.count; seq++ {
 		if !time.Now().Before(deadline) {
@@ -346,6 +350,32 @@ func (l *Send) runBandwidthProbeRound(ctx context.Context, round *bandwidthProbe
 		}
 	}
 	return round.count
+}
+
+func fillBandwidthProbePayload(payload []byte, round *bandwidthProbeRound) {
+	if len(payload) == 0 || round == nil {
+		return
+	}
+	seed := bandwidthProbeSeed(round.key, round.probeID, round.rateBps)
+	binary.BigEndian.PutUint32(seed[25:29], uint32(round.payloadBytes))
+	rng := randv2.NewChaCha8(seed)
+	_, _ = rng.Read(payload)
+}
+
+func bandwidthProbeUDPPayloadSize(key laneKey, probeID uint64, rateBps uint64) int {
+	const span = bandwidthProbeUDPMaxPayloadSize - bandwidthProbeUDPMinPayloadSize + 1
+	seed := bandwidthProbeSeed(key, probeID, rateBps)
+	rng := randv2.NewChaCha8(seed)
+	return bandwidthProbeUDPMinPayloadSize + int(rng.Uint64()%uint64(span))
+}
+
+func bandwidthProbeSeed(key laneKey, probeID uint64, rateBps uint64) [32]byte {
+	var seed [32]byte
+	binary.BigEndian.PutUint64(seed[0:8], key.sessionID)
+	seed[8] = key.laneID
+	binary.BigEndian.PutUint64(seed[9:17], probeID)
+	binary.BigEndian.PutUint64(seed[17:25], rateBps)
+	return seed
 }
 
 func newBandwidthProbeLimiter(rateBps uint64, payloadBytes int) *rate.Limiter {
