@@ -876,8 +876,8 @@ run_leg_selector_case() {
   echo "==== ${name} e2e start ===="
   clear_loss
   write_one_lane_config "${name}" "${PORT_LEG_SELECTOR}" false false 200 600
-  echo "[${name}] apply 30% UDP loss before startup; initial bandwidth probes should mark UDP QoS-limited"
-  apply_udp_partial_loss 1 "${PORT_LEG_SELECTOR}" 30%
+  echo "[${name}] apply 50% UDP loss before startup; initial bandwidth probes should mark UDP QoS-limited"
+  apply_udp_partial_loss 1 "${PORT_LEG_SELECTOR}" 50%
   start_multipath "${name}"
   local client_qos_start_line
   local server_qos_start_line

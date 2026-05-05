@@ -702,10 +702,7 @@ func (l *Send) completeBandwidthProbeTrain(key laneKey, leg transport.LegRef, le
 	if state.endedAt.IsZero() {
 		state.endedAt = now
 	}
-	sampleBps := state.maxStepBps
-	if sampleBps == 0 {
-		sampleBps = bandwidthWindowSampleBps(state.ackedBytes, state.startedAt, state.endedAt)
-	}
+	sampleBps := bandwidthWindowSampleBps(state.ackedBytes, state.startedAt, state.endedAt)
 	state.ewmaBps = sampleBps
 	state.lastLoss = bandwidthAggregateLoss(state.sentFrames, state.ackedFrames)
 	state.sampleCount = 1

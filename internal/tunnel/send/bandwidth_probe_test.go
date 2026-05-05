@@ -251,6 +251,42 @@ func TestSendBandwidthProbeAckUpdatesLaneQuality(t *testing.T) {
 	}
 }
 
+func TestBandwidthProbeCompletionUsesSustainedWindowSample(t *testing.T) {
+	in := New()
+	mustSendState(t, in, 99)
+	in.activateSession(99)
+	key := laneKey{sessionID: 99, laneID: 3}
+	udpLeg := transport.LegRef{
+		Kind:       transport.KindUDP,
+		EndpointID: "udp0",
+		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
+	}
+	lane := newLaneRuntime(3, 10)
+	lane.bindLeg(udpLeg)
+	in.lanes[key] = lane
+
+	legKey := newPingKey(udpLeg)
+	startedAt := time.Now().Add(-10 * time.Second)
+	endedAt := startedAt.Add(10 * time.Second)
+	in.bandwidthLegs[legKey] = &bandwidthLegState{
+		nextRateBps: bandwidthProbeMinRateBps,
+		inFlight:    true,
+		startedAt:   startedAt,
+		endedAt:     endedAt,
+		ackedBytes:  1_000_000,
+		sentFrames:  100,
+		ackedFrames: 100,
+		maxStepBps:  800_000_000,
+	}
+
+	in.completeBandwidthProbeTrain(key, udpLeg, legKey)
+
+	_, udpQ, _, _ := lane.legQualities()
+	if udpQ.BandwidthBps != 800_000 {
+		t.Fatalf("udp bandwidth = %d, want sustained 800000bps", udpQ.BandwidthBps)
+	}
+}
+
 func TestBandwidthProbeAckAttributesBytesToOriginalStep(t *testing.T) {
 	in := New()
 	key := laneKey{sessionID: 99, laneID: 3}
