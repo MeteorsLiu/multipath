@@ -3,6 +3,7 @@ package send
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/MeteorsLiu/multipath/internal/protocol"
 	"github.com/MeteorsLiu/multipath/internal/transport"
@@ -83,6 +84,7 @@ func TestSendBandwidthProbeAckUpdatesLaneQuality(t *testing.T) {
 	in.bandwidthLegs[legKey] = &bandwidthLegState{
 		nextRateBps: bandwidthProbeMinRateBps,
 		inFlight:    true,
+		startedAt:   time.Now().Add(-bandwidthProbeWindow),
 	}
 	in.bandwidthPending[7] = &bandwidthProbeRound{
 		key:          key,
@@ -112,7 +114,7 @@ func TestSendBandwidthProbeAckUpdatesLaneQuality(t *testing.T) {
 		t.Fatalf("udp probe loss = %.2f, want 0.50", udpQ.ProbeLoss)
 	}
 	if state := in.bandwidthLegs[legKey]; state == nil || !state.complete {
-		t.Fatalf("probe complete = %v, want true after loss", state != nil && state.complete)
+		t.Fatalf("probe complete = %v, want true after window elapsed", state != nil && state.complete)
 	}
 }
 
@@ -144,68 +146,40 @@ func TestLaneBandwidthQoSLimitedButKeepsUDPWhenTCPIsSlower(t *testing.T) {
 	}
 }
 
-func TestBandwidthSamplePlateau(t *testing.T) {
-	if samplePlateau(0, 1) {
-		t.Fatal("zero best sample should not be plateau")
-	}
-	if !samplePlateau(1000, 1100) {
-		t.Fatal("10% sample gain should be plateau")
-	}
-	if samplePlateau(1000, 1101) {
-		t.Fatal("sample gain above 10% should continue probing")
-	}
-}
-
-func TestTCPBandwidthProbeDoesNotCompleteBeforeMinimumRounds(t *testing.T) {
+func TestBandwidthProbeDoesNotUpdateLaneQualityBeforeWindowElapsed(t *testing.T) {
 	in := New()
 	key := laneKey{sessionID: 99, laneID: 3}
-	tcpLeg := transport.LegRef{
-		Kind:   transport.KindTCP,
-		ConnID: "tcp-1",
+	udpLeg := transport.LegRef{
+		Kind:       transport.KindUDP,
+		EndpointID: "udp0",
+		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
 	}
 	lane := newLaneRuntime(3, 10)
-	lane.bindLeg(tcpLeg)
+	lane.bindLeg(udpLeg)
 	in.lanes[key] = lane
 
-	legKey := newPingKey(tcpLeg)
-	state := &bandwidthLegState{nextRateBps: bandwidthProbeMinRateBps}
-	in.bandwidthLegs[legKey] = state
-
-	for i := 0; i < bandwidthProbeTCPMinRounds-1; i++ {
-		probeID := uint64(i + 1)
-		state.inFlight = true
-		in.bandwidthPending[probeID] = &bandwidthProbeRound{
-			key:          key,
-			leg:          tcpLeg,
-			legKey:       legKey,
-			probeID:      probeID,
-			count:        4,
-			payloadBytes: 1000,
-			received:     0x0f,
-			firstRXMS:    1000,
-			lastRXMS:     1032,
-		}
-		in.finishBandwidthProbe(probeID)
-		if state.complete {
-			t.Fatalf("tcp probe completed after %d rounds, want at least %d", i+1, bandwidthProbeTCPMinRounds)
-		}
+	legKey := newPingKey(udpLeg)
+	state := &bandwidthLegState{
+		nextRateBps: bandwidthProbeMinRateBps,
+		inFlight:    true,
+		startedAt:   time.Now(),
 	}
-
-	probeID := uint64(bandwidthProbeTCPMinRounds)
-	state.inFlight = true
-	in.bandwidthPending[probeID] = &bandwidthProbeRound{
+	in.bandwidthLegs[legKey] = state
+	in.bandwidthPending[7] = &bandwidthProbeRound{
 		key:          key,
-		leg:          tcpLeg,
+		leg:          udpLeg,
 		legKey:       legKey,
-		probeID:      probeID,
+		probeID:      7,
 		count:        4,
 		payloadBytes: 1000,
 		received:     0x0f,
-		firstRXMS:    1000,
-		lastRXMS:     1032,
 	}
-	in.finishBandwidthProbe(probeID)
-	if !state.complete {
-		t.Fatalf("tcp probe did not complete after %d plateau rounds", bandwidthProbeTCPMinRounds)
+
+	if in.finishBandwidthProbe(7) {
+		t.Fatal("probe completed before bandwidth window elapsed")
+	}
+	_, udpQ, _, _ := lane.legQualities()
+	if udpQ.ProbeSamples != 0 || udpQ.BandwidthBps != 0 {
+		t.Fatalf("udp quality updated before completion: samples=%d bps=%d", udpQ.ProbeSamples, udpQ.BandwidthBps)
 	}
 }

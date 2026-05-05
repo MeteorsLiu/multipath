@@ -265,7 +265,7 @@ func TestEndToEndBandwidthProbeSelectsTCPWhenUDPQoSLimited(t *testing.T) {
 	waitForE2ELane(t, clientIn, key, func(lane *laneRuntime) bool {
 		_, udpQ, _, tcpQ := lane.legQualities()
 		return udpQ.BandwidthQoSLimited && udpQ.BandwidthPreferTCP && tcpQ.ProbeSamples >= minBandwidthProbeSamples
-	}, 5*time.Second)
+	}, 15*time.Second)
 
 	serverConn.dropData.Store(true)
 	sendUntilTUNPacket(t, clientTun, serverTun, []byte("tcp-selected-after-qos"), 3*time.Second)
@@ -273,7 +273,7 @@ func TestEndToEndBandwidthProbeSelectsTCPWhenUDPQoSLimited(t *testing.T) {
 	waitForE2ELane(t, serverIn, key, func(lane *laneRuntime) bool {
 		_, udpQ, _, tcpQ := lane.legQualities()
 		return udpQ.BandwidthQoSLimited && udpQ.BandwidthPreferTCP && tcpQ.ProbeSamples >= minBandwidthProbeSamples
-	}, 5*time.Second)
+	}, 15*time.Second)
 
 	clientConn.dropData.Store(true)
 	sendUntilTUNPacket(t, serverTun, clientTun, []byte("server-tcp-selected-after-qos"), 3*time.Second)

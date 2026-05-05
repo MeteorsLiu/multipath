@@ -38,7 +38,8 @@ func logBandwidthProbeDecision(sessionID uint64, laneID uint8, udp, tcp LegQuali
 	if udp.BandwidthPreferTCP {
 		selected = "tcp"
 	}
-	eventlog.Printf("bandwidth_probe_decision", "session=%d lane=%d udp_bps=%d udp_loss=%.3f udp_samples=%d tcp_bps=%d tcp_loss=%.3f tcp_samples=%d udp_qos_limited=%t tcp_better=%t selected_leg=%s", sessionID, laneID, udp.BandwidthBps, udp.ProbeLoss, udp.ProbeSamples, tcp.BandwidthBps, tcp.ProbeLoss, tcp.ProbeSamples, udp.BandwidthQoSLimited, udp.BandwidthPreferTCP, selected)
+	tcpBetter := tcp.BandwidthBps > udp.BandwidthBps
+	eventlog.Printf("bandwidth_probe_decision", "session=%d lane=%d udp_bps=%d udp_loss=%.3f udp_samples=%d tcp_bps=%d tcp_loss=%.3f tcp_samples=%d udp_qos_limited=%t tcp_better=%t selected_leg=%s", sessionID, laneID, udp.BandwidthBps, udp.ProbeLoss, udp.ProbeSamples, tcp.BandwidthBps, tcp.ProbeLoss, tcp.ProbeSamples, udp.BandwidthQoSLimited, tcpBetter, selected)
 }
 
 func currentLegFromSnapshot(snap laneSnapshot, kind transport.Kind) transport.LegRef {

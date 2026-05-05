@@ -607,10 +607,9 @@ Sender behavior:
    in flight to measure stream capacity.
 4. Increase the next probe rate multiplicatively after low-loss rounds and
    immediately schedule the next round.
-5. Complete the ramp when loss or delay inflation becomes significant, or when
-   delivered bandwidth stops increasing meaningfully across higher-rate rounds.
-   TCP should not complete on an early plateau before enough successful ramp
-   rounds have been sent to exercise the stream.
+5. Run the probe as a sustained window. A short burst only measures transient
+   delivery rate; it does not prove sustainable goodput on links with periodic
+   shaping or stalls.
 6. Do not keep sending periodic bandwidth probes after a leg's ramp completes.
    A new concrete leg may start a new ramp.
 
@@ -644,8 +643,7 @@ Sender behavior:
 2. Merge `received` into the round's cumulative ACK bitmap.
 3. Finish the round early when the ACK bitmap covers all expected probe frames;
    otherwise finish it after the round timeout.
-4. Compute received count, loss, receive span, and an approximate delivered
-   bandwidth sample.
+4. Compute received count and loss for the round.
 5. Feed the sample into per-leg bandwidth EWMA and leg selection policy.
 6. When both UDP and TCP legs for a lane have completed their bandwidth-probe
    ramps, emit a lane-level decision describing whether UDP showed QoS/limit
@@ -755,11 +753,11 @@ Recommended sender behavior:
    rounds.
 3. Increase the probe send rate multiplicatively while loss and delay inflation
    remain low.
-4. Stop the ramp when loss or delay inflation becomes significant, or when
-   delivered bandwidth stops increasing meaningfully across higher-rate rounds.
-5. Record the last stable UDP bandwidth sample into an EWMA.
-6. Record a TCP bandwidth EWMA from TCP probing or transport TCP_INFO where
-   available.
+4. Keep the probe running for a sustained window, and compute bandwidth from
+   total acknowledged bytes divided by wall-clock elapsed time for that window.
+5. Record the sustained UDP bandwidth sample into an EWMA.
+6. Record a sustained TCP bandwidth EWMA from TCP probing or transport TCP_INFO
+   where available.
 7. Treat UDP as QoS-limited when the UDP sample has loss or delay-inflation
    evidence. Select TCP only when TCP's measured bandwidth is better than UDP's.
 
