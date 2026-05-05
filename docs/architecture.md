@@ -235,7 +235,7 @@ bandwidth samples when implemented. Bandwidth probing is an initial per-leg
 capacity ramp and is not a continuous QoS monitor.
 Bandwidth probe results are exposed through `multipath_lane_bandwidth_bps`,
 `multipath_lane_probe_loss_ratio`, `multipath_bandwidth_probe_events_total`,
-and the `bandwidth_probe_sample` event log.
+and the `bandwidth_probe_decision` event log.
 Send arms the FEC flush timer only when the negotiated FEC profile supports
 variable-span REPAIR frames. The timer emits transport-bound REPAIR frames
 through the same scheduling and packet queue path as fill-triggered REPAIR.

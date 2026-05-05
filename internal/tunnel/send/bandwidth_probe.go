@@ -356,8 +356,35 @@ func (l *Send) finishBandwidthProbe(probeID uint64) {
 		metrics.L("lane", round.key.laneID),
 		metrics.L("leg", kindMetricLabel(round.leg.Kind)),
 	)
-	logBandwidthProbeSample(round.key.sessionID, round.key.laneID, round.leg, probeID, acked, int(round.count), loss, sampleBps, ewmaBps, nextRateBps, complete)
+	if complete {
+		l.logBandwidthProbeDecisionIfReady(round.key)
+	}
 	debuglog.Printf("send/bw_probe", "finish session=%d lane=%d leg={%s} probe_id=%d acked=%d count=%d loss=%.3f sample_bps=%d ewma_bps=%d next_rate_bps=%d complete=%t", round.key.sessionID, round.key.laneID, debugLeg(round.leg), probeID, acked, round.count, loss, sampleBps, ewmaBps, nextRateBps, complete)
+}
+
+func (l *Send) logBandwidthProbeDecisionIfReady(key laneKey) {
+	lane := l.getLane(key)
+	if lane == nil {
+		return
+	}
+	udpLeg, udpQ, tcpLeg, tcpQ := lane.legQualities()
+	if udpQ.ProbeSamples < minBandwidthProbeSamples || tcpQ.ProbeSamples < minBandwidthProbeSamples {
+		return
+	}
+	udpKey := newPingKey(udpLeg)
+	tcpKey := newPingKey(tcpLeg)
+	if udpKey.kind == 0 || tcpKey.kind == 0 {
+		return
+	}
+	l.bandwidthMu.Lock()
+	udpState := l.bandwidthLegs[udpKey]
+	tcpState := l.bandwidthLegs[tcpKey]
+	ready := udpState != nil && udpState.complete && tcpState != nil && tcpState.complete
+	l.bandwidthMu.Unlock()
+	if !ready {
+		return
+	}
+	logBandwidthProbeDecision(key.sessionID, key.laneID, udpQ, tcpQ)
 }
 
 func (l *Send) clearBandwidthLeg(leg transport.LegRef) {

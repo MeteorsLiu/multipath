@@ -643,6 +643,9 @@ Sender behavior:
 4. Compute received count, loss, receive span, and an approximate delivered
    bandwidth sample.
 5. Feed the sample into per-leg bandwidth EWMA and leg selection policy.
+6. When both UDP and TCP legs for a lane have completed their bandwidth-probe
+   ramps, emit a lane-level decision describing whether UDP is QoS-limited and
+   which leg should carry DATA.
 
 Receiver behavior:
 
