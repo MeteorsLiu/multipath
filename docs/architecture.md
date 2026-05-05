@@ -231,7 +231,8 @@ candidate for probing and later leg selection; it does not make DATA use TCP by
 default.
 PING/PONG liveness is not treated as a UDP bandwidth or QoS signal. UDP QoS
 detection belongs in send-side leg quality policy and must use data-plane
-bandwidth samples when implemented.
+bandwidth samples when implemented. Bandwidth probing is an initial per-leg
+capacity ramp and is not a continuous QoS monitor.
 Bandwidth probe results are exposed through `multipath_lane_bandwidth_bps`,
 `multipath_lane_probe_loss_ratio`, `multipath_bandwidth_probe_events_total`,
 and the `bandwidth_probe_sample` event log.

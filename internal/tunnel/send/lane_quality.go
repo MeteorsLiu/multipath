@@ -7,11 +7,9 @@ import (
 )
 
 const (
-	minBandwidthProbeSamples           = 3
-	bandwidthProbeLossThreshold        = 0.05
-	bandwidthProbeTCPRatio             = 2
-	bandwidthProbeBadSamplesToSwitch   = 2
-	bandwidthProbeGoodSamplesToRecover = 2
+	minBandwidthProbeSamples    = 1
+	bandwidthProbeLossThreshold = 0.05
+	bandwidthProbeTCPRatio      = 2
 )
 
 type laneQualityState struct {
@@ -71,8 +69,6 @@ type bandwidthQualityState struct {
 	tcpBandwidthBps uint64
 	tcpProbeLoss    float64
 	tcpProbeSamples uint32
-	badSamples      uint32
-	goodSamples     uint32
 	qosLimited      bool
 }
 
@@ -99,33 +95,19 @@ func (q *bandwidthQualityState) recordSample(kind transport.Kind, bandwidthBps u
 		q.tcpBandwidthBps = bandwidthBps
 		q.tcpProbeLoss = bandwidthLossEWMA(q.tcpProbeLoss, loss, q.tcpProbeSamples)
 		q.tcpProbeSamples++
-		return
 	default:
 		return
 	}
-	q.updateQoSState(loss)
+	q.updateQoSState()
 }
 
-func (q *bandwidthQualityState) updateQoSState(loss float64) {
+func (q *bandwidthQualityState) updateQoSState() {
 	if q.udpProbeSamples < minBandwidthProbeSamples || q.tcpProbeSamples < minBandwidthProbeSamples ||
 		q.udpBandwidthBps == 0 || q.tcpBandwidthBps == 0 {
 		return
 	}
-	bad := loss >= bandwidthProbeLossThreshold &&
+	q.qosLimited = q.udpProbeLoss >= bandwidthProbeLossThreshold &&
 		q.tcpBandwidthBps/bandwidthProbeTCPRatio >= q.udpBandwidthBps
-	if bad {
-		q.badSamples++
-		q.goodSamples = 0
-		if q.badSamples >= bandwidthProbeBadSamplesToSwitch {
-			q.qosLimited = true
-		}
-		return
-	}
-	q.goodSamples++
-	q.badSamples = 0
-	if q.goodSamples >= bandwidthProbeGoodSamplesToRecover {
-		q.qosLimited = false
-	}
 }
 
 func bandwidthLossEWMA(old, sample float64, samples uint32) float64 {

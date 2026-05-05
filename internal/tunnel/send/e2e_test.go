@@ -203,8 +203,9 @@ func TestEndToEndBandwidthProbeSelectsTCPWhenUDPQoSLimited(t *testing.T) {
 	defer serverRaw.Close()
 	serverConn := &qosBandwidthProbePacketConn{PacketConn: serverRaw}
 
-	clientUDP := listenPacket(t)
-	defer clientUDP.Close()
+	clientRaw := listenPacket(t)
+	defer clientRaw.Close()
+	clientConn := &qosBandwidthProbePacketConn{PacketConn: clientRaw}
 	serverListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("Listen tcp: %v", err)
@@ -212,13 +213,15 @@ func TestEndToEndBandwidthProbeSelectsTCPWhenUDPQoSLimited(t *testing.T) {
 	defer serverListener.Close()
 
 	serverPacket := newPacketTransport(t, transport.PacketEndpoint{ID: "server", Conn: serverConn})
-	clientPacket := newPacketTransport(t, transport.PacketEndpoint{ID: "lane-1", Conn: clientUDP})
+	clientPacket := newPacketTransport(t, transport.PacketEndpoint{ID: "lane-1", Conn: clientConn})
 	serverStream := transport.NewStream(serverListener)
 	clientStream := transport.NewStream(nil)
 	serverTun := newE2ETUN()
 	clientTun := newE2ETUN()
 	serverIn := New(Config{
 		StreamTransport: serverStream,
+		ProbeInterval:   20 * time.Millisecond,
+		ProbeTimeout:    time.Second,
 	})
 	clientIn := New(Config{
 		StreamTransport: clientStream,
@@ -239,7 +242,7 @@ func TestEndToEndBandwidthProbeSelectsTCPWhenUDPQoSLimited(t *testing.T) {
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
-	serverErr := runE2ERuntimeAsync(ctx, serverIn, nil, serverTun, serverPacket, serverStream)
+	serverErr := runE2ERuntimeAsync(ctx, serverIn, serverTun, serverTun, serverPacket, serverStream)
 	clientErr := runE2ERuntimeAsync(ctx, clientIn, clientTun, clientTun, clientPacket, clientStream)
 
 	sendUntilTUNPacket(t, clientTun, serverTun, []byte("bootstrap-data"), 2*time.Second)
@@ -253,18 +256,27 @@ func TestEndToEndBandwidthProbeSelectsTCPWhenUDPQoSLimited(t *testing.T) {
 		defer lane.mu.Unlock()
 		return lane.udpReady && lane.tcpReady
 	}, 3*time.Second)
+	waitForE2ELane(t, serverIn, key, func(lane *laneRuntime) bool {
+		lane.mu.Lock()
+		defer lane.mu.Unlock()
+		return lane.udpReady && lane.tcpReady
+	}, 3*time.Second)
 
-	for i := 0; i < minBandwidthProbeSamples+bandwidthProbeBadSamplesToSwitch; i++ {
-		clientIn.probeBandwidth(ctx, time.Now().Add(time.Duration(i)*bandwidthProbeInterval))
-		time.Sleep(bandwidthProbeTimeout + 300*time.Millisecond)
-	}
 	waitForE2ELane(t, clientIn, key, func(lane *laneRuntime) bool {
 		_, udpQ, _, tcpQ := lane.legQualities()
 		return udpQ.BandwidthQoSLimited && tcpQ.ProbeSamples >= minBandwidthProbeSamples
-	}, 2*time.Second)
+	}, 5*time.Second)
 
 	serverConn.dropData.Store(true)
 	sendUntilTUNPacket(t, clientTun, serverTun, []byte("tcp-selected-after-qos"), 3*time.Second)
+
+	waitForE2ELane(t, serverIn, key, func(lane *laneRuntime) bool {
+		_, udpQ, _, tcpQ := lane.legQualities()
+		return udpQ.BandwidthQoSLimited && tcpQ.ProbeSamples >= minBandwidthProbeSamples
+	}, 5*time.Second)
+
+	clientConn.dropData.Store(true)
+	sendUntilTUNPacket(t, serverTun, clientTun, []byte("server-tcp-selected-after-qos"), 3*time.Second)
 
 	cancel()
 	waitE2ERuntime(t, serverErr)

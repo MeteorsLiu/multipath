@@ -12,21 +12,23 @@ import (
 )
 
 const (
-	bandwidthProbeInterval    = 5 * time.Second
 	bandwidthProbeTimeout     = time.Second
 	bandwidthProbeRoundWindow = 200 * time.Millisecond
 	bandwidthProbePayloadSize = 1200
 	bandwidthProbeMinRateBps  = uint64(1_000_000)
-	bandwidthProbeMaxRateBps  = uint64(200_000_000)
 	bandwidthProbeMaxFrames   = 64
+	bandwidthProbePlateauGain = 10
+	bandwidthProbePlateauNeed = 2
 )
 
 type bandwidthLegState struct {
-	nextRateBps uint64
-	ewmaBps     uint64
-	lastProbeAt time.Time
-	inFlight    bool
-	lastLoss    float64
+	nextRateBps  uint64
+	ewmaBps      uint64
+	bestSample   uint64
+	inFlight     bool
+	complete     bool
+	plateauCount uint8
+	lastLoss     float64
 }
 
 type bandwidthProbeRound struct {
@@ -108,7 +110,7 @@ func (l *Send) maybeStartBandwidthProbe(ctx context.Context, key laneKey, leg tr
 		state = &bandwidthLegState{nextRateBps: bandwidthProbeMinRateBps}
 		l.bandwidthLegs[legKey] = state
 	}
-	if state.inFlight || (!state.lastProbeAt.IsZero() && now.Sub(state.lastProbeAt) < bandwidthProbeInterval) {
+	if state.inFlight || state.complete {
 		l.bandwidthMu.Unlock()
 		return
 	}
@@ -129,7 +131,6 @@ func (l *Send) maybeStartBandwidthProbe(ctx context.Context, key laneKey, leg tr
 		startedAt:    now,
 	}
 	state.inFlight = true
-	state.lastProbeAt = now
 	l.bandwidthPending[probeID] = round
 	l.bandwidthMu.Unlock()
 
@@ -264,7 +265,17 @@ func (l *Send) receiveBandwidthProbeAck(sessionID uint64, laneID uint8, leg tran
 	if body.LastRXMS > round.lastRXMS {
 		round.lastRXMS = body.LastRXMS
 	}
+	received := round.received
+	var full uint64
+	if round.count == 64 {
+		full = ^uint64(0)
+	} else {
+		full = (uint64(1) << round.count) - 1
+	}
 	l.bandwidthMu.Unlock()
+	if received == full {
+		l.finishBandwidthProbe(body.ProbeID)
+	}
 	return nil
 }
 
@@ -291,23 +302,39 @@ func (l *Send) finishBandwidthProbe(probeID uint64) {
 	state.lastLoss = loss
 	state.inFlight = false
 	if acked > 0 && loss < 0.05 {
-		next := state.nextRateBps * 2
-		if next < bandwidthProbeMinRateBps {
-			next = bandwidthProbeMinRateBps
+		if samplePlateau(state.bestSample, sampleBps) {
+			state.plateauCount++
+			if sampleBps > state.bestSample {
+				state.bestSample = sampleBps
+			}
+		} else {
+			state.bestSample = sampleBps
+			state.plateauCount = 0
 		}
-		if next > bandwidthProbeMaxRateBps {
-			next = bandwidthProbeMaxRateBps
+		if state.plateauCount >= bandwidthProbePlateauNeed {
+			state.complete = true
+		} else {
+			next := state.nextRateBps * 2
+			if next < state.nextRateBps {
+				state.complete = true
+			} else if next < bandwidthProbeMinRateBps {
+				next = bandwidthProbeMinRateBps
+				state.nextRateBps = next
+			} else {
+				state.nextRateBps = next
+			}
 		}
-		state.nextRateBps = next
 	} else {
 		next := state.nextRateBps / 2
 		if next < bandwidthProbeMinRateBps {
 			next = bandwidthProbeMinRateBps
 		}
 		state.nextRateBps = next
+		state.complete = true
 	}
 	ewmaBps := state.ewmaBps
 	nextRateBps := state.nextRateBps
+	complete := state.complete
 	l.bandwidthMu.Unlock()
 
 	if lane := l.getLane(round.key); lane != nil {
@@ -329,8 +356,8 @@ func (l *Send) finishBandwidthProbe(probeID uint64) {
 		metrics.L("lane", round.key.laneID),
 		metrics.L("leg", kindMetricLabel(round.leg.Kind)),
 	)
-	logBandwidthProbeSample(round.key.sessionID, round.key.laneID, round.leg, probeID, acked, int(round.count), loss, sampleBps, ewmaBps, nextRateBps)
-	debuglog.Printf("send/bw_probe", "finish session=%d lane=%d leg={%s} probe_id=%d acked=%d count=%d loss=%.3f sample_bps=%d ewma_bps=%d next_rate_bps=%d", round.key.sessionID, round.key.laneID, debugLeg(round.leg), probeID, acked, round.count, loss, sampleBps, ewmaBps, nextRateBps)
+	logBandwidthProbeSample(round.key.sessionID, round.key.laneID, round.leg, probeID, acked, int(round.count), loss, sampleBps, ewmaBps, nextRateBps, complete)
+	debuglog.Printf("send/bw_probe", "finish session=%d lane=%d leg={%s} probe_id=%d acked=%d count=%d loss=%.3f sample_bps=%d ewma_bps=%d next_rate_bps=%d complete=%t", round.key.sessionID, round.key.laneID, debugLeg(round.leg), probeID, acked, round.count, loss, sampleBps, ewmaBps, nextRateBps, complete)
 }
 
 func (l *Send) clearBandwidthLeg(leg transport.LegRef) {
@@ -369,4 +396,11 @@ func ewmaBandwidth(old, sample uint64) uint64 {
 		return sample
 	}
 	return (old*7 + sample) / 8
+}
+
+func samplePlateau(best, sample uint64) bool {
+	if best == 0 {
+		return false
+	}
+	return sample <= best+best*bandwidthProbePlateauGain/100
 }

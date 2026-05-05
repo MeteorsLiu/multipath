@@ -111,27 +111,41 @@ func TestSendBandwidthProbeAckUpdatesLaneQuality(t *testing.T) {
 	if udpQ.ProbeLoss != 0.5 {
 		t.Fatalf("udp probe loss = %.2f, want 0.50", udpQ.ProbeLoss)
 	}
+	if state := in.bandwidthLegs[legKey]; state == nil || !state.complete {
+		t.Fatalf("probe complete = %v, want true after loss", state != nil && state.complete)
+	}
 }
 
-func TestLaneBandwidthQoSHysteresis(t *testing.T) {
+func TestLaneBandwidthQoSClassification(t *testing.T) {
 	lane := newLaneRuntime(3, 10)
-	for i := 0; i < minBandwidthProbeSamples+bandwidthProbeBadSamplesToSwitch; i++ {
-		lane.recordBandwidthSample(transport.KindTCP, 120_000_000, 0)
-		lane.recordBandwidthSample(transport.KindUDP, 20_000_000, 0.50)
-	}
+	lane.recordBandwidthSample(transport.KindUDP, 20_000_000, 0.50)
+	lane.recordBandwidthSample(transport.KindTCP, 120_000_000, 0)
+
 	_, udpQ, _, _ := lane.legQualities()
 	if !udpQ.BandwidthQoSLimited {
-		t.Fatal("UDP bandwidth QoS was not marked after consecutive bad samples")
+		t.Fatal("UDP bandwidth QoS was not marked after UDP loss and higher TCP bandwidth")
 	}
+}
 
+func TestLaneBandwidthQoSNotMarkedWhenUDPRecoversBeforeTCP(t *testing.T) {
+	lane := newLaneRuntime(3, 10)
 	lane.recordBandwidthSample(transport.KindUDP, 120_000_000, 0)
-	_, udpQ, _, _ = lane.legQualities()
-	if !udpQ.BandwidthQoSLimited {
-		t.Fatal("UDP bandwidth QoS cleared after only one good sample")
-	}
-	lane.recordBandwidthSample(transport.KindUDP, 120_000_000, 0)
-	_, udpQ, _, _ = lane.legQualities()
+	lane.recordBandwidthSample(transport.KindTCP, 120_000_000, 0)
+
+	_, udpQ, _, _ := lane.legQualities()
 	if udpQ.BandwidthQoSLimited {
-		t.Fatal("UDP bandwidth QoS did not clear after consecutive good samples")
+		t.Fatal("UDP bandwidth QoS was marked when UDP bandwidth matched TCP")
+	}
+}
+
+func TestBandwidthSamplePlateau(t *testing.T) {
+	if samplePlateau(0, 1) {
+		t.Fatal("zero best sample should not be plateau")
+	}
+	if !samplePlateau(1000, 1100) {
+		t.Fatal("10% sample gain should be plateau")
+	}
+	if samplePlateau(1000, 1101) {
+		t.Fatal("sample gain above 10% should continue probing")
 	}
 }

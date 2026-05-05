@@ -598,12 +598,17 @@ payload  bytes
 
 Sender behavior:
 
-1. Send one probe round per transport leg selected for bandwidth sampling.
+1. Start one bandwidth-probe ramp per active transport leg selected for
+   bandwidth sampling.
 2. Use `seq = 0..count-1` inside one `probe_id`.
 3. Pace probe frames according to the current probe rate. Do not send a large
    unpaced burst.
-4. Increase the next probe rate multiplicatively after low-loss rounds.
-5. Decrease or hold the next probe rate after loss or delay inflation.
+4. Increase the next probe rate multiplicatively after low-loss rounds and
+   immediately schedule the next round.
+5. Complete the ramp when loss or delay inflation becomes significant, or when
+   delivered bandwidth stops increasing meaningfully across higher-rate rounds.
+6. Do not keep sending periodic bandwidth probes after a leg's ramp completes.
+   A new concrete leg may start a new ramp.
 
 Receiver behavior:
 
@@ -633,9 +638,11 @@ Sender behavior:
 
 1. Match `probe_id` to an outstanding bandwidth probe round.
 2. Merge `received` into the round's cumulative ACK bitmap.
-3. After the round timeout, compute received count, loss, receive span, and an
-   approximate delivered bandwidth sample.
-4. Feed the sample into per-leg bandwidth EWMA and leg selection policy.
+3. Finish the round early when the ACK bitmap covers all expected probe frames;
+   otherwise finish it after the round timeout.
+4. Compute received count, loss, receive span, and an approximate delivered
+   bandwidth sample.
+5. Feed the sample into per-leg bandwidth EWMA and leg selection policy.
 
 Receiver behavior:
 
@@ -737,22 +744,23 @@ detection should use a data-plane bandwidth probe separate from PING/PONG.
 Recommended sender behavior:
 
 1. Keep TCP warm for lanes that negotiated TCP fallback and have a TCP remote.
-2. Probe UDP and TCP with paced, data-sized BW_PROBE rounds.
+2. Probe UDP and TCP once per concrete leg with paced, data-sized BW_PROBE
+   rounds.
 3. Increase the probe send rate multiplicatively while loss and delay inflation
    remain low.
-4. Stop the current round when loss or delay inflation becomes significant.
+4. Stop the ramp when loss or delay inflation becomes significant, or when
+   delivered bandwidth stops increasing meaningfully across higher-rate rounds.
 5. Record the last stable UDP bandwidth sample into an EWMA.
 6. Record a TCP bandwidth EWMA from TCP probing or transport TCP_INFO where
    available.
 7. Treat UDP as QoS-limited only when TCP bandwidth is materially higher than
    UDP bandwidth and the UDP sample has loss or delay-inflation evidence.
 
-The selector must use hysteresis and confidence thresholds so one noisy probe
-round does not flap a lane between UDP and TCP. A QoS decision should require
-bandwidth EWMA samples for both UDP and TCP, then require consecutive bad UDP
-probe rounds before selecting TCP and consecutive good UDP probe rounds before
-clearing the QoS-limited state. BW_PROBE/BW_PROBE_ACK must not replace
-PING/PONG liveness or Session HELLO state.
+The bandwidth probe is an initial capacity classification, not a continuous
+monitor. A QoS decision requires bandwidth samples for both UDP and TCP. Once a
+leg's ramp completes, implementations should not clear the QoS-limited state by
+periodic re-probing; a new concrete leg may be probed again. BW_PROBE/BW_PROBE_ACK
+must not replace PING/PONG liveness or Session HELLO state.
 
 ## NAT and Conntrack Requirements
 
@@ -798,8 +806,7 @@ received UDP socket and observed remote address.
   addition to the implementation's bounded memory limit.
 - Decide whether TCP fallback legs are drained or closed immediately after UDP
   recovery.
-- Tune the bandwidth probe pacing policy and selector hysteresis for UDP QoS
-  detection.
+- Tune the one-shot bandwidth probe ramp policy and UDP QoS threshold.
 - Decide the packet-id exhaustion threshold that triggers graceful session
   rotation before `packet_id` wraps.
 - Decide authentication/encryption separately. This draft only describes

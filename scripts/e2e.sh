@@ -841,23 +841,18 @@ run_leg_selector_case() {
   echo "==== ${name} e2e start ===="
   clear_loss
   write_one_lane_config "${name}" "${PORT_LEG_SELECTOR}" false false 200 600
-  start_multipath "${name}"
-
-  wait_ping_ok "${name} baseline" 12
-  wait_log_pattern "${name}" "accept_hello_ack session=[0-9]+ lane=1 .*tcp conn=" 20 "warm TCP fallback leg reached HELLO_ACK"
-
-  echo "[${name}] apply 30% UDP loss; bandwidth probes should mark UDP QoS-limited and selector should prefer TCP for data"
+  echo "[${name}] apply 30% UDP loss before startup; initial bandwidth probes should mark UDP QoS-limited"
   apply_udp_partial_loss 1 "${PORT_LEG_SELECTOR}" 30%
-  local qos_start_line
-  qos_start_line="$(current_log_line_count)"
-  wait_log_pattern_while_ping "${name}" "bandwidth_probe_sample .*lane=1 leg=udp .*loss=(0\\.[0-9]*[1-9]|1\\.000)" 35 "client observed UDP bandwidth-probe loss" "${qos_start_line}"
-  wait_log_pattern_while_ping "${name}" "schedule_select.*leg=\\{tcp" 45 "leg selector chose TCP for data frame after UDP QoS detection" "${qos_start_line}"
-
-  echo "[${name}] clear UDP loss; bandwidth probes should clear QoS state and selector should return to UDP"
-  clear_loss
-  local recovery_start_line
-  recovery_start_line="$(current_log_line_count)"
-  wait_log_pattern_while_ping "${name}" "schedule_select.*leg=\\{udp" 25 "leg selector chose UDP for data frame after loss cleared" "${recovery_start_line}"
+  start_multipath "${name}"
+  local client_qos_start_line
+  local server_qos_start_line
+  client_qos_start_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
+  server_qos_start_line="$(current_log_file_line_count "${CURRENT_SERVER_LOG}")"
+  wait_log_pattern "${name}" "accept_hello_ack session=[0-9]+ lane=1 .*tcp conn=" 20 "warm TCP fallback leg reached HELLO_ACK"
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "bandwidth_probe_sample .*lane=1 leg=udp .*loss=(0\\.[0-9]*[1-9]|1\\.000)" 35 "client observed UDP bandwidth-probe loss" "${client_qos_start_line}"
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "schedule_select.*leg=\\{tcp" 45 "client leg selector chose TCP for data frame after UDP QoS detection" "${client_qos_start_line}"
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_SERVER_LOG}" "bandwidth_probe_sample .*lane=1 leg=udp .*loss=(0\\.[0-9]*[1-9]|1\\.000)" 35 "server observed UDP bandwidth-probe loss" "${server_qos_start_line}"
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_SERVER_LOG}" "schedule_select.*leg=\\{tcp" 45 "server leg selector chose TCP for data frame after UDP QoS detection" "${server_qos_start_line}"
 
   stop_multipath
   clear_loss
@@ -955,10 +950,6 @@ wait_log_file_pattern() {
   return 1
 }
 
-current_log_line_count() {
-  current_log_file_line_count "${CURRENT_LOG_FILE}"
-}
-
 current_log_file_line_count() {
   local log_file="$1"
   if [[ -z "${log_file}" || ! -f "${log_file}" ]]; then
@@ -994,19 +985,6 @@ wait_log_file_pattern_while_ping() {
   done
   fail "${label}" "${message}: pattern not seen within ${timeout}s: ${pattern}"
   return 1
-}
-
-wait_log_pattern_while_ping() {
-  local label="$1"
-  local pattern="$2"
-  local timeout="${3:-15}"
-  local message="$4"
-  local start_line="${5:-0}"
-  if [[ -z "${CURRENT_LOG_FILE}" || ! -f "${CURRENT_LOG_FILE}" ]]; then
-    fail "${label}" "${message}: log file unset"
-    return 1
-  fi
-  wait_log_file_pattern_while_ping "${label}" "${CURRENT_LOG_FILE}" "${pattern}" "${timeout}" "${message}" "${start_line}"
 }
 
 run_fec_case() {
