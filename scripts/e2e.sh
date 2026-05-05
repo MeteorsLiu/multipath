@@ -911,7 +911,9 @@ run_bandwidth_probe_ceiling_case() {
   client_start_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
 
   wait_ping_ok "${name} baseline-under-rate-limit" 12
-  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "rate_ceiling session=[0-9]+ lane=1 kind=udp rate_bps=[0-9]+ prev_acked_bytes=[0-9]+ acked_bytes=[0-9]+" 35 "client bandwidth probe locked UDP dynamic ceiling" "${client_start_line}"
+  wait_log_file_any_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" 35 "client bandwidth probe converged under UDP rate limit" "${client_start_line}" \
+    "rate_ceiling session=[0-9]+ lane=1 kind=udp rate_bps=[0-9]+ prev_acked_bytes=[0-9]+ acked_bytes=[0-9]+" \
+    "bandwidth_probe_decision .*lane=1 .*udp_qos_limited=true .*tcp_better=true selected_leg=tcp"
   wait_ping_ok "${name} post-ceiling" 12
 
   stop_multipath
@@ -1021,6 +1023,73 @@ current_log_file_line_count() {
 
 wait_log_file_pattern_while_ping() {
   wait_log_file_pattern_while_ping_from "$@" "${NS_C}" "${TUN_C_REMOTE}"
+}
+
+wait_log_file_any_pattern_while_ping() {
+  local label="$1"
+  local log_file="$2"
+  local timeout="${3:-15}"
+  local message="$4"
+  local start_line="${5:-0}"
+  shift 5
+  wait_log_file_any_pattern_while_ping_from "${label}" "${log_file}" "${timeout}" "${message}" "${start_line}" "${NS_C}" "${TUN_C_REMOTE}" "$@"
+}
+
+wait_log_file_any_pattern_while_ping_from() {
+  local label="$1"
+  local log_file="$2"
+  local timeout="${3:-15}"
+  local message="$4"
+  local start_line="${5:-0}"
+  local ping_ns="$6"
+  local ping_remote="$7"
+  shift 7
+  if [[ -z "${log_file}" ]]; then
+    fail "${label}" "${message}: log file unset"
+    return 1
+  fi
+
+  local deadline=$((SECONDS + timeout))
+  while (( SECONDS < deadline )); do
+    if log_file_has_any_pattern_since "${log_file}" "${start_line}" "$@"; then
+      pass "${label}" "${message}"
+      return 0
+    fi
+    if ! check_multipath_alive "${label}"; then
+      return 1
+    fi
+    ping_once_from "${ping_ns}" "${ping_remote}" || true
+    if log_file_has_any_pattern_since "${log_file}" "${start_line}" "$@"; then
+      pass "${label}" "${message}"
+      return 0
+    fi
+    sleep 0.2
+  done
+  if log_file_has_any_pattern_since "${log_file}" "${start_line}" "$@"; then
+    pass "${label}" "${message}"
+    return 0
+  fi
+  echo "[${label}] traffic probe debug: ns=${ping_ns} remote=${ping_remote}"
+  ip netns exec "${ping_ns}" ip -4 route get "${ping_remote}" || true
+  ip netns exec "${ping_ns}" ping -c 1 -W 1 "${ping_remote}" || true
+  fail "${label}" "${message}: patterns not seen within ${timeout}s: $*"
+  return 1
+}
+
+log_file_has_any_pattern_since() {
+  local log_file="$1"
+  local start_line="$2"
+  shift 2
+  if [[ ! -f "${log_file}" ]]; then
+    return 1
+  fi
+  local pattern
+  for pattern in "$@"; do
+    if tail -n "+$((start_line + 1))" "${log_file}" | grep -E -q "${pattern}"; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 wait_log_file_pattern_while_ping_from() {
