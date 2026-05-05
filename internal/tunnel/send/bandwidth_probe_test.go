@@ -536,8 +536,12 @@ func TestBandwidthProbeLimiterStateSurvivesUDPPayloadJitter(t *testing.T) {
 		payloadBytes: bandwidthProbeUDPMinPayloadSize,
 	}
 	next := state.forRound(leg, nextRound)
-	if next == first {
-		t.Fatal("limiter was reused after rate changed")
+	if next != first {
+		t.Fatal("limiter was recreated after rate changed")
+	}
+	wantLimit := float64((bandwidthProbeMinRateBps + bandwidthProbeAdditiveStepBps) / 8)
+	if got := float64(next.Limit()); got != wantLimit {
+		t.Fatalf("limit after rate change = %v, want %v", got, wantLimit)
 	}
 }
 

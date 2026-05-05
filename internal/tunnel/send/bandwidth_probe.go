@@ -303,16 +303,32 @@ func (l *Send) runBandwidthProbeTrain(ctx context.Context, key laneKey, leg tran
 type bandwidthProbeLimiterState struct {
 	limiter *rate.Limiter
 	rateBps uint64
+	burst   int
 }
 
 func (s *bandwidthProbeLimiterState) forRound(leg transport.LegRef, round *bandwidthProbeRound) *rate.Limiter {
 	if round == nil {
 		return nil
 	}
-	if s.limiter == nil || s.rateBps != round.rateBps {
-		s.limiter = newBandwidthProbeLimiter(round.rateBps, bandwidthProbeLimiterPayloadBytes(leg))
-		s.rateBps = round.rateBps
+	bytesPerSecond := bandwidthProbeLimiterBytesPerSecond(round.rateBps)
+	burst := bandwidthProbeLimiterBurst(round.rateBps, bandwidthProbeLimiterPayloadBytes(leg))
+	if bytesPerSecond == 0 || burst == 0 {
+		return nil
 	}
+	limit := rate.Limit(bytesPerSecond)
+	if s.limiter == nil {
+		s.limiter = rate.NewLimiter(limit, burst)
+	} else {
+		now := time.Now()
+		if s.rateBps != round.rateBps {
+			s.limiter.SetLimitAt(now, limit)
+		}
+		if s.burst != burst {
+			s.limiter.SetBurstAt(now, burst)
+		}
+	}
+	s.rateBps = round.rateBps
+	s.burst = burst
 	return s.limiter
 }
 
@@ -421,15 +437,28 @@ func bandwidthProbeLimiterPayloadBytes(leg transport.LegRef) int {
 }
 
 func newBandwidthProbeLimiter(rateBps uint64, payloadBytes int) *rate.Limiter {
-	bytesPerSecond := rateBps / 8
-	if bytesPerSecond == 0 || payloadBytes <= 0 {
+	bytesPerSecond := bandwidthProbeLimiterBytesPerSecond(rateBps)
+	burst := bandwidthProbeLimiterBurst(rateBps, payloadBytes)
+	if bytesPerSecond == 0 || burst == 0 {
 		return nil
+	}
+	return rate.NewLimiter(rate.Limit(bytesPerSecond), burst)
+}
+
+func bandwidthProbeLimiterBytesPerSecond(rateBps uint64) uint64 {
+	return rateBps / 8
+}
+
+func bandwidthProbeLimiterBurst(rateBps uint64, payloadBytes int) int {
+	bytesPerSecond := bandwidthProbeLimiterBytesPerSecond(rateBps)
+	if bytesPerSecond == 0 || payloadBytes <= 0 {
+		return 0
 	}
 	burst := int(bytesPerSecond * uint64(bandwidthProbeBurstWindow) / uint64(time.Second))
 	if burst < payloadBytes {
 		burst = payloadBytes
 	}
-	return rate.NewLimiter(rate.Limit(bytesPerSecond), burst)
+	return burst
 }
 
 func (l *Send) receiveBandwidthProbe(ctx context.Context, sessionID uint64, laneID uint8, leg transport.LegRef, body protocol.BandwidthProbeBody) error {
