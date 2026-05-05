@@ -387,7 +387,13 @@ check_multipath_alive() {
 }
 
 ping_once() {
-  ip netns exec "${NS_C}" ping -c 1 -W 1 "${TUN_C_REMOTE}" >/dev/null 2>&1
+  ping_once_from "${NS_C}" "${TUN_C_REMOTE}"
+}
+
+ping_once_from() {
+  local ns="$1"
+  local remote="$2"
+  ip netns exec "${ns}" ping -c 1 -W 1 "${remote}" >/dev/null 2>&1
 }
 
 wait_ping_ok() {
@@ -879,16 +885,14 @@ run_leg_selector_case() {
   server_qos_start_line="$(current_log_file_line_count "${CURRENT_SERVER_LOG}")"
   wait_log_pattern "${name}" "accept_hello_ack session=[0-9]+ lane=1 .*tcp conn=" 20 "warm TCP fallback leg reached HELLO_ACK"
   wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "bandwidth_probe_decision .*lane=1 .*udp_qos_limited=true .*tcp_better=true selected_leg=tcp" 45 "client produced bandwidth-probe QoS decision" "${client_qos_start_line}"
-  wait_log_file_pattern_while_ping "${name}" "${CURRENT_SERVER_LOG}" "bandwidth_probe_decision .*lane=1 .*udp_qos_limited=true .*tcp_better=true selected_leg=tcp" 45 "server produced bandwidth-probe QoS decision" "${server_qos_start_line}"
-
   local client_select_start_line
-  local server_select_start_line
   client_select_start_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
+  wait_log_file_pattern_while_ping_from "${name}" "${CURRENT_CLIENT_LOG}" "schedule_select.*leg=\\{tcp .*frame=type=DATA" 20 "client leg selector chose TCP for DATA after UDP QoS detection" "${client_select_start_line}" "${NS_C}" "${TUN_C_REMOTE}"
+
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_SERVER_LOG}" "bandwidth_probe_decision .*lane=1 .*udp_qos_limited=true .*tcp_better=true selected_leg=tcp" 45 "server produced bandwidth-probe QoS decision" "${server_qos_start_line}"
+  local server_select_start_line
   server_select_start_line="$(current_log_file_line_count "${CURRENT_SERVER_LOG}")"
-  ip netns exec "${NS_C}" ping -c 20 -i 0.05 -W 1 "${TUN_C_REMOTE}" >/dev/null 2>&1 || true
-  ip netns exec "${NS_S}" ping -c 20 -i 0.05 -W 1 "${TUN_S_REMOTE}" >/dev/null 2>&1 || true
-  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "schedule_select.*leg=\\{tcp" 20 "client leg selector chose TCP for data frame after UDP QoS detection" "${client_select_start_line}"
-  wait_log_file_pattern_while_ping "${name}" "${CURRENT_SERVER_LOG}" "schedule_select.*leg=\\{tcp" 20 "server leg selector chose TCP for data frame after UDP QoS detection" "${server_select_start_line}"
+  wait_log_file_pattern_while_ping_from "${name}" "${CURRENT_SERVER_LOG}" "schedule_select.*leg=\\{tcp .*frame=type=DATA" 20 "server leg selector chose TCP for DATA after UDP QoS detection" "${server_select_start_line}" "${NS_S}" "${TUN_S_REMOTE}"
 
   stop_multipath
   clear_loss
@@ -1016,12 +1020,18 @@ current_log_file_line_count() {
 }
 
 wait_log_file_pattern_while_ping() {
+  wait_log_file_pattern_while_ping_from "$@" "${NS_C}" "${TUN_C_REMOTE}"
+}
+
+wait_log_file_pattern_while_ping_from() {
   local label="$1"
   local log_file="$2"
   local pattern="$3"
   local timeout="${4:-15}"
   local message="$5"
   local start_line="${6:-0}"
+  local ping_ns="$7"
+  local ping_remote="$8"
   if [[ -z "${log_file}" ]]; then
     fail "${label}" "${message}: log file unset"
     return 1
@@ -1036,7 +1046,7 @@ wait_log_file_pattern_while_ping() {
     if ! check_multipath_alive "${label}"; then
       return 1
     fi
-    ping_once || true
+    ping_once_from "${ping_ns}" "${ping_remote}" || true
     if [[ -f "${log_file}" ]] && tail -n "+$((start_line + 1))" "${log_file}" | grep -E -q "${pattern}"; then
       pass "${label}" "${message}"
       return 0
@@ -1047,6 +1057,9 @@ wait_log_file_pattern_while_ping() {
     pass "${label}" "${message}"
     return 0
   fi
+  echo "[${label}] traffic probe debug: ns=${ping_ns} remote=${ping_remote}"
+  ip netns exec "${ping_ns}" ip -4 route get "${ping_remote}" || true
+  ip netns exec "${ping_ns}" ping -c 1 -W 1 "${ping_remote}" || true
   fail "${label}" "${message}: pattern not seen within ${timeout}s: ${pattern}"
   return 1
 }
