@@ -15,13 +15,13 @@ import (
 const (
 	bandwidthProbeAckGrace             = 500 * time.Millisecond
 	bandwidthProbeWindow               = 5 * time.Second
-	bandwidthProbeRoundWindow          = 200 * time.Millisecond
+	bandwidthProbeRoundWindow          = 500 * time.Millisecond
 	bandwidthProbeUDPPayloadSize       = 1200
 	bandwidthProbeTCPPayloadSize       = 32 * 1024
 	bandwidthProbeMinRateBps           = uint64(1_000_000)
 	bandwidthProbeAdditiveStepBps      = uint64(10_000_000)
 	bandwidthProbeMaxFrames            = 64
-	bandwidthProbeMultiplicativeChunks = 7
+	bandwidthProbeMultiplicativeChunks = 6
 	bandwidthProbeAckEvery             = 16
 )
 
@@ -220,20 +220,26 @@ func (l *Send) runBandwidthProbeTrain(ctx context.Context, key laneKey, leg tran
 		if !now.Before(deadline) {
 			break
 		}
-		round := l.startBandwidthProbeRound(key, leg, legKey, now)
-		if round == nil {
-			return
+		stepDeadline := now.Add(bandwidthProbeRoundWindow)
+		if stepDeadline.After(deadline) {
+			stepDeadline = deadline
 		}
-		sent := l.runBandwidthProbeRound(ctx, round, deadline)
-		l.recordBandwidthProbeSent(round, sent)
-		l.advanceBandwidthProbeRate(legKey)
-		if sent < round.count {
-			if ctx.Err() != nil || time.Now().Before(deadline) {
-				l.abortBandwidthProbeTrain(legKey)
+		for time.Now().Before(stepDeadline) {
+			round := l.startBandwidthProbeRound(key, leg, legKey, time.Now())
+			if round == nil {
 				return
 			}
-			break
+			sent := l.runBandwidthProbeRound(ctx, round, stepDeadline)
+			l.recordBandwidthProbeSent(round, sent)
+			if sent < round.count {
+				if ctx.Err() != nil || time.Now().Before(deadline) && time.Now().Before(stepDeadline) {
+					l.abortBandwidthProbeTrain(legKey)
+					return
+				}
+				break
+			}
 		}
+		l.advanceBandwidthProbeRate(legKey)
 	}
 	l.markBandwidthProbeSendComplete(legKey, deadline)
 
