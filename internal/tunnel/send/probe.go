@@ -222,7 +222,7 @@ func (l *Send) handleProbeTargetLostWithReason(ctx context.Context, target probe
 			_ = l.streamTransport.Close(ctx, binding.leg.ConnID)
 		}
 		l.untrackProbeTarget(ctx, binding.leg)
-		lane.clearFallbackDialing()
+		lane.recordFallbackFailure(time.Now())
 		l.maybeStartFallbackDial(ctx, key, lane)
 	}
 	debuglog.Printf("send/probe", "target_lost_done %s", debugLaneState(key, lane))

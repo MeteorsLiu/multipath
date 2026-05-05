@@ -1689,7 +1689,7 @@ func TestSendProbeTimeoutDoesNotRestartFallbackDialInFlight(t *testing.T) {
 	}
 }
 
-func TestSendLegFailureMarksTCPNotReadyAndStartsFallback(t *testing.T) {
+func TestSendLegFailureMarksTCPNotReadyAndBacksOffFallback(t *testing.T) {
 	streamTransport := &fakeStreamTransport{
 		dialLeg: transport.LegRef{
 			Kind:   transport.KindTCP,
@@ -1700,6 +1700,7 @@ func TestSendLegFailureMarksTCPNotReadyAndStartsFallback(t *testing.T) {
 	in.streamTransport = streamTransport
 	in.probeEvents = make(chan probe.Event, 4)
 	mustSendState(t, in, 99)
+	in.activateSession(99)
 	in.negotiatedCaps.Store(uint32(protocol.CapTCPFallback))
 	oldLeg := transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp-old"}
 	lane := newLaneRuntime(3, 1)
@@ -1710,21 +1711,38 @@ func TestSendLegFailureMarksTCPNotReadyAndStartsFallback(t *testing.T) {
 	readProbeEvent(t, in.probeEvents)
 
 	in.OnLegFailure(context.Background(), oldLeg, transport.ErrUnknownConn)
-	waitForDialCount(t, streamTransport, 1)
-	written := readSendPayload(t, in)
-	written.Packet.Release()
+	time.Sleep(10 * time.Millisecond)
 
 	if lane.tcpReady {
 		t.Fatal("tcpReady = true after TCP leg failure")
 	}
-	if !lane.fallbackDialing {
-		t.Fatal("fallbackDialing = false after fallback dial result")
+	if lane.fallbackDialing {
+		t.Fatal("fallbackDialing = true during TCP leg failure backoff")
 	}
 	if got := streamTransport.closed["tcp-old"]; got != 1 {
 		t.Fatalf("closed tcp-old count = %d, want 1", got)
 	}
+	if len(streamTransport.dialed) != 0 {
+		t.Fatalf("fallback dials = %d, want 0 during TCP leg failure backoff", len(streamTransport.dialed))
+	}
+
+	lane.mu.Lock()
+	if lane.fallbackRetryAt.IsZero() {
+		t.Fatal("fallbackRetryAt is zero after TCP leg failure")
+	}
+	lane.fallbackRetryAt = time.Now().Add(-time.Millisecond)
+	lane.mu.Unlock()
+
+	in.retryFallbackDials(context.Background())
+	waitForDialCount(t, streamTransport, 1)
+	written := readSendPayload(t, in)
+	written.Packet.Release()
+
 	if got := streamTransport.dialed[0]; got != "127.0.0.1:4321" {
 		t.Fatalf("dialed remote = %q, want 127.0.0.1:4321", got)
+	}
+	if !lane.fallbackDialing {
+		t.Fatal("fallbackDialing = false after retry dial result")
 	}
 }
 

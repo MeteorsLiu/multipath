@@ -20,8 +20,8 @@ const (
 	bandwidthProbeTCPPayloadSize       = 32 * 1024
 	bandwidthProbeMinRateBps           = uint64(16_000_000)
 	bandwidthProbeAdditiveStepBps      = uint64(10_000_000)
-	bandwidthProbePacingGainNum        = uint64(2)
-	bandwidthProbePacingGainDen        = uint64(1)
+	bandwidthProbePacingGainNum        = uint64(3)
+	bandwidthProbePacingGainDen        = uint64(2)
 	bandwidthProbeMaxFrames            = 64
 	bandwidthProbeMultiplicativeChunks = 0
 	bandwidthProbeAckEvery             = 16
@@ -111,13 +111,14 @@ func (l *Send) probeBandwidth(ctx context.Context, now time.Time) {
 	})
 
 	selectedLane, ok := l.activeBandwidthLane(sessionID)
-	if !ok {
-		for _, item := range lanes {
-			udpLeg, udpQ, tcpLeg, tcpQ := item.lane.legQualities()
-			if l.bandwidthProbeNeeded(udpLeg, udpQ) || l.bandwidthProbeNeeded(tcpLeg, tcpQ) {
-				selectedLane = item.key
-				break
-			}
+	if ok {
+		return
+	}
+	for _, item := range lanes {
+		udpLeg, udpQ, tcpLeg, tcpQ := item.lane.legQualities()
+		if l.bandwidthProbeNeeded(udpLeg, udpQ) || l.bandwidthProbeNeeded(tcpLeg, tcpQ) {
+			selectedLane = item.key
+			break
 		}
 	}
 	if selectedLane.sessionID == 0 {
@@ -132,8 +133,7 @@ func (l *Send) probeBandwidth(ctx context.Context, now time.Time) {
 		udpLeg, udpQ, tcpLeg, tcpQ := lane.legQualities()
 		if l.bandwidthProbeNeeded(udpLeg, udpQ) {
 			candidates = append(candidates, candidate{key: item.key, leg: udpLeg})
-		}
-		if l.bandwidthProbeNeeded(tcpLeg, tcpQ) {
+		} else if l.bandwidthProbeNeeded(tcpLeg, tcpQ) {
 			candidates = append(candidates, candidate{key: item.key, leg: tcpLeg})
 		}
 		break

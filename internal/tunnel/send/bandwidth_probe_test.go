@@ -9,7 +9,7 @@ import (
 	"github.com/MeteorsLiu/multipath/internal/transport"
 )
 
-func TestBandwidthProbeStartsOneLaneAtATime(t *testing.T) {
+func TestBandwidthProbeStartsOneLegAtATime(t *testing.T) {
 	in := New()
 	mustSendState(t, in, 99)
 	in.activateSession(99)
@@ -34,20 +34,49 @@ func TestBandwidthProbeStartsOneLaneAtATime(t *testing.T) {
 	in.bandwidthMu.Lock()
 	defer in.bandwidthMu.Unlock()
 
-	if len(in.bandwidthLegs) != 2 {
-		t.Fatalf("bandwidth legs = %d, want 2", len(in.bandwidthLegs))
+	if len(in.bandwidthLegs) != 1 {
+		t.Fatalf("bandwidth legs = %d, want 1", len(in.bandwidthLegs))
 	}
-	for legKey, state := range in.bandwidthLegs {
-		if state == nil || !state.inFlight {
-			t.Fatalf("leg %v state not in flight: %+v", legKey, state)
-		}
-		if state.key.laneID != 1 {
-			t.Fatalf("leg %v started on lane %d, want lane 1", legKey, state.key.laneID)
-		}
+	state := in.bandwidthLegs[newPingKey(udp1)]
+	if state == nil || !state.inFlight {
+		t.Fatalf("UDP leg state not in flight: %+v", state)
+	}
+	if state.key.laneID != 1 {
+		t.Fatalf("started on lane %d, want lane 1", state.key.laneID)
+	}
+	if _, ok := in.bandwidthLegs[newPingKey(tcp1)]; ok {
+		t.Fatal("TCP probe started while UDP probe is still pending")
 	}
 }
 
-func TestBandwidthProbeSkipsCompletedLane(t *testing.T) {
+func TestBandwidthProbeStartsTCPAfterUDPCompletes(t *testing.T) {
+	in := New()
+	mustSendState(t, in, 99)
+	in.activateSession(99)
+
+	key := laneKey{sessionID: 99, laneID: 1}
+	udp := transport.LegRef{Kind: transport.KindUDP, EndpointID: "udp1", RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234")}
+	tcp := transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp1"}
+
+	lane := newLaneRuntime(1, 1)
+	lane.bindLeg(udp)
+	lane.bindLeg(tcp)
+	in.lanes[key] = lane
+
+	in.bandwidthLegs[newPingKey(udp)] = &bandwidthLegState{key: key, complete: true}
+
+	in.probeBandwidth(context.Background(), time.Now())
+
+	in.bandwidthMu.Lock()
+	defer in.bandwidthMu.Unlock()
+
+	state := in.bandwidthLegs[newPingKey(tcp)]
+	if state == nil || !state.inFlight || state.key != key {
+		t.Fatalf("TCP leg state = %+v, want in-flight lane 1 probe", state)
+	}
+}
+
+func TestBandwidthProbeDoesNotStartAnotherLegWhileInFlight(t *testing.T) {
 	in := New()
 	mustSendState(t, in, 99)
 	in.activateSession(99)
@@ -57,7 +86,6 @@ func TestBandwidthProbeSkipsCompletedLane(t *testing.T) {
 	udp1 := transport.LegRef{Kind: transport.KindUDP, EndpointID: "udp1", RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234")}
 	tcp1 := transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp1"}
 	udp2 := transport.LegRef{Kind: transport.KindUDP, EndpointID: "udp2", RemoteAddr: mustUDPAddr(t, "127.0.0.1:1235")}
-	tcp2 := transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp2"}
 
 	lane1 := newLaneRuntime(1, 1)
 	lane1.bindLeg(udp1)
@@ -66,22 +94,22 @@ func TestBandwidthProbeSkipsCompletedLane(t *testing.T) {
 
 	lane2 := newLaneRuntime(2, 1)
 	lane2.bindLeg(udp2)
-	lane2.bindLeg(tcp2)
 	in.lanes[key2] = lane2
 
-	in.bandwidthLegs[newPingKey(udp1)] = &bandwidthLegState{key: key1, complete: true}
-	in.bandwidthLegs[newPingKey(tcp1)] = &bandwidthLegState{key: key1, complete: true}
+	in.bandwidthLegs[newPingKey(udp1)] = &bandwidthLegState{key: key1, inFlight: true}
 
 	in.probeBandwidth(context.Background(), time.Now())
 
 	in.bandwidthMu.Lock()
 	defer in.bandwidthMu.Unlock()
-
-	for _, leg := range []transport.LegRef{udp2, tcp2} {
-		state := in.bandwidthLegs[newPingKey(leg)]
-		if state == nil || !state.inFlight || state.key != key2 {
-			t.Fatalf("lane 2 leg %v state = %+v, want in-flight lane 2 probe", leg, state)
-		}
+	if len(in.bandwidthLegs) != 1 {
+		t.Fatalf("bandwidth legs = %d, want only the existing in-flight leg", len(in.bandwidthLegs))
+	}
+	if _, ok := in.bandwidthLegs[newPingKey(tcp1)]; ok {
+		t.Fatal("started TCP probe while UDP probe is in flight")
+	}
+	if _, ok := in.bandwidthLegs[newPingKey(udp2)]; ok {
+		t.Fatal("started another lane probe while a probe is in flight")
 	}
 }
 
@@ -253,6 +281,28 @@ func TestBandwidthProbeAckAttributesBytesToOriginalStep(t *testing.T) {
 	wantMaxStepBps := bandwidthWindowSampleBps(wantAckedBytes, step1Start, step1Start.Add(time.Second))
 	if state.maxStepBps != wantMaxStepBps {
 		t.Fatalf("max step bps = %d, want %d", state.maxStepBps, wantMaxStepBps)
+	}
+}
+
+func TestBandwidthProbeRateAdvancesByConservativeGain(t *testing.T) {
+	in := New()
+	udpLeg := transport.LegRef{
+		Kind:       transport.KindUDP,
+		EndpointID: "udp0",
+		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
+	}
+	legKey := newPingKey(udpLeg)
+	in.bandwidthLegs[legKey] = &bandwidthLegState{
+		nextRateBps: bandwidthProbeMinRateBps,
+		inFlight:    true,
+		lastStepBps: 20_000_000,
+	}
+
+	in.advanceBandwidthProbeRate(legKey)
+
+	state := in.bandwidthLegs[legKey]
+	if state.nextRateBps != 30_000_000 {
+		t.Fatalf("next rate = %d, want 30Mbps from 1.5x pacing gain", state.nextRateBps)
 	}
 }
 
