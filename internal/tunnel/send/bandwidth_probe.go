@@ -20,38 +20,46 @@ const (
 	bandwidthProbeTCPPayloadSize       = 32 * 1024
 	bandwidthProbeMinRateBps           = uint64(16_000_000)
 	bandwidthProbeAdditiveStepBps      = uint64(10_000_000)
-	bandwidthProbePacingGainNum        = uint64(6)
-	bandwidthProbePacingGainDen        = uint64(5)
+	bandwidthProbePacingGainNum        = uint64(2)
+	bandwidthProbePacingGainDen        = uint64(1)
 	bandwidthProbeMaxFrames            = 64
 	bandwidthProbeMultiplicativeChunks = 0
 	bandwidthProbeAckEvery             = 16
 )
 
 type bandwidthLegState struct {
-	key            laneKey
-	nextRateBps    uint64
-	ewmaBps        uint64
-	inFlight       bool
-	complete       bool
-	startedAt      time.Time
-	endedAt        time.Time
-	sampleCount    uint32
-	rampChunks     uint32
-	sentFrames     uint64
-	ackedFrames    uint64
-	ackedBytes     uint64
-	stepStartedAt  time.Time
-	stepAckedBytes uint64
-	lastStepBps    uint64
-	maxStepBps     uint64
-	lastLoss       float64
-	lastRoundLoss  float64
+	key           laneKey
+	nextRateBps   uint64
+	ewmaBps       uint64
+	inFlight      bool
+	complete      bool
+	startedAt     time.Time
+	endedAt       time.Time
+	sampleCount   uint32
+	rampChunks    uint32
+	sentFrames    uint64
+	ackedFrames   uint64
+	ackedBytes    uint64
+	currentStepID uint64
+	stepStartedAt time.Time
+	lastStepBps   uint64
+	maxStepBps    uint64
+	steps         map[uint64]*bandwidthProbeStep
+	lastLoss      float64
+	lastRoundLoss float64
+}
+
+type bandwidthProbeStep struct {
+	startedAt  time.Time
+	endedAt    time.Time
+	ackedBytes uint64
 }
 
 type bandwidthProbeRound struct {
 	key          laneKey
 	leg          transport.LegRef
 	legKey       pingKey
+	stepID       uint64
 	probeID      uint64
 	count        uint16
 	payloadBytes int
@@ -195,10 +203,11 @@ func (l *Send) maybeStartBandwidthProbe(ctx context.Context, key laneKey, leg tr
 	state.sentFrames = 0
 	state.ackedFrames = 0
 	state.ackedBytes = 0
+	state.currentStepID = 0
 	state.stepStartedAt = time.Time{}
-	state.stepAckedBytes = 0
 	state.lastStepBps = 0
 	state.maxStepBps = 0
+	state.steps = make(map[uint64]*bandwidthProbeStep)
 	state.lastLoss = 0
 	state.lastRoundLoss = 0
 	state.ewmaBps = 0
@@ -281,11 +290,13 @@ func (l *Send) startBandwidthProbeRound(key laneKey, leg transport.LegRef, legKe
 	if leg.Kind == transport.KindTCP {
 		payloadBytes = bandwidthProbeTCPPayloadSize
 	}
+	stepID := state.currentStepID
 	probeID := l.nextBWProbeID.Add(1)
 	round := &bandwidthProbeRound{
 		key:          key,
 		leg:          leg,
 		legKey:       legKey,
+		stepID:       stepID,
 		probeID:      probeID,
 		count:        probeFrameCount(rateBps, payloadBytes),
 		payloadBytes: payloadBytes,
@@ -438,7 +449,16 @@ func (l *Send) receiveBandwidthProbeAck(sessionID uint64, laneID uint8, leg tran
 			ackedBytes := uint64(acked) * uint64(round.payloadBytes)
 			state.ackedFrames += uint64(acked)
 			state.ackedBytes += ackedBytes
-			state.stepAckedBytes += ackedBytes
+			if state.steps == nil {
+				state.steps = make(map[uint64]*bandwidthProbeStep)
+			}
+			step := state.steps[round.stepID]
+			if step == nil {
+				step = &bandwidthProbeStep{startedAt: round.startedAt}
+				state.steps[round.stepID] = step
+			}
+			step.ackedBytes += ackedBytes
+			l.updateBandwidthProbeStepSample(state, step)
 			state.lastRoundLoss = float64(int(round.count)-bits.OnesCount64(received)) / float64(round.count)
 			if state.lastRoundLoss < 0 {
 				state.lastRoundLoss = 0
@@ -468,8 +488,12 @@ func (l *Send) recordBandwidthProbeSent(round *bandwidthProbeRound, sent uint16)
 func (l *Send) startBandwidthProbeStep(legKey pingKey, now time.Time) {
 	l.bandwidthMu.Lock()
 	if state := l.bandwidthLegs[legKey]; state != nil && !state.complete {
+		state.currentStepID++
 		state.stepStartedAt = now
-		state.stepAckedBytes = 0
+		if state.steps == nil {
+			state.steps = make(map[uint64]*bandwidthProbeStep)
+		}
+		state.steps[state.currentStepID] = &bandwidthProbeStep{startedAt: now}
 	}
 	l.bandwidthMu.Unlock()
 }
@@ -482,13 +506,29 @@ func (l *Send) finishBandwidthProbeStep(legKey pingKey, endedAt time.Time) {
 	if state == nil || state.complete || state.stepStartedAt.IsZero() {
 		return
 	}
-	stepBps := bandwidthWindowSampleBps(state.stepAckedBytes, state.stepStartedAt, endedAt)
+	stepID := state.currentStepID
+	step := state.steps[stepID]
+	ackedBytes := uint64(0)
+	if step != nil {
+		ackedBytes = step.ackedBytes
+		step.endedAt = endedAt
+	}
+	stepBps := bandwidthWindowSampleBps(ackedBytes, state.stepStartedAt, endedAt)
 	state.lastStepBps = stepBps
 	if stepBps > state.maxStepBps {
 		state.maxStepBps = stepBps
 	}
 	state.stepStartedAt = time.Time{}
-	state.stepAckedBytes = 0
+}
+
+func (l *Send) updateBandwidthProbeStepSample(state *bandwidthLegState, step *bandwidthProbeStep) {
+	if state == nil || step == nil || step.endedAt.IsZero() {
+		return
+	}
+	stepBps := bandwidthWindowSampleBps(step.ackedBytes, step.startedAt, step.endedAt)
+	if stepBps > state.maxStepBps {
+		state.maxStepBps = stepBps
+	}
 }
 
 func (l *Send) advanceBandwidthProbeRate(legKey pingKey) {

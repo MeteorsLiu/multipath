@@ -189,6 +189,73 @@ func TestSendBandwidthProbeAckUpdatesLaneQuality(t *testing.T) {
 	}
 }
 
+func TestBandwidthProbeAckAttributesBytesToOriginalStep(t *testing.T) {
+	in := New()
+	key := laneKey{sessionID: 99, laneID: 3}
+	udpLeg := transport.LegRef{
+		Kind:       transport.KindUDP,
+		EndpointID: "udp0",
+		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
+	}
+	legKey := newPingKey(udpLeg)
+	in.bandwidthLegs[legKey] = &bandwidthLegState{
+		nextRateBps: bandwidthProbeMinRateBps,
+		inFlight:    true,
+		steps:       make(map[uint64]*bandwidthProbeStep),
+	}
+
+	step1Start := time.Now()
+	in.startBandwidthProbeStep(legKey, step1Start)
+	round := in.startBandwidthProbeRound(key, udpLeg, legKey, step1Start)
+	if round == nil {
+		t.Fatal("missing first probe round")
+	}
+	if round.stepID != 1 {
+		t.Fatalf("first round stepID = %d, want 1", round.stepID)
+	}
+	in.finishBandwidthProbeStep(legKey, step1Start.Add(time.Second))
+
+	step2Start := step1Start.Add(time.Second)
+	in.startBandwidthProbeStep(legKey, step2Start)
+	if err := in.receiveBandwidthProbeAck(99, 3, udpLeg, protocol.BandwidthProbeAckBody{
+		ProbeID:  round.probeID,
+		Count:    round.count,
+		Received: 0x03,
+	}); err != nil {
+		t.Fatalf("receiveBandwidthProbeAck failed: %v", err)
+	}
+	in.finishBandwidthProbeStep(legKey, step2Start.Add(time.Second))
+
+	in.bandwidthMu.Lock()
+	defer in.bandwidthMu.Unlock()
+	state := in.bandwidthLegs[legKey]
+	if state == nil {
+		t.Fatal("missing bandwidth leg state")
+	}
+	step1 := state.steps[round.stepID]
+	if step1 == nil {
+		t.Fatal("missing step 1")
+	}
+	wantAckedBytes := uint64(2 * round.payloadBytes)
+	if step1.ackedBytes != wantAckedBytes {
+		t.Fatalf("step 1 ackedBytes = %d, want %d", step1.ackedBytes, wantAckedBytes)
+	}
+	step2 := state.steps[state.currentStepID]
+	if step2 == nil {
+		t.Fatal("missing step 2")
+	}
+	if step2.ackedBytes != 0 {
+		t.Fatalf("step 2 ackedBytes = %d, want 0", step2.ackedBytes)
+	}
+	if state.lastStepBps != 0 {
+		t.Fatalf("last step bps = %d, want 0 for delayed ack attributed to step 1", state.lastStepBps)
+	}
+	wantMaxStepBps := bandwidthWindowSampleBps(wantAckedBytes, step1Start, step1Start.Add(time.Second))
+	if state.maxStepBps != wantMaxStepBps {
+		t.Fatalf("max step bps = %d, want %d", state.maxStepBps, wantMaxStepBps)
+	}
+}
+
 func TestLaneBandwidthQoSClassification(t *testing.T) {
 	lane := newLaneRuntime(3, 10)
 	lane.recordBandwidthSample(transport.KindUDP, 59_000_000, 0.041)
