@@ -103,6 +103,7 @@ SERVER_PID=""
 CURRENT_LOG_FILE=""
 CURRENT_CLIENT_LOG=""
 CURRENT_SERVER_LOG=""
+CURRENT_EXTRA_ENV=()
 
 cleanup() {
   set +e
@@ -451,7 +452,7 @@ start_multipath() {
   CURRENT_CLIENT_LOG="${client_log}"
   CURRENT_SERVER_LOG="${server_log}"
   start_server_process "${name}"
-  ip netns exec "${NS_C}" env MULTIPATH_DEBUG="${REAL_E2E_DEBUG}" "${BIN}" -config "${client_config}" >>"${client_log}" 2>&1 &
+  ip netns exec "${NS_C}" env MULTIPATH_DEBUG="${REAL_E2E_DEBUG}" "${CURRENT_EXTRA_ENV[@]}" "${BIN}" -config "${client_config}" >>"${client_log}" 2>&1 &
   CLIENT_PID=$!
 
   echo "[${name}] client log: ${client_log}"
@@ -464,7 +465,7 @@ start_server_process() {
   local server_log="${WORKDIR}/${name}.server.log"
 
   CURRENT_SERVER_LOG="${server_log}"
-  ip netns exec "${NS_S}" env MULTIPATH_DEBUG="${REAL_E2E_DEBUG}" "${BIN}" -config "${server_config}" >>"${server_log}" 2>&1 &
+  ip netns exec "${NS_S}" env MULTIPATH_DEBUG="${REAL_E2E_DEBUG}" "${CURRENT_EXTRA_ENV[@]}" "${BIN}" -config "${server_config}" >>"${server_log}" 2>&1 &
   SERVER_PID=$!
 }
 
@@ -492,6 +493,7 @@ stop_multipath() {
   CURRENT_LOG_FILE=""
   CURRENT_CLIENT_LOG=""
   CURRENT_SERVER_LOG=""
+  CURRENT_EXTRA_ENV=()
 }
 
 clear_loss() {
@@ -1132,6 +1134,7 @@ run_per_lane_fallback_case() {
   clear_loss
   write_two_lane_config "${name}" "${PORT_PER_LANE_FALLBACK}" false false 200 600
   expect_ping_fail_for "${name} precheck" 2
+  CURRENT_EXTRA_ENV=(MULTIPATH_DISABLE_BW_PROBE=1)
   start_multipath "${name}"
 
   wait_ping_ok "${name} baseline" 12

@@ -3,7 +3,9 @@ package send
 import (
 	"context"
 	"errors"
+	"os"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -48,6 +50,7 @@ type Send struct {
 	streamTransport     transport.StreamTransport
 	probeInterval       time.Duration
 	probeTimeout        time.Duration
+	bandwidthProbe      bool
 	fecFlushAlpha       uint32
 	fecFlushMinMs       uint32
 	fecFlushMaxMs       uint32
@@ -121,6 +124,7 @@ func New(configs ...Config) *Send {
 		bandwidthRX:         make(map[bandwidthRXKey]*bandwidthRXRound),
 		packets:             make(chan transport.Payload, defaultPacketQueueSize),
 		sessionManager:      &sessionpkg.Manager{},
+		bandwidthProbe:      bandwidthProbeEnabled(),
 		fecFlushAlpha:       defaultFECFlushAlpha,
 		fecFlushMinMs:       defaultFECFlushMinMs,
 		fecFlushMaxMs:       defaultFECFlushMaxMs,
@@ -130,6 +134,11 @@ func New(configs ...Config) *Send {
 		in.applyConfig(cfg)
 	}
 	return in
+}
+
+func bandwidthProbeEnabled() bool {
+	value := strings.ToLower(strings.TrimSpace(os.Getenv("MULTIPATH_DISABLE_BW_PROBE")))
+	return value == "" || value == "0" || value == "false" || value == "off"
 }
 
 func (l *Send) applyConfig(cfg Config) {

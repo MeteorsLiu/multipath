@@ -93,6 +93,9 @@ type bandwidthRXRound struct {
 }
 
 func (l *Send) probeBandwidth(ctx context.Context, now time.Time) {
+	if !l.bandwidthProbe {
+		return
+	}
 	sessionID, ok := l.activeSession()
 	if !ok {
 		return

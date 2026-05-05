@@ -3,6 +3,7 @@ package send
 import (
 	"bytes"
 	"context"
+	"os"
 	"testing"
 	"time"
 
@@ -47,6 +48,38 @@ func TestBandwidthProbeStartsOneLegAtATime(t *testing.T) {
 	}
 	if _, ok := in.bandwidthLegs[newPingKey(tcp1)]; ok {
 		t.Fatal("TCP probe started while UDP probe is still pending")
+	}
+}
+
+func TestBandwidthProbeCanBeDisabledByEnv(t *testing.T) {
+	t.Setenv("MULTIPATH_DISABLE_BW_PROBE", "1")
+	in := New()
+	mustSendState(t, in, 99)
+	in.activateSession(99)
+
+	udp := transport.LegRef{Kind: transport.KindUDP, EndpointID: "udp1", RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234")}
+	lane := newLaneRuntime(1, 1)
+	lane.bindLeg(udp)
+	in.lanes[laneKey{sessionID: 99, laneID: 1}] = lane
+
+	in.probeBandwidth(context.Background(), time.Now())
+
+	in.bandwidthMu.Lock()
+	defer in.bandwidthMu.Unlock()
+	if len(in.bandwidthLegs) != 0 {
+		t.Fatalf("bandwidth legs = %d, want none when disabled", len(in.bandwidthLegs))
+	}
+}
+
+func TestBandwidthProbeEnabledByDefaultAfterEnvDisabled(t *testing.T) {
+	t.Setenv("MULTIPATH_DISABLE_BW_PROBE", "1")
+	_ = New()
+	if err := os.Unsetenv("MULTIPATH_DISABLE_BW_PROBE"); err != nil {
+		t.Fatalf("Unsetenv: %v", err)
+	}
+	in := New()
+	if !in.bandwidthProbe {
+		t.Fatal("bandwidth probe disabled after env was unset")
 	}
 }
 
