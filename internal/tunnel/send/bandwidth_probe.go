@@ -27,31 +27,36 @@ const (
 	bandwidthProbeAdditiveStepBps      = uint64(10_000_000)
 	bandwidthProbePacingGainNum        = uint64(3)
 	bandwidthProbePacingGainDen        = uint64(2)
+	bandwidthProbeGrowthMinNum         = uint64(11)
+	bandwidthProbeGrowthMinDen         = uint64(10)
 	bandwidthProbeMaxFrames            = 64
 	bandwidthProbeMultiplicativeChunks = 0
 	bandwidthProbeAckEvery             = 16
 )
 
 type bandwidthLegState struct {
-	key           laneKey
-	nextRateBps   uint64
-	ewmaBps       uint64
-	inFlight      bool
-	complete      bool
-	startedAt     time.Time
-	endedAt       time.Time
-	sampleCount   uint32
-	rampChunks    uint32
-	sentFrames    uint64
-	ackedFrames   uint64
-	ackedBytes    uint64
-	currentStepID uint64
-	stepStartedAt time.Time
-	lastStepBps   uint64
-	maxStepBps    uint64
-	steps         map[uint64]*bandwidthProbeStep
-	lastLoss      float64
-	lastRoundLoss float64
+	key            laneKey
+	nextRateBps    uint64
+	ewmaBps        uint64
+	inFlight       bool
+	complete       bool
+	startedAt      time.Time
+	endedAt        time.Time
+	sampleCount    uint32
+	rampChunks     uint32
+	sentFrames     uint64
+	ackedFrames    uint64
+	ackedBytes     uint64
+	currentStepID  uint64
+	stepStartedAt  time.Time
+	lastStepBps    uint64
+	lastStepBytes  uint64
+	prevStepBytes  uint64
+	rateCeilingBps uint64
+	maxStepBps     uint64
+	steps          map[uint64]*bandwidthProbeStep
+	lastLoss       float64
+	lastRoundLoss  float64
 }
 
 type bandwidthProbeStep struct {
@@ -211,6 +216,9 @@ func (l *Send) maybeStartBandwidthProbe(ctx context.Context, key laneKey, leg tr
 	state.currentStepID = 0
 	state.stepStartedAt = time.Time{}
 	state.lastStepBps = 0
+	state.lastStepBytes = 0
+	state.prevStepBytes = 0
+	state.rateCeilingBps = 0
 	state.maxStepBps = 0
 	state.steps = make(map[uint64]*bandwidthProbeStep)
 	state.lastLoss = 0
@@ -544,6 +552,7 @@ func (l *Send) finishBandwidthProbeStep(legKey pingKey, endedAt time.Time) {
 	}
 	stepBps := bandwidthWindowSampleBps(ackedBytes, state.stepStartedAt, endedAt)
 	state.lastStepBps = stepBps
+	state.lastStepBytes = ackedBytes
 	if stepBps > state.maxStepBps {
 		state.maxStepBps = stepBps
 	}
@@ -571,7 +580,12 @@ func (l *Send) advanceBandwidthProbeRate(legKey pingKey) {
 	if state.nextRateBps == 0 {
 		state.nextRateBps = bandwidthProbeMinRateBps
 	}
-	if state.lastStepBps > 0 {
+	if state.rateCeilingBps > 0 {
+		state.nextRateBps = state.rateCeilingBps
+	} else if bandwidthProbeGrowthStalled(state.prevStepBytes, state.lastStepBytes) {
+		state.rateCeilingBps = state.nextRateBps
+		state.nextRateBps = state.rateCeilingBps
+	} else if state.lastStepBps > 0 {
 		next := state.lastStepBps * bandwidthProbePacingGainNum / bandwidthProbePacingGainDen
 		if next < bandwidthProbeMinRateBps {
 			next = bandwidthProbeMinRateBps
@@ -584,7 +598,15 @@ func (l *Send) advanceBandwidthProbeRate(legKey pingKey) {
 		}
 		state.nextRateBps = next
 	}
+	state.prevStepBytes = state.lastStepBytes
 	state.rampChunks++
+}
+
+func bandwidthProbeGrowthStalled(prevBytes, currentBytes uint64) bool {
+	if prevBytes == 0 {
+		return false
+	}
+	return currentBytes*bandwidthProbeGrowthMinDen < prevBytes*bandwidthProbeGrowthMinNum
 }
 
 func (l *Send) markBandwidthProbeSendComplete(legKey pingKey, endedAt time.Time) {

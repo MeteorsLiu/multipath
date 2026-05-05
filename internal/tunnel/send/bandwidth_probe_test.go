@@ -307,6 +307,68 @@ func TestBandwidthProbeRateAdvancesByPacingGain(t *testing.T) {
 	}
 }
 
+func TestBandwidthProbeRateAdvanceLocksDynamicCeilingWhenAckBytesStopGrowing(t *testing.T) {
+	in := New()
+	udpLeg := transport.LegRef{
+		Kind:       transport.KindUDP,
+		EndpointID: "udp0",
+		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
+	}
+	legKey := newPingKey(udpLeg)
+	in.bandwidthLegs[legKey] = &bandwidthLegState{
+		nextRateBps:   90_000_000,
+		inFlight:      true,
+		lastStepBps:   60_000_000,
+		lastStepBytes: 4_300_000,
+		prevStepBytes: 4_000_000,
+	}
+
+	in.advanceBandwidthProbeRate(legKey)
+
+	state := in.bandwidthLegs[legKey]
+	if state.rateCeilingBps != 90_000_000 {
+		t.Fatalf("rate ceiling = %d, want 90Mbps", state.rateCeilingBps)
+	}
+	if state.nextRateBps != 90_000_000 {
+		t.Fatalf("next rate = %d, want dynamic ceiling", state.nextRateBps)
+	}
+
+	state.lastStepBps = 120_000_000
+	state.lastStepBytes = 5_000_000
+	in.advanceBandwidthProbeRate(legKey)
+
+	if state.nextRateBps != 90_000_000 {
+		t.Fatalf("next rate after ceiling = %d, want dynamic ceiling", state.nextRateBps)
+	}
+}
+
+func TestBandwidthProbeRateKeepsRampingWhenAckBytesGrowEnough(t *testing.T) {
+	in := New()
+	udpLeg := transport.LegRef{
+		Kind:       transport.KindUDP,
+		EndpointID: "udp0",
+		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
+	}
+	legKey := newPingKey(udpLeg)
+	in.bandwidthLegs[legKey] = &bandwidthLegState{
+		nextRateBps:   90_000_000,
+		inFlight:      true,
+		lastStepBps:   80_000_000,
+		lastStepBytes: 4_400_000,
+		prevStepBytes: 4_000_000,
+	}
+
+	in.advanceBandwidthProbeRate(legKey)
+
+	state := in.bandwidthLegs[legKey]
+	if state.rateCeilingBps != 0 {
+		t.Fatalf("rate ceiling = %d, want none", state.rateCeilingBps)
+	}
+	if state.nextRateBps != 120_000_000 {
+		t.Fatalf("next rate = %d, want 120Mbps from 1.5x pacing gain", state.nextRateBps)
+	}
+}
+
 func TestBandwidthProbeLimiterUsesByteRateAndShortBurst(t *testing.T) {
 	limiter := newBandwidthProbeLimiter(bandwidthProbeMinRateBps, bandwidthProbeUDPMinPayloadSize)
 	if limiter == nil {
