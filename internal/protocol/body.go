@@ -75,6 +75,27 @@ type CloseBody struct {
 
 func (CloseBody) protocolBody() {}
 
+type BandwidthProbeBody struct {
+	ProbeID uint64
+	Seq     uint16
+	Count   uint16
+	SendMS  uint64
+	Payload []byte
+}
+
+func (BandwidthProbeBody) protocolBody() {}
+
+type BandwidthProbeAckBody struct {
+	ProbeID   uint64
+	BaseSeq   uint16
+	Count     uint16
+	Received  uint64
+	FirstRXMS uint64
+	LastRXMS  uint64
+}
+
+func (BandwidthProbeAckBody) protocolBody() {}
+
 func encodedBodySize(frame Frame) (int, error) {
 	switch frame.Type {
 	case TypeHELLO:
@@ -104,6 +125,18 @@ func encodedBodySize(frame Frame) (int, error) {
 	case TypeCLOSE:
 		_, ok := frame.Body.(CloseBody)
 		return 2, validBody(ok)
+	case TypeBandwidthProbe:
+		body, ok := frame.Body.(BandwidthProbeBody)
+		if !ok || body.Count == 0 || body.Count > 64 || body.Seq >= body.Count {
+			return 0, ErrInvalidFrame
+		}
+		return 20 + len(body.Payload), nil
+	case TypeBandwidthProbeAck:
+		body, ok := frame.Body.(BandwidthProbeAckBody)
+		if !ok || body.Count == 0 || body.Count > 64 || body.BaseSeq != 0 {
+			return 0, ErrInvalidFrame
+		}
+		return 36, nil
 	default:
 		return 0, ErrInvalidFrame
 	}
@@ -147,6 +180,21 @@ func encodeBodyInto(frame Frame, out []byte) error {
 		body := frame.Body.(CloseBody)
 		out[0] = body.Scope
 		out[1] = body.Reason
+	case TypeBandwidthProbe:
+		body := frame.Body.(BandwidthProbeBody)
+		binary.BigEndian.PutUint64(out[:8], body.ProbeID)
+		binary.BigEndian.PutUint16(out[8:10], body.Seq)
+		binary.BigEndian.PutUint16(out[10:12], body.Count)
+		binary.BigEndian.PutUint64(out[12:20], body.SendMS)
+		copy(out[20:], body.Payload)
+	case TypeBandwidthProbeAck:
+		body := frame.Body.(BandwidthProbeAckBody)
+		binary.BigEndian.PutUint64(out[:8], body.ProbeID)
+		binary.BigEndian.PutUint16(out[8:10], body.BaseSeq)
+		binary.BigEndian.PutUint16(out[10:12], body.Count)
+		binary.BigEndian.PutUint64(out[12:20], body.Received)
+		binary.BigEndian.PutUint64(out[20:28], body.FirstRXMS)
+		binary.BigEndian.PutUint64(out[28:36], body.LastRXMS)
 	default:
 		return ErrInvalidFrame
 	}
@@ -208,6 +256,39 @@ func decodeBody(frame *Frame, body []byte) error {
 			return ErrBodyTooShort
 		}
 		frame.Body = CloseBody{Scope: body[0], Reason: body[1]}
+	case TypeBandwidthProbe:
+		if len(body) < 20 {
+			return ErrBodyTooShort
+		}
+		count := binary.BigEndian.Uint16(body[10:12])
+		seq := binary.BigEndian.Uint16(body[8:10])
+		if count == 0 || count > 64 || seq >= count {
+			return ErrInvalidFrame
+		}
+		frame.Body = BandwidthProbeBody{
+			ProbeID: binary.BigEndian.Uint64(body[:8]),
+			Seq:     seq,
+			Count:   count,
+			SendMS:  binary.BigEndian.Uint64(body[12:20]),
+			Payload: body[20:],
+		}
+	case TypeBandwidthProbeAck:
+		if len(body) != 36 {
+			return ErrBodyTooShort
+		}
+		baseSeq := binary.BigEndian.Uint16(body[8:10])
+		count := binary.BigEndian.Uint16(body[10:12])
+		if count == 0 || count > 64 || baseSeq != 0 {
+			return ErrInvalidFrame
+		}
+		frame.Body = BandwidthProbeAckBody{
+			ProbeID:   binary.BigEndian.Uint64(body[:8]),
+			BaseSeq:   baseSeq,
+			Count:     count,
+			Received:  binary.BigEndian.Uint64(body[12:20]),
+			FirstRXMS: binary.BigEndian.Uint64(body[20:28]),
+			LastRXMS:  binary.BigEndian.Uint64(body[28:36]),
+		}
 	default:
 		return ErrInvalidFrame
 	}

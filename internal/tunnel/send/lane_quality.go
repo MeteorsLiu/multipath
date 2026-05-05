@@ -1,0 +1,136 @@
+package send
+
+import (
+	"time"
+
+	"github.com/MeteorsLiu/multipath/internal/transport"
+)
+
+const (
+	minBandwidthProbeSamples           = 3
+	bandwidthProbeLossThreshold        = 0.05
+	bandwidthProbeTCPRatio             = 2
+	bandwidthProbeBadSamplesToSwitch   = 2
+	bandwidthProbeGoodSamplesToRecover = 2
+)
+
+type laneQualityState struct {
+	udpDelivery legQualityTracker
+	tcpDelivery legQualityTracker
+	bandwidth   bandwidthQualityState
+}
+
+type laneQualityInput struct {
+	udpActive bool
+	udpSRTT   time.Duration
+	udpRTTVar time.Duration
+	tcpActive bool
+	tcpSRTT   time.Duration
+	tcpRTTVar time.Duration
+}
+
+func (q *laneQualityState) legQualities(input laneQualityInput) (LegQuality, LegQuality) {
+	udpBW, tcpBW := q.bandwidth.legQualities()
+	return LegQuality{
+			Active:              input.udpActive,
+			DeliveryRate:        q.udpDelivery.deliveryRate(),
+			SmoothedRTT:         input.udpSRTT,
+			RTTVariance:         input.udpRTTVar,
+			BandwidthBps:        udpBW.BandwidthBps,
+			ProbeLoss:           udpBW.ProbeLoss,
+			ProbeSamples:        udpBW.ProbeSamples,
+			BandwidthQoSLimited: udpBW.BandwidthQoSLimited,
+		}, LegQuality{
+			Active:       input.tcpActive,
+			DeliveryRate: q.tcpDelivery.deliveryRate(),
+			SmoothedRTT:  input.tcpSRTT,
+			RTTVariance:  input.tcpRTTVar,
+			BandwidthBps: tcpBW.BandwidthBps,
+			ProbeLoss:    tcpBW.ProbeLoss,
+			ProbeSamples: tcpBW.ProbeSamples,
+		}
+}
+
+func (q *laneQualityState) recordDelivery(kind transport.Kind, onTime bool) {
+	switch kind {
+	case transport.KindUDP:
+		q.udpDelivery.recordDelivery(onTime)
+	case transport.KindTCP:
+		q.tcpDelivery.recordDelivery(onTime)
+	}
+}
+
+func (q *laneQualityState) recordBandwidthSample(kind transport.Kind, bandwidthBps uint64, loss float64) {
+	q.bandwidth.recordSample(kind, bandwidthBps, loss)
+}
+
+type bandwidthQualityState struct {
+	udpBandwidthBps uint64
+	udpProbeLoss    float64
+	udpProbeSamples uint32
+	tcpBandwidthBps uint64
+	tcpProbeLoss    float64
+	tcpProbeSamples uint32
+	badSamples      uint32
+	goodSamples     uint32
+	qosLimited      bool
+}
+
+func (q *bandwidthQualityState) legQualities() (LegQuality, LegQuality) {
+	return LegQuality{
+			BandwidthBps:        q.udpBandwidthBps,
+			ProbeLoss:           q.udpProbeLoss,
+			ProbeSamples:        q.udpProbeSamples,
+			BandwidthQoSLimited: q.qosLimited,
+		}, LegQuality{
+			BandwidthBps: q.tcpBandwidthBps,
+			ProbeLoss:    q.tcpProbeLoss,
+			ProbeSamples: q.tcpProbeSamples,
+		}
+}
+
+func (q *bandwidthQualityState) recordSample(kind transport.Kind, bandwidthBps uint64, loss float64) {
+	switch kind {
+	case transport.KindUDP:
+		q.udpBandwidthBps = bandwidthBps
+		q.udpProbeLoss = bandwidthLossEWMA(q.udpProbeLoss, loss, q.udpProbeSamples)
+		q.udpProbeSamples++
+	case transport.KindTCP:
+		q.tcpBandwidthBps = bandwidthBps
+		q.tcpProbeLoss = bandwidthLossEWMA(q.tcpProbeLoss, loss, q.tcpProbeSamples)
+		q.tcpProbeSamples++
+		return
+	default:
+		return
+	}
+	q.updateQoSState(loss)
+}
+
+func (q *bandwidthQualityState) updateQoSState(loss float64) {
+	if q.udpProbeSamples < minBandwidthProbeSamples || q.tcpProbeSamples < minBandwidthProbeSamples ||
+		q.udpBandwidthBps == 0 || q.tcpBandwidthBps == 0 {
+		return
+	}
+	bad := loss >= bandwidthProbeLossThreshold &&
+		q.tcpBandwidthBps/bandwidthProbeTCPRatio >= q.udpBandwidthBps
+	if bad {
+		q.badSamples++
+		q.goodSamples = 0
+		if q.badSamples >= bandwidthProbeBadSamplesToSwitch {
+			q.qosLimited = true
+		}
+		return
+	}
+	q.goodSamples++
+	q.badSamples = 0
+	if q.goodSamples >= bandwidthProbeGoodSamplesToRecover {
+		q.qosLimited = false
+	}
+}
+
+func bandwidthLossEWMA(old, sample float64, samples uint32) float64 {
+	if samples == 0 {
+		return sample
+	}
+	return (old*7 + sample) / 8
+}

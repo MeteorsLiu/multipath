@@ -844,16 +844,20 @@ run_leg_selector_case() {
   start_multipath "${name}"
 
   wait_ping_ok "${name} baseline" 12
+  wait_log_pattern "${name}" "accept_hello_ack session=[0-9]+ lane=1 .*tcp conn=" 20 "warm TCP fallback leg reached HELLO_ACK"
 
-  echo "[${name}] apply 30% UDP loss; leg selector should prefer TCP for data despite UDP remaining active"
+  echo "[${name}] apply 30% UDP loss; bandwidth probes should mark UDP QoS-limited and selector should prefer TCP for data"
   apply_udp_partial_loss 1 "${PORT_LEG_SELECTOR}" 30%
-  sleep 6
-  wait_log_pattern "${name}" "schedule_select.*leg={tcp" 15 "leg selector chose TCP for data frame after UDP degradation"
+  local qos_start_line
+  qos_start_line="$(current_log_line_count)"
+  wait_log_pattern_while_ping "${name}" "bandwidth_probe_sample .*lane=1 leg=udp .*loss=(0\\.[0-9]*[1-9]|1\\.000)" 35 "client observed UDP bandwidth-probe loss" "${qos_start_line}"
+  wait_log_pattern_while_ping "${name}" "schedule_select.*leg=\\{tcp" 45 "leg selector chose TCP for data frame after UDP QoS detection" "${qos_start_line}"
 
-  echo "[${name}] clear loss; leg selector should return to UDP"
+  echo "[${name}] clear UDP loss; bandwidth probes should clear QoS state and selector should return to UDP"
   clear_loss
-  sleep 4
-  wait_log_pattern "${name}" "schedule_select.*leg={udp" 15 "leg selector chose UDP for data frame after loss cleared"
+  local recovery_start_line
+  recovery_start_line="$(current_log_line_count)"
+  wait_log_pattern_while_ping "${name}" "schedule_select.*leg=\\{udp" 25 "leg selector chose UDP for data frame after loss cleared" "${recovery_start_line}"
 
   stop_multipath
   clear_loss
@@ -945,6 +949,41 @@ wait_log_file_pattern() {
       pass "${label}" "${message}"
       return 0
     fi
+    sleep 0.2
+  done
+  fail "${label}" "${message}: pattern not seen within ${timeout}s: ${pattern}"
+  return 1
+}
+
+current_log_line_count() {
+  if [[ -z "${CURRENT_LOG_FILE}" || ! -f "${CURRENT_LOG_FILE}" ]]; then
+    printf '0\n'
+    return 0
+  fi
+  wc -l <"${CURRENT_LOG_FILE}"
+}
+
+wait_log_pattern_while_ping() {
+  local label="$1"
+  local pattern="$2"
+  local timeout="${3:-15}"
+  local message="$4"
+  local start_line="${5:-0}"
+  if [[ -z "${CURRENT_LOG_FILE}" ]]; then
+    fail "${label}" "${message}: log file unset"
+    return 1
+  fi
+
+  local deadline=$((SECONDS + timeout))
+  while (( SECONDS < deadline )); do
+    if [[ -f "${CURRENT_LOG_FILE}" ]] && tail -n "+$((start_line + 1))" "${CURRENT_LOG_FILE}" | grep -E -q "${pattern}"; then
+      pass "${label}" "${message}"
+      return 0
+    fi
+    if ! check_multipath_alive "${label}"; then
+      return 1
+    fi
+    ping_once || true
     sleep 0.2
   done
   fail "${label}" "${message}: pattern not seen within ${timeout}s: ${pattern}"

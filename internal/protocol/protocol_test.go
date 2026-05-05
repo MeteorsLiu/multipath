@@ -71,7 +71,7 @@ func TestCodecRejectsInvalidFrames(t *testing.T) {
 	if _, err := Encode(Frame{Version: 3, Type: TypeDATA}, nil); !errors.Is(err, ErrInvalidFrame) {
 		t.Fatalf("Encode invalid version err = %v, want ErrInvalidFrame", err)
 	}
-	if _, err := Encode(Frame{Type: TypeCLOSE + 1}, nil); !errors.Is(err, ErrInvalidFrame) {
+	if _, err := Encode(Frame{Type: TypeBandwidthProbeAck + 1}, nil); !errors.Is(err, ErrInvalidFrame) {
 		t.Fatalf("Encode invalid type err = %v, want ErrInvalidFrame", err)
 	}
 	if _, err := Encode(Frame{Type: TypeDATA, Body: HelloBody{}}, nil); !errors.Is(err, ErrInvalidFrame) {

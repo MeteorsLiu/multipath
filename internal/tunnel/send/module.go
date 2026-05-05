@@ -69,6 +69,7 @@ type Send struct {
 	fecProfile       atomic.Uint32 // stores uint8 fec profile
 	negotiatedCaps   atomic.Uint32 // stores uint16 caps
 	nextProbeTarget  atomic.Uint64 // stores probe.Target
+	nextBWProbeID    atomic.Uint64
 
 	// activeSendState caches the *sendState for the currently active session
 	// so the TUN data path can skip the Manager and sessionStatesMu lookups.
@@ -95,6 +96,11 @@ type Send struct {
 	rttMu      sync.Mutex
 	rttPending map[rttPendingKey]rttPendingPing
 
+	bandwidthMu      sync.Mutex
+	bandwidthLegs    map[pingKey]*bandwidthLegState
+	bandwidthPending map[uint64]*bandwidthProbeRound
+	bandwidthRX      map[bandwidthRXKey]*bandwidthRXRound
+
 	runnableCachesMu sync.Mutex
 	runnableCaches   map[uint64]*runnableLaneCache
 }
@@ -110,6 +116,9 @@ func New(configs ...Config) *Send {
 		probeTargets:        make(map[probe.Target]probeBinding),
 		probeKeys:           make(map[pingKey]probe.Target),
 		rttPending:          make(map[rttPendingKey]rttPendingPing),
+		bandwidthLegs:       make(map[pingKey]*bandwidthLegState),
+		bandwidthPending:    make(map[uint64]*bandwidthProbeRound),
+		bandwidthRX:         make(map[bandwidthRXKey]*bandwidthRXRound),
 		packets:             make(chan transport.Payload, defaultPacketQueueSize),
 		sessionManager:      &sessionpkg.Manager{},
 		fecFlushAlpha:       defaultFECFlushAlpha,
@@ -521,6 +530,18 @@ func frameEncodeCapacity(frame protocol.Frame) (int, error) {
 	case protocol.TypeCLOSE:
 		_, ok := frame.Body.(protocol.CloseBody)
 		return headerSize + 2, validFrameBody(ok)
+	case protocol.TypeBandwidthProbe:
+		body, ok := frame.Body.(protocol.BandwidthProbeBody)
+		if !ok || body.Count == 0 || body.Count > 64 || body.Seq >= body.Count {
+			return 0, protocol.ErrInvalidFrame
+		}
+		return headerSize + 20 + len(body.Payload), nil
+	case protocol.TypeBandwidthProbeAck:
+		body, ok := frame.Body.(protocol.BandwidthProbeAckBody)
+		if !ok || body.Count == 0 || body.Count > 64 || body.BaseSeq != 0 {
+			return 0, protocol.ErrInvalidFrame
+		}
+		return headerSize + 36, nil
 	default:
 		return 0, protocol.ErrInvalidFrame
 	}

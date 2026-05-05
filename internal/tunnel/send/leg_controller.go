@@ -23,7 +23,7 @@ func (legController) tryStartFallback(lane *laneRuntime, streamAvailable bool, n
 		return "", false
 	}
 	_, udpQ, _, tcpQ := lane.legQualities()
-	return lane.tryStartFallback(streamAvailable, now, warmFallbackWanted(udpQ, tcpQ))
+	return lane.tryStartFallback(streamAvailable, now, tcpWarmWanted(udpQ, tcpQ))
 }
 
 func (legController) fallbackDialTimeout(probeTimeout time.Duration) time.Duration {
@@ -33,14 +33,6 @@ func (legController) fallbackDialTimeout(probeTimeout time.Duration) time.Durati
 	return maxFallbackDialTimeout
 }
 
-func warmFallbackWanted(udp, tcp LegQuality) bool {
-	if !udp.Active || tcp.Active {
-		return false
-	}
-	if udp.DeliveryRate < minUDPDelivery {
-		return true
-	}
-	return udp.SmoothedRTT > 0 &&
-		udp.RTTVariance > 0 &&
-		udp.RTTVariance >= udp.SmoothedRTT
+func tcpWarmWanted(udp, tcp LegQuality) bool {
+	return udp.Active && !tcp.Active
 }

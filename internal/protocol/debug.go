@@ -49,6 +49,10 @@ func debugFrame(frame Frame) string {
 		return fmt.Sprintf("%s base_packet_id=%d key=%d source_span=%d symbol_len=%d", base, body.BasePacketID, body.Key, body.SourceSpan, len(body.Symbol))
 	case CloseBody:
 		return fmt.Sprintf("%s scope=%d reason=%d", base, body.Scope, body.Reason)
+	case BandwidthProbeBody:
+		return fmt.Sprintf("%s probe_id=%d seq=%d count=%d send_ms=%d payload_len=%d", base, body.ProbeID, body.Seq, body.Count, body.SendMS, len(body.Payload))
+	case BandwidthProbeAckBody:
+		return fmt.Sprintf("%s probe_id=%d base_seq=%d count=%d received=%#x first_rx_ms=%d last_rx_ms=%d", base, body.ProbeID, body.BaseSeq, body.Count, body.Received, body.FirstRXMS, body.LastRXMS)
 	default:
 		return base
 	}
@@ -70,6 +74,10 @@ func frameTypeName(frameType FrameType) string {
 		return "REPAIR"
 	case TypeCLOSE:
 		return "CLOSE"
+	case TypeBandwidthProbe:
+		return "BW_PROBE"
+	case TypeBandwidthProbeAck:
+		return "BW_PROBE_ACK"
 	default:
 		return fmt.Sprintf("UNKNOWN(%d)", frameType)
 	}

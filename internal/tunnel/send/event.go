@@ -33,6 +33,10 @@ func logLaneHandshakeTimeout(sessionID uint64, laneID uint8, leg transport.LegRe
 	eventlog.Printf("lane_handshake_timeout", "session=%d lane=%d leg=%s timeout=%s ref={%s}", sessionID, laneID, kindMetricLabel(leg.Kind), timeout, debugLeg(leg))
 }
 
+func logBandwidthProbeSample(sessionID uint64, laneID uint8, leg transport.LegRef, probeID uint64, acked, count int, loss float64, sampleBps, ewmaBps, nextRateBps uint64) {
+	eventlog.Printf("bandwidth_probe_sample", "session=%d lane=%d leg=%s probe_id=%d acked=%d count=%d loss=%.3f sample_bps=%d ewma_bps=%d next_rate_bps=%d ref={%s}", sessionID, laneID, kindMetricLabel(leg.Kind), probeID, acked, count, loss, sampleBps, ewmaBps, nextRateBps, debugLeg(leg))
+}
+
 func currentLegFromSnapshot(snap laneSnapshot, kind transport.Kind) transport.LegRef {
 	switch kind {
 	case transport.KindUDP:

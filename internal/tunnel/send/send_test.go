@@ -652,7 +652,7 @@ func TestSendRetryFallbackDialsAfterDialError(t *testing.T) {
 	waitForDialCount(t, streamTransport, 2)
 }
 
-func TestSendRetryFallbackDialsSkipsHealthyUDP(t *testing.T) {
+func TestSendRetryFallbackDialsWarmsTCPWhenUDPHealthy(t *testing.T) {
 	streamTransport := &fakeStreamTransport{
 		dialLeg: transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp0"},
 	}
@@ -672,9 +672,20 @@ func TestSendRetryFallbackDialsSkipsHealthyUDP(t *testing.T) {
 	in.lanes[laneKey{sessionID: 99, laneID: 3}] = lane
 
 	in.retryFallbackDials(context.Background())
-	time.Sleep(10 * time.Millisecond)
-	if len(streamTransport.dialed) != 0 {
-		t.Fatalf("fallback dials = %d, want 0 while UDP is healthy", len(streamTransport.dialed))
+	waitForDialCount(t, streamTransport, 1)
+	written := readSendPayload(t, in)
+	defer written.Packet.Release()
+	if got := streamTransport.dialed[0]; got != "127.0.0.1:4321" {
+		t.Fatalf("dialed remote = %q, want 127.0.0.1:4321", got)
+	}
+	if written.Leg.Kind != transport.KindTCP || written.Leg.ConnID != "tcp0" {
+		t.Fatalf("warm fallback HELLO leg = %+v, want TCP tcp0", written.Leg)
+	}
+	if !lane.udpReady {
+		t.Fatal("warm fallback marked UDP not ready")
+	}
+	if lane.tcpReady {
+		t.Fatal("TCP ready before warm fallback HELLO_ACK")
 	}
 }
 
@@ -2208,6 +2219,10 @@ func writeTestControl(ctx context.Context, in *Send, event transport.Payload) er
 		return state.OnPong(ctx, event.Leg, frame)
 	case protocol.TypeCLOSE:
 		return state.OnClose(ctx, event.Leg, frame)
+	case protocol.TypeBandwidthProbe:
+		return state.OnBandwidthProbe(ctx, event.Leg, frame)
+	case protocol.TypeBandwidthProbeAck:
+		return state.OnBandwidthProbeAck(ctx, event.Leg, frame)
 	default:
 		return nil
 	}
@@ -2363,6 +2378,8 @@ func (w testProbeLoopRunner) Run(ctx context.Context) error {
 			if err := w.send.retryOpenHELLO(ctx, uint64(now.UnixMilli())); err != nil {
 				return err
 			}
+			w.send.retryFallbackDials(ctx)
+			w.send.probeBandwidth(ctx, now)
 		}
 	}
 }

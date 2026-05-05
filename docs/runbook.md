@@ -181,10 +181,10 @@ The real E2E builds the current binary, creates two Linux network namespaces,
 connects them with two veth paths, starts client/server with real TUN devices,
 and runs protocol-level cases for multipath scheduling, per-lane fallback
 isolation, concurrent multi-lane fallback, legacy `tcp` flag compatibility,
-UDP-to-TCP fallback, fallback dial error (no runnable lane), NAT traversal,
-FEC weak-net comparison, FEC over TCP fallback, multipath plus FEC, FEC loaded
-latency under iperf3 UDP background traffic, weighted scheduling, and near-MTU
-packet survival. It requires Linux, `go`, root
+UDP-to-TCP fallback, fallback dial error (no runnable lane), bandwidth-probe
+QoS leg selection, NAT traversal, FEC weak-net comparison, FEC over TCP
+fallback, multipath plus FEC, FEC loaded latency under iperf3 UDP background
+traffic, weighted scheduling, and near-MTU packet survival. It requires Linux, `go`, root
 privileges, `ip`, `tc`, `ping`, and `iptables`. Run it as a regular user when
 possible; the script builds the binary before escalating for network namespace
 setup. `iperf3` and `timeout` enable an

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -197,6 +198,79 @@ func TestEndToEndTCPFallbackAfterUDPHELLOTimeout(t *testing.T) {
 	}
 }
 
+func TestEndToEndBandwidthProbeSelectsTCPWhenUDPQoSLimited(t *testing.T) {
+	serverRaw := listenPacket(t)
+	defer serverRaw.Close()
+	serverConn := &qosBandwidthProbePacketConn{PacketConn: serverRaw}
+
+	clientUDP := listenPacket(t)
+	defer clientUDP.Close()
+	serverListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen tcp: %v", err)
+	}
+	defer serverListener.Close()
+
+	serverPacket := newPacketTransport(t, transport.PacketEndpoint{ID: "server", Conn: serverConn})
+	clientPacket := newPacketTransport(t, transport.PacketEndpoint{ID: "lane-1", Conn: clientUDP})
+	serverStream := transport.NewStream(serverListener)
+	clientStream := transport.NewStream(nil)
+	serverTun := newE2ETUN()
+	clientTun := newE2ETUN()
+	serverIn := New(Config{
+		StreamTransport: serverStream,
+	})
+	clientIn := New(Config{
+		StreamTransport: clientStream,
+		ProbeInterval:   20 * time.Millisecond,
+		ProbeTimeout:    time.Second,
+		BootstrapLanes: []BootstrapLane{
+			{
+				LaneID: 1,
+				Weight: 1,
+				Leg: transport.LegRef{
+					Kind:       transport.KindUDP,
+					EndpointID: "lane-1",
+					RemoteAddr: serverRaw.LocalAddr(),
+				},
+				TCPRemote: serverListener.Addr().String(),
+			},
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	serverErr := runE2ERuntimeAsync(ctx, serverIn, nil, serverTun, serverPacket, serverStream)
+	clientErr := runE2ERuntimeAsync(ctx, clientIn, clientTun, clientTun, clientPacket, clientStream)
+
+	sendUntilTUNPacket(t, clientTun, serverTun, []byte("bootstrap-data"), 2*time.Second)
+	sessionID, ok := clientIn.activeSession()
+	if !ok || sessionID == 0 {
+		t.Fatalf("client active session = (%d,%v), want generated session", sessionID, ok)
+	}
+	key := laneKey{sessionID: sessionID, laneID: 1}
+	waitForE2ELane(t, clientIn, key, func(lane *laneRuntime) bool {
+		lane.mu.Lock()
+		defer lane.mu.Unlock()
+		return lane.udpReady && lane.tcpReady
+	}, 3*time.Second)
+
+	for i := 0; i < minBandwidthProbeSamples+bandwidthProbeBadSamplesToSwitch; i++ {
+		clientIn.probeBandwidth(ctx, time.Now().Add(time.Duration(i)*bandwidthProbeInterval))
+		time.Sleep(bandwidthProbeTimeout + 300*time.Millisecond)
+	}
+	waitForE2ELane(t, clientIn, key, func(lane *laneRuntime) bool {
+		_, udpQ, _, tcpQ := lane.legQualities()
+		return udpQ.BandwidthQoSLimited && tcpQ.ProbeSamples >= minBandwidthProbeSamples
+	}, 2*time.Second)
+
+	serverConn.dropData.Store(true)
+	sendUntilTUNPacket(t, clientTun, serverTun, []byte("tcp-selected-after-qos"), 3*time.Second)
+
+	cancel()
+	waitE2ERuntime(t, serverErr)
+	waitE2ERuntime(t, clientErr)
+}
+
 type e2eTUN struct {
 	in  chan []byte
 	out chan []byte
@@ -235,6 +309,39 @@ type dropDataPacketConn struct {
 	packet  []byte
 	dropped chan struct{}
 	once    sync.Once
+}
+
+type qosBandwidthProbePacketConn struct {
+	net.PacketConn
+	dropData atomic.Bool
+}
+
+func (c *qosBandwidthProbePacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	for {
+		n, addr, err := c.PacketConn.ReadFrom(p)
+		if err != nil {
+			return n, addr, err
+		}
+		if c.shouldDrop(p[:n]) {
+			continue
+		}
+		return n, addr, nil
+	}
+}
+
+func (c *qosBandwidthProbePacketConn) shouldDrop(payload []byte) bool {
+	frame, err := protocol.Decode(payload)
+	if err != nil {
+		return false
+	}
+	switch body := frame.Body.(type) {
+	case protocol.BandwidthProbeBody:
+		return frame.Type == protocol.TypeBandwidthProbe && body.Seq != 0 && body.Seq+1 != body.Count
+	case protocol.DataBody:
+		return c.dropData.Load()
+	default:
+		return false
+	}
 }
 
 func (c *dropDataPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
@@ -429,6 +536,25 @@ func waitDropped(t *testing.T, dropped <-chan struct{}, timeout time.Duration) {
 	case <-dropped:
 	case <-time.After(timeout):
 		t.Fatal("timed out waiting for packet drop")
+	}
+}
+
+func waitForE2ELane(t *testing.T, in *Send, key laneKey, ok func(*laneRuntime) bool, timeout time.Duration) {
+	t.Helper()
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		lane := in.getLane(key)
+		if lane != nil && ok(lane) {
+			return
+		}
+		select {
+		case <-ticker.C:
+		case <-deadline.C:
+			t.Fatalf("timed out waiting for lane session=%d lane=%d", key.sessionID, key.laneID)
+		}
 	}
 }
 

@@ -5,10 +5,14 @@ import (
 )
 
 type LegQuality struct {
-	Active       bool
-	DeliveryRate float64
-	SmoothedRTT  time.Duration
-	RTTVariance  time.Duration
+	Active              bool
+	DeliveryRate        float64
+	SmoothedRTT         time.Duration
+	RTTVariance         time.Duration
+	BandwidthBps        uint64
+	ProbeLoss           float64
+	ProbeSamples        uint32
+	BandwidthQoSLimited bool
 }
 
 type LegSelector interface {
@@ -40,6 +44,10 @@ func (QualityLegSelector) Pick(udp, tcp LegQuality) (useUDP bool, ok bool) {
 	// RTT variance exceeds mean: shaper (bufferbloat, jitter).
 	if udp.RTTVariance > 0 && udp.RTTVariance >= udp.SmoothedRTT &&
 		tcp.DeliveryRate >= minTCPDelivery {
+		return false, true
+	}
+
+	if udp.BandwidthQoSLimited && tcp.ProbeSamples >= minBandwidthProbeSamples {
 		return false, true
 	}
 

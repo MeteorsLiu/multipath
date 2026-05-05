@@ -34,8 +34,9 @@ arrives late. It is not a general reliable-transport deduplication layer.
 - Session: one logical tunnel between a client and a server.
 - Lane: one independently scheduled logical path inside a session.
 - Transport leg: the concrete carrier for a lane, currently UDP or TCP.
-- Fallback: a per-lane decision to use TCP while the same lane's UDP leg is
-  unavailable.
+- Fallback: a per-lane transport decision. A lane may keep a warm TCP leg while
+  still sending DATA on UDP, then use TCP when UDP is unavailable or selected
+  against due to lane quality.
 - Frame: one protocol message after the UDP or TCP transport envelope.
 - SLC: the protocol's sliding linear coding layer. SLC profiles use random
   linear coding over GF(2^8) with DATA shards and one REPAIR shard.
@@ -189,6 +190,8 @@ Frame types:
 0x5 DATA
 0x6 REPAIR
 0x7 CLOSE
+0x8 BW_PROBE
+0x9 BW_PROBE_ACK
 ```
 
 `session_id` identifies the tunnel. `lane_id` identifies the lane that carries
@@ -293,7 +296,8 @@ Receiver behavior:
 
 ## Type 0x3: PING
 
-PING probes liveness and keeps NAT mappings warm.
+PING probes liveness and keeps NAT mappings warm. PING/PONG are small control
+frames and are not a UDP data-plane bandwidth or QoS probe.
 
 Body:
 
@@ -371,10 +375,12 @@ Sender behavior:
 2. Allocate the next session-wide `packet_id`.
 3. Build DATA with `packet_id` and the IP packet.
 4. Select a healthy lane.
-5. Send DATA on that lane's UDP leg if UDP is active.
-6. Otherwise send DATA on that lane's TCP leg if TCP fallback is active.
-7. Do not select a lane with no usable transport leg.
-8. If the DATA frame is written successfully and FEC is enabled, insert
+5. Select that lane's transport leg using the send-side leg policy.
+6. Prefer UDP when it is active and not selected against by quality policy.
+7. Send DATA on the TCP leg when UDP is unavailable or the leg policy selects
+   TCP.
+8. Do not select a lane with no usable transport leg.
+9. If the DATA frame is written successfully and FEC is enabled, insert
    `(packet_id, ip_packet)` into the SLC transmit window.
 
 Receiver behavior:
@@ -575,6 +581,68 @@ Receiver behavior:
 For session CLOSE, `lane_id = 0xff` may be used when no specific lane is
 intended.
 
+## Type 0x8: BW_PROBE
+
+BW_PROBE is an optional data-plane-sized bandwidth probe frame. It is not
+emitted to TUN and is not part of FEC.
+
+Body:
+
+```text
+probe_id uint64
+seq      uint16
+count    uint16 // total frames in this probe round, 1..64
+send_ms  uint64
+payload  bytes
+```
+
+Sender behavior:
+
+1. Send one probe round per transport leg selected for bandwidth sampling.
+2. Use `seq = 0..count-1` inside one `probe_id`.
+3. Pace probe frames according to the current probe rate. Do not send a large
+   unpaced burst.
+4. Increase the next probe rate multiplicatively after low-loss rounds.
+5. Decrease or hold the next probe rate after loss or delay inflation.
+
+Receiver behavior:
+
+1. Validate session, lane, and body length.
+2. Drop frames with `count = 0`, `count > 64`, or `seq >= count`.
+3. Do not emit the payload to TUN.
+4. Maintain a per-leg cumulative receive bitmap for the current probe round.
+5. Reply with BW_PROBE_ACK on the same transport leg.
+
+## Type 0x9: BW_PROBE_ACK
+
+BW_PROBE_ACK reports the receiver's cumulative bitmap for one bandwidth probe
+round.
+
+Body:
+
+```text
+probe_id    uint64
+base_seq    uint16 // currently 0
+count       uint16
+received    uint64 // bit N set means seq base_seq+N was received
+first_rx_ms uint64
+last_rx_ms  uint64
+```
+
+Sender behavior:
+
+1. Match `probe_id` to an outstanding bandwidth probe round.
+2. Merge `received` into the round's cumulative ACK bitmap.
+3. After the round timeout, compute received count, loss, receive span, and an
+   approximate delivered bandwidth sample.
+4. Feed the sample into per-leg bandwidth EWMA and leg selection policy.
+
+Receiver behavior:
+
+1. Validate session and lane.
+2. Drop ACKs that do not match an outstanding local probe round.
+3. Do not emit anything to TUN.
+
 ## Lane State Machine
 
 Each lane owns independent UDP and TCP transport-leg health.
@@ -583,9 +651,9 @@ Each lane owns independent UDP and TCP transport-leg health.
 new
   -> udp_probing
   -> udp_active
-  -> udp_suspect
-  -> tcp_connecting
-  -> tcp_active
+  -> tcp_warming
+  -> udp_tcp_active
+  -> tcp_selected
   -> closed
 ```
 
@@ -593,13 +661,16 @@ Important transitions:
 
 ```text
 udp_probing + HELLO_ACK over UDP -> udp_active
-udp_active + PING timeout        -> udp_suspect
-udp_suspect + TCP HELLO_ACK      -> tcp_active
-tcp_active + UDP PONG            -> udp_active
+udp_active + TCP HELLO sent      -> tcp_warming
+tcp_warming + TCP HELLO_ACK      -> udp_tcp_active
+udp_tcp_active + UDP selected    -> udp_tcp_active
+udp_tcp_active + TCP selected    -> tcp_selected
+tcp_selected + UDP selected      -> udp_tcp_active
 open + CLOSE                     -> closed
 ```
 
-Fallback is per lane. If lane A falls back to TCP, lane B can continue on UDP.
+Fallback and TCP warming are per lane. If lane A warms or selects TCP, lane B
+can continue on UDP.
 
 ## Session Establishment Flow
 
@@ -631,28 +702,57 @@ TUN packet -> DATA packet_id=103 -> lane 2 UDP
 `lane_id` on REPAIR describes the lane that carries the REPAIR frame. It does
 not restrict which DATA symbols the REPAIR can protect.
 
-## UDP to TCP Fallback Flow
+## UDP to TCP Warm Fallback Flow
 
-Only the failed lane falls back.
+Only the affected lane warms or selects TCP. TCP warming does not imply DATA is
+sent on TCP; it only makes a TCP leg available for later leg selection and
+bandwidth comparison.
 
 ```text
-lane 2 UDP PING timeout
-Client opens lane 2 TCP leg
+lane 2 UDP HELLO_ACK
+Client opens lane 2 TCP leg in warm mode
 Client -> Server over TCP: HELLO(session, lane=2)
 Server -> Client over TCP: HELLO_ACK(session, lane=2)
 
 lane 1 continues over UDP
-lane 2 DATA and REPAIR use TCP while UDP is unhealthy
+lane 2 DATA and REPAIR continue using UDP unless leg policy selects TCP
 ```
 
-The client continues low-rate UDP PING for lane 2. If UDP recovers:
+If UDP becomes unavailable or the leg policy selects TCP:
 
 ```text
-Client -> Server over UDP: PING(session, lane=2)
-Server -> Client over UDP: PONG(session, lane=2)
-lane 2 switches back to UDP
-TCP leg is closed immediately or after a short drain period
+lane 2 DATA and REPAIR use TCP
+UDP PING continues at low rate so UDP recovery remains observable
 ```
+
+When UDP is selected again, DATA and REPAIR return to UDP. The TCP warm leg may
+remain open for low-rate probing or be closed after a drain/cooldown policy.
+
+## UDP QoS Bandwidth Probe Design
+
+PING/PONG liveness does not reliably detect UDP QoS that targets large packets,
+high packet rate, or sustained bandwidth. Implementations that need UDP QoS
+detection should use a data-plane bandwidth probe separate from PING/PONG.
+
+Recommended sender behavior:
+
+1. Keep TCP warm for lanes that negotiated TCP fallback and have a TCP remote.
+2. Probe UDP and TCP with paced, data-sized BW_PROBE rounds.
+3. Increase the probe send rate multiplicatively while loss and delay inflation
+   remain low.
+4. Stop the current round when loss or delay inflation becomes significant.
+5. Record the last stable UDP bandwidth sample into an EWMA.
+6. Record a TCP bandwidth EWMA from TCP probing or transport TCP_INFO where
+   available.
+7. Treat UDP as QoS-limited only when TCP bandwidth is materially higher than
+   UDP bandwidth and the UDP sample has loss or delay-inflation evidence.
+
+The selector must use hysteresis and confidence thresholds so one noisy probe
+round does not flap a lane between UDP and TCP. A QoS decision should require
+bandwidth EWMA samples for both UDP and TCP, then require consecutive bad UDP
+probe rounds before selecting TCP and consecutive good UDP probe rounds before
+clearing the QoS-limited state. BW_PROBE/BW_PROBE_ACK must not replace
+PING/PONG liveness or Session HELLO state.
 
 ## NAT and Conntrack Requirements
 
@@ -698,6 +798,8 @@ received UDP socket and observed remote address.
   addition to the implementation's bounded memory limit.
 - Decide whether TCP fallback legs are drained or closed immediately after UDP
   recovery.
+- Tune the bandwidth probe pacing policy and selector hysteresis for UDP QoS
+  detection.
 - Decide the packet-id exhaustion threshold that triggers graceful session
   rotation before `packet_id` wraps.
 - Decide authentication/encryption separately. This draft only describes

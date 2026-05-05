@@ -33,8 +33,7 @@ type laneRuntime struct {
 	fallbackBackoff time.Duration
 	fallbackRetryAt time.Time
 
-	udpQuality legQualityTracker
-	tcpQuality legQualityTracker
+	quality laneQualityState
 }
 
 // laneSnapshot is a value-copy of laneRuntime mutable fields, returned by
@@ -85,31 +84,28 @@ func (l *laneRuntime) legQualities() (udpLeg transport.LegRef, udpQ LegQuality, 
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	udpLeg = l.udpLeg
-	udpQ = LegQuality{
-		Active:       l.udpReady && l.udpLeg.EndpointID != "" && l.udpLeg.RemoteAddr != nil,
-		DeliveryRate: l.udpQuality.deliveryRate(),
-		SmoothedRTT:  durationOrZero(l.rttUDP.SRTT()),
-		RTTVariance:  durationOrZero(l.rttUDP.RTTVAR()),
-	}
 	tcpLeg = l.tcpLeg
-	tcpQ = LegQuality{
-		Active:       l.tcpReady && l.tcpLeg.ConnID != "",
-		DeliveryRate: l.tcpQuality.deliveryRate(),
-		SmoothedRTT:  durationOrZero(l.rttTCP.SRTT()),
-		RTTVariance:  durationOrZero(l.rttTCP.RTTVAR()),
-	}
+	udpQ, tcpQ = l.quality.legQualities(laneQualityInput{
+		udpActive: l.udpReady && l.udpLeg.EndpointID != "" && l.udpLeg.RemoteAddr != nil,
+		udpSRTT:   durationOrZero(l.rttUDP.SRTT()),
+		udpRTTVar: durationOrZero(l.rttUDP.RTTVAR()),
+		tcpActive: l.tcpReady && l.tcpLeg.ConnID != "",
+		tcpSRTT:   durationOrZero(l.rttTCP.SRTT()),
+		tcpRTTVar: durationOrZero(l.rttTCP.RTTVAR()),
+	})
 	return
+}
+
+func (l *laneRuntime) recordBandwidthSample(kind transport.Kind, bandwidthBps uint64, loss float64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.quality.recordBandwidthSample(kind, bandwidthBps, loss)
 }
 
 func (l *laneRuntime) recordDelivery(kind transport.Kind, onTime bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	switch kind {
-	case transport.KindUDP:
-		l.udpQuality.recordDelivery(onTime)
-	case transport.KindTCP:
-		l.tcpQuality.recordDelivery(onTime)
-	}
+	l.quality.recordDelivery(kind, onTime)
 }
 
 func legCharge(leg transport.LegRef, payloadLen int) uint32 {

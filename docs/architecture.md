@@ -168,6 +168,7 @@ global FEC profile and codec
 HELLO bootstrap and retry data
 per-route HELLO timeout policy
 per-leg RTT estimator sampled from PONG
+per-lane leg controller for TCP warm fallback decisions
 RTT-driven FEC flush timer for variable-span SLC
 transport-bound output queue
 ```
@@ -224,6 +225,16 @@ RecvState adapter lives in the send package so it can implement
 those hooks methods on `Send`.
 Send does not expose semantic control methods such as AcceptHello,
 AcceptHelloAck, ObserveLane, ReceivePing, ReceivePong, or Close.
+Send may keep a per-lane TCP fallback leg warm after UDP HELLO_ACK when TCP
+fallback is negotiated and a TCP remote is configured. A warm TCP leg is a
+candidate for probing and later leg selection; it does not make DATA use TCP by
+default.
+PING/PONG liveness is not treated as a UDP bandwidth or QoS signal. UDP QoS
+detection belongs in send-side leg quality policy and must use data-plane
+bandwidth samples when implemented.
+Bandwidth probe results are exposed through `multipath_lane_bandwidth_bps`,
+`multipath_lane_probe_loss_ratio`, `multipath_bandwidth_probe_events_total`,
+and the `bandwidth_probe_sample` event log.
 Send arms the FEC flush timer only when the negotiated FEC profile supports
 variable-span REPAIR frames. The timer emits transport-bound REPAIR frames
 through the same scheduling and packet queue path as fill-triggered REPAIR.
@@ -248,6 +259,8 @@ type ControlState interface {
     OnPing(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error
     OnPong(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error
     OnClose(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error
+    OnBandwidthProbe(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error
+    OnBandwidthProbeAck(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error
 }
 
 type Config struct {
@@ -271,9 +284,10 @@ Recv does not write transport sockets.
 Recv.Write is a convenience for packet input when no transport leg is known.
 Recv.WriteTo decodes protocol frames from transport payloads with their leg.
 Recv emits received or recovered IP packets through Packets().
-Recv passes decoded HELLO, HELLO_ACK, PING, PONG, and CLOSE frames to the
-configured ControlState.
+Recv passes decoded HELLO, HELLO_ACK, PING, PONG, CLOSE, BW_PROBE, and
+BW_PROBE_ACK frames to the configured ControlState.
 Recv does not pass DATA or REPAIR to ControlState.
+Recv does not emit BW_PROBE payloads to TUN.
 Recv only accepts DATA or REPAIR for sessions admitted by the shared Session
 Manager. Unknown-session DATA or REPAIR is dropped.
 Recv owns receive-side FEC windows.
@@ -427,12 +441,15 @@ Rules:
 
 ```text
 Runtime bootstrap calls ProbeLoop.Bootstrap.
-ProbeLoop.Run drives probe, HELLO retry, and fallback flow.
+ProbeLoop.Run drives probe, HELLO retry, and fallback/warm-leg flow.
 ProbeLoop does not read TUN or transport sockets.
 ProbeLoop does not schedule DATA directly.
 ProbeLoop is implemented in the send package because it adapts generic
 probe/core events and retry ticks to Send-owned lane state. The probe/core
 package remains independent and owns only the generic probe state machine.
+ProbeLoop must not own UDP QoS bandwidth estimation. Bandwidth probing feeds
+send-side leg quality state; ProbeLoop may trigger maintenance ticks but must
+not become a data-plane scheduler.
 ```
 
 ## Schedule Strategy

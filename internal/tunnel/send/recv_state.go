@@ -75,3 +75,21 @@ func (s *RecvState) OnClose(ctx context.Context, leg transport.LegRef, frame pro
 	}
 	return s.sender.close(ctx, frame.SessionID, frame.LaneID, body.Scope, body.Reason)
 }
+
+func (s *RecvState) OnBandwidthProbe(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error {
+	body, ok := frame.Body.(protocol.BandwidthProbeBody)
+	if !ok {
+		debuglog.Printf("send/control", "invalid_body type=BW_PROBE")
+		return protocol.ErrInvalidFrame
+	}
+	return s.sender.receiveBandwidthProbe(ctx, frame.SessionID, frame.LaneID, leg, body)
+}
+
+func (s *RecvState) OnBandwidthProbeAck(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error {
+	body, ok := frame.Body.(protocol.BandwidthProbeAckBody)
+	if !ok {
+		debuglog.Printf("send/control", "invalid_body type=BW_PROBE_ACK")
+		return protocol.ErrInvalidFrame
+	}
+	return s.sender.receiveBandwidthProbeAck(frame.SessionID, frame.LaneID, leg, body)
+}

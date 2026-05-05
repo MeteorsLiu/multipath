@@ -22,6 +22,9 @@ const (
 	ScheduleSkipTotal         = "multipath_schedule_skip_total"
 	LaneEventsTotal           = "multipath_lane_events_total"
 	LaneRTTMs                 = "multipath_lane_rtt_ms"
+	LaneBandwidthBps          = "multipath_lane_bandwidth_bps"
+	LaneProbeLossRatio        = "multipath_lane_probe_loss_ratio"
+	BandwidthProbeEventsTotal = "multipath_bandwidth_probe_events_total"
 	FECEventsTotal            = "multipath_fec_events_total"
 	FECFlushTotal             = "multipath_fec_flush_total"
 	ProbeEventsTotal          = "multipath_probe_events_total"
@@ -119,6 +122,21 @@ var specs = map[string]metricSpec{
 		kind:   metricGauge,
 		help:   "Smoothed RTT in milliseconds by lane and transport leg.",
 		labels: []string{"session", "lane", "leg"},
+	},
+	LaneBandwidthBps: {
+		kind:   metricGauge,
+		help:   "Estimated bandwidth in bits per second by lane and transport leg.",
+		labels: []string{"session", "lane", "leg"},
+	},
+	LaneProbeLossRatio: {
+		kind:   metricGauge,
+		help:   "Last bandwidth probe loss ratio by lane and transport leg.",
+		labels: []string{"session", "lane", "leg"},
+	},
+	BandwidthProbeEventsTotal: {
+		kind:   metricCounter,
+		help:   "Total bandwidth probe events.",
+		labels: []string{"event", "session", "lane", "leg"},
 	},
 	FECEventsTotal: {
 		kind:   metricCounter,

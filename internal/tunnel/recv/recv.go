@@ -24,6 +24,8 @@ type ControlState interface {
 	OnPing(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error
 	OnPong(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error
 	OnClose(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error
+	OnBandwidthProbe(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error
+	OnBandwidthProbeAck(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error
 }
 
 type Config struct {
@@ -144,6 +146,10 @@ func (o *Recv) WriteTo(ctx context.Context, leg transport.LegRef, packet *packet
 		return o.handleREPAIR(ctx, frame)
 	case protocol.TypeCLOSE:
 		return o.handleCLOSE(ctx, leg, frame)
+	case protocol.TypeBandwidthProbe:
+		return o.handleBandwidthProbe(ctx, leg, frame)
+	case protocol.TypeBandwidthProbeAck:
+		return o.handleBandwidthProbeAck(ctx, leg, frame)
 	default:
 		return nil
 	}
@@ -199,6 +205,32 @@ func (o *Recv) handlePONG(ctx context.Context, leg transport.LegRef, frame proto
 		return nil
 	}
 	return o.control.OnPong(ctx, leg, frame)
+}
+
+func (o *Recv) handleBandwidthProbe(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error {
+	if _, ok := frame.Body.(protocol.BandwidthProbeBody); !ok {
+		debuglog.Printf("recv/control", "bw_probe_invalid_body session=%d lane=%d", frame.SessionID, frame.LaneID)
+		return protocol.ErrInvalidFrame
+	}
+	debuglog.Printf("recv/control", "bw_probe session=%d lane=%d leg={%s}", frame.SessionID, frame.LaneID, debugLeg(leg))
+	if o.control == nil {
+		debuglog.Printf("recv/control", "bw_probe_drop no_control session=%d lane=%d", frame.SessionID, frame.LaneID)
+		return nil
+	}
+	return o.control.OnBandwidthProbe(ctx, leg, frame)
+}
+
+func (o *Recv) handleBandwidthProbeAck(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error {
+	if _, ok := frame.Body.(protocol.BandwidthProbeAckBody); !ok {
+		debuglog.Printf("recv/control", "bw_probe_ack_invalid_body session=%d lane=%d", frame.SessionID, frame.LaneID)
+		return protocol.ErrInvalidFrame
+	}
+	debuglog.Printf("recv/control", "bw_probe_ack session=%d lane=%d leg={%s}", frame.SessionID, frame.LaneID, debugLeg(leg))
+	if o.control == nil {
+		debuglog.Printf("recv/control", "bw_probe_ack_drop no_control session=%d lane=%d", frame.SessionID, frame.LaneID)
+		return nil
+	}
+	return o.control.OnBandwidthProbeAck(ctx, leg, frame)
 }
 
 func (o *Recv) handleDATA(ctx context.Context, frame protocol.Frame, packet *packetbuf.Packet) (bool, error) {
@@ -415,8 +447,6 @@ func (o *Recv) emitTransportPacket(ctx context.Context, packet *packetbuf.Packet
 		return false, ctx.Err()
 	}
 }
-
-
 
 func (o *Recv) recvState(sessionID uint64) *recvState {
 	// Fast path: read-locked lookup. The Get/lookup pair stays inside

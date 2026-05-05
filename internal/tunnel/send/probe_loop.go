@@ -138,6 +138,7 @@ func (l *ProbeLoop) run(ctx context.Context, events <-chan core.Event) error {
 				return err
 			}
 			l.sender.retryFallbackDials(ctx)
+			l.sender.probeBandwidth(ctx, now)
 		}
 	}
 }

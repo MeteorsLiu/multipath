@@ -23,6 +23,8 @@ const (
 	TypeDATA
 	TypeREPAIR
 	TypeCLOSE
+	TypeBandwidthProbe
+	TypeBandwidthProbeAck
 )
 
 var (
@@ -47,7 +49,7 @@ func Encode(frame Frame, dst []byte) ([]byte, error) {
 		debugEncodeError(frame, err)
 		return nil, err
 	}
-	if frame.Type == 0 || frame.Type > TypeCLOSE {
+	if frame.Type == 0 || frame.Type > TypeBandwidthProbeAck {
 		err := fmt.Errorf("%w: type out of range", ErrInvalidFrame)
 		debugEncodeError(frame, err)
 		return nil, err
@@ -85,7 +87,7 @@ func Decode(src []byte) (Frame, error) {
 	vt := src[0]
 	version := vt >> 4
 	frameType := FrameType(vt & 0x0f)
-	if version != Version || frameType == 0 || frameType > TypeCLOSE {
+	if version != Version || frameType == 0 || frameType > TypeBandwidthProbeAck {
 		debugDecodeError(len(src), ErrInvalidFrame)
 		return Frame{}, ErrInvalidFrame
 	}

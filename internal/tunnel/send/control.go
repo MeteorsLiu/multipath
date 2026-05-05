@@ -247,6 +247,8 @@ func (i *Send) closeLane(ctx context.Context, key laneKey) {
 	udpLeg, tcpLeg := lane.legs()
 	i.untrackProbeTarget(ctx, udpLeg)
 	i.untrackProbeTarget(ctx, tcpLeg)
+	i.clearBandwidthLeg(udpLeg)
+	i.clearBandwidthLeg(tcpLeg)
 	if i.streamTransport != nil && tcpLeg.ConnID != "" {
 		_ = i.streamTransport.Close(ctx, tcpLeg.ConnID)
 	}
