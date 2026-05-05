@@ -3,6 +3,7 @@ package send
 import (
 	"context"
 	"math/bits"
+	"slices"
 	"time"
 
 	"github.com/MeteorsLiu/multipath/internal/debuglog"
@@ -22,6 +23,7 @@ const (
 )
 
 type bandwidthLegState struct {
+	key           laneKey
 	nextRateBps   uint64
 	ewmaBps       uint64
 	inFlight      bool
@@ -86,21 +88,61 @@ func (l *Send) probeBandwidth(ctx context.Context, now time.Time) {
 	}
 	l.lanesMu.RUnlock()
 
+	slices.SortFunc(lanes, func(a, b laneCandidate) int {
+		return int(a.key.laneID) - int(b.key.laneID)
+	})
+
+	selectedLane, ok := l.activeBandwidthLane(sessionID)
+	if !ok {
+		for _, item := range lanes {
+			_, udpQ, _, tcpQ := item.lane.legQualities()
+			if udpQ.Active || tcpQ.Active {
+				selectedLane = item.key
+				break
+			}
+		}
+	}
+	if selectedLane.sessionID == 0 {
+		return
+	}
+
 	for _, item := range lanes {
-		key := item.key
+		if item.key != selectedLane {
+			continue
+		}
 		lane := item.lane
 		udpLeg, udpQ, tcpLeg, tcpQ := lane.legQualities()
 		if udpQ.Active {
-			candidates = append(candidates, candidate{key: key, leg: udpLeg})
+			candidates = append(candidates, candidate{key: item.key, leg: udpLeg})
 		}
 		if tcpQ.Active {
-			candidates = append(candidates, candidate{key: key, leg: tcpLeg})
+			candidates = append(candidates, candidate{key: item.key, leg: tcpLeg})
 		}
+		break
 	}
 
 	for _, item := range candidates {
 		l.maybeStartBandwidthProbe(ctx, item.key, item.leg, now)
 	}
+}
+
+func (l *Send) activeBandwidthLane(sessionID uint64) (laneKey, bool) {
+	l.bandwidthMu.Lock()
+	defer l.bandwidthMu.Unlock()
+
+	var selected laneKey
+	for _, state := range l.bandwidthLegs {
+		if state == nil || !state.inFlight || state.complete || state.key.sessionID != sessionID {
+			continue
+		}
+		if selected.sessionID == 0 || state.key.laneID < selected.laneID {
+			selected = state.key
+		}
+	}
+	if selected.sessionID == 0 {
+		return laneKey{}, false
+	}
+	return selected, true
 }
 
 func (l *Send) maybeStartBandwidthProbe(ctx context.Context, key laneKey, leg transport.LegRef, now time.Time) {
@@ -112,9 +154,10 @@ func (l *Send) maybeStartBandwidthProbe(ctx context.Context, key laneKey, leg tr
 	l.bandwidthMu.Lock()
 	state := l.bandwidthLegs[legKey]
 	if state == nil {
-		state = &bandwidthLegState{nextRateBps: bandwidthProbeMinRateBps}
+		state = &bandwidthLegState{key: key, nextRateBps: bandwidthProbeMinRateBps}
 		l.bandwidthLegs[legKey] = state
 	}
+	state.key = key
 	if state.inFlight || state.complete {
 		l.bandwidthMu.Unlock()
 		return

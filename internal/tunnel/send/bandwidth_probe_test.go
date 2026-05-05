@@ -9,6 +9,44 @@ import (
 	"github.com/MeteorsLiu/multipath/internal/transport"
 )
 
+func TestBandwidthProbeStartsOneLaneAtATime(t *testing.T) {
+	in := New()
+	mustSendState(t, in, 99)
+	in.activateSession(99)
+
+	udp1 := transport.LegRef{Kind: transport.KindUDP, EndpointID: "udp1", RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234")}
+	tcp1 := transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp1"}
+	udp2 := transport.LegRef{Kind: transport.KindUDP, EndpointID: "udp2", RemoteAddr: mustUDPAddr(t, "127.0.0.1:1235")}
+	tcp2 := transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp2"}
+
+	lane1 := newLaneRuntime(1, 1)
+	lane1.bindLeg(udp1)
+	lane1.bindLeg(tcp1)
+	in.lanes[laneKey{sessionID: 99, laneID: 1}] = lane1
+
+	lane2 := newLaneRuntime(2, 1)
+	lane2.bindLeg(udp2)
+	lane2.bindLeg(tcp2)
+	in.lanes[laneKey{sessionID: 99, laneID: 2}] = lane2
+
+	in.probeBandwidth(context.Background(), time.Now())
+
+	in.bandwidthMu.Lock()
+	defer in.bandwidthMu.Unlock()
+
+	if len(in.bandwidthLegs) != 2 {
+		t.Fatalf("bandwidth legs = %d, want 2", len(in.bandwidthLegs))
+	}
+	for legKey, state := range in.bandwidthLegs {
+		if state == nil || !state.inFlight {
+			t.Fatalf("leg %v state not in flight: %+v", legKey, state)
+		}
+		if state.key.laneID != 1 {
+			t.Fatalf("leg %v started on lane %d, want lane 1", legKey, state.key.laneID)
+		}
+	}
+}
+
 func TestSendReceiveBandwidthProbeRepliesWithBitmap(t *testing.T) {
 	in := New()
 	mustSendState(t, in, 99)
