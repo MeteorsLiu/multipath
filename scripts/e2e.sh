@@ -69,6 +69,7 @@ PORT_MTU=5012
 PORT_FEC_LOADED_LATENCY=5013
 PORT_LEG_SELECTOR=5014
 PORT_SERVER_RESTART=5015
+PORT_BW_PROBE_CEILING=5016
 
 PATH1_C="10.201.1.1/24"
 PATH1_S="10.201.1.2/24"
@@ -539,6 +540,15 @@ add_delay_band() {
   ip netns exec "${ns}" tc qdisc replace dev "${dev}" parent "1:${band}" handle "${handle}:" netem delay "${delay}"
 }
 
+add_rate_band() {
+  local ns="$1"
+  local dev="$2"
+  local band="$3"
+  local handle="$4"
+  local rate="$5"
+  ip netns exec "${ns}" tc qdisc replace dev "${dev}" parent "1:${band}" handle "${handle}:" netem rate "${rate}"
+}
+
 add_port_filter() {
   local ns="$1"
   local dev="$2"
@@ -674,6 +684,23 @@ apply_udp_partial_loss() {
 
   setup_prio_qdisc "${NS_S}" "${server_dev}"
   add_loss_band "${NS_S}" "${server_dev}" 3 30 "${loss}"
+  add_port_filter "${NS_S}" "${server_dev}" 1 udp sport "${port}" 3
+}
+
+apply_udp_tunnel_rate_path() {
+  local path="$1"
+  local port="$2"
+  local rate="$3"
+  local client_dev server_dev
+  client_dev="$(path_client_dev "${path}")"
+  server_dev="$(path_server_dev "${path}")"
+
+  setup_prio_qdisc "${NS_C}" "${client_dev}"
+  add_rate_band "${NS_C}" "${client_dev}" 3 30 "${rate}"
+  add_port_filter "${NS_C}" "${client_dev}" 1 udp dport "${port}" 3
+
+  setup_prio_qdisc "${NS_S}" "${server_dev}"
+  add_rate_band "${NS_S}" "${server_dev}" 3 30 "${rate}"
   add_port_filter "${NS_S}" "${server_dev}" 1 udp sport "${port}" 3
 }
 
@@ -853,6 +880,26 @@ run_leg_selector_case() {
   wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "schedule_select.*leg=\\{tcp" 45 "client leg selector chose TCP for data frame after UDP QoS detection" "${client_qos_start_line}"
   wait_log_file_pattern_while_ping "${name}" "${CURRENT_SERVER_LOG}" "bandwidth_probe_decision .*lane=1 .*udp_qos_limited=true .*tcp_better=true selected_leg=tcp" 45 "server produced bandwidth-probe QoS decision" "${server_qos_start_line}"
   wait_log_file_pattern_while_ping "${name}" "${CURRENT_SERVER_LOG}" "schedule_select.*leg=\\{tcp" 45 "server leg selector chose TCP for data frame after UDP QoS detection" "${server_qos_start_line}"
+
+  stop_multipath
+  clear_loss
+  echo "==== ${name} e2e end ===="
+}
+
+run_bandwidth_probe_ceiling_case() {
+  local name="bandwidth-probe-ceiling"
+  echo "==== ${name} e2e start ===="
+  clear_loss
+  write_one_lane_config "${name}" "${PORT_BW_PROBE_CEILING}" false false 200 1000
+  echo "[${name}] rate-limit UDP tunnel before startup; bandwidth probe should lock dynamic ceiling instead of ramping forever"
+  apply_udp_tunnel_rate_path 1 "${PORT_BW_PROBE_CEILING}" 80mbit
+  start_multipath "${name}"
+  local client_start_line
+  client_start_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
+
+  wait_ping_ok "${name} baseline-under-rate-limit" 12
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "rate_ceiling session=[0-9]+ lane=1 kind=udp rate_bps=[0-9]+ prev_acked_bytes=[0-9]+ acked_bytes=[0-9]+" 35 "client bandwidth probe locked UDP dynamic ceiling" "${client_start_line}"
+  wait_ping_ok "${name} post-ceiling" 12
 
   stop_multipath
   clear_loss
@@ -1371,6 +1418,7 @@ run_fallback_case
 run_server_restart_reconnect_case
 run_fallback_dial_error_case
 run_leg_selector_case
+run_bandwidth_probe_ceiling_case
 run_nat_case
 run_fec_comparison
 run_fec_tcp_fallback_case

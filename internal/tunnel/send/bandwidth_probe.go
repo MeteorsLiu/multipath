@@ -585,6 +585,7 @@ func (l *Send) advanceBandwidthProbeRate(legKey pingKey) {
 	} else if bandwidthProbeGrowthStalled(state.prevStepBytes, state.lastStepBytes) {
 		state.rateCeilingBps = state.nextRateBps
 		state.nextRateBps = state.rateCeilingBps
+		debuglog.Printf("send/bw_probe", "rate_ceiling session=%d lane=%d kind=%s rate_bps=%d prev_acked_bytes=%d acked_bytes=%d", state.key.sessionID, state.key.laneID, kindMetricLabel(legKey.kind), state.rateCeilingBps, state.prevStepBytes, state.lastStepBytes)
 	} else if state.lastStepBps > 0 {
 		next := state.lastStepBps * bandwidthProbePacingGainNum / bandwidthProbePacingGainDen
 		if next < bandwidthProbeMinRateBps {
