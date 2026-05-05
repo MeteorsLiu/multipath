@@ -69,7 +69,7 @@ PORT_MTU=5012
 PORT_FEC_LOADED_LATENCY=5013
 PORT_LEG_SELECTOR=5014
 PORT_SERVER_RESTART=5015
-PORT_BW_PROBE_CEILING=5016
+PORT_BW_PROBE_CONVERGENCE=5016
 
 PATH1_C="10.201.1.1/24"
 PATH1_S="10.201.1.2/24"
@@ -899,22 +899,22 @@ run_leg_selector_case() {
   echo "==== ${name} e2e end ===="
 }
 
-run_bandwidth_probe_ceiling_case() {
-  local name="bandwidth-probe-ceiling"
+run_bandwidth_probe_convergence_case() {
+  local name="bandwidth-probe-convergence"
   echo "==== ${name} e2e start ===="
   clear_loss
-  write_one_lane_config "${name}" "${PORT_BW_PROBE_CEILING}" false false 200 1000
-  echo "[${name}] rate-limit UDP tunnel before startup; bandwidth probe should lock dynamic ceiling instead of ramping forever"
-  apply_udp_tunnel_rate_path 1 "${PORT_BW_PROBE_CEILING}" 80mbit
+  write_one_lane_config "${name}" "${PORT_BW_PROBE_CONVERGENCE}" false false 200 1000
+  echo "[${name}] rate-limit UDP tunnel before startup; bandwidth probe should converge without a static cap"
+  apply_udp_tunnel_rate_path 1 "${PORT_BW_PROBE_CONVERGENCE}" 80mbit
   start_multipath "${name}"
   local client_start_line
   client_start_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
 
   wait_ping_ok "${name} baseline-under-rate-limit" 12
-  wait_log_file_any_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" 35 "client bandwidth probe converged under UDP rate limit" "${client_start_line}" \
+  wait_log_file_any_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" 35 "client bandwidth probe converged under UDP rate limit without static cap" "${client_start_line}" \
     "rate_ceiling session=[0-9]+ lane=1 kind=udp rate_bps=[0-9]+ prev_acked_bytes=[0-9]+ acked_bytes=[0-9]+" \
     "bandwidth_probe_decision .*lane=1 .*udp_qos_limited=true .*tcp_better=true selected_leg=tcp"
-  wait_ping_ok "${name} post-ceiling" 12
+  wait_ping_ok "${name} post-convergence" 12
 
   stop_multipath
   clear_loss
@@ -1518,7 +1518,7 @@ run_fallback_case
 run_server_restart_reconnect_case
 run_fallback_dial_error_case
 run_leg_selector_case
-run_bandwidth_probe_ceiling_case
+run_bandwidth_probe_convergence_case
 run_nat_case
 run_fec_comparison
 run_fec_tcp_fallback_case

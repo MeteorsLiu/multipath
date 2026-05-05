@@ -402,6 +402,35 @@ func TestBandwidthProbeRateKeepsRampingWhenAckBytesGrowEnough(t *testing.T) {
 	}
 }
 
+func TestBandwidthProbeRateAdvanceUsesAdditiveStepWhenLossIncreases(t *testing.T) {
+	in := New()
+	udpLeg := transport.LegRef{
+		Kind:       transport.KindUDP,
+		EndpointID: "udp0",
+		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
+	}
+	legKey := newPingKey(udpLeg)
+	in.bandwidthLegs[legKey] = &bandwidthLegState{
+		nextRateBps:   90_000_000,
+		inFlight:      true,
+		lastStepBps:   100_000_000,
+		lastStepBytes: 6_000_000,
+		prevStepBytes: 4_000_000,
+		prevStepLoss:  0.02,
+		lastStepLoss:  0.04,
+	}
+
+	in.advanceBandwidthProbeRate(legKey)
+
+	state := in.bandwidthLegs[legKey]
+	if state.nextRateBps != 100_000_000 {
+		t.Fatalf("next rate = %d, want additive increase to 100Mbps", state.nextRateBps)
+	}
+	if state.rateCeilingBps != 0 {
+		t.Fatalf("dynamic ceiling = %d, want none before ack plateau", state.rateCeilingBps)
+	}
+}
+
 func TestBandwidthProbeLimiterUsesByteRateAndShortBurst(t *testing.T) {
 	limiter := newBandwidthProbeLimiter(bandwidthProbeMinRateBps, bandwidthProbeUDPMinPayloadSize)
 	if limiter == nil {
