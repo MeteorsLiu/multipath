@@ -257,6 +257,7 @@ func probeFrameCount(rateBps uint64, payloadBytes int) uint16 {
 
 func (l *Send) runBandwidthProbeTrain(ctx context.Context, key laneKey, leg transport.LegRef, legKey pingKey) {
 	deadline := time.Now().Add(bandwidthProbeWindow)
+	var limiterState bandwidthProbeLimiterState
 	for {
 		now := time.Now()
 		if !now.Before(deadline) {
@@ -267,19 +268,12 @@ func (l *Send) runBandwidthProbeTrain(ctx context.Context, key laneKey, leg tran
 			stepDeadline = deadline
 		}
 		l.startBandwidthProbeStep(legKey, now)
-		var limiter *rate.Limiter
-		var limiterRate uint64
-		var limiterPayloadBytes int
 		for time.Now().Before(stepDeadline) {
 			round := l.startBandwidthProbeRound(key, leg, legKey, time.Now())
 			if round == nil {
 				return
 			}
-			if limiter == nil || limiterRate != round.rateBps || limiterPayloadBytes != round.payloadBytes {
-				limiter = newBandwidthProbeLimiter(round.rateBps, round.payloadBytes)
-				limiterRate = round.rateBps
-				limiterPayloadBytes = round.payloadBytes
-			}
+			limiter := limiterState.forRound(leg, round)
 			sent := l.runBandwidthProbeRound(ctx, round, stepDeadline, limiter)
 			l.recordBandwidthProbeSent(round, sent)
 			if sent < round.count {
@@ -304,6 +298,22 @@ func (l *Send) runBandwidthProbeTrain(ctx context.Context, key laneKey, leg tran
 	case <-timer.C:
 	}
 	l.completeBandwidthProbeTrain(key, leg, legKey)
+}
+
+type bandwidthProbeLimiterState struct {
+	limiter *rate.Limiter
+	rateBps uint64
+}
+
+func (s *bandwidthProbeLimiterState) forRound(leg transport.LegRef, round *bandwidthProbeRound) *rate.Limiter {
+	if round == nil {
+		return nil
+	}
+	if s.limiter == nil || s.rateBps != round.rateBps {
+		s.limiter = newBandwidthProbeLimiter(round.rateBps, bandwidthProbeLimiterPayloadBytes(leg))
+		s.rateBps = round.rateBps
+	}
+	return s.limiter
 }
 
 func (l *Send) startBandwidthProbeRound(key laneKey, leg transport.LegRef, legKey pingKey, now time.Time) *bandwidthProbeRound {
@@ -401,6 +411,13 @@ func bandwidthProbeSeed(key laneKey, probeID uint64, rateBps uint64) [32]byte {
 	binary.BigEndian.PutUint64(seed[9:17], probeID)
 	binary.BigEndian.PutUint64(seed[17:25], rateBps)
 	return seed
+}
+
+func bandwidthProbeLimiterPayloadBytes(leg transport.LegRef) int {
+	if leg.Kind == transport.KindTCP {
+		return bandwidthProbeTCPPayloadSize
+	}
+	return bandwidthProbeUDPMaxPayloadSize
 }
 
 func newBandwidthProbeLimiter(rateBps uint64, payloadBytes int) *rate.Limiter {

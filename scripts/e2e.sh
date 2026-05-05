@@ -1141,6 +1141,7 @@ run_fec_case() {
 
   clear_loss
   write_one_lane_config "${label}" "${PORT_FEC}" false "${fec_flag}" 200 3000
+  CURRENT_EXTRA_ENV=(MULTIPATH_DISABLE_BW_PROBE=1)
   start_multipath "${label}"
   wait_ping_ok "${label} baseline" 12
 
@@ -1262,6 +1263,7 @@ run_fec_tcp_fallback_case() {
   echo "==== ${name} e2e start ===="
   clear_loss
   write_one_lane_config "${name}" "${PORT_FEC_TCP_FALLBACK}" false true 200 600
+  CURRENT_EXTRA_ENV=(MULTIPATH_DISABLE_BW_PROBE=1)
   start_multipath "${name}"
 
   wait_ping_ok "${name} baseline" 12
@@ -1284,6 +1286,7 @@ run_multipath_fec_case() {
   echo "==== ${name} e2e start ===="
   clear_loss
   write_two_lane_config "${name}" "${PORT_MULTIPATH_FEC}" false true 200 3000
+  CURRENT_EXTRA_ENV=(MULTIPATH_DISABLE_BW_PROBE=1)
   start_multipath "${name}"
 
   wait_ping_ok "${name} baseline" 12
@@ -1329,6 +1332,7 @@ run_fec_loaded_latency_case() {
 
   clear_loss
   write_one_lane_config "${name}" "${PORT_FEC_LOADED_LATENCY}" false true 200 3000
+  CURRENT_EXTRA_ENV=(MULTIPATH_DISABLE_BW_PROBE=1)
   start_multipath "${name}"
   wait_ping_ok "${name} baseline" 12
 

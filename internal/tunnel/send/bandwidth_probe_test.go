@@ -444,6 +444,41 @@ func TestBandwidthProbeLimiterUsesByteRateAndShortBurst(t *testing.T) {
 	}
 }
 
+func TestBandwidthProbeLimiterStateSurvivesUDPPayloadJitter(t *testing.T) {
+	state := bandwidthProbeLimiterState{}
+	leg := transport.LegRef{
+		Kind:       transport.KindUDP,
+		EndpointID: "udp1",
+		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
+	}
+	firstRound := &bandwidthProbeRound{
+		rateBps:      bandwidthProbeMinRateBps,
+		payloadBytes: bandwidthProbeUDPMinPayloadSize,
+	}
+	first := state.forRound(leg, firstRound)
+	if first == nil {
+		t.Fatal("missing limiter")
+	}
+
+	secondRound := &bandwidthProbeRound{
+		rateBps:      bandwidthProbeMinRateBps,
+		payloadBytes: bandwidthProbeUDPMaxPayloadSize,
+	}
+	second := state.forRound(leg, secondRound)
+	if second != first {
+		t.Fatal("limiter was recreated for UDP payload jitter")
+	}
+
+	nextRound := &bandwidthProbeRound{
+		rateBps:      bandwidthProbeMinRateBps + bandwidthProbeAdditiveStepBps,
+		payloadBytes: bandwidthProbeUDPMinPayloadSize,
+	}
+	next := state.forRound(leg, nextRound)
+	if next == first {
+		t.Fatal("limiter was reused after rate changed")
+	}
+}
+
 func TestBandwidthProbeUDPPayloadSizeIsJittered(t *testing.T) {
 	key := laneKey{sessionID: 99, laneID: 1}
 	sawDifferent := false
