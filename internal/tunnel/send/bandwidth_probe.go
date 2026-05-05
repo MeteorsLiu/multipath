@@ -714,7 +714,8 @@ func (l *Send) logBandwidthProbeDecisionIfReady(key laneKey) {
 	if !ready {
 		return
 	}
-	logBandwidthProbeDecision(key.sessionID, key.laneID, udpQ, tcpQ)
+	useUDP, ok := l.legSelector(key.sessionID).Pick(udpQ, tcpQ)
+	logBandwidthProbeDecision(key.sessionID, key.laneID, udpQ, tcpQ, useUDP, ok)
 }
 
 func (l *Send) clearBandwidthLeg(leg transport.LegRef) {

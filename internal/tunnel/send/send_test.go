@@ -57,6 +57,38 @@ func TestSendWriteScheduledFrame(t *testing.T) {
 	}
 }
 
+func TestSendWriteScheduledFrameUsesTCPAfterBandwidthQoSDecision(t *testing.T) {
+	in := New()
+	lane := newLaneRuntime(3, 10)
+	lane.bindLeg(transport.LegRef{
+		Kind:       transport.KindUDP,
+		EndpointID: "udp0",
+		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
+	})
+	lane.bindLeg(transport.LegRef{
+		Kind:   transport.KindTCP,
+		ConnID: "tcp0",
+	})
+	lane.recordBandwidthSample(transport.KindUDP, 50_000_000, 0.10)
+	lane.recordBandwidthSample(transport.KindTCP, 100_000_000, 0)
+	in.lanes[laneKey{sessionID: 99, laneID: 3}] = lane
+
+	_, _, err := in.writeScheduledFrame(context.Background(), protocol.Frame{
+		Type:      protocol.TypeDATA,
+		SessionID: 99,
+		Body:      protocol.DataBody{Packet: []byte("packet")},
+	})
+	if err != nil {
+		t.Fatalf("writeScheduledFrame failed: %v", err)
+	}
+
+	written := readSendPayload(t, in)
+	defer written.Packet.Release()
+	if written.Leg.Kind != transport.KindTCP || written.Leg.ConnID != "tcp0" {
+		t.Fatalf("written leg = %+v, want TCP tcp0", written.Leg)
+	}
+}
+
 func TestSendWriteScheduledFrameNoRunnableLane(t *testing.T) {
 	in := New()
 	_, _, err := in.writeScheduledFrame(context.Background(), protocol.Frame{

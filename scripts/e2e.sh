@@ -879,9 +879,16 @@ run_leg_selector_case() {
   server_qos_start_line="$(current_log_file_line_count "${CURRENT_SERVER_LOG}")"
   wait_log_pattern "${name}" "accept_hello_ack session=[0-9]+ lane=1 .*tcp conn=" 20 "warm TCP fallback leg reached HELLO_ACK"
   wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "bandwidth_probe_decision .*lane=1 .*udp_qos_limited=true .*tcp_better=true selected_leg=tcp" 45 "client produced bandwidth-probe QoS decision" "${client_qos_start_line}"
-  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "schedule_select.*leg=\\{tcp" 45 "client leg selector chose TCP for data frame after UDP QoS detection" "${client_qos_start_line}"
   wait_log_file_pattern_while_ping "${name}" "${CURRENT_SERVER_LOG}" "bandwidth_probe_decision .*lane=1 .*udp_qos_limited=true .*tcp_better=true selected_leg=tcp" 45 "server produced bandwidth-probe QoS decision" "${server_qos_start_line}"
-  wait_log_file_pattern_while_ping "${name}" "${CURRENT_SERVER_LOG}" "schedule_select.*leg=\\{tcp" 45 "server leg selector chose TCP for data frame after UDP QoS detection" "${server_qos_start_line}"
+
+  local client_select_start_line
+  local server_select_start_line
+  client_select_start_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
+  server_select_start_line="$(current_log_file_line_count "${CURRENT_SERVER_LOG}")"
+  ip netns exec "${NS_C}" ping -c 20 -i 0.05 -W 1 "${TUN_C_REMOTE}" >/dev/null 2>&1 || true
+  ip netns exec "${NS_S}" ping -c 20 -i 0.05 -W 1 "${TUN_S_REMOTE}" >/dev/null 2>&1 || true
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "schedule_select.*leg=\\{tcp" 20 "client leg selector chose TCP for data frame after UDP QoS detection" "${client_select_start_line}"
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_SERVER_LOG}" "schedule_select.*leg=\\{tcp" 20 "server leg selector chose TCP for data frame after UDP QoS detection" "${server_select_start_line}"
 
   stop_multipath
   clear_loss
