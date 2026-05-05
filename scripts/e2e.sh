@@ -956,27 +956,33 @@ wait_log_file_pattern() {
 }
 
 current_log_line_count() {
-  if [[ -z "${CURRENT_LOG_FILE}" || ! -f "${CURRENT_LOG_FILE}" ]]; then
+  current_log_file_line_count "${CURRENT_LOG_FILE}"
+}
+
+current_log_file_line_count() {
+  local log_file="$1"
+  if [[ -z "${log_file}" || ! -f "${log_file}" ]]; then
     printf '0\n'
     return 0
   fi
-  wc -l <"${CURRENT_LOG_FILE}"
+  wc -l <"${log_file}"
 }
 
-wait_log_pattern_while_ping() {
+wait_log_file_pattern_while_ping() {
   local label="$1"
-  local pattern="$2"
-  local timeout="${3:-15}"
-  local message="$4"
-  local start_line="${5:-0}"
-  if [[ -z "${CURRENT_LOG_FILE}" ]]; then
+  local log_file="$2"
+  local pattern="$3"
+  local timeout="${4:-15}"
+  local message="$5"
+  local start_line="${6:-0}"
+  if [[ -z "${log_file}" ]]; then
     fail "${label}" "${message}: log file unset"
     return 1
   fi
 
   local deadline=$((SECONDS + timeout))
   while (( SECONDS < deadline )); do
-    if [[ -f "${CURRENT_LOG_FILE}" ]] && tail -n "+$((start_line + 1))" "${CURRENT_LOG_FILE}" | grep -E -q "${pattern}"; then
+    if [[ -f "${log_file}" ]] && tail -n "+$((start_line + 1))" "${log_file}" | grep -E -q "${pattern}"; then
       pass "${label}" "${message}"
       return 0
     fi
@@ -988,6 +994,19 @@ wait_log_pattern_while_ping() {
   done
   fail "${label}" "${message}: pattern not seen within ${timeout}s: ${pattern}"
   return 1
+}
+
+wait_log_pattern_while_ping() {
+  local label="$1"
+  local pattern="$2"
+  local timeout="${3:-15}"
+  local message="$4"
+  local start_line="${5:-0}"
+  if [[ -z "${CURRENT_LOG_FILE}" || ! -f "${CURRENT_LOG_FILE}" ]]; then
+    fail "${label}" "${message}: log file unset"
+    return 1
+  fi
+  wait_log_file_pattern_while_ping "${label}" "${CURRENT_LOG_FILE}" "${pattern}" "${timeout}" "${message}" "${start_line}"
 }
 
 run_fec_case() {
@@ -1094,10 +1113,14 @@ run_per_lane_fallback_case() {
 
   echo "[${name}] block UDP only on path2; lane=2 must fall back to TCP while lane=1 stays on UDP"
   apply_udp_tunnel_block_path 2 "${PORT_PER_LANE_FALLBACK}"
+  local client_block_line
+  local server_block_line
+  client_block_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
+  server_block_line="$(current_log_file_line_count "${CURRENT_SERVER_LOG}")"
 
   wait_ping_ok "${name} mixed-lane-state" 15
-  wait_log_pattern "${name}" "accept_hello_ack session=[0-9]+ lane=2 .*tcp conn=" 15 "lane=2 reached TCP HELLO_ACK after path2 UDP block"
-  assert_log_not_contains "${name}" "accept_hello_ack session=[0-9]+ lane=1 .*tcp conn=" "lane=1 stayed on UDP while only path2 was blocked"
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "schedule_select .*lane=2 .*leg=\\{tcp" 15 "client sent lane=2 DATA over TCP after path2 UDP block" "${client_block_line}"
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_SERVER_LOG}" "schedule_select .*lane=1 .*leg=\\{udp" 15 "server kept lane=1 DATA on UDP while only path2 was blocked" "${server_block_line}"
 
   echo "[${name}] restore UDP; lane=2 must come back to UDP"
   clear_loss
