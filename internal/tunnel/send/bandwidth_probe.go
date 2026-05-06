@@ -16,27 +16,22 @@ import (
 )
 
 const (
-	bandwidthProbeAckGrace             = 500 * time.Millisecond
-	bandwidthProbeWindow               = 10 * time.Second
-	bandwidthProbeRoundWindow          = 500 * time.Millisecond
-	bandwidthProbeBurstWindow          = 2 * time.Millisecond
-	bandwidthProbeUDPMinPayloadSize    = 1200
-	bandwidthProbeUDPMaxPayloadSize    = 1400
-	bandwidthProbeTCPPayloadSize       = 32 * 1024
-	bandwidthProbeMinRateBps           = uint64(16_000_000)
-	bandwidthProbeAdditiveStepBps      = uint64(10_000_000)
-	bandwidthProbePacingGainNum        = uint64(3)
-	bandwidthProbePacingGainDen        = uint64(2)
-	bandwidthProbeGrowthMinNum         = uint64(11)
-	bandwidthProbeGrowthMinDen         = uint64(10)
-	bandwidthProbeDeliveryMinNum       = uint64(99)
-	bandwidthProbeDeliveryMinDen       = uint64(100)
-	bandwidthProbeRelativeMinTargetBps = bandwidthProbeMinRateBps + 6*bandwidthProbeAdditiveStepBps
-	bandwidthProbeLossIncreaseEpsilon  = 0.005
-	bandwidthProbeMaxFrames            = 64
-	bandwidthProbeMultiplicativeChunks = 0
-	bandwidthProbeAckEvery             = 16
-	bandwidthProbeFrameOverhead        = 30
+	bandwidthProbeAckGrace          = 500 * time.Millisecond
+	bandwidthProbeWindow            = 10 * time.Second
+	bandwidthProbeRoundWindow       = 500 * time.Millisecond
+	bandwidthProbeBurstWindow       = 2 * time.Millisecond
+	bandwidthProbeUDPMinPayloadSize = 1200
+	bandwidthProbeUDPMaxPayloadSize = 1400
+	bandwidthProbeTCPPayloadSize    = 32 * 1024
+	bandwidthProbeMaxFrames         = 64
+	bandwidthProbeAckEvery          = 16
+	bandwidthProbeFrameOverhead     = 30
+	bandwidthProbeMinRateBps        = uint64(16_000_000)
+	bandwidthProbeAdditiveStepBps   = uint64(10_000_000)
+	bandwidthProbePlateauGrowth     = 1.05
+	bandwidthProbePlateauSteps      = 2
+	bandwidthProbeTCPSafetyWindow   = 30 * time.Second
+	bandwidthProbeTCPRateBps        = uint64(16_000_000)
 )
 
 type bandwidthLegState struct {
