@@ -52,7 +52,7 @@ be fully redesigned.
 session established
   ↓
 TCP probe (if TCP leg exists and needs probing):
-  start at 16 Mbps → advance aggressively → stop on plateau
+  start at 16 Mbps → advance +10Mbps/step → stop on plateau
   ↓
 record refBps = maxStepBps in lane quality
   ↓
@@ -120,11 +120,11 @@ func nextRate(rate, cap uint64, growthStalled bool) uint64 {
         return cap       // UDP: already at cap
     }
     if cap == 0 {
-        // TCP: double until plateau
+        // TCP: additive +10Mbps until plateau
         if growthStalled {
             return rate
         }
-        return rate * 2
+        return rate + 10_000_000
     }
     // UDP: adaptive approach to cap
     gap := cap - rate
@@ -272,4 +272,4 @@ to match the new internal structure. New test cases:
 | UDP starts at ref/4 | Verify start rate = max(16M, ref/4) |
 | Adaptive rate near cap | Verify small steps when close to cap |
 | Adaptive rate far from cap | Verify doubling when far from cap |
-| TCP rate doubles each step | TCP with no plateau doubles each step |
+| TCP rate +10Mbps each step | TCP with no plateau adds 10Mbps each step |

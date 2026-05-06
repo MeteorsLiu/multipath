@@ -4,7 +4,7 @@
 
 **Goal:** Rewrite `bandwidth_probe.go` to structurally guarantee UDP rate never exceeds TCP reference, with simplified stop conditions and adaptive rate advance.
 
-**Architecture:** Two separate probe strategies — TCP doubles rate until throughput plateaus (establishing the reference), UDP adaptive-advances toward the TCP reference cap and stops on loss or plateau-below-cap. All external call signatures unchanged.
+**Architecture:** Two separate probe strategies — TCP adds +10Mbps per step until throughput plateaus (establishing the reference), UDP adaptive-advances toward the TCP reference cap and stops on loss or plateau-below-cap. All external call signatures unchanged.
 
 **Tech Stack:** Go, `golang.org/x/time/rate`, internal protocol/transport packages.
 
@@ -96,7 +96,7 @@ func nextBandwidthProbeRate(rate, cap uint64, growthStalled bool) uint64 {
 		if growthStalled {
 			return rate
 		}
-		return rate * 2
+		return rate + bandwidthProbeAdditiveStepBps
 	}
 	gap := cap - rate
 	if gap > rate {
@@ -933,17 +933,13 @@ func TestNextBandwidthProbeRateUDPAdaptive(t *testing.T) {
 }
 
 func TestNextBandwidthProbeRateTCPNoCap(t *testing.T) {
-	// TCP doubles each step (no plateau)
-	if got := nextBandwidthProbeRate(16_000_000, 0, false); got != 32_000_000 {
-		t.Fatalf("TCP no plateau: got %d, want 32000000", got)
+	// TCP additive +10Mbps per step (no plateau)
+	if got := nextBandwidthProbeRate(16_000_000, 0, false); got != 26_000_000 {
+		t.Fatalf("TCP no plateau: got %d, want 26000000", got)
 	}
 	// TCP plateau: no change
 	if got := nextBandwidthProbeRate(128_000_000, 0, true); got != 128_000_000 {
 		t.Fatalf("TCP plateau: got %d, want 128000000", got)
-	}
-	// TCP with cap=0 treats as no cap
-	if got := nextBandwidthProbeRate(16_000_000, 0, false); got != 32_000_000 {
-		t.Fatalf("TCP cap=0: got %d, want 32000000", got)
 	}
 }
 
