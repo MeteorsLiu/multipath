@@ -56,8 +56,8 @@ TCP probe (if TCP leg exists and needs probing):
   ↓
 record refBps = maxStepBps in lane quality
   ↓
-UDP probe (if UDP leg exists, TCP ref ready, and UDP needs probing):
-  start at max(16Mbps, refBps/4) → adaptive advance → cap at refBps
+UDP probe (if UDP leg exists and needs probing):
+  start at 16 Mbps → add +10Mbps/step → stop on loss ≥ 1%
   ↓
   stop on: loss ≥ 1%, OR stepBps plateau while rate < cap
   ↓
@@ -68,12 +68,15 @@ record result in lane quality (QoS-limited or not)
 
 | Condition | TCP | UDP |
 |-----------|-----|-----|
-| stepBps plateau (2 steps, growth < 5%) | **Stop**, maxStepBps → reference | rate < cap: **Stop**, QoS / rate ≥ cap: continue |
+| stepBps plateau (2 steps, growth < 5%) | **Stop** | N/A (plateau does not stop UDP) |
 | loss ≥ 1% | N/A | **Stop**, QoS detected |
 | 10 s window expired | N/A | **Stop**, no QoS |
 
 TCP has no hard window bound; plateau stops it immediately. A safety
 deadline of 30 s prevents infinite probes.
+
+UDP has a 10 s hard window. Only loss ≥ 1% stops it early; otherwise
+it runs the full window.
 
 ## Data Flow
 
