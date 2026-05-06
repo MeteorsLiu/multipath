@@ -119,18 +119,6 @@ func TestBandwidthProbeFrameEncoding(t *testing.T) {
 	}
 }
 
-func TestBandwidthProbeUDPRateCap(t *testing.T) {
-	in := New()
-	key := laneKey{sessionID: 99, laneID: 3}
-
-	if got := in.udpBandwidthProbeRateCap(key, udpLeg()); got != 0 {
-		t.Fatalf("no lane: got %d, want 0", got)
-	}
-	if got := in.udpBandwidthProbeRateCap(key, tcpLeg()); got != 0 {
-		t.Fatalf("TCP leg: got %d, want 0", got)
-	}
-}
-
 func TestProbeFrameCount(t *testing.T) {
 	count := probeFrameCount(16_000_000, bandwidthProbeFrameBytes(1400))
 	if count < 2 || count > bandwidthProbeMaxFrames {

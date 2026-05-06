@@ -295,8 +295,8 @@ func (l *Send) maybeStartBandwidthProbe(ctx context.Context, key laneKey, leg tr
 	state.stepOrder = nil
 	state.stepBps = nil
 	state.lastLoss = 0
-	state.capBps = l.udpBandwidthProbeRateCap(key, leg)
-	state.rateBps = bandwidthProbeStartRate(state.capBps)
+	state.capBps = 0
+	state.rateBps = bandwidthProbeStartRate(0)
 	l.bandwidthMu.Unlock()
 
 	debuglog.Printf("send/bw_probe", "train_start session=%d lane=%d leg={%s} cap_bps=%d start_bps=%d window=%s", key.sessionID, key.laneID, debugLeg(leg), state.capBps, state.rateBps, bandwidthProbeWindow)
@@ -375,20 +375,9 @@ func (l *Send) runBandwidthProbeTrain(ctx context.Context, key laneKey, leg tran
 		}
 
 		if isUDP {
-			l.bandwidthMu.Lock()
-			state := l.bandwidthLegs[legKey]
-			capBps := state.capBps
-			rateBps := state.rateBps
-			l.bandwidthMu.Unlock()
-
 			if stepLoss >= bandwidthProbeLossThreshold {
 				endedAt = time.Now()
 				debuglog.Printf("send/bw_probe", "stop_udp_loss session=%d lane=%d loss=%.3f", key.sessionID, key.laneID, stepLoss)
-				break
-			}
-			if capBps > 0 && rateBps < capBps && bandwidthProbePlateau(l.getStepBpsSlice(legKey)) {
-				endedAt = time.Now()
-				debuglog.Printf("send/bw_probe", "stop_udp_plateau_below_cap session=%d lane=%d", key.sessionID, key.laneID)
 				break
 			}
 		} else {
@@ -423,13 +412,6 @@ func (l *Send) getStepBpsSlice(legKey pingKey) []uint64 {
 		return nil
 	}
 	return state.stepBps
-}
-
-func (l *Send) udpBandwidthProbeRateCap(key laneKey, leg transport.LegRef) uint64 {
-	if leg.Kind != transport.KindUDP {
-		return 0
-	}
-	return l.bandwidthProbeTCPReferenceBps(key)
 }
 
 func (l *Send) bandwidthProbeTCPReferenceBps(key laneKey) uint64 {
