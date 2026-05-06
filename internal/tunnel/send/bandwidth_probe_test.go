@@ -666,7 +666,7 @@ func TestBandwidthProbeRateAdvanceLocksDynamicCeilingWhenAckBytesStopGrowing(t *
 	stepAckedBytes := uint64(4_300_000)
 	stepEndedAt := stepStartedAt.Add(bandwidthProbeSampleDuration(stepAckedBytes, 60_000_000))
 	in.bandwidthLegs[legKey] = &bandwidthLegState{
-		nextRateBps:   90_000_000,
+		nextRateBps:   106_000_000,
 		inFlight:      true,
 		lastStepBps:   60_000_000,
 		lastStepBytes: stepAckedBytes,
@@ -677,9 +677,9 @@ func TestBandwidthProbeRateAdvanceLocksDynamicCeilingWhenAckBytesStopGrowing(t *
 			1: {
 				startedAt:      stepStartedAt,
 				endedAt:        stepEndedAt,
-				rateBps:        90_000_000,
+				rateBps:        106_000_000,
 				prevAckedBytes: 4_000_000,
-				sentBytes:      uint64(float64(90_000_000/8) * stepEndedAt.Sub(stepStartedAt).Seconds()),
+				sentBytes:      uint64(float64(106_000_000/8) * stepEndedAt.Sub(stepStartedAt).Seconds()),
 				ackedBytes:     stepAckedBytes,
 				sentFrames:     100,
 				ackedFrames:    100,
@@ -749,7 +749,7 @@ func TestBandwidthProbeRateAdvanceDoesNotLockCeilingBeforeTargetIsAttempted(t *t
 	}
 }
 
-func TestBandwidthProbeRateAdvanceDoesNotLockCeilingOnSmallTargetGap(t *testing.T) {
+func TestBandwidthProbeRateAdvanceDoesNotLockCeilingDuringEarlyRamp(t *testing.T) {
 	in := New()
 	udpLeg := transport.LegRef{
 		Kind:       transport.KindUDP,
@@ -786,7 +786,7 @@ func TestBandwidthProbeRateAdvanceDoesNotLockCeilingOnSmallTargetGap(t *testing.
 
 	state := in.bandwidthLegs[legKey]
 	if state.rateCeilingBps != 0 {
-		t.Fatalf("rate ceiling = %d, want none before target materially exceeds sample", state.rateCeilingBps)
+		t.Fatalf("rate ceiling = %d, want none during early ramp", state.rateCeilingBps)
 	}
 	if state.nextRateBps != 76_000_000 {
 		t.Fatalf("next rate = %d, want additive increase to 76Mbps", state.nextRateBps)

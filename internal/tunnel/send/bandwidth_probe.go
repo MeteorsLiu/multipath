@@ -33,8 +33,7 @@ const (
 	bandwidthProbeDeliveryMinDen       = uint64(100)
 	bandwidthProbeAttemptMinNum        = uint64(95)
 	bandwidthProbeAttemptMinDen        = uint64(100)
-	bandwidthProbeCeilingGapNum        = uint64(3)
-	bandwidthProbeCeilingGapDen        = uint64(2)
+	bandwidthProbeCeilingMinTargetBps  = bandwidthProbeMinRateBps + 6*bandwidthProbeAdditiveStepBps
 	bandwidthProbeLossIncreaseEpsilon  = 0.005
 	bandwidthProbeStepAckMinNum        = uint64(9)
 	bandwidthProbeStepAckMinDen        = uint64(10)
@@ -776,8 +775,8 @@ func (l *Send) lockBandwidthProbeRateCeilingForStep(state *bandwidthLegState, le
 	}
 	if !bandwidthProbeStepAckComplete(step) ||
 		!bandwidthProbeTargetAttempted(sentBps, step.rateBps) ||
+		!bandwidthProbeCeilingTargetMature(step.rateBps) ||
 		!bandwidthProbeUnderDelivered(stepBps, step.rateBps) ||
-		!bandwidthProbeCeilingGapExceeded(stepBps, step.rateBps) ||
 		!bandwidthProbeGrowthStalled(prevAckedBytes, step.ackedBytes) {
 		return false
 	}
@@ -857,12 +856,8 @@ func bandwidthProbeTargetAttempted(sentBps, targetBps uint64) bool {
 	return sentBps*bandwidthProbeAttemptMinDen >= targetBps*bandwidthProbeAttemptMinNum
 }
 
-func bandwidthProbeCeilingGapExceeded(sampleBps, targetBps uint64) bool {
-	if sampleBps == 0 || targetBps == 0 || targetBps <= sampleBps {
-		return false
-	}
-	gap := bandwidthProbeAdditiveStepBps * bandwidthProbeCeilingGapNum / bandwidthProbeCeilingGapDen
-	return targetBps-sampleBps >= gap
+func bandwidthProbeCeilingTargetMature(targetBps uint64) bool {
+	return targetBps >= bandwidthProbeCeilingMinTargetBps
 }
 
 func bandwidthProbeLossIncreased(prevLoss, currentLoss float64) bool {
