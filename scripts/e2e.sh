@@ -912,7 +912,7 @@ run_bandwidth_probe_convergence_case() {
   client_start_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
 
   wait_ping_ok "${name} baseline-under-rate-limit" 12
-  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "send/bw_probe: train_finish .*leg=\\{tcp .*window_bps=[0-9]+" 20 "client measured TCP reference first" "${client_start_line}"
+  wait_client_tcp_reference_probe "${name}" "${client_start_line}"
   wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "bandwidth_probe_decision .*lane=1 .*udp_qos_limited=true .*tcp_better=true selected_leg=tcp" 35 "client bandwidth probe classified UDP relative to TCP" "${client_start_line}"
   wait_ping_ok "${name} post-convergence" 12
 
@@ -932,7 +932,7 @@ run_bandwidth_probe_tcp_reference_case() {
   local client_start_line
   client_start_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
   wait_ping_ok "${name} baseline" 12
-  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "send/bw_probe: train_finish .*leg=\\{tcp .*window_bps=[0-9]+" 20 "client measured TCP reference first" "${client_start_line}"
+  wait_client_tcp_reference_probe "${name}" "${client_start_line}"
   wait_bandwidth_probe_udp_rate_window "${name}" "${CURRENT_CLIENT_LOG}" "${client_start_line}" 40 "client UDP probe measured 200mbit bottleneck without excessive probe target" 160000000 260000000 300000000
   wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "bandwidth_probe_decision .*lane=1 .*udp_qos_limited=true .*tcp_better=true selected_leg=tcp" 35 "client classified UDP relative to TCP reference" "${client_start_line}"
 
@@ -1124,6 +1124,63 @@ current_log_file_line_count() {
 
 wait_log_file_pattern_while_ping() {
   wait_log_file_pattern_while_ping_from "$@" "${NS_C}" "${TUN_C_REMOTE}"
+}
+
+wait_client_tcp_reference_probe() {
+  local name="$1"
+  local start_line="$2"
+
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "accept_hello_ack session=[0-9]+ lane=1 .*tcp conn=" 25 "client warmed TCP reference leg" "${start_line}"
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "send/bw_probe: train_start .*leg=\\{tcp " 10 "client started TCP reference probe" "${start_line}"
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "send/bw_probe: train_finish .*leg=\\{tcp .*window_bps=[0-9]+" 25 "client finished TCP reference probe" "${start_line}"
+  assert_client_tcp_reference_before_udp_probe "${name}" "${start_line}"
+}
+
+assert_client_tcp_reference_before_udp_probe() {
+  local label="$1"
+  local start_line="$2"
+  local output status
+
+  set +e
+  output="$(awk -v start="${start_line}" '
+    NR <= start { next }
+    /send\/bw_probe: train_start/ && /leg=\{udp/ {
+      message = "udp train_start before tcp train_finish: " $0
+      status = 1
+      done = 1
+      exit
+    }
+    /send\/bw_probe: train_finish/ && /leg=\{tcp/ {
+      message = "tcp train_finish before udp train_start"
+      status = 0
+      done = 1
+      exit
+    }
+    END {
+      if (!done) {
+        message = "need tcp train_finish"
+        status = 2
+      }
+      print message
+      exit status
+    }
+  ' "${CURRENT_CLIENT_LOG}" 2>/dev/null)"
+  status=$?
+  set -e
+
+  case "${status}" in
+  0)
+    pass "${label}" "client TCP reference completed before UDP probe"
+    ;;
+  1)
+    fail "${label}" "client UDP bandwidth probe started before TCP reference completed: ${output}"
+    return 1
+    ;;
+  *)
+    fail "${label}" "client TCP reference order could not be verified: ${output}"
+    return 1
+    ;;
+  esac
 }
 
 wait_log_file_any_pattern_while_ping() {
