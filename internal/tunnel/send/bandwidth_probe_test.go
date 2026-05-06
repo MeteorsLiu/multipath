@@ -110,6 +110,35 @@ func TestBandwidthProbeStartsTCPAfterUDPCompletes(t *testing.T) {
 	}
 }
 
+func TestBandwidthProbeStartsUDPWhenKnownLegIsDegraded(t *testing.T) {
+	in := New()
+	mustSendState(t, in, 99)
+	in.activateSession(99)
+
+	key := laneKey{sessionID: 99, laneID: 1}
+	udp := transport.LegRef{Kind: transport.KindUDP, EndpointID: "udp1", RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234")}
+	tcp := transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp1"}
+
+	lane := newLaneRuntime(1, 1)
+	lane.bindLeg(udp)
+	lane.bindLeg(tcp)
+	lane.markUDPNotReady()
+	in.lanes[key] = lane
+
+	in.probeBandwidth(context.Background(), time.Now())
+
+	in.bandwidthMu.Lock()
+	defer in.bandwidthMu.Unlock()
+
+	state := in.bandwidthLegs[newPingKey(udp)]
+	if state == nil || !state.inFlight || state.key != key {
+		t.Fatalf("UDP leg state = %+v, want in-flight degraded UDP probe", state)
+	}
+	if _, ok := in.bandwidthLegs[newPingKey(tcp)]; ok {
+		t.Fatal("TCP probe started before degraded UDP probe completed")
+	}
+}
+
 func TestBandwidthProbeDoesNotStartAnotherLegWhileInFlight(t *testing.T) {
 	in := New()
 	mustSendState(t, in, 99)

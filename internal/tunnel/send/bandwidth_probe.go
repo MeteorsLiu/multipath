@@ -182,7 +182,7 @@ func (l *Send) activeBandwidthLane(sessionID uint64) (laneKey, bool) {
 }
 
 func (l *Send) bandwidthProbeNeeded(leg transport.LegRef, quality LegQuality) bool {
-	if !quality.Active {
+	if !quality.Active && !bandwidthProbeCanUseInactiveLeg(leg) {
 		return false
 	}
 	legKey := newPingKey(leg)
@@ -194,6 +194,10 @@ func (l *Send) bandwidthProbeNeeded(leg transport.LegRef, quality LegQuality) bo
 	needed := state == nil || !state.complete
 	l.bandwidthMu.Unlock()
 	return needed
+}
+
+func bandwidthProbeCanUseInactiveLeg(leg transport.LegRef) bool {
+	return leg.Kind == transport.KindUDP && leg.EndpointID != "" && leg.RemoteAddr != nil
 }
 
 func (l *Send) maybeStartBandwidthProbe(ctx context.Context, key laneKey, leg transport.LegRef, now time.Time) {
