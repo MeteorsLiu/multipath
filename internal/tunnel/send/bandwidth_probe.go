@@ -80,9 +80,9 @@ func nextBandwidthProbeRate(rate, cap uint64, growthStalled bool) uint64 {
 }
 
 type bandwidthLegState struct {
-	key      laneKey
-	capBps   uint64
-	rateBps  uint64
+	key     laneKey
+	capBps  uint64
+	rateBps uint64
 
 	inFlight  bool
 	complete  bool
@@ -192,7 +192,7 @@ func (l *Send) probeBandwidth(ctx context.Context, now time.Time) {
 			continue
 		}
 		lane := item.lane
-	udpLeg, udpQ, tcpLeg, tcpQ := lane.legQualities()
+		udpLeg, udpQ, tcpLeg, tcpQ := lane.legQualities()
 		if leg, ok := l.bandwidthProbeCandidate(item.key, item.lane, udpLeg, udpQ, tcpLeg, tcpQ); ok {
 			candidates = append(candidates, candidate{key: item.key, leg: leg})
 		}
