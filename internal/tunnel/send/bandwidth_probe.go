@@ -192,7 +192,7 @@ func (l *Send) probeBandwidth(ctx context.Context, now time.Time) {
 			continue
 		}
 		lane := item.lane
-	_, udpQ, _, tcpQ := lane.legQualities()
+	udpLeg, udpQ, tcpLeg, tcpQ := lane.legQualities()
 		if leg, ok := l.bandwidthProbeCandidate(item.key, item.lane, udpLeg, udpQ, tcpLeg, tcpQ); ok {
 			candidates = append(candidates, candidate{key: item.key, leg: leg})
 		}
@@ -701,23 +701,15 @@ func (l *Send) receiveBandwidthProbeAck(sessionID uint64, laneID uint8, leg tran
 			}
 			step := state.steps[round.stepID]
 			if step == nil {
-				step = &bandwidthProbeStep{startedAt: round.startedAt}
+				step = &bandwidthProbeStep{startedAt: round.startedAt, rateBps: round.rateBps}
 				state.steps[round.stepID] = step
 			}
 			if step.startedAt.IsZero() || round.startedAt.Before(step.startedAt) {
 				step.startedAt = round.startedAt
 			}
-			if step.rateBps == 0 {
-				step.rateBps = round.rateBps
-			}
 			updateBandwidthProbeStepRXSpan(step, round)
 			step.ackedBytes += ackedBytes
 			step.ackedFrames += uint64(acked)
-			l.updateBandwidthProbeStepSample(state, legKey, round.stepID, step)
-			state.lastRoundLoss = float64(int(round.count)-bits.OnesCount64(received)) / float64(round.count)
-			if state.lastRoundLoss < 0 {
-				state.lastRoundLoss = 0
-			}
 		}
 	}
 	l.bandwidthMu.Unlock()
@@ -743,14 +735,11 @@ func (l *Send) recordBandwidthProbeSent(round *bandwidthProbeRound, sent uint16)
 	}
 	step := state.steps[round.stepID]
 	if step == nil {
-		step = &bandwidthProbeStep{startedAt: round.startedAt}
+		step = &bandwidthProbeStep{startedAt: round.startedAt, rateBps: round.rateBps}
 		state.steps[round.stepID] = step
 	}
 	if step.startedAt.IsZero() || round.startedAt.Before(step.startedAt) {
 		step.startedAt = round.startedAt
-	}
-	if step.rateBps == 0 {
-		step.rateBps = round.rateBps
 	}
 	step.sentBytes += uint64(sent) * uint64(round.frameBytes)
 	step.sentFrames += uint64(sent)
@@ -922,7 +911,7 @@ func (l *Send) logBandwidthProbeDecisionIfReady(key laneKey) {
 	if lane == nil {
 		return
 	}
-	udpLeg, udpQ, tcpLeg, tcpQ := lane.legQualities()
+	_, udpQ, _, tcpQ := lane.legQualities()
 	if udpQ.ProbeSamples < minBandwidthProbeSamples || tcpQ.ProbeSamples < minBandwidthProbeSamples {
 		return
 	}
