@@ -587,6 +587,47 @@ func TestBandwidthProbeStepSampleUsesReceiverSpanWhenAvailable(t *testing.T) {
 	}
 }
 
+func TestBandwidthProbeRateCeilingUsesAckWindowWhenReceiverSpanExists(t *testing.T) {
+	in := New()
+	key := laneKey{sessionID: 99, laneID: 3}
+	udpLeg := transport.LegRef{
+		Kind:       transport.KindUDP,
+		EndpointID: "udp0",
+		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
+	}
+	legKey := newPingKey(udpLeg)
+	stepStart := time.Now()
+	step := &bandwidthProbeStep{
+		startedAt:      stepStart,
+		endedAt:        stepStart.Add(time.Second),
+		rateBps:        300_000_000,
+		prevAckedBytes: 24_000_000,
+		ackedBytes:     25_000_000,
+		firstRXMS:      10_000,
+		lastRXMS:       13_000,
+		sentFrames:     100,
+		ackedFrames:    100,
+	}
+	state := &bandwidthLegState{
+		key:           key,
+		nextRateBps:   300_000_000,
+		inFlight:      true,
+		prevStepBytes: step.prevAckedBytes,
+		lastStepID:    1,
+		currentStepID: 1,
+		steps: map[uint64]*bandwidthProbeStep{
+			1: step,
+		},
+	}
+
+	if !in.lockBandwidthProbeRateCeilingForStep(state, legKey, 1, step) {
+		t.Fatal("rate ceiling did not lock")
+	}
+	if state.rateCeilingBps != 200_000_000 {
+		t.Fatalf("rate ceiling = %d, want ACK-window 200000000", state.rateCeilingBps)
+	}
+}
+
 func TestBandwidthProbeRateAdvancesAdditivelyAfterStartup(t *testing.T) {
 	in := New()
 	udpLeg := transport.LegRef{

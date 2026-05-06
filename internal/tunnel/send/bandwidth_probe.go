@@ -682,7 +682,7 @@ func (l *Send) updateBandwidthProbeStepSample(state *bandwidthLegState, legKey p
 }
 
 func (l *Send) refreshBandwidthProbeStepSample(state *bandwidthLegState, stepID uint64, step *bandwidthProbeStep) {
-	stepBps := bandwidthProbeStepBps(step)
+	stepBps := bandwidthProbeStepCeilingBps(step)
 	if stepID != state.lastStepID {
 		if stepBps > state.maxStepBps {
 			state.maxStepBps = stepBps
@@ -762,7 +762,7 @@ func (l *Send) lockBandwidthProbeRateCeilingForStep(state *bandwidthLegState, le
 	if step == nil || step.endedAt.IsZero() || step.rateBps == 0 || state.rateCeilingBps > 0 {
 		return false
 	}
-	stepBps := bandwidthProbeStepBps(step)
+	stepBps := bandwidthProbeStepCeilingBps(step)
 	prevAckedBytes := bandwidthProbePreviousStepAckedBytes(state, stepID, step)
 	if prevAckedBytes == 0 {
 		return false
@@ -797,6 +797,13 @@ func bandwidthProbeStepBps(step *bandwidthProbeStep) uint64 {
 	if step.firstRXMS != 0 && step.lastRXMS > step.firstRXMS {
 		elapsed := time.Duration(step.lastRXMS-step.firstRXMS) * time.Millisecond
 		return step.ackedBytes * 8 * uint64(time.Second) / uint64(elapsed)
+	}
+	return bandwidthWindowSampleBps(step.ackedBytes, step.startedAt, step.endedAt)
+}
+
+func bandwidthProbeStepCeilingBps(step *bandwidthProbeStep) uint64 {
+	if step == nil {
+		return 0
 	}
 	return bandwidthWindowSampleBps(step.ackedBytes, step.startedAt, step.endedAt)
 }
