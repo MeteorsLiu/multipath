@@ -412,6 +412,7 @@ func TestBandwidthProbeLateAckCanLockDynamicCeiling(t *testing.T) {
 	round.frameBytes = 100_000
 	round.count = 64
 	in.recordBandwidthProbeSent(round, 64)
+	in.bandwidthLegs[legKey].steps[round.stepID].sentBytes = 90_000_000 / 8
 	in.finishBandwidthProbeStep(legKey, stepEnd)
 	in.advanceBandwidthProbeRate(legKey)
 
@@ -469,6 +470,7 @@ func TestBandwidthProbeOlderLateAckCanLockDynamicCeiling(t *testing.T) {
 	round.frameBytes = 100_000
 	round.count = 64
 	in.recordBandwidthProbeSent(round, 64)
+	in.bandwidthLegs[legKey].steps[round.stepID].sentBytes = 90_000_000 / 8
 	in.finishBandwidthProbeStep(legKey, step1End)
 	in.advanceBandwidthProbeRate(legKey)
 
@@ -542,10 +544,11 @@ func TestBandwidthProbeLateAckUsesUpdatedPreviousStepBytes(t *testing.T) {
 	if round2 == nil {
 		t.Fatal("missing second probe round")
 	}
-	round2.rateBps = 90_000_000
+	round2.rateBps = 100_000_000
 	round2.frameBytes = 100_000
 	round2.count = 64
 	in.recordBandwidthProbeSent(round2, 64)
+	in.bandwidthLegs[legKey].steps[round2.stepID].sentBytes = 100_000_000 / 8
 	in.finishBandwidthProbeStep(legKey, step2Start.Add(time.Second))
 	in.advanceBandwidthProbeRate(legKey)
 
@@ -602,6 +605,7 @@ func TestBandwidthProbeRateCeilingUsesAckWindowWhenReceiverSpanExists(t *testing
 		endedAt:        stepStart.Add(time.Second),
 		rateBps:        300_000_000,
 		prevAckedBytes: 24_000_000,
+		sentBytes:      300_000_000 / 8,
 		ackedBytes:     25_000_000,
 		firstRXMS:      10_000,
 		lastRXMS:       13_000,
@@ -675,6 +679,7 @@ func TestBandwidthProbeRateAdvanceLocksDynamicCeilingWhenAckBytesStopGrowing(t *
 				endedAt:        stepEndedAt,
 				rateBps:        90_000_000,
 				prevAckedBytes: 4_000_000,
+				sentBytes:      uint64(float64(90_000_000/8) * stepEndedAt.Sub(stepStartedAt).Seconds()),
 				ackedBytes:     stepAckedBytes,
 				sentFrames:     100,
 				ackedFrames:    100,
@@ -698,6 +703,93 @@ func TestBandwidthProbeRateAdvanceLocksDynamicCeilingWhenAckBytesStopGrowing(t *
 
 	if state.nextRateBps != 60_000_000 {
 		t.Fatalf("next rate after ceiling = %d, want dynamic ceiling", state.nextRateBps)
+	}
+}
+
+func TestBandwidthProbeRateAdvanceDoesNotLockCeilingBeforeTargetIsAttempted(t *testing.T) {
+	in := New()
+	udpLeg := transport.LegRef{
+		Kind:       transport.KindUDP,
+		EndpointID: "udp0",
+		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
+	}
+	legKey := newPingKey(udpLeg)
+	stepStartedAt := time.Now()
+	stepEndedAt := stepStartedAt.Add(time.Second)
+	in.bandwidthLegs[legKey] = &bandwidthLegState{
+		nextRateBps:   90_000_000,
+		inFlight:      true,
+		lastStepBps:   56_000_000,
+		lastStepBytes: 7_000_000,
+		prevStepBytes: 7_100_000,
+		lastStepID:    1,
+		currentStepID: 1,
+		steps: map[uint64]*bandwidthProbeStep{
+			1: {
+				startedAt:      stepStartedAt,
+				endedAt:        stepEndedAt,
+				rateBps:        90_000_000,
+				prevAckedBytes: 7_100_000,
+				sentBytes:      7_000_000,
+				ackedBytes:     7_000_000,
+				sentFrames:     100,
+				ackedFrames:    100,
+			},
+		},
+	}
+
+	in.advanceBandwidthProbeRate(legKey)
+
+	state := in.bandwidthLegs[legKey]
+	if state.rateCeilingBps != 0 {
+		t.Fatalf("rate ceiling = %d, want none before target send rate is attempted", state.rateCeilingBps)
+	}
+	if state.nextRateBps != 100_000_000 {
+		t.Fatalf("next rate = %d, want additive increase to 100Mbps", state.nextRateBps)
+	}
+}
+
+func TestBandwidthProbeRateAdvanceDoesNotLockCeilingOnSmallTargetGap(t *testing.T) {
+	in := New()
+	udpLeg := transport.LegRef{
+		Kind:       transport.KindUDP,
+		EndpointID: "udp0",
+		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
+	}
+	legKey := newPingKey(udpLeg)
+	stepStartedAt := time.Now()
+	stepAckedBytes := uint64(7_100_000)
+	stepEndedAt := stepStartedAt.Add(bandwidthProbeSampleDuration(stepAckedBytes, 56_800_000))
+	in.bandwidthLegs[legKey] = &bandwidthLegState{
+		nextRateBps:   66_000_000,
+		inFlight:      true,
+		lastStepBps:   56_800_000,
+		lastStepBytes: stepAckedBytes,
+		prevStepBytes: 7_200_000,
+		lastStepID:    1,
+		currentStepID: 1,
+		steps: map[uint64]*bandwidthProbeStep{
+			1: {
+				startedAt:      stepStartedAt,
+				endedAt:        stepEndedAt,
+				rateBps:        66_000_000,
+				prevAckedBytes: 7_200_000,
+				sentBytes:      uint64(float64(66_000_000/8) * stepEndedAt.Sub(stepStartedAt).Seconds()),
+				ackedBytes:     stepAckedBytes,
+				sentFrames:     100,
+				ackedFrames:    100,
+			},
+		},
+	}
+
+	in.advanceBandwidthProbeRate(legKey)
+
+	state := in.bandwidthLegs[legKey]
+	if state.rateCeilingBps != 0 {
+		t.Fatalf("rate ceiling = %d, want none before target materially exceeds sample", state.rateCeilingBps)
+	}
+	if state.nextRateBps != 76_000_000 {
+		t.Fatalf("next rate = %d, want additive increase to 76Mbps", state.nextRateBps)
 	}
 }
 
