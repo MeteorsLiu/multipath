@@ -368,6 +368,7 @@ func (l *Send) runBandwidthProbeTrain(ctx context.Context, key laneKey, leg tran
 				break
 			}
 		}
+		time.Sleep(bandwidthProbeAckGrace / 10)
 		stepBps, stepLoss := l.finishBandwidthProbeStep(legKey, stepID, stepDeadline)
 		if stepBps == 0 && stepLoss >= 1 {
 			l.abortBandwidthProbeTrain(legKey)
