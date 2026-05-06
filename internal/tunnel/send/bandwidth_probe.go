@@ -34,6 +34,51 @@ const (
 	bandwidthProbeTCPRateBps        = uint64(16_000_000)
 )
 
+func bandwidthProbePlateau(stepBps []uint64) bool {
+	if len(stepBps) < bandwidthProbePlateauSteps+1 {
+		return false
+	}
+	n := len(stepBps)
+	lastMax := stepBps[n-1]
+	if stepBps[n-2] > lastMax {
+		lastMax = stepBps[n-2]
+	}
+	prev := stepBps[n-1-bandwidthProbePlateauSteps]
+	return float64(lastMax) < float64(prev)*bandwidthProbePlateauGrowth
+}
+
+func nextBandwidthProbeRate(rate, cap uint64, growthStalled bool) uint64 {
+	if cap > 0 && rate >= cap {
+		return cap
+	}
+	if cap == 0 {
+		if growthStalled {
+			return rate
+		}
+		return rate + bandwidthProbeAdditiveStepBps
+	}
+	gap := cap - rate
+	if gap > rate {
+		return rate * 2
+	}
+	if gap > rate/4 {
+		step := gap / 2
+		if step < bandwidthProbeAdditiveStepBps {
+			step = bandwidthProbeAdditiveStepBps
+		}
+		next := rate + step
+		if next > cap {
+			return cap
+		}
+		return next
+	}
+	next := rate + 5_000_000
+	if next > cap {
+		return cap
+	}
+	return next
+}
+
 type bandwidthLegState struct {
 	key           laneKey
 	nextRateBps   uint64
