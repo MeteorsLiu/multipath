@@ -598,15 +598,15 @@ payload  bytes
 
 Sender behavior:
 
-1. Start one bandwidth-probe ramp per active transport leg selected for
-   bandwidth sampling.
+1. Start bandwidth-probe ramps only for transport legs selected by the
+   send-side leg quality policy.
 2. Use `seq = 0..count-1` inside one `probe_id`.
 3. Pace probe frames according to the current probe rate. Do not send a large
    unpaced burst. UDP probe payloads should remain data-plane/MTU sized; TCP
    probe payloads may be larger stream frames so the ramp can put enough bytes
    in flight to measure stream capacity.
-4. Increase the next probe rate multiplicatively after low-loss rounds and
-   immediately schedule the next round.
+4. Increase the next probe rate only while the leg quality policy still needs
+   more evidence for the current leg.
 5. Run the probe as a sustained window. A short burst only measures transient
    delivery rate; it does not prove sustainable goodput on links with periodic
    shaping or stalls.
@@ -645,9 +645,9 @@ Sender behavior:
    otherwise finish it after the round timeout.
 4. Compute received count and loss for the round.
 5. Feed the sample into per-leg bandwidth EWMA and leg selection policy.
-6. When both UDP and TCP legs for a lane have completed their bandwidth-probe
-   ramps, emit a lane-level decision describing whether UDP showed QoS/limit
-   evidence, whether TCP measured better, and which leg should carry DATA.
+6. When the lane has enough TCP-vs-UDP evidence to classify the leg quality,
+   emit a lane-level decision describing whether UDP showed QoS/limit evidence,
+   whether TCP measured better, and which leg should carry DATA.
 
 Receiver behavior:
 
@@ -749,24 +749,41 @@ detection should use a data-plane bandwidth probe separate from PING/PONG.
 Recommended sender behavior:
 
 1. Keep TCP warm for lanes that negotiated TCP fallback and have a TCP remote.
-2. Probe UDP and TCP once per concrete leg with paced, data-sized BW_PROBE
-   rounds.
-3. Increase the probe send rate multiplicatively while loss and delay inflation
-   remain low.
-4. Keep the probe running for a sustained window, and compute bandwidth from
-   total acknowledged bytes divided by wall-clock elapsed time for that window.
-5. Record the sustained UDP bandwidth sample into an EWMA.
-6. Record a sustained TCP bandwidth EWMA from TCP probing or transport TCP_INFO
-   where available.
-7. Treat UDP as QoS-limited when the UDP sample has loss or delay-inflation
-   evidence. Select TCP only when TCP's measured bandwidth is materially better
-   than UDP's, so small probe differences do not override UDP preference.
+2. Establish a TCP reference first, using a paced TCP BW_PROBE ramp or
+   transport TCP_INFO where available. This reference is the comparison target
+   for the lane, not a global configured maximum.
+3. Wait for that TCP reference only when the lane already has a TCP leg or has
+   a configured TCP remote that this peer can dial. Negotiated fallback
+   capability alone is not evidence that a TCP reference path exists.
+4. Probe UDP after the TCP reference exists. UDP probing answers one question:
+   can UDP get close enough to the TCP reference without material probe loss?
+5. Increase UDP probe rate gradually toward the TCP reference while more
+   evidence is needed. Do not continue increasing UDP just to discover its
+   absolute ceiling after the relative TCP-vs-UDP decision is already clear.
+6. Stop UDP probing as soon as either result is clear:
+   UDP is close enough to the TCP reference with low loss, or UDP is materially
+   below the TCP reference with loss or under-delivery evidence.
+7. Record the completed paced step that produced the TCP reference or UDP
+   decision into per-leg EWMA state. Do not average that result across the
+   entire ramp from the minimum probe rate; the warmup ramp is control input,
+   not the measured QoS sample.
+8. Treat UDP as QoS-limited when the UDP sample has loss/under-delivery evidence
+   and TCP's measured bandwidth is materially better than UDP's. Select TCP only
+   when that material difference exists, so small probe differences do not
+   override UDP preference.
 
 The bandwidth probe is an initial capacity classification, not a continuous
-monitor. A QoS decision requires bandwidth samples for both UDP and TCP. Once a
-leg's ramp completes, implementations should not clear the QoS-limited state by
-periodic re-probing; a new concrete leg may be probed again. BW_PROBE/BW_PROBE_ACK
-must not replace PING/PONG liveness or Session HELLO state.
+monitor. A QoS decision for lanes with TCP fallback requires a TCP reference and
+a UDP sample relative to that reference. Once a leg's ramp completes,
+implementations should not clear the QoS-limited state by periodic re-probing; a
+new concrete leg may be probed again. BW_PROBE/BW_PROBE_ACK must not replace
+PING/PONG liveness or Session HELLO state.
+
+Known precision caveat: ACKs may arrive after the pacing step that sent their
+BW_PROBE chunk. Implementations should attribute ACKed bytes to the step that
+created the matching `probe_id`, not the step active when the ACK is processed.
+Otherwise delayed ACKs can undercount one step, overcount the next step, and
+make feedback pacing or peak-rate selection jitter.
 
 ## NAT and Conntrack Requirements
 

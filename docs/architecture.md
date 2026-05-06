@@ -231,8 +231,17 @@ candidate for probing and later leg selection; it does not make DATA use TCP by
 default.
 PING/PONG liveness is not treated as a UDP bandwidth or QoS signal. UDP QoS
 detection belongs in send-side leg quality policy and must use data-plane
-bandwidth samples when implemented. Bandwidth probing is an initial per-leg
-capacity ramp and is not a continuous QoS monitor.
+bandwidth samples when implemented. Bandwidth probing is an initial lane
+classification and is not a continuous QoS monitor. For lanes with TCP
+fallback and an actual TCP reference path, Send establishes a TCP bandwidth
+reference first, then probes UDP only long enough to decide whether UDP can
+approach that reference without material loss or under-delivery. Negotiated
+fallback capability by itself must not make Send wait for a TCP reference when
+the lane has no TCP leg and no dialable TCP remote. Send must not keep
+increasing UDP probe traffic merely to discover UDP's absolute ceiling after
+the relative TCP-vs-UDP decision is clear. Probe results recorded into leg
+quality state come from the completed paced step that produced the reference or
+decision, not from averaging the whole warmup ramp.
 Bandwidth probe results are exposed through `multipath_lane_bandwidth_bps`,
 `multipath_lane_probe_loss_ratio`, `multipath_bandwidth_probe_events_total`,
 and the `bandwidth_probe_decision` event log.
@@ -450,7 +459,7 @@ probe/core events and retry ticks to Send-owned lane state. The probe/core
 package remains independent and owns only the generic probe state machine.
 ProbeLoop must not own UDP QoS bandwidth estimation. Bandwidth probing feeds
 send-side leg quality state; ProbeLoop may trigger maintenance ticks but must
-not become a data-plane scheduler.
+not choose TCP-vs-UDP probe policy and must not become a data-plane scheduler.
 ```
 
 ## Schedule Strategy

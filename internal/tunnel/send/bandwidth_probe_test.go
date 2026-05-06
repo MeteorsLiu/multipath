@@ -39,15 +39,15 @@ func TestBandwidthProbeStartsOneLegAtATime(t *testing.T) {
 	if len(in.bandwidthLegs) != 1 {
 		t.Fatalf("bandwidth legs = %d, want 1", len(in.bandwidthLegs))
 	}
-	state := in.bandwidthLegs[newPingKey(udp1)]
+	state := in.bandwidthLegs[newPingKey(tcp1)]
 	if state == nil || !state.inFlight {
-		t.Fatalf("UDP leg state not in flight: %+v", state)
+		t.Fatalf("TCP leg state not in flight: %+v", state)
 	}
 	if state.key.laneID != 1 {
 		t.Fatalf("started on lane %d, want lane 1", state.key.laneID)
 	}
-	if _, ok := in.bandwidthLegs[newPingKey(tcp1)]; ok {
-		t.Fatal("TCP probe started while UDP probe is still pending")
+	if _, ok := in.bandwidthLegs[newPingKey(udp1)]; ok {
+		t.Fatal("UDP probe started before TCP reference")
 	}
 }
 
@@ -83,7 +83,7 @@ func TestBandwidthProbeEnabledByDefaultAfterEnvDisabled(t *testing.T) {
 	}
 }
 
-func TestBandwidthProbeStartsTCPAfterUDPCompletes(t *testing.T) {
+func TestBandwidthProbeStartsUDPAfterTCPReferenceCompletes(t *testing.T) {
 	in := New()
 	mustSendState(t, in, 99)
 	in.activateSession(99)
@@ -97,20 +97,95 @@ func TestBandwidthProbeStartsTCPAfterUDPCompletes(t *testing.T) {
 	lane.bindLeg(tcp)
 	in.lanes[key] = lane
 
-	in.bandwidthLegs[newPingKey(udp)] = &bandwidthLegState{key: key, complete: true}
+	lane.recordBandwidthSample(transport.KindTCP, 100_000_000, 0)
+	in.bandwidthLegs[newPingKey(tcp)] = &bandwidthLegState{key: key, complete: true}
 
 	in.probeBandwidth(context.Background(), time.Now())
 
 	in.bandwidthMu.Lock()
 	defer in.bandwidthMu.Unlock()
 
-	state := in.bandwidthLegs[newPingKey(tcp)]
+	state := in.bandwidthLegs[newPingKey(udp)]
 	if state == nil || !state.inFlight || state.key != key {
-		t.Fatalf("TCP leg state = %+v, want in-flight lane 1 probe", state)
+		t.Fatalf("UDP leg state = %+v, want in-flight lane 1 probe", state)
 	}
 }
 
-func TestBandwidthProbeStartsUDPWhenKnownLegIsDegraded(t *testing.T) {
+func TestBandwidthProbeDoesNotStartUDPWhileTCPReferenceInFlight(t *testing.T) {
+	in := New()
+	mustSendState(t, in, 99)
+	in.activateSession(99)
+
+	key := laneKey{sessionID: 99, laneID: 1}
+	udp := transport.LegRef{Kind: transport.KindUDP, EndpointID: "udp1", RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234")}
+	tcp := transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp1"}
+
+	lane := newLaneRuntime(1, 1)
+	lane.bindLeg(udp)
+	lane.bindLeg(tcp)
+	in.lanes[key] = lane
+	in.bandwidthLegs[newPingKey(tcp)] = &bandwidthLegState{key: key, inFlight: true}
+
+	in.probeBandwidth(context.Background(), time.Now())
+
+	in.bandwidthMu.Lock()
+	defer in.bandwidthMu.Unlock()
+	if _, ok := in.bandwidthLegs[newPingKey(udp)]; ok {
+		t.Fatal("UDP probe started while TCP reference probe is in flight")
+	}
+}
+
+func TestBandwidthProbeStartsUDPWhenNoTCPReferencePathExists(t *testing.T) {
+	in := New()
+	in.streamTransport = &fakeStreamTransport{}
+	mustSendState(t, in, 99)
+	in.activateSession(99)
+	in.negotiatedCaps.Store(uint32(protocol.CapTCPFallback))
+
+	key := laneKey{sessionID: 99, laneID: 1}
+	udp := transport.LegRef{Kind: transport.KindUDP, EndpointID: "udp1", RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234")}
+
+	lane := newLaneRuntime(1, 1)
+	lane.bindLeg(udp)
+	in.lanes[key] = lane
+
+	in.probeBandwidth(context.Background(), time.Now())
+
+	in.bandwidthMu.Lock()
+	defer in.bandwidthMu.Unlock()
+
+	state := in.bandwidthLegs[newPingKey(udp)]
+	if state == nil || !state.inFlight || state.key != key {
+		t.Fatalf("UDP leg state = %+v, want in-flight UDP probe without TCP path", state)
+	}
+}
+
+func TestBandwidthProbeWaitsForDialableTCPReference(t *testing.T) {
+	in := New()
+	in.streamTransport = &fakeStreamTransport{}
+	mustSendState(t, in, 99)
+	in.activateSession(99)
+	in.negotiatedCaps.Store(uint32(protocol.CapTCPFallback))
+
+	key := laneKey{sessionID: 99, laneID: 1}
+	udp := transport.LegRef{Kind: transport.KindUDP, EndpointID: "udp1", RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234")}
+
+	lane := newLaneRuntime(1, 1)
+	lane.bindLeg(udp)
+	lane.setTCPRemote("127.0.0.1:4321")
+	in.lanes[key] = lane
+
+	in.probeBandwidth(context.Background(), time.Now())
+
+	in.bandwidthMu.Lock()
+	defer in.bandwidthMu.Unlock()
+
+	if _, ok := in.bandwidthLegs[newPingKey(udp)]; ok {
+		t.Fatal("UDP probe started while waiting for dialable TCP reference")
+	}
+}
+
+func TestBandwidthProbeStillStartsTCPReferenceWhenUDPIsDegraded(t *testing.T) {
 	in := New()
 	mustSendState(t, in, 99)
 	in.activateSession(99)
@@ -130,12 +205,12 @@ func TestBandwidthProbeStartsUDPWhenKnownLegIsDegraded(t *testing.T) {
 	in.bandwidthMu.Lock()
 	defer in.bandwidthMu.Unlock()
 
-	state := in.bandwidthLegs[newPingKey(udp)]
+	state := in.bandwidthLegs[newPingKey(tcp)]
 	if state == nil || !state.inFlight || state.key != key {
-		t.Fatalf("UDP leg state = %+v, want in-flight degraded UDP probe", state)
+		t.Fatalf("TCP leg state = %+v, want in-flight TCP reference probe", state)
 	}
-	if _, ok := in.bandwidthLegs[newPingKey(tcp)]; ok {
-		t.Fatal("TCP probe started before degraded UDP probe completed")
+	if _, ok := in.bandwidthLegs[newPingKey(udp)]; ok {
+		t.Fatal("UDP probe started before TCP reference")
 	}
 }
 
@@ -317,6 +392,60 @@ func TestBandwidthProbeCompletionUsesSustainedWindowSample(t *testing.T) {
 	}
 }
 
+func TestBandwidthProbeCompletionUsesBestCompletedStepSample(t *testing.T) {
+	in := New()
+	mustSendState(t, in, 99)
+	in.activateSession(99)
+	key := laneKey{sessionID: 99, laneID: 3}
+	udpLeg := transport.LegRef{
+		Kind:       transport.KindUDP,
+		EndpointID: "udp0",
+		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
+	}
+	lane := newLaneRuntime(3, 10)
+	lane.bindLeg(udpLeg)
+	in.lanes[key] = lane
+
+	legKey := newPingKey(udpLeg)
+	startedAt := time.Now().Add(-10 * time.Second)
+	endedAt := startedAt.Add(10 * time.Second)
+	bestStepStart := startedAt.Add(4 * time.Second)
+	in.bandwidthLegs[legKey] = &bandwidthLegState{
+		nextRateBps: bandwidthProbeMinRateBps,
+		inFlight:    true,
+		startedAt:   startedAt,
+		endedAt:     endedAt,
+		ackedBytes:  3_000_000,
+		sentFrames:  100,
+		ackedFrames: 100,
+		steps: map[uint64]*bandwidthProbeStep{
+			1: {
+				startedAt:   startedAt,
+				endedAt:     startedAt.Add(time.Second),
+				rateBps:     bandwidthProbeMinRateBps,
+				ackedBytes:  1_000_000,
+				sentFrames:  100,
+				ackedFrames: 100,
+			},
+			2: {
+				startedAt:   bestStepStart,
+				endedAt:     bestStepStart.Add(time.Second),
+				rateBps:     200_000_000,
+				ackedBytes:  25_000_000,
+				sentFrames:  100,
+				ackedFrames: 100,
+			},
+		},
+	}
+
+	in.completeBandwidthProbeTrain(key, udpLeg, legKey)
+
+	_, udpQ, _, _ := lane.legQualities()
+	if udpQ.BandwidthBps != 200_000_000 {
+		t.Fatalf("udp bandwidth = %d, want best completed step 200000000bps", udpQ.BandwidthBps)
+	}
+}
+
 func TestBandwidthProbeAckAttributesBytesToOriginalStep(t *testing.T) {
 	in := New()
 	key := laneKey{sessionID: 99, laneID: 3}
@@ -384,219 +513,6 @@ func TestBandwidthProbeAckAttributesBytesToOriginalStep(t *testing.T) {
 	}
 }
 
-func TestBandwidthProbeLateAckCanRecordDynamicCeilingCandidate(t *testing.T) {
-	in := New()
-	key := laneKey{sessionID: 99, laneID: 3}
-	udpLeg := transport.LegRef{
-		Kind:       transport.KindUDP,
-		EndpointID: "udp0",
-		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
-	}
-	legKey := newPingKey(udpLeg)
-	in.bandwidthLegs[legKey] = &bandwidthLegState{
-		key:           key,
-		nextRateBps:   90_000_000,
-		inFlight:      true,
-		prevStepBytes: 7_000_000,
-		steps:         make(map[uint64]*bandwidthProbeStep),
-	}
-
-	stepStart := time.Now()
-	stepEnd := stepStart.Add(time.Second)
-	in.startBandwidthProbeStep(legKey, stepStart)
-	round := in.startBandwidthProbeRound(key, udpLeg, legKey, stepStart)
-	if round == nil {
-		t.Fatal("missing probe round")
-	}
-	round.rateBps = 90_000_000
-	round.frameBytes = 100_000
-	round.count = 64
-	in.recordBandwidthProbeSent(round, 64)
-	in.bandwidthLegs[legKey].steps[round.stepID].sentBytes = 90_000_000 / 8
-	in.finishBandwidthProbeStep(legKey, stepEnd)
-	in.advanceBandwidthProbeRate(legKey)
-
-	state := in.bandwidthLegs[legKey]
-	if state.rateCeilingBps != 0 {
-		t.Fatalf("rate ceiling before delayed ACK = %d, want none", state.rateCeilingBps)
-	}
-	if err := in.receiveBandwidthProbeAck(99, 3, udpLeg, protocol.BandwidthProbeAckBody{
-		ProbeID:  round.probeID,
-		Count:    round.count,
-		Received: ^uint64(0),
-	}); err != nil {
-		t.Fatalf("receiveBandwidthProbeAck failed: %v", err)
-	}
-
-	if state.rateCeilingBps != 0 {
-		t.Fatalf("rate ceiling after delayed ACK = %d, want deferred lock", state.rateCeilingBps)
-	}
-	if state.ceilingSample.rateBps != 51_200_000 {
-		t.Fatalf("ceiling candidate after delayed ACK = %d, want ACK-derived 51200000", state.ceilingSample.rateBps)
-	}
-	if state.lastStepBytes != 6_400_000 {
-		t.Fatalf("last step bytes = %d, want delayed ACK bytes", state.lastStepBytes)
-	}
-
-	in.completeBandwidthProbeTrain(key, udpLeg, legKey)
-
-	if state.rateCeilingBps != 51_200_000 {
-		t.Fatalf("rate ceiling after completion = %d, want ACK-derived 51200000", state.rateCeilingBps)
-	}
-	if state.nextRateBps != state.rateCeilingBps {
-		t.Fatalf("next rate = %d, want ceiling %d", state.nextRateBps, state.rateCeilingBps)
-	}
-}
-
-func TestBandwidthProbeOlderLateAckCanRecordDynamicCeilingCandidate(t *testing.T) {
-	in := New()
-	key := laneKey{sessionID: 99, laneID: 3}
-	udpLeg := transport.LegRef{
-		Kind:       transport.KindUDP,
-		EndpointID: "udp0",
-		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
-	}
-	legKey := newPingKey(udpLeg)
-	in.bandwidthLegs[legKey] = &bandwidthLegState{
-		key:           key,
-		nextRateBps:   90_000_000,
-		inFlight:      true,
-		prevStepBytes: 7_000_000,
-		steps:         make(map[uint64]*bandwidthProbeStep),
-	}
-
-	step1Start := time.Now()
-	step1End := step1Start.Add(time.Second)
-	in.startBandwidthProbeStep(legKey, step1Start)
-	round := in.startBandwidthProbeRound(key, udpLeg, legKey, step1Start)
-	if round == nil {
-		t.Fatal("missing probe round")
-	}
-	round.rateBps = 90_000_000
-	round.frameBytes = 100_000
-	round.count = 64
-	in.recordBandwidthProbeSent(round, 64)
-	in.bandwidthLegs[legKey].steps[round.stepID].sentBytes = 90_000_000 / 8
-	in.finishBandwidthProbeStep(legKey, step1End)
-	in.advanceBandwidthProbeRate(legKey)
-
-	step2Start := step1End
-	in.startBandwidthProbeStep(legKey, step2Start)
-	in.finishBandwidthProbeStep(legKey, step2Start.Add(time.Second))
-	in.advanceBandwidthProbeRate(legKey)
-
-	state := in.bandwidthLegs[legKey]
-	if state.lastStepID != 2 {
-		t.Fatalf("last step id = %d, want 2", state.lastStepID)
-	}
-	if err := in.receiveBandwidthProbeAck(99, 3, udpLeg, protocol.BandwidthProbeAckBody{
-		ProbeID:  round.probeID,
-		Count:    round.count,
-		Received: ^uint64(0),
-	}); err != nil {
-		t.Fatalf("receiveBandwidthProbeAck failed: %v", err)
-	}
-
-	if state.rateCeilingBps != 0 {
-		t.Fatalf("rate ceiling after older delayed ACK = %d, want deferred lock", state.rateCeilingBps)
-	}
-	if state.ceilingSample.rateBps != 51_200_000 {
-		t.Fatalf("ceiling candidate after older delayed ACK = %d, want ACK-derived 51200000", state.ceilingSample.rateBps)
-	}
-	if state.lastStepID != 2 {
-		t.Fatalf("last step id after older delayed ACK = %d, want 2", state.lastStepID)
-	}
-	step1 := state.steps[1]
-	if step1 == nil || step1.ackedBytes != 6_400_000 {
-		t.Fatalf("step 1 acked bytes = %d, want 6400000", func() uint64 {
-			if step1 == nil {
-				return 0
-			}
-			return step1.ackedBytes
-		}())
-	}
-
-	in.completeBandwidthProbeTrain(key, udpLeg, legKey)
-
-	if state.rateCeilingBps != 51_200_000 {
-		t.Fatalf("rate ceiling after completion = %d, want ACK-derived 51200000", state.rateCeilingBps)
-	}
-}
-
-func TestBandwidthProbeLateAckUsesUpdatedPreviousStepBytes(t *testing.T) {
-	in := New()
-	key := laneKey{sessionID: 99, laneID: 3}
-	udpLeg := transport.LegRef{
-		Kind:       transport.KindUDP,
-		EndpointID: "udp0",
-		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
-	}
-	legKey := newPingKey(udpLeg)
-	in.bandwidthLegs[legKey] = &bandwidthLegState{
-		key:           key,
-		nextRateBps:   90_000_000,
-		inFlight:      true,
-		prevStepBytes: 5_000_000,
-		steps:         make(map[uint64]*bandwidthProbeStep),
-	}
-
-	step1Start := time.Now()
-	in.startBandwidthProbeStep(legKey, step1Start)
-	round1 := in.startBandwidthProbeRound(key, udpLeg, legKey, step1Start)
-	if round1 == nil {
-		t.Fatal("missing first probe round")
-	}
-	round1.rateBps = 80_000_000
-	round1.frameBytes = 100_000
-	round1.count = 64
-	in.recordBandwidthProbeSent(round1, 64)
-	in.finishBandwidthProbeStep(legKey, step1Start.Add(time.Second))
-	in.advanceBandwidthProbeRate(legKey)
-
-	step2Start := step1Start.Add(time.Second)
-	in.startBandwidthProbeStep(legKey, step2Start)
-	round2 := in.startBandwidthProbeRound(key, udpLeg, legKey, step2Start)
-	if round2 == nil {
-		t.Fatal("missing second probe round")
-	}
-	round2.rateBps = 100_000_000
-	round2.frameBytes = 100_000
-	round2.count = 64
-	in.recordBandwidthProbeSent(round2, 64)
-	in.bandwidthLegs[legKey].steps[round2.stepID].sentBytes = 100_000_000 / 8
-	in.finishBandwidthProbeStep(legKey, step2Start.Add(time.Second))
-	in.advanceBandwidthProbeRate(legKey)
-
-	if err := in.receiveBandwidthProbeAck(99, 3, udpLeg, protocol.BandwidthProbeAckBody{
-		ProbeID:  round1.probeID,
-		Count:    round1.count,
-		Received: ^uint64(0),
-	}); err != nil {
-		t.Fatalf("receive first ACK failed: %v", err)
-	}
-	if err := in.receiveBandwidthProbeAck(99, 3, udpLeg, protocol.BandwidthProbeAckBody{
-		ProbeID:  round2.probeID,
-		Count:    round2.count,
-		Received: ^uint64(0),
-	}); err != nil {
-		t.Fatalf("receive second ACK failed: %v", err)
-	}
-
-	state := in.bandwidthLegs[legKey]
-	if state.rateCeilingBps != 0 {
-		t.Fatalf("rate ceiling = %d, want deferred lock", state.rateCeilingBps)
-	}
-	if state.ceilingSample.rateBps != 51_200_000 {
-		t.Fatalf("ceiling candidate = %d, want ACK-derived 51200000 from second step", state.ceilingSample.rateBps)
-	}
-
-	in.completeBandwidthProbeTrain(key, udpLeg, legKey)
-
-	if state.rateCeilingBps != 51_200_000 {
-		t.Fatalf("rate ceiling after completion = %d, want ACK-derived 51200000 from second step", state.rateCeilingBps)
-	}
-}
-
 func TestBandwidthProbeStepSampleUsesReceiverSpanWhenAvailable(t *testing.T) {
 	stepStart := time.Now()
 	step := &bandwidthProbeStep{
@@ -614,7 +530,7 @@ func TestBandwidthProbeStepSampleUsesReceiverSpanWhenAvailable(t *testing.T) {
 	}
 }
 
-func TestBandwidthProbeRateCeilingUsesAckWindowWhenReceiverSpanExists(t *testing.T) {
+func TestBandwidthProbeStopsUDPWhenCloseToTCPReference(t *testing.T) {
 	in := New()
 	key := laneKey{sessionID: 99, laneID: 3}
 	udpLeg := transport.LegRef{
@@ -622,41 +538,128 @@ func TestBandwidthProbeRateCeilingUsesAckWindowWhenReceiverSpanExists(t *testing
 		EndpointID: "udp0",
 		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
 	}
+	tcpLeg := transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp0"}
+	lane := newLaneRuntime(3, 10)
+	lane.bindLeg(udpLeg)
+	lane.bindLeg(tcpLeg)
+	lane.recordBandwidthSample(transport.KindTCP, 120_000_000, 0)
+	in.lanes[key] = lane
+
 	legKey := newPingKey(udpLeg)
-	stepStart := time.Now()
-	step := &bandwidthProbeStep{
-		startedAt:      stepStart,
-		endedAt:        stepStart.Add(time.Second),
-		rateBps:        300_000_000,
-		prevAckedBytes: 24_000_000,
-		sentBytes:      300_000_000 / 8,
-		ackedBytes:     25_000_000,
-		firstRXMS:      10_000,
-		lastRXMS:       13_000,
-		sentFrames:     100,
-		ackedFrames:    100,
-	}
-	state := &bandwidthLegState{
-		key:           key,
-		nextRateBps:   300_000_000,
-		inFlight:      true,
-		prevStepBytes: step.prevAckedBytes,
-		lastStepID:    1,
-		currentStepID: 1,
+	in.bandwidthLegs[legKey] = &bandwidthLegState{
+		key:          key,
+		inFlight:     true,
+		lastStepID:   1,
+		lastStepBps:  90_000_000,
+		lastStepLoss: 0,
 		steps: map[uint64]*bandwidthProbeStep{
-			1: step,
+			1: {rateBps: 96_000_000, ackedBytes: 5_625_000},
 		},
 	}
 
-	updateBandwidthProbeRateCeilingCandidateForStep(state, 1, step)
-	if state.ceilingSample.rateBps != 200_000_000 {
-		t.Fatalf("ceiling candidate = %d, want ACK-window 200000000", state.ceilingSample.rateBps)
+	stop, reason := in.shouldStopBandwidthProbeTrain(key, udpLeg, legKey)
+	if !stop || reason != "udp_close_to_tcp_reference" {
+		t.Fatalf("stop = (%t,%q), want close-to-reference stop", stop, reason)
 	}
-	if !in.lockBandwidthProbeRateCeilingFromCandidate(state, legKey) {
-		t.Fatal("rate ceiling did not lock")
+}
+
+func TestBandwidthProbeStopsUDPWhenLossBelowTCPReference(t *testing.T) {
+	in := New()
+	key := laneKey{sessionID: 99, laneID: 3}
+	udpLeg := transport.LegRef{
+		Kind:       transport.KindUDP,
+		EndpointID: "udp0",
+		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
 	}
-	if state.rateCeilingBps != 200_000_000 {
-		t.Fatalf("rate ceiling = %d, want ACK-window 200000000", state.rateCeilingBps)
+	tcpLeg := transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp0"}
+	lane := newLaneRuntime(3, 10)
+	lane.bindLeg(udpLeg)
+	lane.bindLeg(tcpLeg)
+	lane.recordBandwidthSample(transport.KindTCP, 180_000_000, 0)
+	in.lanes[key] = lane
+
+	legKey := newPingKey(udpLeg)
+	in.bandwidthLegs[legKey] = &bandwidthLegState{
+		key:          key,
+		inFlight:     true,
+		lastStepID:   1,
+		lastStepBps:  80_000_000,
+		lastStepLoss: 0.05,
+		steps: map[uint64]*bandwidthProbeStep{
+			1: {rateBps: 90_000_000, ackedBytes: 5_000_000},
+		},
+	}
+
+	stop, reason := in.shouldStopBandwidthProbeTrain(key, udpLeg, legKey)
+	if !stop || reason != "udp_loss_below_tcp_reference" {
+		t.Fatalf("stop = (%t,%q), want loss-below-reference stop", stop, reason)
+	}
+}
+
+func TestBandwidthProbeStopsUDPWhenPlateauBelowTCPReference(t *testing.T) {
+	in := New()
+	key := laneKey{sessionID: 99, laneID: 3}
+	udpLeg := transport.LegRef{
+		Kind:       transport.KindUDP,
+		EndpointID: "udp0",
+		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
+	}
+	tcpLeg := transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp0"}
+	lane := newLaneRuntime(3, 10)
+	lane.bindLeg(udpLeg)
+	lane.bindLeg(tcpLeg)
+	lane.recordBandwidthSample(transport.KindTCP, 200_000_000, 0)
+	in.lanes[key] = lane
+
+	legKey := newPingKey(udpLeg)
+	in.bandwidthLegs[legKey] = &bandwidthLegState{
+		key:          key,
+		inFlight:     true,
+		lastStepID:   1,
+		lastStepBps:  60_000_000,
+		lastStepLoss: 0,
+		steps: map[uint64]*bandwidthProbeStep{
+			1: {
+				rateBps:        90_000_000,
+				prevAckedBytes: 5_000_000,
+				ackedBytes:     5_200_000,
+			},
+		},
+	}
+
+	stop, reason := in.shouldStopBandwidthProbeTrain(key, udpLeg, legKey)
+	if !stop || reason != "udp_plateau_below_tcp_reference" {
+		t.Fatalf("stop = (%t,%q), want plateau-below-reference stop", stop, reason)
+	}
+}
+
+func TestBandwidthProbeKeepsUDPProbingBeforeTCPReference(t *testing.T) {
+	in := New()
+	key := laneKey{sessionID: 99, laneID: 3}
+	udpLeg := transport.LegRef{
+		Kind:       transport.KindUDP,
+		EndpointID: "udp0",
+		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
+	}
+	lane := newLaneRuntime(3, 10)
+	lane.bindLeg(udpLeg)
+	in.lanes[key] = lane
+
+	legKey := newPingKey(udpLeg)
+	in.bandwidthLegs[legKey] = &bandwidthLegState{
+		key:          key,
+		inFlight:     true,
+		lastStepID:   1,
+		lastStepBps:  60_000_000,
+		lastStepLoss: 0.05,
+		steps: map[uint64]*bandwidthProbeStep{
+			1: {rateBps: 90_000_000, ackedBytes: 5_000_000},
+		},
+	}
+
+	stop, reason := in.shouldStopBandwidthProbeTrain(key, udpLeg, legKey)
+	if stop || reason != "" {
+		t.Fatalf("stop = (%t,%q), want keep probing without TCP reference", stop, reason)
 	}
 }
 
@@ -682,259 +685,6 @@ func TestBandwidthProbeRateAdvancesAdditivelyAfterStartup(t *testing.T) {
 	}
 }
 
-func TestBandwidthProbeCompletionLocksDynamicCeilingWhenAckBytesStopGrowing(t *testing.T) {
-	in := New()
-	udpLeg := transport.LegRef{
-		Kind:       transport.KindUDP,
-		EndpointID: "udp0",
-		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
-	}
-	legKey := newPingKey(udpLeg)
-	stepStartedAt := time.Now()
-	stepAckedBytes := uint64(4_300_000)
-	stepEndedAt := stepStartedAt.Add(bandwidthProbeSampleDuration(stepAckedBytes, 60_000_000))
-	in.bandwidthLegs[legKey] = &bandwidthLegState{
-		nextRateBps:   106_000_000,
-		inFlight:      true,
-		lastStepBps:   60_000_000,
-		lastStepBytes: stepAckedBytes,
-		prevStepBytes: 4_000_000,
-		lastStepID:    1,
-		currentStepID: 1,
-		steps: map[uint64]*bandwidthProbeStep{
-			1: {
-				startedAt:      stepStartedAt,
-				endedAt:        stepEndedAt,
-				rateBps:        106_000_000,
-				prevAckedBytes: 4_000_000,
-				sentBytes:      uint64(float64(106_000_000/8) * stepEndedAt.Sub(stepStartedAt).Seconds()),
-				ackedBytes:     stepAckedBytes,
-				sentFrames:     100,
-				ackedFrames:    100,
-			},
-		},
-	}
-
-	in.advanceBandwidthProbeRate(legKey)
-
-	state := in.bandwidthLegs[legKey]
-	if state.rateCeilingBps != 0 {
-		t.Fatalf("rate ceiling after rate advance = %d, want deferred lock", state.rateCeilingBps)
-	}
-	if state.nextRateBps != 116_000_000 {
-		t.Fatalf("next rate = %d, want additive increase to 116Mbps", state.nextRateBps)
-	}
-
-	in.completeBandwidthProbeTrain(laneKey{sessionID: 99, laneID: 3}, udpLeg, legKey)
-
-	if state.rateCeilingBps != 60_000_000 {
-		t.Fatalf("rate ceiling after completion = %d, want ACK-derived 60Mbps", state.rateCeilingBps)
-	}
-	if state.nextRateBps != 60_000_000 {
-		t.Fatalf("next rate after completion = %d, want dynamic ceiling", state.nextRateBps)
-	}
-
-	state.lastStepBps = 120_000_000
-	state.lastStepBytes = 5_000_000
-	in.advanceBandwidthProbeRate(legKey)
-
-	if state.nextRateBps != 60_000_000 {
-		t.Fatalf("next rate after ceiling = %d, want dynamic ceiling", state.nextRateBps)
-	}
-}
-
-func TestBandwidthProbeCompletionUsesHighestMatureCeilingCandidate(t *testing.T) {
-	in := New()
-	udpLeg := transport.LegRef{
-		Kind:       transport.KindUDP,
-		EndpointID: "udp0",
-		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
-	}
-	legKey := newPingKey(udpLeg)
-	stepStartedAt := time.Now()
-	in.bandwidthLegs[legKey] = &bandwidthLegState{
-		key:           laneKey{sessionID: 99, laneID: 3},
-		nextRateBps:   216_000_000,
-		inFlight:      true,
-		lastStepID:    3,
-		currentStepID: 3,
-		steps: map[uint64]*bandwidthProbeStep{
-			1: {
-				startedAt:      stepStartedAt,
-				endedAt:        stepStartedAt.Add(time.Second),
-				rateBps:        90_000_000,
-				prevAckedBytes: 7_100_000,
-				ackedBytes:     7_000_000,
-				sentFrames:     100,
-				ackedFrames:    100,
-			},
-			2: {
-				startedAt:   stepStartedAt.Add(time.Second),
-				endedAt:     stepStartedAt.Add(2 * time.Second),
-				rateBps:     196_000_000,
-				ackedBytes:  25_000_000,
-				sentFrames:  100,
-				ackedFrames: 100,
-			},
-			3: {
-				startedAt:   stepStartedAt.Add(2 * time.Second),
-				endedAt:     stepStartedAt.Add(3 * time.Second),
-				rateBps:     206_000_000,
-				ackedBytes:  25_000_000,
-				sentFrames:  100,
-				ackedFrames: 100,
-			},
-		},
-	}
-
-	in.completeBandwidthProbeTrain(laneKey{sessionID: 99, laneID: 3}, udpLeg, legKey)
-
-	state := in.bandwidthLegs[legKey]
-	if state.rateCeilingBps != 200_000_000 {
-		t.Fatalf("rate ceiling = %d, want highest mature ACK ceiling 200Mbps", state.rateCeilingBps)
-	}
-	if state.ceilingSample.stepID != 3 {
-		t.Fatalf("ceiling step = %d, want 3", state.ceilingSample.stepID)
-	}
-}
-
-func TestBandwidthProbeCompletionDoesNotLockCeilingDuringEarlyRamp(t *testing.T) {
-	in := New()
-	udpLeg := transport.LegRef{
-		Kind:       transport.KindUDP,
-		EndpointID: "udp0",
-		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
-	}
-	legKey := newPingKey(udpLeg)
-	stepStartedAt := time.Now()
-	stepAckedBytes := uint64(7_100_000)
-	stepEndedAt := stepStartedAt.Add(bandwidthProbeSampleDuration(stepAckedBytes, 56_800_000))
-	in.bandwidthLegs[legKey] = &bandwidthLegState{
-		key:           laneKey{sessionID: 99, laneID: 3},
-		nextRateBps:   66_000_000,
-		inFlight:      true,
-		lastStepBps:   56_800_000,
-		lastStepBytes: stepAckedBytes,
-		prevStepBytes: 7_200_000,
-		lastStepID:    1,
-		currentStepID: 1,
-		steps: map[uint64]*bandwidthProbeStep{
-			1: {
-				startedAt:      stepStartedAt,
-				endedAt:        stepEndedAt,
-				rateBps:        66_000_000,
-				prevAckedBytes: 7_200_000,
-				sentBytes:      uint64(float64(66_000_000/8) * stepEndedAt.Sub(stepStartedAt).Seconds()),
-				ackedBytes:     stepAckedBytes,
-				sentFrames:     100,
-				ackedFrames:    100,
-			},
-		},
-	}
-
-	in.completeBandwidthProbeTrain(laneKey{sessionID: 99, laneID: 3}, udpLeg, legKey)
-
-	state := in.bandwidthLegs[legKey]
-	if state.rateCeilingBps != 0 {
-		t.Fatalf("rate ceiling = %d, want none during early ramp", state.rateCeilingBps)
-	}
-	if state.ceilingSample.rateBps != 0 {
-		t.Fatalf("ceiling candidate = %d, want none during early ramp", state.ceilingSample.rateBps)
-	}
-}
-
-func TestBandwidthProbeCompletionCanUsePartialAckWindow(t *testing.T) {
-	in := New()
-	udpLeg := transport.LegRef{
-		Kind:       transport.KindUDP,
-		EndpointID: "udp0",
-		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
-	}
-	legKey := newPingKey(udpLeg)
-	stepStartedAt := time.Now()
-	stepAckedBytes := uint64(4_300_000)
-	stepEndedAt := stepStartedAt.Add(bandwidthProbeSampleDuration(stepAckedBytes, 60_000_000))
-	in.bandwidthLegs[legKey] = &bandwidthLegState{
-		key:           laneKey{sessionID: 99, laneID: 3},
-		nextRateBps:   90_000_000,
-		inFlight:      true,
-		lastStepBps:   60_000_000,
-		lastStepBytes: stepAckedBytes,
-		prevStepBytes: 4_000_000,
-		lastStepID:    1,
-		currentStepID: 1,
-		steps: map[uint64]*bandwidthProbeStep{
-			1: {
-				startedAt:      stepStartedAt,
-				endedAt:        stepEndedAt,
-				rateBps:        90_000_000,
-				prevAckedBytes: 4_000_000,
-				ackedBytes:     stepAckedBytes,
-				sentFrames:     100,
-				ackedFrames:    80,
-			},
-		},
-	}
-
-	in.completeBandwidthProbeTrain(laneKey{sessionID: 99, laneID: 3}, udpLeg, legKey)
-
-	state := in.bandwidthLegs[legKey]
-	if state.rateCeilingBps != 60_000_000 {
-		t.Fatalf("rate ceiling = %d, want ACK-derived 60Mbps", state.rateCeilingBps)
-	}
-}
-
-func TestBandwidthProbeCompletionDoesNotLockCeilingBeforeTargetIsUnderdelivered(t *testing.T) {
-	in := New()
-	udpLeg := transport.LegRef{
-		Kind:       transport.KindUDP,
-		EndpointID: "udp0",
-		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
-	}
-	legKey := newPingKey(udpLeg)
-	stepStartedAt := time.Now()
-	stepAckedBytes := uint64(11_250_000)
-	stepEndedAt := stepStartedAt.Add(time.Second)
-	in.bandwidthLegs[legKey] = &bandwidthLegState{
-		key:           laneKey{sessionID: 99, laneID: 3},
-		nextRateBps:   90_000_000,
-		inFlight:      true,
-		lastStepBps:   90_000_000,
-		lastStepBytes: stepAckedBytes,
-		prevStepBytes: 4_000_000,
-		lastStepID:    1,
-		currentStepID: 1,
-		steps: map[uint64]*bandwidthProbeStep{
-			1: {
-				startedAt:      stepStartedAt,
-				endedAt:        stepEndedAt,
-				rateBps:        90_000_000,
-				prevAckedBytes: 4_000_000,
-				ackedBytes:     stepAckedBytes,
-				sentFrames:     100,
-				ackedFrames:    100,
-			},
-		},
-	}
-
-	in.completeBandwidthProbeTrain(laneKey{sessionID: 99, laneID: 3}, udpLeg, legKey)
-
-	state := in.bandwidthLegs[legKey]
-	if state.rateCeilingBps != 0 {
-		t.Fatalf("rate ceiling = %d, want none while target is delivered", state.rateCeilingBps)
-	}
-	if state.ceilingSample.rateBps != 0 {
-		t.Fatalf("ceiling candidate = %d, want none while target is delivered", state.ceilingSample.rateBps)
-	}
-}
-
-func bandwidthProbeSampleDuration(ackedBytes uint64, bps uint64) time.Duration {
-	if ackedBytes == 0 || bps == 0 {
-		return 0
-	}
-	return time.Duration(ackedBytes * 8 * uint64(time.Second) / bps)
-}
-
 func TestBandwidthProbeRateUsesAdditiveIncreaseWhenAckBytesGrowEnough(t *testing.T) {
 	in := New()
 	udpLeg := transport.LegRef{
@@ -954,9 +704,6 @@ func TestBandwidthProbeRateUsesAdditiveIncreaseWhenAckBytesGrowEnough(t *testing
 	in.advanceBandwidthProbeRate(legKey)
 
 	state := in.bandwidthLegs[legKey]
-	if state.rateCeilingBps != 0 {
-		t.Fatalf("rate ceiling = %d, want none", state.rateCeilingBps)
-	}
 	if state.nextRateBps != 100_000_000 {
 		t.Fatalf("next rate = %d, want additive increase to 100Mbps", state.nextRateBps)
 	}
@@ -985,9 +732,6 @@ func TestBandwidthProbeRateAdvanceUsesAdditiveStepWhenLossIncreases(t *testing.T
 	state := in.bandwidthLegs[legKey]
 	if state.nextRateBps != 100_000_000 {
 		t.Fatalf("next rate = %d, want additive increase to 100Mbps", state.nextRateBps)
-	}
-	if state.rateCeilingBps != 0 {
-		t.Fatalf("dynamic ceiling = %d, want none before ack plateau", state.rateCeilingBps)
 	}
 }
 

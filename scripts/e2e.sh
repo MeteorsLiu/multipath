@@ -905,17 +905,15 @@ run_bandwidth_probe_convergence_case() {
   echo "==== ${name} e2e start ===="
   clear_loss
   write_one_lane_config "${name}" "${PORT_BW_PROBE_CONVERGENCE}" false false 200 1000
-  echo "[${name}] rate-limit UDP tunnel before startup; bandwidth probe should converge without a static cap"
+  echo "[${name}] rate-limit UDP tunnel before startup; bandwidth probe should classify UDP relative to TCP"
   apply_udp_tunnel_rate_path 1 "${PORT_BW_PROBE_CONVERGENCE}" 80mbit
   start_multipath "${name}"
   local client_start_line
   client_start_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
 
   wait_ping_ok "${name} baseline-under-rate-limit" 12
-  wait_bandwidth_probe_additive_ramp "${name}" "${CURRENT_CLIENT_LOG}" "${client_start_line}" 8 "client UDP bandwidth probe used additive ramp"
-  wait_log_file_any_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" 35 "client bandwidth probe converged under UDP rate limit without static cap" "${client_start_line}" \
-    "rate_ceiling session=[0-9]+ lane=1 kind=udp rate_bps=[0-9]+ target_bps=[0-9]+ prev_acked_bytes=[0-9]+ acked_bytes=[0-9]+" \
-    "bandwidth_probe_decision .*lane=1 .*udp_qos_limited=true .*tcp_better=true selected_leg=tcp"
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "send/bw_probe: train_finish .*leg=\\{tcp .*window_bps=[0-9]+" 20 "client measured TCP reference first" "${client_start_line}"
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "bandwidth_probe_decision .*lane=1 .*udp_qos_limited=true .*tcp_better=true selected_leg=tcp" 35 "client bandwidth probe classified UDP relative to TCP" "${client_start_line}"
   wait_ping_ok "${name} post-convergence" 12
 
   stop_multipath
@@ -923,80 +921,19 @@ run_bandwidth_probe_convergence_case() {
   echo "==== ${name} e2e end ===="
 }
 
-wait_bandwidth_probe_ceiling_sample() {
-  local label="$1"
-  local log_file="$2"
-  local start_line="$3"
-  local timeout="${4:-35}"
-  local message="$5"
-  local min_bps="${6:-160000000}"
-  local max_bps="${7:-260000000}"
-  local deadline=$((SECONDS + timeout))
-  local output status
-
-  while (( SECONDS < deadline )); do
-    set +e
-    output="$(awk \
-      -v start="${start_line}" \
-      -v min_bps="${min_bps}" \
-      -v max_bps="${max_bps}" '
-        NR <= start { next }
-        /rate_ceiling .*kind=udp/ {
-          rate = target = prev = acked = 0
-          for (i = 1; i <= NF; i++) {
-            if ($i ~ /^rate_bps=/) { split($i, p, "="); rate = p[2] + 0 }
-            if ($i ~ /^target_bps=/) { split($i, p, "="); target = p[2] + 0 }
-            if ($i ~ /^prev_acked_bytes=/) { split($i, p, "="); prev = p[2] + 0 }
-            if ($i ~ /^acked_bytes=/) { split($i, p, "="); acked = p[2] + 0 }
-          }
-          if (rate > 0 && target > 0 && prev > 0 && acked > 0 && rate * 100 < target * 99 && acked * 10 < prev * 11) {
-            ceiling = rate
-          }
-        }
-        END {
-          if (ceiling == 0) {
-            print "need ceiling"
-            exit 2
-          }
-          if (ceiling < min_bps || ceiling > max_bps) {
-            printf("bad ceiling=%d\n", ceiling)
-            exit 1
-          }
-          printf("ok ceiling=%d\n", ceiling)
-          exit 0
-        }
-      ' "${log_file}" 2>/dev/null)"
-    status=$?
-    set -e
-    case "${status}" in
-    0)
-      pass "${label}" "${message}: ${output#ok }"
-      return 0
-      ;;
-    1)
-      fail "${label}" "${message}: ACK-derived ceiling outside [${min_bps}, ${max_bps}] bps: ${output#bad }"
-      return 1
-      ;;
-    esac
-    sleep 0.2
-  done
-  fail "${label}" "${message}: ACK-derived ceiling sample not observed within ${timeout}s"
-  return 1
-}
-
-run_bandwidth_probe_ceiling_case() {
-  local name="bandwidth-probe-ceiling"
+run_bandwidth_probe_tcp_reference_case() {
+  local name="bandwidth-probe-tcp-reference"
   echo "==== ${name} e2e start ===="
   clear_loss
   write_one_lane_config "${name}" "${PORT_BW_PROBE_GUARD}" false false 200 1000
-  echo "[${name}] apply 200mbit UDP tunnel bottleneck; bandwidth probe should lock ACK-derived dynamic ceiling"
+  echo "[${name}] apply 200mbit UDP tunnel bottleneck; bandwidth probe should classify UDP relative to TCP reference"
   apply_udp_tunnel_rate_path 1 "${PORT_BW_PROBE_GUARD}" 200mbit
   start_multipath "${name}"
   local client_start_line
   client_start_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
   wait_ping_ok "${name} baseline" 12
-  wait_bandwidth_probe_additive_ramp "${name}" "${CURRENT_CLIENT_LOG}" "${client_start_line}" 8 "client UDP bandwidth probe used additive ramp"
-  wait_bandwidth_probe_ceiling_sample "${name}" "${CURRENT_CLIENT_LOG}" "${client_start_line}" 35 "client bandwidth probe locked 200mbit ACK ceiling"
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "send/bw_probe: train_finish .*leg=\\{tcp .*window_bps=[0-9]+" 20 "client measured TCP reference first" "${client_start_line}"
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "bandwidth_probe_decision .*lane=1 .*udp_qos_limited=true .*tcp_better=true selected_leg=tcp" 35 "client classified UDP relative to TCP reference" "${client_start_line}"
 
   stop_multipath
   clear_loss
@@ -1047,77 +984,6 @@ count_log_pattern() {
     return 0
   fi
   grep -c "${pattern}" "${log_file}" || true
-}
-
-wait_bandwidth_probe_additive_ramp() {
-  local label="$1"
-  local log_file="$2"
-  local start_line="$3"
-  local timeout="${4:-8}"
-  local message="$5"
-  local min_distinct="${6:-3}"
-  local deadline=$((SECONDS + timeout))
-  local output status
-
-  while (( SECONDS < deadline )); do
-    set +e
-    output="$(awk \
-      -v start="${start_line}" \
-      -v min_rate=16000000 \
-      -v step_rate=10000000 \
-      -v min_distinct="${min_distinct}" '
-        NR <= start { next }
-        $0 !~ /send\/bw_probe/ || $0 !~ /round_start/ || $0 !~ /leg=\{udp / { next }
-        {
-          rate = 0
-          for (i = 1; i <= NF; i++) {
-            if ($i ~ /^rate_bps=/) {
-              split($i, parts, "=")
-              rate = parts[2] + 0
-              break
-            }
-          }
-          if (rate == 0) {
-            next
-          }
-          if (rate < min_rate || ((rate - min_rate) % step_rate) != 0) {
-            printf("bad %d\n", rate)
-            bad = 1
-            exit 1
-          }
-          if (!(rate in seen)) {
-            seen[rate] = 1
-            distinct++
-          }
-        }
-        END {
-          if (distinct >= min_distinct) {
-            printf("ok %d\n", distinct)
-            exit 0
-          }
-          if (bad) {
-            exit 1
-          }
-          printf("need %d\n", distinct)
-          exit 2
-        }
-      ' "${log_file}" 2>/dev/null)"
-    status=$?
-    set -e
-    case "${status}" in
-    0)
-      pass "${label}" "${message}"
-      return 0
-      ;;
-    1)
-      fail "${label}" "${message}: non-additive UDP probe rate observed: ${output#bad }"
-      return 1
-      ;;
-    esac
-    sleep 0.2
-  done
-  fail "${label}" "${message}: additive UDP probe sequence not observed within ${timeout}s"
-  return 1
 }
 
 assert_log_not_contains() {
@@ -1676,7 +1542,7 @@ run_server_restart_reconnect_case
 run_fallback_dial_error_case
 run_leg_selector_case
 run_bandwidth_probe_convergence_case
-run_bandwidth_probe_ceiling_case
+run_bandwidth_probe_tcp_reference_case
 run_nat_case
 run_fec_comparison
 run_fec_tcp_fallback_case
