@@ -384,6 +384,63 @@ func TestBandwidthProbeAckAttributesBytesToOriginalStep(t *testing.T) {
 	}
 }
 
+func TestBandwidthProbeLateAckCanLockDynamicCeiling(t *testing.T) {
+	in := New()
+	key := laneKey{sessionID: 99, laneID: 3}
+	udpLeg := transport.LegRef{
+		Kind:       transport.KindUDP,
+		EndpointID: "udp0",
+		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
+	}
+	legKey := newPingKey(udpLeg)
+	in.bandwidthLegs[legKey] = &bandwidthLegState{
+		key:           key,
+		nextRateBps:   90_000_000,
+		inFlight:      true,
+		prevStepBytes: 7_000_000,
+		steps:         make(map[uint64]*bandwidthProbeStep),
+	}
+
+	stepStart := time.Now()
+	stepEnd := stepStart.Add(time.Second)
+	in.startBandwidthProbeStep(legKey, stepStart)
+	round := in.startBandwidthProbeRound(key, udpLeg, legKey, stepStart)
+	if round == nil {
+		t.Fatal("missing probe round")
+	}
+	round.rateBps = 90_000_000
+	round.frameBytes = 100_000
+	round.count = 64
+	in.recordBandwidthProbeSent(round, 64)
+	in.finishBandwidthProbeStep(legKey, stepEnd)
+	in.advanceBandwidthProbeRate(legKey)
+
+	state := in.bandwidthLegs[legKey]
+	if state.rateCeilingBps != 0 {
+		t.Fatalf("rate ceiling before delayed ACK = %d, want none", state.rateCeilingBps)
+	}
+	if err := in.receiveBandwidthProbeAck(99, 3, udpLeg, protocol.BandwidthProbeAckBody{
+		ProbeID:  round.probeID,
+		Count:    round.count,
+		Received: ^uint64(0),
+	}); err != nil {
+		t.Fatalf("receiveBandwidthProbeAck failed: %v", err)
+	}
+
+	if state.rateCeilingBps != 51_200_000 {
+		t.Fatalf("rate ceiling after delayed ACK = %d, want ACK-derived 51200000", state.rateCeilingBps)
+	}
+	if state.nextRateBps != state.rateCeilingBps {
+		t.Fatalf("next rate = %d, want ceiling %d", state.nextRateBps, state.rateCeilingBps)
+	}
+	if state.lastStepBytes != 6_400_000 {
+		t.Fatalf("last step bytes = %d, want delayed ACK bytes", state.lastStepBytes)
+	}
+	if state.prevStepBytes != state.lastStepBytes {
+		t.Fatalf("prev step bytes = %d, want updated to locked step bytes %d", state.prevStepBytes, state.lastStepBytes)
+	}
+}
+
 func TestBandwidthProbeRateAdvancesAdditivelyAfterStartup(t *testing.T) {
 	in := New()
 	udpLeg := transport.LegRef{
