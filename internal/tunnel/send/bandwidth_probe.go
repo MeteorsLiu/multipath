@@ -192,7 +192,7 @@ func (l *Send) probeBandwidth(ctx context.Context, now time.Time) {
 			continue
 		}
 		lane := item.lane
-		udpLeg, udpQ, tcpLeg, tcpQ := lane.legQualities()
+	_, udpQ, _, tcpQ := lane.legQualities()
 		if leg, ok := l.bandwidthProbeCandidate(item.key, item.lane, udpLeg, udpQ, tcpLeg, tcpQ); ok {
 			candidates = append(candidates, candidate{key: item.key, leg: leg})
 		}
@@ -858,13 +858,19 @@ func (l *Send) completeBandwidthProbeTrain(key laneKey, leg transport.LegRef, le
 	if state.endedAt.IsZero() {
 		state.endedAt = now
 	}
-	sampleBps := bandwidthProbeBestCompletedStepBps(state)
-	if sampleBps == 0 {
-		sampleBps = bandwidthWindowSampleBps(state.ackedBytes, state.startedAt, state.endedAt)
+	var bestBps uint64
+	for _, stepID := range state.stepOrder {
+		if step := state.steps[stepID]; step != nil && !step.endedAt.IsZero() {
+			if bps := bandwidthProbeStepCeilingBps(step); bps > bestBps {
+				bestBps = bps
+			}
+		}
 	}
-	state.ewmaBps = sampleBps
-	state.lastLoss = bandwidthAggregateLoss(state.sentFrames, state.ackedFrames)
-	state.sampleCount = 1
+	if bestBps == 0 {
+		bestBps = bandwidthWindowSampleBps(state.ackedBytes, state.startedAt, state.endedAt)
+	}
+	aggregateLoss := bandwidthAggregateLoss(state.sentFrames, state.ackedFrames)
+	state.lastLoss = aggregateLoss
 	state.complete = true
 	state.inFlight = false
 	for probeID, round := range l.bandwidthPending {
@@ -872,16 +878,12 @@ func (l *Send) completeBandwidthProbeTrain(key laneKey, leg transport.LegRef, le
 			delete(l.bandwidthPending, probeID)
 		}
 	}
-	ewmaBps := state.ewmaBps
-	nextRateBps := state.nextRateBps
-	sampleCount := state.sampleCount
-	aggregateLoss := state.lastLoss
 	l.bandwidthMu.Unlock()
 
 	if lane := l.getLane(key); lane != nil {
-		lane.recordBandwidthSample(leg.Kind, ewmaBps, aggregateLoss)
+		lane.recordBandwidthSample(leg.Kind, bestBps, aggregateLoss)
 	}
-	metrics.SetGauge(metrics.LaneBandwidthBps, float64(ewmaBps),
+	metrics.SetGauge(metrics.LaneBandwidthBps, float64(bestBps),
 		metrics.L("session", key.sessionID),
 		metrics.L("lane", key.laneID),
 		metrics.L("leg", kindMetricLabel(leg.Kind)),
@@ -898,25 +900,8 @@ func (l *Send) completeBandwidthProbeTrain(key laneKey, leg transport.LegRef, le
 		metrics.L("leg", kindMetricLabel(leg.Kind)),
 	)
 	l.logBandwidthProbeDecisionIfReady(key)
-	debuglog.Printf("send/bw_probe", "train_finish session=%d lane=%d leg={%s} window_loss=%.3f window_bps=%d next_rate_bps=%d samples=%d", key.sessionID, key.laneID, debugLeg(leg), aggregateLoss, ewmaBps, nextRateBps, sampleCount)
+	debuglog.Printf("send/bw_probe", "train_finish session=%d lane=%d leg={%s} loss=%.3f bps=%d", key.sessionID, key.laneID, debugLeg(leg), aggregateLoss, bestBps)
 	return true
-}
-
-func bandwidthProbeBestCompletedStepBps(state *bandwidthLegState) uint64 {
-	if state == nil {
-		return 0
-	}
-	var best uint64
-	for _, step := range state.steps {
-		if step == nil || step.endedAt.IsZero() || step.ackedFrames == 0 {
-			continue
-		}
-		stepBps := bandwidthProbeStepCeilingBps(step)
-		if stepBps > best {
-			best = stepBps
-		}
-	}
-	return best
 }
 
 func (l *Send) abortBandwidthProbeTrain(legKey pingKey) {
@@ -939,19 +924,6 @@ func (l *Send) logBandwidthProbeDecisionIfReady(key laneKey) {
 	}
 	udpLeg, udpQ, tcpLeg, tcpQ := lane.legQualities()
 	if udpQ.ProbeSamples < minBandwidthProbeSamples || tcpQ.ProbeSamples < minBandwidthProbeSamples {
-		return
-	}
-	udpKey := newPingKey(udpLeg)
-	tcpKey := newPingKey(tcpLeg)
-	if udpKey.kind == 0 || tcpKey.kind == 0 {
-		return
-	}
-	l.bandwidthMu.Lock()
-	udpState := l.bandwidthLegs[udpKey]
-	tcpState := l.bandwidthLegs[tcpKey]
-	ready := udpState != nil && udpState.complete && tcpState != nil && tcpState.complete
-	l.bandwidthMu.Unlock()
-	if !ready {
 		return
 	}
 	useUDP, ok := l.legSelector(key.sessionID).Pick(udpQ, tcpQ)
