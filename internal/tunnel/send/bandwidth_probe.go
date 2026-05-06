@@ -277,7 +277,7 @@ func (l *Send) maybeStartBandwidthProbe(ctx context.Context, key laneKey, leg tr
 	l.bandwidthMu.Lock()
 	state := l.bandwidthLegs[legKey]
 	if state == nil {
-		state = &bandwidthLegState{key: key, nextRateBps: bandwidthProbeMinRateBps}
+		state = &bandwidthLegState{key: key}
 		l.bandwidthLegs[legKey] = state
 	}
 	state.key = key
@@ -288,31 +288,33 @@ func (l *Send) maybeStartBandwidthProbe(ctx context.Context, key laneKey, leg tr
 	state.inFlight = true
 	state.startedAt = now
 	state.endedAt = time.Time{}
-	state.sampleCount = 0
-	state.rampChunks = 0
 	state.sentFrames = 0
 	state.ackedFrames = 0
 	state.ackedBytes = 0
-	state.currentStepID = 0
-	state.lastStepID = 0
-	state.stepStartedAt = time.Time{}
-	state.lastStepBps = 0
-	state.lastStepBytes = 0
-	state.prevStepBytes = 0
-	state.maxStepBps = 0
 	state.steps = make(map[uint64]*bandwidthProbeStep)
+	state.stepOrder = nil
+	state.stepBps = nil
 	state.lastLoss = 0
-	state.prevStepLoss = 0
-	state.lastStepLoss = 0
-	state.lastRoundLoss = 0
-	state.ewmaBps = 0
-	if state.nextRateBps == 0 {
-		state.nextRateBps = bandwidthProbeMinRateBps
-	}
+	state.capBps = l.udpBandwidthProbeRateCap(key, leg)
+	state.rateBps = bandwidthProbeStartRate(state.capBps)
 	l.bandwidthMu.Unlock()
 
-	debuglog.Printf("send/bw_probe", "train_start session=%d lane=%d leg={%s} window=%s", key.sessionID, key.laneID, debugLeg(leg), bandwidthProbeWindow)
+	debuglog.Printf("send/bw_probe", "train_start session=%d lane=%d leg={%s} cap_bps=%d start_bps=%d window=%s", key.sessionID, key.laneID, debugLeg(leg), state.capBps, state.rateBps, bandwidthProbeWindow)
 	go l.runBandwidthProbeTrain(ctx, key, leg, legKey)
+}
+
+func bandwidthProbeStartRate(capBps uint64) uint64 {
+	if capBps == 0 {
+		return bandwidthProbeMinRateBps
+	}
+	start := capBps / 4
+	if start < bandwidthProbeMinRateBps {
+		start = bandwidthProbeMinRateBps
+	}
+	if start > capBps {
+		start = capBps
+	}
+	return start
 }
 
 func probeFrameCount(rateBps uint64, payloadBytes int) uint16 {
@@ -421,6 +423,13 @@ func (l *Send) getStepBpsSlice(legKey pingKey) []uint64 {
 		return nil
 	}
 	return state.stepBps
+}
+
+func (l *Send) udpBandwidthProbeRateCap(key laneKey, leg transport.LegRef) uint64 {
+	if leg.Kind != transport.KindUDP {
+		return 0
+	}
+	return l.bandwidthProbeTCPReferenceBps(key)
 }
 
 func (l *Send) bandwidthProbeTCPReferenceBps(key laneKey) uint64 {
