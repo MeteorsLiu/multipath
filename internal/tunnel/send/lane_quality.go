@@ -110,6 +110,9 @@ func (q *bandwidthQualityState) updateQoSState() {
 		return
 	}
 	q.qosLimited = q.udpProbeLoss >= bandwidthProbeLossThreshold
+	if !q.qosLimited {
+		q.qosLimited = float64(q.udpBandwidthBps)*tcpBandwidthPreferRatio <= float64(q.tcpBandwidthBps)
+	}
 	q.preferTCP = q.qosLimited && float64(q.tcpBandwidthBps) >= float64(q.udpBandwidthBps)*tcpBandwidthPreferRatio
 }
 
