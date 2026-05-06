@@ -499,7 +499,7 @@ func (l *Send) enqueueFrameWithSize(ctx context.Context, leg transport.LegRef, f
 		return 0, err
 	}
 	written := len(packet.Payload)
-	if debuglog.Enabled() {
+	if debuglog.Enabled() && !debugSuppressFrame(frame) {
 		debuglog.Printf("send", "enqueue_frame frame=%s leg={%s} bytes=%d", debugFrameSummary(frame), debugLeg(leg), written)
 	}
 	metrics.IncCounter(metrics.ProtocolFramesTotal,

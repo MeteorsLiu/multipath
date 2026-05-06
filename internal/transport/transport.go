@@ -65,9 +65,6 @@ func RunWriter(ctx context.Context, packets <-chan Payload, packet PacketTranspo
 			if payload.Packet == nil {
 				continue
 			}
-			if debuglog.Enabled() {
-				debuglog.Printf("transport", "writer dispatch %s bytes=%d", debugLeg(payload.Leg), len(payload.Packet.Payload))
-			}
 			err := writePayload(ctx, payload, packet, stream)
 			payload.Packet.Release()
 			if err != nil {

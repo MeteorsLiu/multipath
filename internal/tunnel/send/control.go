@@ -302,7 +302,9 @@ func (i *Send) writeControlFrameOnLeg(ctx context.Context, leg transport.LegRef,
 		debuglog.Printf("send/control", "control_leg_unavailable frame=%s leg={%s}", debugFrameSummary(frame), debugLeg(leg))
 		return errLaneUnavailable
 	}
-	debuglog.Printf("send/control", "control_out %s leg={%s}", debugFrameSummary(frame), debugLeg(leg))
+	if !debugSuppressFrame(frame) {
+		debuglog.Printf("send/control", "control_out %s leg={%s}", debugFrameSummary(frame), debugLeg(leg))
+	}
 	_, err := i.enqueueFrame(ctx, leg, frame)
 	return err
 }

@@ -33,17 +33,12 @@ func (i *Send) WriteTo(ctx context.Context, leg transport.LegRef, packet *packet
 	if packet == nil {
 		return nil
 	}
-	if debuglog.Enabled() {
-		debuglog.Printf("send", "transport_queue leg={%s} bytes=%d", debugLeg(leg), len(packet.Payload))
-	}
 	select {
 	case i.packets <- transport.Payload{Leg: leg, Packet: packet}:
 		return nil
 	case <-ctx.Done():
 		packet.Release()
-		if debuglog.Enabled() {
-			debuglog.Printf("send", "transport_queue_drop ctx_done leg={%s}", debugLeg(leg))
-		}
+		debuglog.Printf("send", "transport_queue_drop ctx_done leg={%s}", debugLeg(leg))
 		return ctx.Err()
 	}
 }

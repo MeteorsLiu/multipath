@@ -10,6 +10,9 @@ func debugEncodeFrame(frame Frame, frameLen int) {
 	if !debuglog.Enabled() {
 		return
 	}
+	if debugSuppressFrame(frame) {
+		return
+	}
 	debuglog.Printf("protocol", "encode %s frame_len=%d", debugFrame(frame), frameLen)
 }
 
@@ -22,6 +25,9 @@ func debugEncodeError(frame Frame, err error) {
 
 func debugDecodeFrame(frame Frame, frameLen int) {
 	if !debuglog.Enabled() {
+		return
+	}
+	if debugSuppressFrame(frame) {
 		return
 	}
 	debuglog.Printf("protocol", "decode %s frame_len=%d", debugFrame(frame), frameLen)
@@ -56,6 +62,10 @@ func debugFrame(frame Frame) string {
 	default:
 		return base
 	}
+}
+
+func debugSuppressFrame(frame Frame) bool {
+	return frame.Type == TypeBandwidthProbe || frame.Type == TypeBandwidthProbeAck
 }
 
 func frameTypeName(frameType FrameType) string {
