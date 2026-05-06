@@ -384,7 +384,7 @@ func TestBandwidthProbeAckAttributesBytesToOriginalStep(t *testing.T) {
 	}
 }
 
-func TestBandwidthProbeLateAckCanLockDynamicCeiling(t *testing.T) {
+func TestBandwidthProbeLateAckCanRecordDynamicCeilingCandidate(t *testing.T) {
 	in := New()
 	key := laneKey{sessionID: 99, laneID: 3}
 	udpLeg := transport.LegRef{
@@ -428,21 +428,27 @@ func TestBandwidthProbeLateAckCanLockDynamicCeiling(t *testing.T) {
 		t.Fatalf("receiveBandwidthProbeAck failed: %v", err)
 	}
 
-	if state.rateCeilingBps != 51_200_000 {
-		t.Fatalf("rate ceiling after delayed ACK = %d, want ACK-derived 51200000", state.rateCeilingBps)
+	if state.rateCeilingBps != 0 {
+		t.Fatalf("rate ceiling after delayed ACK = %d, want deferred lock", state.rateCeilingBps)
 	}
-	if state.nextRateBps != state.rateCeilingBps {
-		t.Fatalf("next rate = %d, want ceiling %d", state.nextRateBps, state.rateCeilingBps)
+	if state.ceilingSample.rateBps != 51_200_000 {
+		t.Fatalf("ceiling candidate after delayed ACK = %d, want ACK-derived 51200000", state.ceilingSample.rateBps)
 	}
 	if state.lastStepBytes != 6_400_000 {
 		t.Fatalf("last step bytes = %d, want delayed ACK bytes", state.lastStepBytes)
 	}
-	if state.prevStepBytes != state.lastStepBytes {
-		t.Fatalf("prev step bytes = %d, want updated to locked step bytes %d", state.prevStepBytes, state.lastStepBytes)
+
+	in.completeBandwidthProbeTrain(key, udpLeg, legKey)
+
+	if state.rateCeilingBps != 51_200_000 {
+		t.Fatalf("rate ceiling after completion = %d, want ACK-derived 51200000", state.rateCeilingBps)
+	}
+	if state.nextRateBps != state.rateCeilingBps {
+		t.Fatalf("next rate = %d, want ceiling %d", state.nextRateBps, state.rateCeilingBps)
 	}
 }
 
-func TestBandwidthProbeOlderLateAckCanLockDynamicCeiling(t *testing.T) {
+func TestBandwidthProbeOlderLateAckCanRecordDynamicCeilingCandidate(t *testing.T) {
 	in := New()
 	key := laneKey{sessionID: 99, laneID: 3}
 	udpLeg := transport.LegRef{
@@ -491,8 +497,11 @@ func TestBandwidthProbeOlderLateAckCanLockDynamicCeiling(t *testing.T) {
 		t.Fatalf("receiveBandwidthProbeAck failed: %v", err)
 	}
 
-	if state.rateCeilingBps != 51_200_000 {
-		t.Fatalf("rate ceiling after older delayed ACK = %d, want ACK-derived 51200000", state.rateCeilingBps)
+	if state.rateCeilingBps != 0 {
+		t.Fatalf("rate ceiling after older delayed ACK = %d, want deferred lock", state.rateCeilingBps)
+	}
+	if state.ceilingSample.rateBps != 51_200_000 {
+		t.Fatalf("ceiling candidate after older delayed ACK = %d, want ACK-derived 51200000", state.ceilingSample.rateBps)
 	}
 	if state.lastStepID != 2 {
 		t.Fatalf("last step id after older delayed ACK = %d, want 2", state.lastStepID)
@@ -505,6 +514,12 @@ func TestBandwidthProbeOlderLateAckCanLockDynamicCeiling(t *testing.T) {
 			}
 			return step1.ackedBytes
 		}())
+	}
+
+	in.completeBandwidthProbeTrain(key, udpLeg, legKey)
+
+	if state.rateCeilingBps != 51_200_000 {
+		t.Fatalf("rate ceiling after completion = %d, want ACK-derived 51200000", state.rateCeilingBps)
 	}
 }
 
@@ -568,8 +583,17 @@ func TestBandwidthProbeLateAckUsesUpdatedPreviousStepBytes(t *testing.T) {
 	}
 
 	state := in.bandwidthLegs[legKey]
+	if state.rateCeilingBps != 0 {
+		t.Fatalf("rate ceiling = %d, want deferred lock", state.rateCeilingBps)
+	}
+	if state.ceilingSample.rateBps != 51_200_000 {
+		t.Fatalf("ceiling candidate = %d, want ACK-derived 51200000 from second step", state.ceilingSample.rateBps)
+	}
+
+	in.completeBandwidthProbeTrain(key, udpLeg, legKey)
+
 	if state.rateCeilingBps != 51_200_000 {
-		t.Fatalf("rate ceiling = %d, want ACK-derived 51200000 from second step", state.rateCeilingBps)
+		t.Fatalf("rate ceiling after completion = %d, want ACK-derived 51200000 from second step", state.rateCeilingBps)
 	}
 }
 
@@ -624,7 +648,11 @@ func TestBandwidthProbeRateCeilingUsesAckWindowWhenReceiverSpanExists(t *testing
 		},
 	}
 
-	if !in.lockBandwidthProbeRateCeilingForStep(state, legKey, 1, step) {
+	updateBandwidthProbeRateCeilingCandidateForStep(state, 1, step)
+	if state.ceilingSample.rateBps != 200_000_000 {
+		t.Fatalf("ceiling candidate = %d, want ACK-window 200000000", state.ceilingSample.rateBps)
+	}
+	if !in.lockBandwidthProbeRateCeilingFromCandidate(state, legKey) {
 		t.Fatal("rate ceiling did not lock")
 	}
 	if state.rateCeilingBps != 200_000_000 {
@@ -654,7 +682,7 @@ func TestBandwidthProbeRateAdvancesAdditivelyAfterStartup(t *testing.T) {
 	}
 }
 
-func TestBandwidthProbeRateAdvanceLocksDynamicCeilingWhenAckBytesStopGrowing(t *testing.T) {
+func TestBandwidthProbeCompletionLocksDynamicCeilingWhenAckBytesStopGrowing(t *testing.T) {
 	in := New()
 	udpLeg := transport.LegRef{
 		Kind:       transport.KindUDP,
@@ -690,11 +718,20 @@ func TestBandwidthProbeRateAdvanceLocksDynamicCeilingWhenAckBytesStopGrowing(t *
 	in.advanceBandwidthProbeRate(legKey)
 
 	state := in.bandwidthLegs[legKey]
+	if state.rateCeilingBps != 0 {
+		t.Fatalf("rate ceiling after rate advance = %d, want deferred lock", state.rateCeilingBps)
+	}
+	if state.nextRateBps != 116_000_000 {
+		t.Fatalf("next rate = %d, want additive increase to 116Mbps", state.nextRateBps)
+	}
+
+	in.completeBandwidthProbeTrain(laneKey{sessionID: 99, laneID: 3}, udpLeg, legKey)
+
 	if state.rateCeilingBps != 60_000_000 {
-		t.Fatalf("rate ceiling = %d, want ACK-derived 60Mbps", state.rateCeilingBps)
+		t.Fatalf("rate ceiling after completion = %d, want ACK-derived 60Mbps", state.rateCeilingBps)
 	}
 	if state.nextRateBps != 60_000_000 {
-		t.Fatalf("next rate = %d, want dynamic ceiling", state.nextRateBps)
+		t.Fatalf("next rate after completion = %d, want dynamic ceiling", state.nextRateBps)
 	}
 
 	state.lastStepBps = 120_000_000
@@ -706,7 +743,7 @@ func TestBandwidthProbeRateAdvanceLocksDynamicCeilingWhenAckBytesStopGrowing(t *
 	}
 }
 
-func TestBandwidthProbeRateAdvanceDoesNotLockCeilingBeforeTargetIsAttempted(t *testing.T) {
+func TestBandwidthProbeCompletionUsesHighestMatureCeilingCandidate(t *testing.T) {
 	in := New()
 	udpLeg := transport.LegRef{
 		Kind:       transport.KindUDP,
@@ -715,41 +752,53 @@ func TestBandwidthProbeRateAdvanceDoesNotLockCeilingBeforeTargetIsAttempted(t *t
 	}
 	legKey := newPingKey(udpLeg)
 	stepStartedAt := time.Now()
-	stepEndedAt := stepStartedAt.Add(time.Second)
 	in.bandwidthLegs[legKey] = &bandwidthLegState{
-		nextRateBps:   90_000_000,
+		key:           laneKey{sessionID: 99, laneID: 3},
+		nextRateBps:   216_000_000,
 		inFlight:      true,
-		lastStepBps:   56_000_000,
-		lastStepBytes: 7_000_000,
-		prevStepBytes: 7_100_000,
-		lastStepID:    1,
-		currentStepID: 1,
+		lastStepID:    3,
+		currentStepID: 3,
 		steps: map[uint64]*bandwidthProbeStep{
 			1: {
 				startedAt:      stepStartedAt,
-				endedAt:        stepEndedAt,
+				endedAt:        stepStartedAt.Add(time.Second),
 				rateBps:        90_000_000,
 				prevAckedBytes: 7_100_000,
-				sentBytes:      7_000_000,
 				ackedBytes:     7_000_000,
 				sentFrames:     100,
 				ackedFrames:    100,
 			},
+			2: {
+				startedAt:   stepStartedAt.Add(time.Second),
+				endedAt:     stepStartedAt.Add(2 * time.Second),
+				rateBps:     196_000_000,
+				ackedBytes:  25_000_000,
+				sentFrames:  100,
+				ackedFrames: 100,
+			},
+			3: {
+				startedAt:   stepStartedAt.Add(2 * time.Second),
+				endedAt:     stepStartedAt.Add(3 * time.Second),
+				rateBps:     206_000_000,
+				ackedBytes:  25_000_000,
+				sentFrames:  100,
+				ackedFrames: 100,
+			},
 		},
 	}
 
-	in.advanceBandwidthProbeRate(legKey)
+	in.completeBandwidthProbeTrain(laneKey{sessionID: 99, laneID: 3}, udpLeg, legKey)
 
 	state := in.bandwidthLegs[legKey]
-	if state.rateCeilingBps != 0 {
-		t.Fatalf("rate ceiling = %d, want none before target send rate is attempted", state.rateCeilingBps)
+	if state.rateCeilingBps != 200_000_000 {
+		t.Fatalf("rate ceiling = %d, want highest mature ACK ceiling 200Mbps", state.rateCeilingBps)
 	}
-	if state.nextRateBps != 100_000_000 {
-		t.Fatalf("next rate = %d, want additive increase to 100Mbps", state.nextRateBps)
+	if state.ceilingSample.stepID != 3 {
+		t.Fatalf("ceiling step = %d, want 3", state.ceilingSample.stepID)
 	}
 }
 
-func TestBandwidthProbeRateAdvanceDoesNotLockCeilingDuringEarlyRamp(t *testing.T) {
+func TestBandwidthProbeCompletionDoesNotLockCeilingDuringEarlyRamp(t *testing.T) {
 	in := New()
 	udpLeg := transport.LegRef{
 		Kind:       transport.KindUDP,
@@ -761,6 +810,7 @@ func TestBandwidthProbeRateAdvanceDoesNotLockCeilingDuringEarlyRamp(t *testing.T
 	stepAckedBytes := uint64(7_100_000)
 	stepEndedAt := stepStartedAt.Add(bandwidthProbeSampleDuration(stepAckedBytes, 56_800_000))
 	in.bandwidthLegs[legKey] = &bandwidthLegState{
+		key:           laneKey{sessionID: 99, laneID: 3},
 		nextRateBps:   66_000_000,
 		inFlight:      true,
 		lastStepBps:   56_800_000,
@@ -782,18 +832,18 @@ func TestBandwidthProbeRateAdvanceDoesNotLockCeilingDuringEarlyRamp(t *testing.T
 		},
 	}
 
-	in.advanceBandwidthProbeRate(legKey)
+	in.completeBandwidthProbeTrain(laneKey{sessionID: 99, laneID: 3}, udpLeg, legKey)
 
 	state := in.bandwidthLegs[legKey]
 	if state.rateCeilingBps != 0 {
 		t.Fatalf("rate ceiling = %d, want none during early ramp", state.rateCeilingBps)
 	}
-	if state.nextRateBps != 76_000_000 {
-		t.Fatalf("next rate = %d, want additive increase to 76Mbps", state.nextRateBps)
+	if state.ceilingSample.rateBps != 0 {
+		t.Fatalf("ceiling candidate = %d, want none during early ramp", state.ceilingSample.rateBps)
 	}
 }
 
-func TestBandwidthProbeRateAdvanceDoesNotLockCeilingOnIncompleteStepAck(t *testing.T) {
+func TestBandwidthProbeCompletionCanUsePartialAckWindow(t *testing.T) {
 	in := New()
 	udpLeg := transport.LegRef{
 		Kind:       transport.KindUDP,
@@ -805,6 +855,7 @@ func TestBandwidthProbeRateAdvanceDoesNotLockCeilingOnIncompleteStepAck(t *testi
 	stepAckedBytes := uint64(4_300_000)
 	stepEndedAt := stepStartedAt.Add(bandwidthProbeSampleDuration(stepAckedBytes, 60_000_000))
 	in.bandwidthLegs[legKey] = &bandwidthLegState{
+		key:           laneKey{sessionID: 99, laneID: 3},
 		nextRateBps:   90_000_000,
 		inFlight:      true,
 		lastStepBps:   60_000_000,
@@ -825,18 +876,15 @@ func TestBandwidthProbeRateAdvanceDoesNotLockCeilingOnIncompleteStepAck(t *testi
 		},
 	}
 
-	in.advanceBandwidthProbeRate(legKey)
+	in.completeBandwidthProbeTrain(laneKey{sessionID: 99, laneID: 3}, udpLeg, legKey)
 
 	state := in.bandwidthLegs[legKey]
-	if state.rateCeilingBps != 0 {
-		t.Fatalf("rate ceiling = %d, want none with incomplete ACKs", state.rateCeilingBps)
-	}
-	if state.nextRateBps != 100_000_000 {
-		t.Fatalf("next rate = %d, want additive increase to 100Mbps", state.nextRateBps)
+	if state.rateCeilingBps != 60_000_000 {
+		t.Fatalf("rate ceiling = %d, want ACK-derived 60Mbps", state.rateCeilingBps)
 	}
 }
 
-func TestBandwidthProbeRateAdvanceDoesNotLockCeilingBeforeTargetIsUnderdelivered(t *testing.T) {
+func TestBandwidthProbeCompletionDoesNotLockCeilingBeforeTargetIsUnderdelivered(t *testing.T) {
 	in := New()
 	udpLeg := transport.LegRef{
 		Kind:       transport.KindUDP,
@@ -848,6 +896,7 @@ func TestBandwidthProbeRateAdvanceDoesNotLockCeilingBeforeTargetIsUnderdelivered
 	stepAckedBytes := uint64(11_250_000)
 	stepEndedAt := stepStartedAt.Add(time.Second)
 	in.bandwidthLegs[legKey] = &bandwidthLegState{
+		key:           laneKey{sessionID: 99, laneID: 3},
 		nextRateBps:   90_000_000,
 		inFlight:      true,
 		lastStepBps:   90_000_000,
@@ -868,14 +917,14 @@ func TestBandwidthProbeRateAdvanceDoesNotLockCeilingBeforeTargetIsUnderdelivered
 		},
 	}
 
-	in.advanceBandwidthProbeRate(legKey)
+	in.completeBandwidthProbeTrain(laneKey{sessionID: 99, laneID: 3}, udpLeg, legKey)
 
 	state := in.bandwidthLegs[legKey]
 	if state.rateCeilingBps != 0 {
 		t.Fatalf("rate ceiling = %d, want none while target is delivered", state.rateCeilingBps)
 	}
-	if state.nextRateBps != 100_000_000 {
-		t.Fatalf("next rate = %d, want additive increase to 100Mbps", state.nextRateBps)
+	if state.ceilingSample.rateBps != 0 {
+		t.Fatalf("ceiling candidate = %d, want none while target is delivered", state.ceilingSample.rateBps)
 	}
 }
 

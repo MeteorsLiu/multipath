@@ -31,12 +31,8 @@ const (
 	bandwidthProbeGrowthMinDen         = uint64(10)
 	bandwidthProbeDeliveryMinNum       = uint64(99)
 	bandwidthProbeDeliveryMinDen       = uint64(100)
-	bandwidthProbeAttemptMinNum        = uint64(95)
-	bandwidthProbeAttemptMinDen        = uint64(100)
 	bandwidthProbeCeilingMinTargetBps  = bandwidthProbeMinRateBps + 6*bandwidthProbeAdditiveStepBps
 	bandwidthProbeLossIncreaseEpsilon  = 0.005
-	bandwidthProbeStepAckMinNum        = uint64(9)
-	bandwidthProbeStepAckMinDen        = uint64(10)
 	bandwidthProbeMaxFrames            = 64
 	bandwidthProbeMultiplicativeChunks = 0
 	bandwidthProbeAckEvery             = 16
@@ -63,6 +59,7 @@ type bandwidthLegState struct {
 	lastStepBytes  uint64
 	prevStepBytes  uint64
 	rateCeilingBps uint64
+	ceilingSample  bandwidthProbeCeilingSample
 	maxStepBps     uint64
 	steps          map[uint64]*bandwidthProbeStep
 	lastLoss       float64
@@ -82,6 +79,15 @@ type bandwidthProbeStep struct {
 	ackedBytes     uint64
 	sentFrames     uint64
 	ackedFrames    uint64
+}
+
+type bandwidthProbeCeilingSample struct {
+	stepID         uint64
+	rateBps        uint64
+	targetBps      uint64
+	prevAckedBytes uint64
+	ackedBytes     uint64
+	sentBps        uint64
 }
 
 type bandwidthProbeRound struct {
@@ -247,6 +253,7 @@ func (l *Send) maybeStartBandwidthProbe(ctx context.Context, key laneKey, leg tr
 	state.lastStepBytes = 0
 	state.prevStepBytes = 0
 	state.rateCeilingBps = 0
+	state.ceilingSample = bandwidthProbeCeilingSample{}
 	state.maxStepBps = 0
 	state.steps = make(map[uint64]*bandwidthProbeStep)
 	state.lastLoss = 0
@@ -683,7 +690,7 @@ func (l *Send) updateBandwidthProbeStepSample(state *bandwidthLegState, legKey p
 		return
 	}
 	l.refreshBandwidthProbeStepSample(state, stepID, step)
-	l.lockBandwidthProbeRateCeilingFromSteps(state, legKey)
+	l.updateBandwidthProbeRateCeilingCandidateFromSteps(state)
 }
 
 func (l *Send) refreshBandwidthProbeStepSample(state *bandwidthLegState, stepID uint64, step *bandwidthProbeStep) {
@@ -718,7 +725,6 @@ func (l *Send) advanceBandwidthProbeRate(legKey pingKey) {
 	}
 	if state.rateCeilingBps > 0 {
 		state.nextRateBps = state.rateCeilingBps
-	} else if l.lockBandwidthProbeRateCeilingFromSteps(state, legKey) {
 	} else if state.lastStepBps > 0 {
 		next := uint64(0)
 		if state.rampChunks < bandwidthProbeMultiplicativeChunks &&
@@ -745,44 +751,51 @@ func (l *Send) advanceBandwidthProbeRate(legKey pingKey) {
 	state.rampChunks++
 }
 
-func (l *Send) lockBandwidthProbeRateCeilingFromSteps(state *bandwidthLegState, legKey pingKey) bool {
-	if state == nil || state.rateCeilingBps > 0 {
-		return false
+func (l *Send) updateBandwidthProbeRateCeilingCandidateFromSteps(state *bandwidthLegState) {
+	if state == nil {
+		return
 	}
 	for stepID := uint64(1); stepID <= state.lastStepID; stepID++ {
 		step := state.steps[stepID]
-		if !l.lockBandwidthProbeRateCeilingForStep(state, legKey, stepID, step) {
-			continue
-		}
-		if stepID == state.lastStepID {
-			state.prevStepBytes = state.lastStepBytes
-			state.prevStepLoss = state.lastStepLoss
-		}
-		return true
+		updateBandwidthProbeRateCeilingCandidateForStep(state, stepID, step)
 	}
-	return false
 }
 
-func (l *Send) lockBandwidthProbeRateCeilingForStep(state *bandwidthLegState, legKey pingKey, stepID uint64, step *bandwidthProbeStep) bool {
-	if step == nil || step.endedAt.IsZero() || step.rateBps == 0 || state.rateCeilingBps > 0 {
-		return false
+func updateBandwidthProbeRateCeilingCandidateForStep(state *bandwidthLegState, stepID uint64, step *bandwidthProbeStep) {
+	if state == nil || step == nil || step.endedAt.IsZero() || step.rateBps == 0 {
+		return
 	}
 	stepBps := bandwidthProbeStepCeilingBps(step)
 	sentBps := bandwidthProbeStepSentBps(step)
 	prevAckedBytes := bandwidthProbePreviousStepAckedBytes(state, stepID, step)
-	if prevAckedBytes == 0 {
-		return false
-	}
-	if !bandwidthProbeStepAckComplete(step) ||
-		!bandwidthProbeTargetAttempted(sentBps, step.rateBps) ||
+	if stepBps == 0 ||
+		prevAckedBytes == 0 ||
 		!bandwidthProbeCeilingTargetMature(step.rateBps) ||
 		!bandwidthProbeUnderDelivered(stepBps, step.rateBps) ||
 		!bandwidthProbeGrowthStalled(prevAckedBytes, step.ackedBytes) {
+		return
+	}
+	if state.ceilingSample.rateBps != 0 && stepBps <= state.ceilingSample.rateBps {
+		return
+	}
+	state.ceilingSample = bandwidthProbeCeilingSample{
+		stepID:         stepID,
+		rateBps:        stepBps,
+		targetBps:      step.rateBps,
+		prevAckedBytes: prevAckedBytes,
+		ackedBytes:     step.ackedBytes,
+		sentBps:        sentBps,
+	}
+}
+
+func (l *Send) lockBandwidthProbeRateCeilingFromCandidate(state *bandwidthLegState, legKey pingKey) bool {
+	if state == nil || state.rateCeilingBps > 0 || state.ceilingSample.rateBps == 0 {
 		return false
 	}
-	state.rateCeilingBps = stepBps
-	state.nextRateBps = state.rateCeilingBps
-	debuglog.Printf("send/bw_probe", "rate_ceiling session=%d lane=%d kind=%s rate_bps=%d target_bps=%d prev_acked_bytes=%d acked_bytes=%d sent_bps=%d step_id=%d", state.key.sessionID, state.key.laneID, kindMetricLabel(legKey.kind), state.rateCeilingBps, step.rateBps, prevAckedBytes, step.ackedBytes, sentBps, stepID)
+	sample := state.ceilingSample
+	state.rateCeilingBps = sample.rateBps
+	state.nextRateBps = sample.rateBps
+	debuglog.Printf("send/bw_probe", "rate_ceiling session=%d lane=%d kind=%s rate_bps=%d target_bps=%d prev_acked_bytes=%d acked_bytes=%d sent_bps=%d step_id=%d", state.key.sessionID, state.key.laneID, kindMetricLabel(legKey.kind), sample.rateBps, sample.targetBps, sample.prevAckedBytes, sample.ackedBytes, sample.sentBps, sample.stepID)
 	return true
 }
 
@@ -849,28 +862,12 @@ func bandwidthProbeUnderDelivered(sampleBps, targetBps uint64) bool {
 	return sampleBps*bandwidthProbeDeliveryMinDen < targetBps*bandwidthProbeDeliveryMinNum
 }
 
-func bandwidthProbeTargetAttempted(sentBps, targetBps uint64) bool {
-	if sentBps == 0 || targetBps == 0 {
-		return false
-	}
-	return sentBps*bandwidthProbeAttemptMinDen >= targetBps*bandwidthProbeAttemptMinNum
-}
-
 func bandwidthProbeCeilingTargetMature(targetBps uint64) bool {
 	return targetBps >= bandwidthProbeCeilingMinTargetBps
 }
 
 func bandwidthProbeLossIncreased(prevLoss, currentLoss float64) bool {
 	return currentLoss > prevLoss+bandwidthProbeLossIncreaseEpsilon
-}
-
-func bandwidthProbeStepAckComplete(step *bandwidthProbeStep) bool {
-	sent := stepSentFrames(step)
-	if sent == 0 {
-		return false
-	}
-	acked := stepAckedFrames(step)
-	return acked*bandwidthProbeStepAckMinDen >= sent*bandwidthProbeStepAckMinNum
 }
 
 func stepSentFrames(step *bandwidthProbeStep) uint64 {
@@ -910,6 +907,8 @@ func (l *Send) completeBandwidthProbeTrain(key laneKey, leg transport.LegRef, le
 		state.endedAt = now
 	}
 	sampleBps := bandwidthWindowSampleBps(state.ackedBytes, state.startedAt, state.endedAt)
+	l.updateBandwidthProbeRateCeilingCandidateFromSteps(state)
+	l.lockBandwidthProbeRateCeilingFromCandidate(state, legKey)
 	state.ewmaBps = sampleBps
 	state.lastLoss = bandwidthAggregateLoss(state.sentFrames, state.ackedFrames)
 	state.sampleCount = 1
