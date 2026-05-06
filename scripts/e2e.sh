@@ -914,7 +914,7 @@ run_bandwidth_probe_convergence_case() {
   wait_ping_ok "${name} baseline-under-rate-limit" 12
   wait_bandwidth_probe_additive_ramp "${name}" "${CURRENT_CLIENT_LOG}" "${client_start_line}" 8 "client UDP bandwidth probe used additive ramp"
   wait_log_file_any_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" 35 "client bandwidth probe converged under UDP rate limit without static cap" "${client_start_line}" \
-    "rate_ceiling session=[0-9]+ lane=1 kind=udp rate_bps=[0-9]+ prev_acked_bytes=[0-9]+ acked_bytes=[0-9]+" \
+    "rate_ceiling session=[0-9]+ lane=1 kind=udp rate_bps=[0-9]+ target_bps=[0-9]+ prev_acked_bytes=[0-9]+ acked_bytes=[0-9]+" \
     "bandwidth_probe_decision .*lane=1 .*udp_qos_limited=true .*tcp_better=true selected_leg=tcp"
   wait_ping_ok "${name} post-convergence" 12
 
@@ -929,7 +929,7 @@ wait_bandwidth_probe_ceiling_sample() {
   local start_line="$3"
   local timeout="${4:-35}"
   local message="$5"
-  local min_bps="${6:-120000000}"
+  local min_bps="${6:-160000000}"
   local max_bps="${7:-260000000}"
   local deadline=$((SECONDS + timeout))
   local output status
@@ -942,23 +942,15 @@ wait_bandwidth_probe_ceiling_sample() {
       -v max_bps="${max_bps}" '
         NR <= start { next }
         /rate_ceiling .*kind=udp/ {
-          rate = prev = acked = 0
+          rate = target = prev = acked = 0
           for (i = 1; i <= NF; i++) {
             if ($i ~ /^rate_bps=/) { split($i, p, "="); rate = p[2] + 0 }
+            if ($i ~ /^target_bps=/) { split($i, p, "="); target = p[2] + 0 }
             if ($i ~ /^prev_acked_bytes=/) { split($i, p, "="); prev = p[2] + 0 }
             if ($i ~ /^acked_bytes=/) { split($i, p, "="); acked = p[2] + 0 }
           }
-          if (rate > 0 && prev > 0 && acked > 0 && acked * 10 < prev * 11) {
+          if (rate > 0 && target > 0 && prev > 0 && acked > 0 && rate * 100 < target * 99 && acked * 10 < prev * 11) {
             ceiling = rate
-          }
-        }
-        /train_finish .*leg=\{udp / {
-          bps = 0
-          for (i = 1; i <= NF; i++) {
-            if ($i ~ /^window_bps=/) { split($i, p, "="); bps = p[2] + 0 }
-          }
-          if (bps > 0) {
-            sample = bps
           }
         }
         END {
@@ -966,15 +958,11 @@ wait_bandwidth_probe_ceiling_sample() {
             print "need ceiling"
             exit 2
           }
-          if (sample == 0) {
-            print "need sample"
-            exit 2
-          }
-          if (sample < min_bps || sample > max_bps) {
-            printf("bad sample=%d ceiling=%d\n", sample, ceiling)
+          if (ceiling < min_bps || ceiling > max_bps) {
+            printf("bad ceiling=%d\n", ceiling)
             exit 1
           }
-          printf("ok sample=%d ceiling=%d\n", sample, ceiling)
+          printf("ok ceiling=%d\n", ceiling)
           exit 0
         }
       ' "${log_file}" 2>/dev/null)"
@@ -986,7 +974,7 @@ wait_bandwidth_probe_ceiling_sample() {
       return 0
       ;;
     1)
-      fail "${label}" "${message}: ACK-derived bandwidth outside [${min_bps}, ${max_bps}] bps: ${output#bad }"
+      fail "${label}" "${message}: ACK-derived ceiling outside [${min_bps}, ${max_bps}] bps: ${output#bad }"
       return 1
       ;;
     esac

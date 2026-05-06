@@ -255,6 +255,7 @@ func TestSendBandwidthProbeAckUpdatesLaneQuality(t *testing.T) {
 		probeID:      7,
 		count:        4,
 		payloadBytes: 1000,
+		frameBytes:   bandwidthProbeFrameBytes(1000),
 	}
 
 	if err := in.receiveBandwidthProbeAck(99, 3, udpLeg, protocol.BandwidthProbeAckBody{
@@ -363,7 +364,7 @@ func TestBandwidthProbeAckAttributesBytesToOriginalStep(t *testing.T) {
 	if step1 == nil {
 		t.Fatal("missing step 1")
 	}
-	wantAckedBytes := uint64(2 * round.payloadBytes)
+	wantAckedBytes := uint64(2 * round.frameBytes)
 	if step1.ackedBytes != wantAckedBytes {
 		t.Fatalf("step 1 ackedBytes = %d, want %d", step1.ackedBytes, wantAckedBytes)
 	}
@@ -419,15 +420,19 @@ func TestBandwidthProbeRateAdvanceLocksDynamicCeilingWhenAckBytesStopGrowing(t *
 		lastStepBps:   60_000_000,
 		lastStepBytes: 4_300_000,
 		prevStepBytes: 4_000_000,
+		currentStepID: 1,
+		steps: map[uint64]*bandwidthProbeStep{
+			1: {sentFrames: 100, ackedFrames: 100},
+		},
 	}
 
 	in.advanceBandwidthProbeRate(legKey)
 
 	state := in.bandwidthLegs[legKey]
-	if state.rateCeilingBps != 90_000_000 {
-		t.Fatalf("rate ceiling = %d, want 90Mbps", state.rateCeilingBps)
+	if state.rateCeilingBps != 60_000_000 {
+		t.Fatalf("rate ceiling = %d, want ACK-derived 60Mbps", state.rateCeilingBps)
 	}
-	if state.nextRateBps != 90_000_000 {
+	if state.nextRateBps != 60_000_000 {
 		t.Fatalf("next rate = %d, want dynamic ceiling", state.nextRateBps)
 	}
 
@@ -435,8 +440,70 @@ func TestBandwidthProbeRateAdvanceLocksDynamicCeilingWhenAckBytesStopGrowing(t *
 	state.lastStepBytes = 5_000_000
 	in.advanceBandwidthProbeRate(legKey)
 
-	if state.nextRateBps != 90_000_000 {
+	if state.nextRateBps != 60_000_000 {
 		t.Fatalf("next rate after ceiling = %d, want dynamic ceiling", state.nextRateBps)
+	}
+}
+
+func TestBandwidthProbeRateAdvanceDoesNotLockCeilingOnIncompleteStepAck(t *testing.T) {
+	in := New()
+	udpLeg := transport.LegRef{
+		Kind:       transport.KindUDP,
+		EndpointID: "udp0",
+		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
+	}
+	legKey := newPingKey(udpLeg)
+	in.bandwidthLegs[legKey] = &bandwidthLegState{
+		nextRateBps:   90_000_000,
+		inFlight:      true,
+		lastStepBps:   60_000_000,
+		lastStepBytes: 4_300_000,
+		prevStepBytes: 4_000_000,
+		currentStepID: 1,
+		steps: map[uint64]*bandwidthProbeStep{
+			1: {sentFrames: 100, ackedFrames: 80},
+		},
+	}
+
+	in.advanceBandwidthProbeRate(legKey)
+
+	state := in.bandwidthLegs[legKey]
+	if state.rateCeilingBps != 0 {
+		t.Fatalf("rate ceiling = %d, want none with incomplete ACKs", state.rateCeilingBps)
+	}
+	if state.nextRateBps != 100_000_000 {
+		t.Fatalf("next rate = %d, want additive increase to 100Mbps", state.nextRateBps)
+	}
+}
+
+func TestBandwidthProbeRateAdvanceDoesNotLockCeilingBeforeTargetIsUnderdelivered(t *testing.T) {
+	in := New()
+	udpLeg := transport.LegRef{
+		Kind:       transport.KindUDP,
+		EndpointID: "udp0",
+		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
+	}
+	legKey := newPingKey(udpLeg)
+	in.bandwidthLegs[legKey] = &bandwidthLegState{
+		nextRateBps:   90_000_000,
+		inFlight:      true,
+		lastStepBps:   90_000_000,
+		lastStepBytes: 4_300_000,
+		prevStepBytes: 4_000_000,
+		currentStepID: 1,
+		steps: map[uint64]*bandwidthProbeStep{
+			1: {sentFrames: 100, ackedFrames: 100},
+		},
+	}
+
+	in.advanceBandwidthProbeRate(legKey)
+
+	state := in.bandwidthLegs[legKey]
+	if state.rateCeilingBps != 0 {
+		t.Fatalf("rate ceiling = %d, want none while target is delivered", state.rateCeilingBps)
+	}
+	if state.nextRateBps != 100_000_000 {
+		t.Fatalf("next rate = %d, want additive increase to 100Mbps", state.nextRateBps)
 	}
 }
 
@@ -523,7 +590,7 @@ func TestBandwidthProbeRateAdvanceTreatsFirstLossAsIncrease(t *testing.T) {
 }
 
 func TestBandwidthProbeLimiterUsesByteRateAndShortBurst(t *testing.T) {
-	limiter := newBandwidthProbeLimiter(bandwidthProbeMinRateBps, bandwidthProbeUDPMinPayloadSize)
+	limiter := newBandwidthProbeLimiter(bandwidthProbeMinRateBps, bandwidthProbeFrameBytes(bandwidthProbeUDPMinPayloadSize))
 	if limiter == nil {
 		t.Fatal("missing limiter")
 	}
@@ -532,6 +599,33 @@ func TestBandwidthProbeLimiterUsesByteRateAndShortBurst(t *testing.T) {
 	}
 	if got := limiter.Limit(); got != 2_000_000 {
 		t.Fatalf("limit = %v, want 2000000 bytes/s", got)
+	}
+}
+
+func TestBandwidthProbeRoundPacesEncodedFrameBytes(t *testing.T) {
+	in := New()
+	key := laneKey{sessionID: 99, laneID: 3}
+	udpLeg := transport.LegRef{
+		Kind:       transport.KindUDP,
+		EndpointID: "udp0",
+		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
+	}
+	legKey := newPingKey(udpLeg)
+	in.bandwidthLegs[legKey] = &bandwidthLegState{
+		nextRateBps:   bandwidthProbeMinRateBps,
+		inFlight:      true,
+		currentStepID: 1,
+	}
+
+	round := in.startBandwidthProbeRound(key, udpLeg, legKey, time.Now())
+	if round == nil {
+		t.Fatal("missing bandwidth probe round")
+	}
+	if round.frameBytes != round.payloadBytes+bandwidthProbeFrameOverhead {
+		t.Fatalf("frame bytes = %d, want payload + overhead %d", round.frameBytes, round.payloadBytes+bandwidthProbeFrameOverhead)
+	}
+	if got := probeFrameCount(round.rateBps, round.frameBytes); round.count != got {
+		t.Fatalf("round count = %d, want frame-byte based %d", round.count, got)
 	}
 }
 
@@ -679,6 +773,7 @@ func TestBandwidthProbeDoesNotUpdateLaneQualityBeforeTrainCompletes(t *testing.T
 		probeID:      7,
 		count:        4,
 		payloadBytes: 1000,
+		frameBytes:   bandwidthProbeFrameBytes(1000),
 		received:     0x0f,
 	}
 
