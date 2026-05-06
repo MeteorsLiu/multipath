@@ -80,30 +80,24 @@ func nextBandwidthProbeRate(rate, cap uint64, growthStalled bool) uint64 {
 }
 
 type bandwidthLegState struct {
-	key           laneKey
-	nextRateBps   uint64
-	ewmaBps       uint64
-	inFlight      bool
-	complete      bool
-	startedAt     time.Time
-	endedAt       time.Time
-	sampleCount   uint32
-	rampChunks    uint32
-	sentFrames    uint64
-	ackedFrames   uint64
-	ackedBytes    uint64
-	currentStepID uint64
-	lastStepID    uint64
-	stepStartedAt time.Time
-	lastStepBps   uint64
-	lastStepBytes uint64
-	prevStepBytes uint64
-	maxStepBps    uint64
-	steps         map[uint64]*bandwidthProbeStep
-	lastLoss      float64
-	prevStepLoss  float64
-	lastStepLoss  float64
-	lastRoundLoss float64
+	key      laneKey
+	capBps   uint64
+	rateBps  uint64
+
+	inFlight  bool
+	complete  bool
+	startedAt time.Time
+	endedAt   time.Time
+
+	sentFrames  uint64
+	ackedFrames uint64
+	ackedBytes  uint64
+
+	steps     map[uint64]*bandwidthProbeStep
+	stepOrder []uint64
+	stepBps   []uint64
+
+	lastLoss float64
 }
 
 type bandwidthProbeStep struct {
