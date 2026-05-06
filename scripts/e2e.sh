@@ -933,6 +933,7 @@ run_bandwidth_probe_tcp_reference_case() {
   client_start_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
   wait_ping_ok "${name} baseline" 12
   wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "send/bw_probe: train_finish .*leg=\\{tcp .*window_bps=[0-9]+" 20 "client measured TCP reference first" "${client_start_line}"
+  wait_bandwidth_probe_udp_rate_window "${name}" "${CURRENT_CLIENT_LOG}" "${client_start_line}" 40 "client UDP probe measured 200mbit bottleneck without excessive probe target" 160000000 260000000 300000000
   wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "bandwidth_probe_decision .*lane=1 .*udp_qos_limited=true .*tcp_better=true selected_leg=tcp" 35 "client classified UDP relative to TCP reference" "${client_start_line}"
 
   stop_multipath
@@ -984,6 +985,87 @@ count_log_pattern() {
     return 0
   fi
   grep -c "${pattern}" "${log_file}" || true
+}
+
+wait_bandwidth_probe_udp_rate_window() {
+  local label="$1"
+  local log_file="$2"
+  local start_line="$3"
+  local timeout="${4:-35}"
+  local message="$5"
+  local min_window_bps="$6"
+  local max_window_bps="$7"
+  local max_target_bps="$8"
+  local deadline=$((SECONDS + timeout))
+  local output status
+
+  while (( SECONDS < deadline )); do
+    set +e
+    output="$(awk \
+      -v start="${start_line}" \
+      -v min_window="${min_window_bps}" \
+      -v max_window="${max_window_bps}" \
+      -v max_target="${max_target_bps}" '
+        NR <= start { next }
+        /send\/bw_probe: round_start/ && /leg=\{udp/ {
+          rate = 0
+          for (i = 1; i <= NF; i++) {
+            if ($i ~ /^rate_bps=/) {
+              split($i, parts, "=")
+              rate = parts[2] + 0
+              break
+            }
+          }
+          if (rate > max_rate) {
+            max_rate = rate
+          }
+        }
+        /send\/bw_probe: train_finish/ && /leg=\{udp/ {
+          for (i = 1; i <= NF; i++) {
+            if ($i ~ /^window_bps=/) {
+              split($i, parts, "=")
+              window_bps = parts[2] + 0
+              finish = 1
+            }
+          }
+        }
+        END {
+          if (!finish) {
+            print "need udp train_finish"
+            exit 2
+          }
+          if (window_bps < min_window || window_bps > max_window) {
+            printf("bad-window window_bps=%d max_rate_bps=%d\n", window_bps, max_rate)
+            exit 1
+          }
+          if (max_rate > max_target) {
+            printf("bad-target window_bps=%d max_rate_bps=%d\n", window_bps, max_rate)
+            exit 1
+          }
+          printf("ok window_bps=%d max_rate_bps=%d\n", window_bps, max_rate)
+          exit 0
+        }
+      ' "${log_file}" 2>/dev/null)"
+    status=$?
+    set -e
+    case "${status}" in
+    0)
+      pass "${label}" "${message}: ${output#ok }"
+      return 0
+      ;;
+    1)
+      fail "${label}" "${message}: ${output}"
+      return 1
+      ;;
+    esac
+    if ! check_multipath_alive "${label}"; then
+      return 1
+    fi
+    ping_once_from "${NS_C}" "${TUN_C_REMOTE}" || true
+    sleep 0.2
+  done
+  fail "${label}" "${message}: UDP train_finish not observed within ${timeout}s"
+  return 1
 }
 
 assert_log_not_contains() {
