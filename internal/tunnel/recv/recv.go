@@ -116,7 +116,7 @@ func (o *Recv) WriteTo(ctx context.Context, leg transport.LegRef, packet *packet
 		)
 		return nil
 	}
-	if debuglog.Enabled() && !debugSuppressFrame(frame) {
+	if debuglog.Enabled() {
 		debuglog.Printf("recv", "frame_in %s leg={%s}", debugFrameSummary(frame), debugLeg(leg))
 	}
 	metrics.IncCounter(metrics.ProtocolFramesTotal,
@@ -212,6 +212,7 @@ func (o *Recv) handleBandwidthProbe(ctx context.Context, leg transport.LegRef, f
 		debuglog.Printf("recv/control", "bw_probe_invalid_body session=%d lane=%d", frame.SessionID, frame.LaneID)
 		return protocol.ErrInvalidFrame
 	}
+	debuglog.Printf("recv/control", "bw_probe session=%d lane=%d leg={%s}", frame.SessionID, frame.LaneID, debugLeg(leg))
 	if o.control == nil {
 		debuglog.Printf("recv/control", "bw_probe_drop no_control session=%d lane=%d", frame.SessionID, frame.LaneID)
 		return nil
@@ -224,6 +225,7 @@ func (o *Recv) handleBandwidthProbeAck(ctx context.Context, leg transport.LegRef
 		debuglog.Printf("recv/control", "bw_probe_ack_invalid_body session=%d lane=%d", frame.SessionID, frame.LaneID)
 		return protocol.ErrInvalidFrame
 	}
+	debuglog.Printf("recv/control", "bw_probe_ack session=%d lane=%d leg={%s}", frame.SessionID, frame.LaneID, debugLeg(leg))
 	if o.control == nil {
 		debuglog.Printf("recv/control", "bw_probe_ack_drop no_control session=%d lane=%d", frame.SessionID, frame.LaneID)
 		return nil

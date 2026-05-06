@@ -32,10 +32,6 @@ func debugFrameSummary(frame protocol.Frame) string {
 	}
 }
 
-func debugSuppressFrame(frame protocol.Frame) bool {
-	return frame.Type == protocol.TypeBandwidthProbe || frame.Type == protocol.TypeBandwidthProbeAck
-}
-
 func debugFrameType(frameType protocol.FrameType) string {
 	switch frameType {
 	case protocol.TypeHELLO:
