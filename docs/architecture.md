@@ -551,6 +551,9 @@ returning or transfer ownership to its own output channel before returning.
 After WriteTo returns, Transport must not read or release packet.
 Transport RunWriter consumes Payload values and releases Payload.Packet after
 the transport write returns.
+Transport RunWriter must not allow a blocked write on one transport leg to
+prevent writes on another leg. It preserves write order within each concrete
+leg, but different legs may be written independently.
 Transport Write/WriteTo must not retain payload after returning unless it
 copies bytes itself.
 ```

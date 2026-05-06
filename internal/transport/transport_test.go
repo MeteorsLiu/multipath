@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"net"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/MeteorsLiu/multipath/internal/packetbuf"
 )
@@ -52,8 +54,57 @@ func TestRunWriterDropsStaleTCPConn(t *testing.T) {
 	}
 }
 
+func TestRunWriterDoesNotBlockUDPBehindBlockedTCP(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	packets := make(chan Payload, 2)
+	stream := &runWriterStream{
+		block: make(chan struct{}),
+	}
+	packet := &runWriterPacket{wrote: make(chan struct{})}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- RunWriter(ctx, packets, packet, stream)
+	}()
+
+	tcpPacket := packetbuf.Acquire(16)
+	udpPacket := packetbuf.Acquire(16)
+	packets <- Payload{
+		Leg:    LegRef{Kind: KindTCP, ConnID: "blocked"},
+		Packet: tcpPacket,
+	}
+	packets <- Payload{
+		Leg: LegRef{
+			Kind:       KindUDP,
+			EndpointID: "udp0",
+			RemoteAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1234},
+		},
+		Packet: udpPacket,
+	}
+
+	select {
+	case <-packet.wrote:
+	case <-time.After(time.Second):
+		t.Fatal("UDP write blocked behind TCP write")
+	}
+
+	cancel()
+	close(stream.block)
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("RunWriter err = %v, want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("RunWriter did not stop after context cancellation")
+	}
+}
+
 type runWriterStream struct {
 	err    error
+	block  chan struct{}
 	writes int
 }
 
@@ -68,9 +119,33 @@ func (s *runWriterStream) Dial(ctx context.Context, remote string) (LegRef, erro
 
 func (s *runWriterStream) Write(ctx context.Context, connID string, payload []byte) (int, error) {
 	s.writes++
+	if s.block != nil {
+		select {
+		case <-s.block:
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+	}
 	return 0, s.err
 }
 
 func (s *runWriterStream) Close(ctx context.Context, connID string) error {
 	return nil
+}
+
+type runWriterPacket struct {
+	once  sync.Once
+	wrote chan struct{}
+}
+
+func (p *runWriterPacket) Run(ctx context.Context, writer PacketWriter) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (p *runWriterPacket) WriteTo(ctx context.Context, endpointID string, remote net.Addr, payload []byte) (int, error) {
+	p.once.Do(func() {
+		close(p.wrote)
+	})
+	return len(payload), nil
 }
