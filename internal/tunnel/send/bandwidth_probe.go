@@ -224,6 +224,9 @@ func (l *Send) bandwidthProbeAwaitingTCPReference(key laneKey, lane *laneRuntime
 	if tcpQ.ProbeSamples >= minBandwidthProbeSamples {
 		return false
 	}
+	if !tcpQ.Active {
+		return false
+	}
 	if newPingKey(tcpLeg).kind != 0 {
 		return true
 	}
