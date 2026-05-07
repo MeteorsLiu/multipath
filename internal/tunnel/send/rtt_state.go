@@ -59,8 +59,8 @@ func (l *Send) recordRTTPing(target probe.Target, pingID uint64, timeMS uint64, 
 	l.rttPending[rttPendingKey{target: target, pingID: pingID}] = rttPendingPing{
 		sessionID:  binding.sessionID,
 		laneID:     binding.laneID,
-		legKey:    newPingKey(binding.leg),
-		timeMS:    timeMS,
+		legKey:     newPingKey(binding.leg),
+		timeMS:     timeMS,
 		deadlineMS: deadlineMS,
 	}
 	l.rttMu.Unlock()
