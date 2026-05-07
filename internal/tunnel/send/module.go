@@ -553,6 +553,9 @@ func frameEncodeCapacity(frame protocol.Frame) (int, error) {
 			return 0, protocol.ErrInvalidFrame
 		}
 		return headerSize + 36, nil
+	case protocol.TypeBandwidthProbeDone:
+		_, ok := frame.Body.(protocol.BandwidthProbeDoneBody)
+		return headerSize + 8, validFrameBody(ok)
 	default:
 		return 0, protocol.ErrInvalidFrame
 	}

@@ -52,6 +52,8 @@ func debugFrameType(frameType protocol.FrameType) string {
 		return "BW_PROBE"
 	case protocol.TypeBandwidthProbeAck:
 		return "BW_PROBE_ACK"
+	case protocol.TypeBandwidthProbeDone:
+		return "BW_PROBE_DONE"
 	default:
 		return fmt.Sprintf("UNKNOWN(%d)", frameType)
 	}
