@@ -946,22 +946,18 @@ run_bandwidth_probe_tcp_reference_case() {
   wait_ping_ok "${name} baseline" 12
   wait_client_tcp_reference_probe "${name}" "${client_start_line}"
 
-  set +e
-  wait_bandwidth_probe_udp_rate_window "${name}" "${CURRENT_CLIENT_LOG}" "${client_start_line}" 40 "client UDP probe measured 200mbit bottleneck without excessive probe target" 160000000 260000000 300000000
-  local probe_window_ok=$?
-  set -e
+  echo "[${name}] waiting for UDP probe train_finish..."
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "send/bw_probe: train_finish .*leg=\\{udp .*window_bps=[0-9]+" 40 "UDP probe completed" "${client_start_line}"
 
   echo "[${name}] probe log summary (client UDP leg):"
-  grep -n -F 'send/bw_probe:' "${CURRENT_CLIENT_LOG}" | grep -F 'leg={udp' | sed 's/^/[probe-debug] /' || echo "[probe-debug] (no entries)"
+  grep -n -F 'send/bw_probe:' "${CURRENT_CLIENT_LOG}" 2>/dev/null | grep -F 'leg={udp' | sed 's/^/[probe-debug] /' || echo "[probe-debug] (no entries)"
 
   echo "[${name}] tc stats after test (client ${VETHC1}):"
   ip netns exec "${NS_C}" tc -s qdisc show dev "${VETHC1}" 2>&1 | sed 's/^/[tc-after] /' || echo "[tc-after] (failed)"
   echo "[${name}] tc stats after test (server ${VETHS1}):"
   ip netns exec "${NS_S}" tc -s qdisc show dev "${VETHS1}" 2>&1 | sed 's/^/[tc-after] /' || echo "[tc-after] (failed)"
 
-  if [[ ${probe_window_ok} -ne 0 ]]; then
-    fail "${name}" "client UDP probe window check failed (see debug above)"
-  fi
+  wait_bandwidth_probe_udp_rate_window "${name}" "${CURRENT_CLIENT_LOG}" "${client_start_line}" 5 "client UDP probe measured 200mbit bottleneck without excessive probe target" 160000000 260000000 300000000
   wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "bandwidth_probe_decision .*lane=1 .*udp_qos_limited=true .*tcp_better=true selected_leg=tcp" 35 "client classified UDP relative to TCP reference" "${client_start_line}"
 
   stop_multipath
