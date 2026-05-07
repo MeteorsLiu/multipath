@@ -886,7 +886,6 @@ run_leg_selector_case() {
   client_qos_start_line="$(current_log_file_line_count "${client_log_file}")"
   server_qos_start_line="$(current_log_file_line_count "${server_log_file}")"
   start_multipath "${name}"
-  echo "[${name}] DEBUG: CURRENT_CLIENT_LOG=${CURRENT_CLIENT_LOG} CURRENT_SERVER_LOG=${CURRENT_SERVER_LOG} client_qos_start_line=${client_qos_start_line} server_qos_start_line=${server_qos_start_line}"
   wait_log_pattern "${name}" "accept_hello_ack session=[0-9]+ lane=1 .*tcp conn=" 20 "warm TCP fallback leg reached HELLO_ACK"
   wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "bandwidth_probe_decision .*lane=1 .*udp_qos_limited=true .*tcp_better=true selected_leg=tcp" 45 "client produced bandwidth-probe QoS decision" "${client_qos_start_line}"
   local client_select_start_line
@@ -916,7 +915,6 @@ run_bandwidth_probe_convergence_case() {
   start_multipath "${name}"
 
   wait_ping_ok "${name} baseline-under-rate-limit" 12
-  echo "[${name}] DEBUG: CURRENT_CLIENT_LOG=${CURRENT_CLIENT_LOG} start_line=${client_start_line}"
   wait_client_tcp_reference_probe "${name}" "${client_start_line}"
   wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "bandwidth_probe_decision .*lane=1 .*udp_qos_limited=true .*tcp_better=true selected_leg=tcp" 35 "client bandwidth probe classified UDP relative to TCP" "${client_start_line}"
   wait_ping_ok "${name} post-convergence" 12
@@ -938,7 +936,6 @@ run_bandwidth_probe_tcp_reference_case() {
   client_start_line="$(current_log_file_line_count "${client_log_file}")"
   start_multipath "${name}"
   wait_ping_ok "${name} baseline" 12
-  echo "[${name}] DEBUG: CURRENT_CLIENT_LOG=${CURRENT_CLIENT_LOG} start_line=${client_start_line}"
   wait_client_tcp_reference_probe "${name}" "${client_start_line}"
   wait_bandwidth_probe_udp_rate_window "${name}" "${CURRENT_CLIENT_LOG}" "${client_start_line}" 40 "client UDP probe measured 200mbit bottleneck without excessive probe target" 160000000 260000000 300000000
   wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "bandwidth_probe_decision .*lane=1 .*udp_qos_limited=true .*tcp_better=true selected_leg=tcp" 35 "client classified UDP relative to TCP reference" "${client_start_line}"
@@ -1272,8 +1269,14 @@ wait_log_file_pattern_while_ping_from() {
   fi
 
   local deadline=$((SECONDS + timeout))
+  local grep_cmd
+  if [[ -z "${start_line}" || "${start_line}" == "0" ]]; then
+    grep_cmd() { grep -E -q "${pattern}" "${log_file}"; }
+  else
+    grep_cmd() { tail -n "+$((start_line + 1))" "${log_file}" | grep -E -q "${pattern}"; }
+  fi
   while (( SECONDS < deadline )); do
-    if [[ -f "${log_file}" ]] && tail -n "+$((start_line + 1))" "${log_file}" | grep -E -q "${pattern}"; then
+    if [[ -f "${log_file}" ]] && grep_cmd; then
       pass "${label}" "${message}"
       return 0
     fi
@@ -1281,13 +1284,13 @@ wait_log_file_pattern_while_ping_from() {
       return 1
     fi
     ping_once_from "${ping_ns}" "${ping_remote}" || true
-    if [[ -f "${log_file}" ]] && tail -n "+$((start_line + 1))" "${log_file}" | grep -E -q "${pattern}"; then
+    if [[ -f "${log_file}" ]] && grep_cmd; then
       pass "${label}" "${message}"
       return 0
     fi
     sleep 0.2
   done
-  if [[ -f "${log_file}" ]] && tail -n "+$((start_line + 1))" "${log_file}" | grep -E -q "${pattern}"; then
+  if [[ -f "${log_file}" ]] && grep_cmd; then
     pass "${label}" "${message}"
     return 0
   fi

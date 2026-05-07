@@ -143,12 +143,10 @@ type bandwidthRXRound struct {
 
 func (l *Send) probeBandwidth(ctx context.Context, now time.Time) {
 	if !l.bandwidthProbe {
-		debuglog.Printf("send/bw_probe", "probe_disabled")
 		return
 	}
 	sessionID, ok := l.activeSession()
 	if !ok {
-		debuglog.Printf("send/bw_probe", "probe_no_session has_session=%t session_id=%d", l.hasActiveSession.Load(), l.activeSessionID.Load())
 		return
 	}
 
@@ -176,12 +174,10 @@ func (l *Send) probeBandwidth(ctx context.Context, now time.Time) {
 
 	selectedLane, ok := l.activeBandwidthLane(sessionID)
 	if ok {
-		debuglog.Printf("send/bw_probe", "probe_scan_skip active_probe=%t", true)
 		return
 	}
 	for _, item := range lanes {
 		if !l.isBandwidthProbeServerReady(item.key) {
-			debuglog.Printf("send/bw_probe", "probe_scan_skip server_not_ready session=%d lane=%d", item.key.sessionID, item.key.laneID)
 			continue
 		}
 		udpLeg, udpQ, tcpLeg, tcpQ := item.lane.legQualities()
@@ -191,7 +187,6 @@ func (l *Send) probeBandwidth(ctx context.Context, now time.Time) {
 		}
 	}
 	if selectedLane.sessionID == 0 {
-		debuglog.Printf("send/bw_probe", "probe_no_candidate lanes=%d", len(lanes))
 		return
 	}
 
@@ -210,7 +205,6 @@ func (l *Send) probeBandwidth(ctx context.Context, now time.Time) {
 	for _, item := range candidates {
 		l.maybeStartBandwidthProbe(ctx, item.key, item.leg, now)
 	}
-	debuglog.Printf("send/bw_probe", "probe_scan session=%d lanes=%d selected_session=%d candidates=%d server_ready_map=%t", sessionID, len(lanes), selectedLane.sessionID, len(candidates), l.bandwidthProbeServerReady != nil)
 }
 
 func (l *Send) bandwidthProbeCandidate(key laneKey, lane *laneRuntime, udpLeg transport.LegRef, udpQ LegQuality, tcpLeg transport.LegRef, tcpQ LegQuality) (transport.LegRef, bool) {
@@ -218,7 +212,6 @@ func (l *Send) bandwidthProbeCandidate(key laneKey, lane *laneRuntime, udpLeg tr
 		return tcpLeg, true
 	}
 	if !l.bandwidthProbeNeeded(udpLeg, udpQ) {
-		debuglog.Printf("send/bw_probe", "probe_candidate_skip session=%d lane=%d tcp_active=%t tcp_needed=%t udp_active=%t udp_kind=%d", key.sessionID, key.laneID, tcpQ.Active, l.bandwidthProbeNeeded(tcpLeg, tcpQ), udpQ.Active, udpLeg.Kind)
 		return transport.LegRef{}, false
 	}
 	if l.bandwidthProbeAwaitingTCPReference(key, lane, tcpLeg, tcpQ) {
