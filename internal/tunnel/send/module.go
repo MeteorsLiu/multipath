@@ -46,12 +46,13 @@ var (
 //     fecProfile, negotiatedCaps, nextProbeTarget) need no lock.
 type Send struct {
 	// Immutable after construction.
-	sessionManager      *sessionpkg.Manager
-	streamTransport     transport.StreamTransport
-	probeInterval       time.Duration
-	probeTimeout        time.Duration
-	bandwidthProbe      bool
-	fecFlushAlpha       uint32
+	sessionManager         *sessionpkg.Manager
+	streamTransport        transport.StreamTransport
+	probeInterval          time.Duration
+	probeTimeout           time.Duration
+	bandwidthProbe         bool
+	bandwidthProbeCapBps   uint64
+	fecFlushAlpha          uint32
 	fecFlushMinMs       uint32
 	fecFlushMaxMs       uint32
 	fecFlushColdStartMs uint32
@@ -169,6 +170,9 @@ func (l *Send) applyConfig(cfg Config) {
 		l.fecFlushColdStartMs = cfg.FECFlushColdStartMs
 	}
 	l.fecFlushFixedMs = cfg.FECFlushFixedMs
+	if cfg.BandwidthProbeCapBps > 0 {
+		l.bandwidthProbeCapBps = cfg.BandwidthProbeCapBps
+	}
 	if cfg.ProbeEvents != nil {
 		l.probeEvents = cfg.ProbeEvents
 	}

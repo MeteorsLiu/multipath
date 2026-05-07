@@ -19,8 +19,9 @@ type Config struct {
 	FECFlushMinMs       uint32
 	FECFlushMaxMs       uint32
 	FECFlushColdStartMs uint32
-	FECFlushFixedMs     uint32
-	BootstrapLanes      []BootstrapLane
+	FECFlushFixedMs      uint32
+	BandwidthProbeCapBps uint64
+	BootstrapLanes       []BootstrapLane
 }
 
 type BootstrapLane struct {

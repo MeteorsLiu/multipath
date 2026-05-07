@@ -298,8 +298,8 @@ func (l *Send) maybeStartBandwidthProbe(ctx context.Context, key laneKey, leg tr
 	state.stepOrder = nil
 	state.stepBps = nil
 	state.lastLoss = 0
-	state.capBps = 0
-	state.rateBps = bandwidthProbeStartRate(0)
+	state.capBps = l.bandwidthProbeCapBps
+	state.rateBps = bandwidthProbeStartRate(l.bandwidthProbeCapBps)
 	l.bandwidthMu.Unlock()
 
 	debuglog.Printf("send/bw_probe", "train_start session=%d lane=%d leg={%s} cap_bps=%d start_bps=%d window=%s", key.sessionID, key.laneID, debugLeg(leg), state.capBps, state.rateBps, bandwidthProbeWindow)

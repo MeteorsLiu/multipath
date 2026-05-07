@@ -47,8 +47,9 @@ type Config struct {
 	FECFlushMaxMs       uint32       `json:"fecFlushMaxMs,omitempty"`
 	FECFlushColdStartMs uint32       `json:"fecFlushColdStartMs,omitempty"`
 	FECFlushFixedMs     uint32       `json:"fecFlushFixedMs,omitempty"`
-	ProbeIntervalMS     int          `json:"probeIntervalMS"`
-	ProbeTimeoutMS      int          `json:"probeTimeoutMS"`
+	ProbeIntervalMS       int   `json:"probeIntervalMS"`
+	ProbeTimeoutMS        int   `json:"probeTimeoutMS"`
+	BandwidthProbeCapBps  int64 `json:"bandwidthProbeCapBps"`
 }
 
 func ParseConfig(path string) (Config, error) {
@@ -78,6 +79,9 @@ func (c *Config) setDefaults() {
 	}
 	if c.ProbeTimeoutMS == 0 {
 		c.ProbeTimeoutMS = int(defaultProbeTimeout / time.Millisecond)
+	}
+	if c.BandwidthProbeCapBps == 0 {
+		c.BandwidthProbeCapBps = 200_000_000
 	}
 	for i := range c.Client.RemotePaths {
 		if c.Client.RemotePaths[i].Weight <= 0 {

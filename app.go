@@ -87,17 +87,18 @@ func buildServerRuntime(cfg Config, device *tun.Device) (*appRuntime, []io.Close
 	probeEvents := make(chan probecore.Event, 128)
 	sessions := &session.Manager{}
 	in := send.New(send.Config{
-		StreamTransport:     streamTransport,
-		SessionManager:      sessions,
-		ProbeInterval:       cfg.probeInterval(),
-		ProbeTimeout:        cfg.probeTimeout(),
-		ProbeEvents:         probeEvents,
-		EnableFEC:           cfg.FEC,
-		FECFlushAlpha:       cfg.FECFlushAlpha,
-		FECFlushMinMs:       cfg.FECFlushMinMs,
-		FECFlushMaxMs:       cfg.FECFlushMaxMs,
-		FECFlushColdStartMs: cfg.FECFlushColdStartMs,
-		FECFlushFixedMs:     cfg.FECFlushFixedMs,
+		StreamTransport:        streamTransport,
+		SessionManager:         sessions,
+		ProbeInterval:          cfg.probeInterval(),
+		ProbeTimeout:           cfg.probeTimeout(),
+		ProbeEvents:            probeEvents,
+		EnableFEC:              cfg.FEC,
+		FECFlushAlpha:          cfg.FECFlushAlpha,
+		FECFlushMinMs:          cfg.FECFlushMinMs,
+		FECFlushMaxMs:          cfg.FECFlushMaxMs,
+		FECFlushColdStartMs:    cfg.FECFlushColdStartMs,
+		FECFlushFixedMs:        cfg.FECFlushFixedMs,
+		BandwidthProbeCapBps:   uint64(cfg.BandwidthProbeCapBps),
 	})
 	in.EnableBandwidthProbeServerReady()
 	probeLoop := send.NewProbeLoop(in, send.ProbeLoopConfig{
@@ -177,18 +178,19 @@ func buildClientRuntime(cfg Config, device *tun.Device) (*appRuntime, []io.Close
 	probeEvents := make(chan probecore.Event, 128)
 	sessions := &session.Manager{}
 	in := send.New(send.Config{
-		StreamTransport:     streamTransport,
-		SessionManager:      sessions,
-		ProbeInterval:       cfg.probeInterval(),
-		ProbeTimeout:        cfg.probeTimeout(),
-		ProbeEvents:         probeEvents,
-		EnableFEC:           cfg.FEC,
-		FECFlushAlpha:       cfg.FECFlushAlpha,
-		FECFlushMinMs:       cfg.FECFlushMinMs,
-		FECFlushMaxMs:       cfg.FECFlushMaxMs,
-		FECFlushColdStartMs: cfg.FECFlushColdStartMs,
-		FECFlushFixedMs:     cfg.FECFlushFixedMs,
-		BootstrapLanes:      bootstrap,
+		StreamTransport:        streamTransport,
+		SessionManager:         sessions,
+		ProbeInterval:          cfg.probeInterval(),
+		ProbeTimeout:           cfg.probeTimeout(),
+		ProbeEvents:            probeEvents,
+		EnableFEC:              cfg.FEC,
+		FECFlushAlpha:          cfg.FECFlushAlpha,
+		FECFlushMinMs:          cfg.FECFlushMinMs,
+		FECFlushMaxMs:          cfg.FECFlushMaxMs,
+		FECFlushColdStartMs:    cfg.FECFlushColdStartMs,
+		FECFlushFixedMs:        cfg.FECFlushFixedMs,
+		BandwidthProbeCapBps:   uint64(cfg.BandwidthProbeCapBps),
+		BootstrapLanes:         bootstrap,
 	})
 	probeLoop := send.NewProbeLoop(in, send.ProbeLoopConfig{
 		Events:   probeEvents,
