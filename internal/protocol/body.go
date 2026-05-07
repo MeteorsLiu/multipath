@@ -96,6 +96,12 @@ type BandwidthProbeAckBody struct {
 
 func (BandwidthProbeAckBody) protocolBody() {}
 
+type BandwidthProbeDoneBody struct {
+	ResultBps uint64
+}
+
+func (BandwidthProbeDoneBody) protocolBody() {}
+
 func encodedBodySize(frame Frame) (int, error) {
 	switch frame.Type {
 	case TypeHELLO:
@@ -137,6 +143,9 @@ func encodedBodySize(frame Frame) (int, error) {
 			return 0, ErrInvalidFrame
 		}
 		return 36, nil
+	case TypeBandwidthProbeDone:
+		_, ok := frame.Body.(BandwidthProbeDoneBody)
+		return 8, validBody(ok)
 	default:
 		return 0, ErrInvalidFrame
 	}
@@ -195,6 +204,9 @@ func encodeBodyInto(frame Frame, out []byte) error {
 		binary.BigEndian.PutUint64(out[12:20], body.Received)
 		binary.BigEndian.PutUint64(out[20:28], body.FirstRXMS)
 		binary.BigEndian.PutUint64(out[28:36], body.LastRXMS)
+	case TypeBandwidthProbeDone:
+		body := frame.Body.(BandwidthProbeDoneBody)
+		binary.BigEndian.PutUint64(out[:8], body.ResultBps)
 	default:
 		return ErrInvalidFrame
 	}
@@ -288,6 +300,13 @@ func decodeBody(frame *Frame, body []byte) error {
 			Received:  binary.BigEndian.Uint64(body[12:20]),
 			FirstRXMS: binary.BigEndian.Uint64(body[20:28]),
 			LastRXMS:  binary.BigEndian.Uint64(body[28:36]),
+		}
+	case TypeBandwidthProbeDone:
+		if len(body) < 8 {
+			return ErrBodyTooShort
+		}
+		frame.Body = BandwidthProbeDoneBody{
+			ResultBps: binary.BigEndian.Uint64(body[:8]),
 		}
 	default:
 		return ErrInvalidFrame

@@ -71,6 +71,12 @@ func TestTypedFramesRoundTrip(t *testing.T) {
 			LaneID:    1,
 			Body:      BandwidthProbeAckBody{ProbeID: 99, Count: 4, Received: 0x0d, FirstRXMS: 12350, LastRXMS: 12355},
 		},
+		{
+			Type:      TypeBandwidthProbeDone,
+			SessionID: 11,
+			LaneID:    1,
+			Body:      BandwidthProbeDoneBody{ResultBps: 123456789},
+		},
 	}
 
 	for _, frame := range tests {
@@ -97,6 +103,7 @@ func TestBodyTooShort(t *testing.T) {
 		TypeCLOSE,
 		TypeBandwidthProbe,
 		TypeBandwidthProbeAck,
+		TypeBandwidthProbeDone,
 	} {
 		frame := make([]byte, headerSize+1)
 		frame[0] = Version<<4 | uint8(frameType)
