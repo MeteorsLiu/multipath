@@ -882,7 +882,24 @@ func (l *Send) completeBandwidthProbeTrain(key laneKey, leg transport.LegRef, le
 	)
 	l.logBandwidthProbeDecisionIfReady(key)
 	debuglog.Printf("send/bw_probe", "train_finish session=%d lane=%d leg={%s} loss=%.3f bps=%d", key.sessionID, key.laneID, debugLeg(leg), aggregateLoss, bestBps)
+	l.sendBandwidthProbeDone(key, leg, bestBps)
 	return true
+}
+
+func (l *Send) sendBandwidthProbeDone(key laneKey, leg transport.LegRef, bestBps uint64) {
+	frame := protocol.Frame{
+		Type:      protocol.TypeBandwidthProbeDone,
+		SessionID: key.sessionID,
+		LaneID:    key.laneID,
+		Body: protocol.BandwidthProbeDoneBody{
+			ResultBps: bestBps,
+		},
+	}
+	if err := l.writeControlFrameOnLeg(context.TODO(), leg, frame); err != nil {
+		debuglog.Printf("send/bw_probe", "done_send_fail session=%d lane=%d err=%v", key.sessionID, key.laneID, err)
+	} else {
+		debuglog.Printf("send/bw_probe", "done_sent session=%d lane=%d bps=%d", key.sessionID, key.laneID, bestBps)
+	}
 }
 
 func (l *Send) abortBandwidthProbeTrain(legKey pingKey) {
