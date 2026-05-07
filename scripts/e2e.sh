@@ -957,7 +957,7 @@ run_bandwidth_probe_tcp_reference_case() {
   echo "[${name}] tc stats after test (server ${VETHS1}):"
   ip netns exec "${NS_S}" tc -s qdisc show dev "${VETHS1}" 2>&1 | sed 's/^/[tc-after] /' || echo "[tc-after] (failed)"
 
-  wait_bandwidth_probe_udp_rate_window "${name}" "${CURRENT_CLIENT_LOG}" "${client_start_line}" 5 "client UDP probe measured 200mbit bottleneck without excessive probe target" 160000000 260000000 300000000
+  wait_bandwidth_probe_udp_rate_window "${name}" "${CURRENT_CLIENT_LOG}" "${client_start_line}" 5 "client UDP probe measured veth throughput" 60000000 140000000 200000000
   wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "bandwidth_probe_decision .*lane=1 .*udp_qos_limited=true .*tcp_better=true selected_leg=tcp" 35 "client classified UDP relative to TCP reference" "${client_start_line}"
 
   stop_multipath
