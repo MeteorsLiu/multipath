@@ -99,6 +99,7 @@ func buildServerRuntime(cfg Config, device *tun.Device) (*appRuntime, []io.Close
 		FECFlushColdStartMs: cfg.FECFlushColdStartMs,
 		FECFlushFixedMs:     cfg.FECFlushFixedMs,
 	})
+	in.EnableBandwidthProbeServerReady()
 	probeLoop := send.NewProbeLoop(in, send.ProbeLoopConfig{
 		Events:   probeEvents,
 		Interval: cfg.probeInterval(),

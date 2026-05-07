@@ -907,6 +907,14 @@ func (l *Send) sendBandwidthProbeDone(key laneKey, leg transport.LegRef, bestBps
 	}
 }
 
+func (l *Send) EnableBandwidthProbeServerReady() {
+	l.bandwidthMu.Lock()
+	defer l.bandwidthMu.Unlock()
+	if l.bandwidthProbeServerReady == nil {
+		l.bandwidthProbeServerReady = make(map[laneKey]bool)
+	}
+}
+
 func (l *Send) isBandwidthProbeServerReady(key laneKey) bool {
 	l.bandwidthMu.Lock()
 	defer l.bandwidthMu.Unlock()
