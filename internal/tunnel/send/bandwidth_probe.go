@@ -323,6 +323,16 @@ func bandwidthProbeStartRate(capBps uint64) uint64 {
 	return start
 }
 
+func bandwidthProbeEffectiveRate(rateBps, capBps uint64) uint64 {
+	if rateBps == 0 {
+		rateBps = bandwidthProbeMinRateBps
+	}
+	if capBps > 0 && rateBps > capBps {
+		return capBps
+	}
+	return rateBps
+}
+
 func probeFrameCount(rateBps uint64, payloadBytes int) uint16 {
 	bytesPerRound := rateBps * uint64(bandwidthProbeRoundWindow) / uint64(time.Second) / 8
 	count := bytesPerRound / uint64(payloadBytes)
@@ -379,11 +389,7 @@ func (l *Send) runBandwidthProbeTrain(ctx context.Context, key laneKey, leg tran
 			}
 		}
 		time.Sleep(bandwidthProbeAckGrace / 10)
-		stepBps, stepLoss := l.finishBandwidthProbeStep(legKey, stepID, stepDeadline)
-		if stepBps == 0 && stepLoss >= 1 {
-			l.abortBandwidthProbeTrain(legKey)
-			return
-		}
+		_, stepLoss := l.finishBandwidthProbeStep(legKey, stepID, stepDeadline)
 
 		if isUDP {
 			if stepLoss >= bandwidthProbeLossThreshold {
@@ -483,10 +489,7 @@ func (l *Send) startBandwidthProbeRound(key laneKey, leg transport.LegRef, legKe
 		l.bandwidthMu.Unlock()
 		return nil
 	}
-	rateBps := state.rateBps
-	if rateBps == 0 {
-		rateBps = bandwidthProbeMinRateBps
-	}
+	rateBps := bandwidthProbeEffectiveRate(state.rateBps, state.capBps)
 	probeID := l.nextBWProbeID.Add(1)
 	payloadBytes := bandwidthProbeUDPPayloadSize(key, probeID, rateBps)
 	if leg.Kind == transport.KindTCP {
@@ -758,9 +761,10 @@ func (l *Send) startBandwidthProbeStep(legKey pingKey, stepID uint64, now time.T
 	if state.steps == nil {
 		state.steps = make(map[uint64]*bandwidthProbeStep)
 	}
+	rateBps := bandwidthProbeEffectiveRate(state.rateBps, state.capBps)
 	step := &bandwidthProbeStep{
 		startedAt: now,
-		rateBps:   state.rateBps,
+		rateBps:   rateBps,
 	}
 	state.steps[stepID] = step
 	state.stepOrder = append(state.stepOrder, stepID)

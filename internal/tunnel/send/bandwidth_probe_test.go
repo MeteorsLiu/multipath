@@ -1,6 +1,7 @@
 package send
 
 import (
+	"context"
 	"net"
 	"testing"
 	"time"
@@ -87,6 +88,41 @@ func TestBandwidthProbeStartRate(t *testing.T) {
 	}
 }
 
+func TestBandwidthProbeEffectiveRateCapsTCP(t *testing.T) {
+	in := New()
+	key := laneKey{sessionID: 99, laneID: 1}
+	leg := transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp0"}
+	legKey := newPingKey(leg)
+	capBps := uint64(50_000_000)
+
+	in.bandwidthLegs[legKey] = &bandwidthLegState{
+		key:      key,
+		capBps:   capBps,
+		rateBps:  200_000_000,
+		inFlight: true,
+		steps:    make(map[uint64]*bandwidthProbeStep),
+	}
+
+	step := in.startBandwidthProbeStep(legKey, 1, time.Now())
+	if step == nil {
+		t.Fatal("nil step")
+	}
+	if step.rateBps != capBps {
+		t.Fatalf("step rateBps = %d, want cap %d", step.rateBps, capBps)
+	}
+
+	round := in.startBandwidthProbeRound(key, leg, legKey, 1, time.Now())
+	if round == nil {
+		t.Fatal("nil round")
+	}
+	if round.rateBps != capBps {
+		t.Fatalf("round rateBps = %d, want cap %d", round.rateBps, capBps)
+	}
+	if got := probeFrameCount(capBps, bandwidthProbeFrameBytes(bandwidthProbeTCPPayloadSize)); round.count != got {
+		t.Fatalf("round count = %d, want count for capped rate %d", round.count, got)
+	}
+}
+
 func TestBandwidthProbeLimiterFromRate(t *testing.T) {
 	limiter := newBandwidthProbeLimiter(bandwidthProbeMinRateBps, bandwidthProbeFrameBytes(bandwidthProbeUDPMinPayloadSize))
 	if limiter == nil {
@@ -151,4 +187,66 @@ func TestBandwidthProbeServerReadyMarked(t *testing.T) {
 	if in.isBandwidthProbeServerReady(other) {
 		t.Fatal("unmarked lane should return false")
 	}
+}
+
+func TestBandwidthProbeCompletesZeroAckLaneAndAdvances(t *testing.T) {
+	in := New()
+	in.activateSession(99)
+	in.bandwidthProbeCapBps = bandwidthProbeMinRateBps
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	key1 := laneKey{sessionID: 99, laneID: 1}
+	lane1 := newLaneRuntime(1, 1)
+	leg1 := transport.LegRef{
+		Kind:       transport.KindUDP,
+		EndpointID: "udp1",
+		RemoteAddr: mustUDPAddr(t, "127.0.0.1:10001"),
+	}
+	lane1.bindLeg(leg1)
+	in.lanes[key1] = lane1
+
+	key2 := laneKey{sessionID: 99, laneID: 2}
+	lane2 := newLaneRuntime(2, 1)
+	leg2 := transport.LegRef{
+		Kind:       transport.KindUDP,
+		EndpointID: "udp2",
+		RemoteAddr: mustUDPAddr(t, "127.0.0.1:10002"),
+	}
+	lane2.bindLeg(leg2)
+	in.lanes[key2] = lane2
+
+	in.maybeStartBandwidthProbe(ctx, key1, leg1, time.Now())
+	waitForBandwidthProbeComplete(t, in, newPingKey(leg1), 3*time.Second)
+
+	_, udpQ1, _, _ := lane1.legQualities()
+	if udpQ1.ProbeSamples != 1 || udpQ1.BandwidthBps != 0 || udpQ1.ProbeLoss != 1 {
+		t.Fatalf("lane1 UDP quality = samples=%d bps=%d loss=%.3f, want 1/0/1", udpQ1.ProbeSamples, udpQ1.BandwidthBps, udpQ1.ProbeLoss)
+	}
+
+	in.probeBandwidth(ctx, time.Now())
+
+	in.bandwidthMu.Lock()
+	state2 := in.bandwidthLegs[newPingKey(leg2)]
+	started2 := state2 != nil && state2.inFlight
+	in.bandwidthMu.Unlock()
+	if !started2 {
+		t.Fatal("lane2 bandwidth probe did not start after lane1 zero-ack completion")
+	}
+}
+
+func waitForBandwidthProbeComplete(t *testing.T, in *Send, legKey pingKey, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		in.bandwidthMu.Lock()
+		state := in.bandwidthLegs[legKey]
+		complete := state != nil && state.complete
+		in.bandwidthMu.Unlock()
+		if complete {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("timed out waiting for bandwidth probe completion")
 }
