@@ -555,7 +555,7 @@ add_rate_band() {
   local band="$3"
   local handle="$4"
   local rate="$5"
-  ip netns exec "${ns}" tc qdisc replace dev "${dev}" parent "1:${band}" handle "${handle}:" netem rate "${rate}"
+  ip netns exec "${ns}" tc qdisc replace dev "${dev}" parent "1:${band}" handle "${handle}:" tbf rate "${rate}" burst 1mbit latency 100ms
 }
 
 add_port_filter() {
