@@ -353,11 +353,13 @@ func (l *Send) runBandwidthProbeTrain(ctx context.Context, key laneKey, leg tran
 		stepID++
 		step := l.startBandwidthProbeStep(legKey, stepID, now)
 		if step == nil {
+			l.abortBandwidthProbeTrain(legKey)
 			return
 		}
 		for time.Now().Before(stepDeadline) {
 			round := l.startBandwidthProbeRound(key, leg, legKey, stepID, time.Now())
 			if round == nil {
+				l.abortBandwidthProbeTrain(legKey)
 				return
 			}
 			limiter := limiterState.forRound(leg, round)
