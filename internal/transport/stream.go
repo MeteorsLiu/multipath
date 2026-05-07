@@ -9,7 +9,6 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/MeteorsLiu/multipath/internal/debuglog"
 	"github.com/MeteorsLiu/multipath/internal/metrics"
@@ -177,23 +176,21 @@ func (s *Stream) Close(ctx context.Context, connID string) error {
 }
 
 func (s *Stream) acceptLoop(ctx context.Context, writer PacketWriter) error {
-	for {
-		if tcpListener, ok := s.listener.(*net.TCPListener); ok {
-			if err := tcpListener.SetDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
-				debuglog.Printf("transport/tcp", "accept deadline err=%v", err)
-				return err
-			}
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = s.listener.Close()
+		case <-done:
 		}
+	}()
+	defer close(done)
 
+	for {
 		conn, err := s.listener.Accept()
 		if err != nil {
-			if isTimeout(err) {
-				select {
-				case <-ctx.Done():
-					return nil
-				default:
-					continue
-				}
+			if ctx.Err() != nil {
+				return nil
 			}
 			debuglog.Printf("transport/tcp", "accept err=%v", err)
 			metrics.IncCounter(metrics.TransportErrorsTotal,

@@ -985,7 +985,7 @@ func (l *Send) markBandwidthProbeDone(sessionID uint64, laneID uint8) {
 	l.bandwidthMu.Lock()
 	defer l.bandwidthMu.Unlock()
 	if l.bandwidthProbeServerReady == nil {
-		l.bandwidthProbeServerReady = make(map[laneKey]bool)
+		return
 	}
 	l.bandwidthProbeServerReady[laneKey{sessionID: sessionID, laneID: laneID}] = true
 }

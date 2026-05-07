@@ -172,10 +172,19 @@ func TestBandwidthProbeServerReadyNil(t *testing.T) {
 	if !in.isBandwidthProbeServerReady(key) {
 		t.Fatal("nil map should always return true")
 	}
+
+	in.markBandwidthProbeDone(99, 2)
+	if !in.isBandwidthProbeServerReady(key) {
+		t.Fatal("mark on disabled server-ready gate should keep all lanes ready")
+	}
+	if !in.isBandwidthProbeServerReady(laneKey{sessionID: 99, laneID: 3}) {
+		t.Fatal("disabled server-ready gate should not become lane-scoped after mark")
+	}
 }
 
 func TestBandwidthProbeServerReadyMarked(t *testing.T) {
 	in := New()
+	in.EnableBandwidthProbeServerReady()
 	key := laneKey{sessionID: 99, laneID: 1}
 
 	in.markBandwidthProbeDone(99, 1)
