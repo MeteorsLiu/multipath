@@ -879,11 +879,13 @@ run_leg_selector_case() {
   write_one_lane_config "${name}" "${PORT_LEG_SELECTOR}" false false 200 600
   echo "[${name}] apply 50% UDP loss before startup; initial bandwidth probes should mark UDP QoS-limited"
   apply_udp_partial_loss 1 "${PORT_LEG_SELECTOR}" 50%
-  start_multipath "${name}"
   local client_qos_start_line
   local server_qos_start_line
-  client_qos_start_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
-  server_qos_start_line="$(current_log_file_line_count "${CURRENT_SERVER_LOG}")"
+  local client_log_file="${WORKDIR}/${name}.client.log"
+  local server_log_file="${WORKDIR}/${name}.server.log"
+  client_qos_start_line="$(current_log_file_line_count "${client_log_file}")"
+  server_qos_start_line="$(current_log_file_line_count "${server_log_file}")"
+  start_multipath "${name}"
   wait_log_pattern "${name}" "accept_hello_ack session=[0-9]+ lane=1 .*tcp conn=" 20 "warm TCP fallback leg reached HELLO_ACK"
   wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "bandwidth_probe_decision .*lane=1 .*udp_qos_limited=true .*tcp_better=true selected_leg=tcp" 45 "client produced bandwidth-probe QoS decision" "${client_qos_start_line}"
   local client_select_start_line
@@ -907,9 +909,10 @@ run_bandwidth_probe_convergence_case() {
   write_one_lane_config "${name}" "${PORT_BW_PROBE_CONVERGENCE}" false false 200 1000
   echo "[${name}] rate-limit UDP tunnel before startup; bandwidth probe should classify UDP relative to TCP"
   apply_udp_tunnel_rate_path 1 "${PORT_BW_PROBE_CONVERGENCE}" 80mbit
-  start_multipath "${name}"
   local client_start_line
-  client_start_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
+  local client_log_file="${WORKDIR}/${name}.client.log"
+  client_start_line="$(current_log_file_line_count "${client_log_file}")"
+  start_multipath "${name}"
 
   wait_ping_ok "${name} baseline-under-rate-limit" 12
   wait_client_tcp_reference_probe "${name}" "${client_start_line}"
@@ -928,9 +931,10 @@ run_bandwidth_probe_tcp_reference_case() {
   write_one_lane_config "${name}" "${PORT_BW_PROBE_GUARD}" false false 200 1000
   echo "[${name}] apply 200mbit UDP tunnel bottleneck; bandwidth probe should classify UDP relative to TCP reference"
   apply_udp_tunnel_rate_path 1 "${PORT_BW_PROBE_GUARD}" 200mbit
-  start_multipath "${name}"
   local client_start_line
-  client_start_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
+  local client_log_file="${WORKDIR}/${name}.client.log"
+  client_start_line="$(current_log_file_line_count "${client_log_file}")"
+  start_multipath "${name}"
   wait_ping_ok "${name} baseline" 12
   wait_client_tcp_reference_probe "${name}" "${client_start_line}"
   wait_bandwidth_probe_udp_rate_window "${name}" "${CURRENT_CLIENT_LOG}" "${client_start_line}" 40 "client UDP probe measured 200mbit bottleneck without excessive probe target" 160000000 260000000 300000000
