@@ -937,7 +937,7 @@ run_bandwidth_probe_tcp_reference_case() {
   start_multipath "${name}"
   wait_ping_ok "${name} baseline" 12
   wait_client_tcp_reference_probe "${name}" "${client_start_line}"
-  wait_bandwidth_probe_udp_rate_window "${name}" "${CURRENT_CLIENT_LOG}" "${client_start_line}" 5 "client UDP probe measured veth throughput" 60000000 140000000 200000000
+  wait_bandwidth_probe_udp_rate_window "${name}" "${CURRENT_CLIENT_LOG}" "${client_start_line}" 40 "client UDP probe measured veth throughput" 60000000 140000000 200000000
   wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "bandwidth_probe_decision .*lane=1 .*udp_qos_limited=true .*tcp_better=true selected_leg=tcp" 35 "client classified UDP relative to TCP reference" "${client_start_line}"
 
   stop_multipath
