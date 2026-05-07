@@ -30,7 +30,7 @@ const (
 	bandwidthProbeAdditiveStepBps   = uint64(10_000_000)
 	bandwidthProbePlateauGrowth     = 1.05
 	bandwidthProbePlateauSteps      = 2
-	bandwidthProbeTCPSafetyWindow   = 30 * time.Second
+	bandwidthProbeTCPSafetyWindow   = 10 * time.Second
 	bandwidthProbeTCPRateBps        = uint64(16_000_000)
 )
 
