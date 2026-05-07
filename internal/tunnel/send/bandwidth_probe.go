@@ -143,10 +143,12 @@ type bandwidthRXRound struct {
 
 func (l *Send) probeBandwidth(ctx context.Context, now time.Time) {
 	if !l.bandwidthProbe {
+		debuglog.Printf("send/bw_probe", "probe_disabled")
 		return
 	}
 	sessionID, ok := l.activeSession()
 	if !ok {
+		debuglog.Printf("send/bw_probe", "probe_no_session has_session=%t session_id=%d", l.hasActiveSession.Load(), l.activeSessionID.Load())
 		return
 	}
 
@@ -189,6 +191,7 @@ func (l *Send) probeBandwidth(ctx context.Context, now time.Time) {
 		}
 	}
 	if selectedLane.sessionID == 0 {
+		debuglog.Printf("send/bw_probe", "probe_no_candidate lanes=%d", len(lanes))
 		return
 	}
 
