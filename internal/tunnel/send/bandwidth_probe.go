@@ -884,7 +884,7 @@ func (l *Send) completeBandwidthProbeTrain(key laneKey, leg transport.LegRef, le
 		metrics.L("leg", kindMetricLabel(leg.Kind)),
 	)
 	l.logBandwidthProbeDecisionIfReady(key)
-	debuglog.Printf("send/bw_probe", "train_finish session=%d lane=%d leg={%s} loss=%.3f bps=%d", key.sessionID, key.laneID, debugLeg(leg), aggregateLoss, bestBps)
+	debuglog.Printf("send/bw_probe", "train_finish session=%d lane=%d leg={%s} loss=%.3f window_bps=%d", key.sessionID, key.laneID, debugLeg(leg), aggregateLoss, bestBps)
 	l.sendBandwidthProbeDone(key, leg, bestBps)
 	return true
 }
