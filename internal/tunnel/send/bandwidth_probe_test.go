@@ -129,3 +129,26 @@ func TestProbeFrameCount(t *testing.T) {
 		t.Fatalf("count=%d, want capped at %d", count, bandwidthProbeMaxFrames)
 	}
 }
+
+func TestBandwidthProbeServerReadyNil(t *testing.T) {
+	in := New()
+	key := laneKey{sessionID: 99, laneID: 1}
+	if !in.isBandwidthProbeServerReady(key) {
+		t.Fatal("nil map should always return true")
+	}
+}
+
+func TestBandwidthProbeServerReadyMarked(t *testing.T) {
+	in := New()
+	key := laneKey{sessionID: 99, laneID: 1}
+
+	in.markBandwidthProbeDone(99, 1)
+
+	if !in.isBandwidthProbeServerReady(key) {
+		t.Fatal("marked lane should return true")
+	}
+	other := laneKey{sessionID: 99, laneID: 2}
+	if in.isBandwidthProbeServerReady(other) {
+		t.Fatal("unmarked lane should return false")
+	}
+}
