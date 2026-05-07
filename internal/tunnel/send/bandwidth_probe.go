@@ -900,6 +900,54 @@ func (l *Send) completeBandwidthProbeTrain(key laneKey, leg transport.LegRef, le
 	return true
 }
 
+func (l *Send) completeBandwidthProbeLostLeg(key laneKey, leg transport.LegRef, reason string) {
+	legKey := newPingKey(leg)
+	if legKey.kind == 0 {
+		return
+	}
+
+	l.bandwidthMu.Lock()
+	state := l.bandwidthLegs[legKey]
+	if state == nil || state.complete || !state.inFlight {
+		l.bandwidthMu.Unlock()
+		return
+	}
+	now := time.Now()
+	if state.startedAt.IsZero() {
+		state.startedAt = now
+	}
+	if state.endedAt.IsZero() {
+		state.endedAt = now
+	}
+	var bestBps uint64
+	for _, stepID := range state.stepOrder {
+		if step := state.steps[stepID]; step != nil && !step.endedAt.IsZero() {
+			if bps := bandwidthProbeStepCeilingBps(step); bps > bestBps {
+				bestBps = bps
+			}
+		}
+	}
+	if bestBps == 0 {
+		bestBps = bandwidthWindowSampleBps(state.ackedBytes, state.startedAt, state.endedAt)
+	}
+	aggregateLoss := bandwidthAggregateLoss(state.sentFrames, state.ackedFrames)
+	state.lastLoss = aggregateLoss
+	state.complete = true
+	state.inFlight = false
+	for probeID, round := range l.bandwidthPending {
+		if round.legKey == legKey {
+			delete(l.bandwidthPending, probeID)
+		}
+	}
+	l.bandwidthMu.Unlock()
+
+	if lane := l.getLane(key); lane != nil {
+		lane.recordBandwidthSample(leg.Kind, bestBps, aggregateLoss)
+	}
+	l.logBandwidthProbeDecisionIfReady(key)
+	debuglog.Printf("send/bw_probe", "train_finish_lost session=%d lane=%d leg={%s} reason=%s loss=%.3f window_bps=%d", key.sessionID, key.laneID, debugLeg(leg), reason, aggregateLoss, bestBps)
+}
+
 func (l *Send) sendBandwidthProbeDone(key laneKey, leg transport.LegRef, bestBps uint64) {
 	frame := protocol.Frame{
 		Type:      protocol.TypeBandwidthProbeDone,

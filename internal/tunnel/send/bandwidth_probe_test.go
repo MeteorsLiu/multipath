@@ -235,6 +235,56 @@ func TestBandwidthProbeCompletesZeroAckLaneAndAdvances(t *testing.T) {
 	}
 }
 
+func TestBandwidthProbeLostLegReleasesNextLane(t *testing.T) {
+	in := New()
+	in.activateSession(99)
+	in.bandwidthProbeCapBps = bandwidthProbeMinRateBps
+
+	key2 := laneKey{sessionID: 99, laneID: 2}
+	lane2 := newLaneRuntime(2, 1)
+	leg2 := transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp2"}
+	lane2.bindLeg(leg2)
+	in.lanes[key2] = lane2
+	in.bandwidthLegs[newPingKey(leg2)] = &bandwidthLegState{
+		key:       key2,
+		capBps:    bandwidthProbeMinRateBps,
+		rateBps:   bandwidthProbeMinRateBps,
+		inFlight:  true,
+		startedAt: time.Now().Add(-time.Second),
+		steps:     make(map[uint64]*bandwidthProbeStep),
+	}
+
+	key3 := laneKey{sessionID: 99, laneID: 3}
+	lane3 := newLaneRuntime(3, 1)
+	leg3 := transport.LegRef{
+		Kind:       transport.KindUDP,
+		EndpointID: "udp3",
+		RemoteAddr: mustUDPAddr(t, "127.0.0.1:10003"),
+	}
+	lane3.bindLeg(leg3)
+	in.lanes[key3] = lane3
+
+	in.completeBandwidthProbeLostLeg(key2, leg2, "probe_timeout")
+
+	in.bandwidthMu.Lock()
+	state2 := in.bandwidthLegs[newPingKey(leg2)]
+	done2 := state2 != nil && state2.complete && !state2.inFlight
+	in.bandwidthMu.Unlock()
+	if !done2 {
+		t.Fatal("lost leg did not complete in-flight bandwidth probe")
+	}
+
+	in.probeBandwidth(context.Background(), time.Now())
+
+	in.bandwidthMu.Lock()
+	state3 := in.bandwidthLegs[newPingKey(leg3)]
+	started3 := state3 != nil && state3.inFlight
+	in.bandwidthMu.Unlock()
+	if !started3 {
+		t.Fatal("lane3 bandwidth probe did not start after lane2 leg loss")
+	}
+}
+
 func waitForBandwidthProbeComplete(t *testing.T, in *Send, legKey pingKey, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)

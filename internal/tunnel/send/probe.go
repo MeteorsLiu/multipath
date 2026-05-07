@@ -190,6 +190,7 @@ func (l *Send) handleProbeTargetLostWithReason(ctx context.Context, target probe
 		l.untrackProbeTarget(ctx, binding.leg)
 		return nil
 	}
+	l.completeBandwidthProbeLostLeg(key, binding.leg, reason)
 	debuglog.Printf("send/probe", "target_lost target=%d leg={%s} before=%s", target, debugLeg(binding.leg), debugLaneState(key, lane))
 	before := lane.snapshot()
 	if !sameLaneSnapshotLeg(before, binding.leg) {
