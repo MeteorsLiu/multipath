@@ -177,6 +177,9 @@ func (l *Send) probeBandwidth(ctx context.Context, now time.Time) {
 		return
 	}
 	for _, item := range lanes {
+		if !l.isBandwidthProbeServerReady(item.key) {
+			continue
+		}
 		udpLeg, udpQ, tcpLeg, tcpQ := item.lane.legQualities()
 		if _, ok := l.bandwidthProbeCandidate(item.key, item.lane, udpLeg, udpQ, tcpLeg, tcpQ); ok {
 			selectedLane = item.key
@@ -900,6 +903,24 @@ func (l *Send) sendBandwidthProbeDone(key laneKey, leg transport.LegRef, bestBps
 	} else {
 		debuglog.Printf("send/bw_probe", "done_sent session=%d lane=%d bps=%d", key.sessionID, key.laneID, bestBps)
 	}
+}
+
+func (l *Send) isBandwidthProbeServerReady(key laneKey) bool {
+	l.bandwidthMu.Lock()
+	defer l.bandwidthMu.Unlock()
+	if l.bandwidthProbeServerReady == nil {
+		return true
+	}
+	return l.bandwidthProbeServerReady[key]
+}
+
+func (l *Send) markBandwidthProbeDone(sessionID uint64, laneID uint8) {
+	l.bandwidthMu.Lock()
+	defer l.bandwidthMu.Unlock()
+	if l.bandwidthProbeServerReady == nil {
+		l.bandwidthProbeServerReady = make(map[laneKey]bool)
+	}
+	l.bandwidthProbeServerReady[laneKey{sessionID: sessionID, laneID: laneID}] = true
 }
 
 func (l *Send) abortBandwidthProbeTrain(legKey pingKey) {

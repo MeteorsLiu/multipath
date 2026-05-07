@@ -104,6 +104,8 @@ type Send struct {
 	bandwidthPending map[uint64]*bandwidthProbeRound
 	bandwidthRX      map[bandwidthRXKey]*bandwidthRXRound
 
+	bandwidthProbeServerReady map[laneKey]bool
+
 	runnableCachesMu sync.Mutex
 	runnableCaches   map[uint64]*runnableLaneCache
 }
