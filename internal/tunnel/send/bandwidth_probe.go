@@ -218,6 +218,7 @@ func (l *Send) bandwidthProbeCandidate(key laneKey, lane *laneRuntime, udpLeg tr
 		return tcpLeg, true
 	}
 	if !l.bandwidthProbeNeeded(udpLeg, udpQ) {
+		debuglog.Printf("send/bw_probe", "probe_candidate_skip session=%d lane=%d tcp_active=%t tcp_needed=%t udp_active=%t udp_kind=%d", key.sessionID, key.laneID, tcpQ.Active, l.bandwidthProbeNeeded(tcpLeg, tcpQ), udpQ.Active, udpLeg.Kind)
 		return transport.LegRef{}, false
 	}
 	if l.bandwidthProbeAwaitingTCPReference(key, lane, tcpLeg, tcpQ) {
