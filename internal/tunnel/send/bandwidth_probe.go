@@ -362,7 +362,9 @@ func (l *Send) runBandwidthProbeTrain(ctx context.Context, key laneKey, leg tran
 			}
 			limiter := limiterState.forRound(leg, round)
 			sent := l.runBandwidthProbeRound(ctx, round, stepDeadline, limiter)
-			l.recordBandwidthProbeSent(round, sent)
+			if sent == round.count {
+				l.recordBandwidthProbeSent(round, sent)
+			}
 			if sent < round.count {
 				if ctx.Err() != nil || time.Now().Before(deadline) && time.Now().Before(stepDeadline) {
 					l.abortBandwidthProbeTrain(legKey)
