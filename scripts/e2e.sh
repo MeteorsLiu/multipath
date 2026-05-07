@@ -711,6 +711,14 @@ apply_udp_tunnel_rate_path() {
   setup_prio_qdisc "${NS_S}" "${server_dev}"
   add_rate_band "${NS_S}" "${server_dev}" 3 30 "${rate}"
   add_port_filter "${NS_S}" "${server_dev}" 1 udp sport "${port}" 3
+
+  echo "[tc-debug] rate=${rate} port=${port} path=${path}"
+  echo "[tc-debug] client ${client_dev}:"
+  ip netns exec "${NS_C}" tc -s qdisc show dev "${client_dev}" 2>&1 | sed 's/^/[tc-debug]   /'
+  echo "[tc-debug] server ${server_dev}:"
+  ip netns exec "${NS_S}" tc -s qdisc show dev "${server_dev}" 2>&1 | sed 's/^/[tc-debug]   /'
+  echo "[tc-debug] client filter ${client_dev}:"
+  ip netns exec "${NS_C}" tc -s filter show dev "${client_dev}" 2>&1 | sed 's/^/[tc-debug]   /'
 }
 
 apply_nat_tcp_block() {
@@ -939,6 +947,14 @@ run_bandwidth_probe_tcp_reference_case() {
   wait_client_tcp_reference_probe "${name}" "${client_start_line}"
   wait_bandwidth_probe_udp_rate_window "${name}" "${CURRENT_CLIENT_LOG}" "${client_start_line}" 40 "client UDP probe measured 200mbit bottleneck without excessive probe target" 160000000 260000000 300000000
   wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "bandwidth_probe_decision .*lane=1 .*udp_qos_limited=true .*tcp_better=true selected_leg=tcp" 35 "client classified UDP relative to TCP reference" "${client_start_line}"
+
+  echo "[${name}] probe log summary (client UDP leg):"
+  grep -n -F 'send/bw_probe:' "${CURRENT_CLIENT_LOG}" | grep -F 'leg={udp' | sed 's/^/[probe-debug] /'
+
+  echo "[${name}] tc stats after test (client ${VETHC1}):"
+  ip netns exec "${NS_C}" tc -s qdisc show dev "${VETHC1}" 2>&1 | sed 's/^/[tc-after] /'
+  echo "[${name}] tc stats after test (server ${VETHS1}):"
+  ip netns exec "${NS_S}" tc -s qdisc show dev "${VETHS1}" 2>&1 | sed 's/^/[tc-after] /'
 
   stop_multipath
   clear_loss
