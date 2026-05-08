@@ -102,6 +102,12 @@ func (l *laneRuntime) recordBandwidthSample(kind transport.Kind, bandwidthBps ui
 	l.quality.recordBandwidthSample(kind, bandwidthBps, loss)
 }
 
+func (l *laneRuntime) recordBandwidthSampleWithReference(kind transport.Kind, bandwidthBps uint64, loss float64, referenceBps uint64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.quality.recordBandwidthSampleWithReference(kind, bandwidthBps, loss, referenceBps)
+}
+
 func (l *laneRuntime) recordDelivery(kind transport.Kind, onTime bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()

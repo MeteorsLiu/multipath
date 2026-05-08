@@ -48,7 +48,7 @@ func (QualityLegSelector) Pick(udp, tcp LegQuality) (useUDP bool, ok bool) {
 		return false, true
 	}
 
-	if udp.BandwidthPreferTCP && tcp.ProbeSamples >= minBandwidthProbeSamples {
+	if udp.BandwidthPreferTCP {
 		return false, true
 	}
 

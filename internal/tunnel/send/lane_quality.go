@@ -63,6 +63,10 @@ func (q *laneQualityState) recordBandwidthSample(kind transport.Kind, bandwidthB
 	q.bandwidth.recordSample(kind, bandwidthBps, loss)
 }
 
+func (q *laneQualityState) recordBandwidthSampleWithReference(kind transport.Kind, bandwidthBps uint64, loss float64, referenceBps uint64) {
+	q.bandwidth.recordSampleWithReference(kind, bandwidthBps, loss, referenceBps)
+}
+
 type bandwidthQualityState struct {
 	udpBandwidthBps uint64
 	udpProbeLoss    float64
@@ -89,6 +93,10 @@ func (q *bandwidthQualityState) legQualities() (LegQuality, LegQuality) {
 }
 
 func (q *bandwidthQualityState) recordSample(kind transport.Kind, bandwidthBps uint64, loss float64) {
+	q.recordSampleWithReference(kind, bandwidthBps, loss, 0)
+}
+
+func (q *bandwidthQualityState) recordSampleWithReference(kind transport.Kind, bandwidthBps uint64, loss float64, referenceBps uint64) {
 	switch kind {
 	case transport.KindUDP:
 		q.udpBandwidthBps = bandwidthBps
@@ -101,19 +109,24 @@ func (q *bandwidthQualityState) recordSample(kind transport.Kind, bandwidthBps u
 	default:
 		return
 	}
-	q.updateQoSState()
+	q.updateQoSState(referenceBps)
 }
 
-func (q *bandwidthQualityState) updateQoSState() {
-	if q.udpProbeSamples < minBandwidthProbeSamples || q.tcpProbeSamples < minBandwidthProbeSamples ||
-		q.udpBandwidthBps == 0 || q.tcpBandwidthBps == 0 {
+func (q *bandwidthQualityState) updateQoSState(referenceBps uint64) {
+	if q.udpProbeSamples < minBandwidthProbeSamples || q.udpBandwidthBps == 0 {
 		return
+	}
+	if referenceBps == 0 {
+		if q.tcpProbeSamples < minBandwidthProbeSamples || q.tcpBandwidthBps == 0 {
+			return
+		}
+		referenceBps = q.tcpBandwidthBps
 	}
 	q.qosLimited = q.udpProbeLoss >= bandwidthProbeLossThreshold
 	if !q.qosLimited {
-		q.qosLimited = float64(q.udpBandwidthBps)*tcpBandwidthPreferRatio <= float64(q.tcpBandwidthBps)
+		q.qosLimited = float64(q.udpBandwidthBps)*tcpBandwidthPreferRatio <= float64(referenceBps)
 	}
-	q.preferTCP = q.qosLimited && float64(q.tcpBandwidthBps) >= float64(q.udpBandwidthBps)*tcpBandwidthPreferRatio
+	q.preferTCP = q.qosLimited && referenceBps >= uint64(float64(q.udpBandwidthBps)*tcpBandwidthPreferRatio)
 }
 
 func bandwidthLossEWMA(old, sample float64, samples uint32) float64 {

@@ -286,13 +286,43 @@ func TestBandwidthProbeCandidateWithCapSkipsTCP(t *testing.T) {
 	key := laneKey{sessionID: 99, laneID: 1}
 	lane := newLaneRuntime(1, 1)
 	udp := udpLeg()
-	tcp := tcpLeg()
+	tcp := transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp0"}
 	lane.bindLeg(udp)
 	lane.bindLeg(tcp)
 
 	leg, ok := in.bandwidthProbeCandidate(key, lane, udp, LegQuality{Active: true}, tcp, LegQuality{Active: true})
 	if !ok || leg.Kind != transport.KindUDP {
 		t.Fatalf("candidate = (%s,%t), want UDP", debugLeg(leg), ok)
+	}
+}
+
+func TestBandwidthProbeCappedUDPDecisionDoesNotWaitForTCPReference(t *testing.T) {
+	in := New()
+	in.bandwidthProbeCapBps = 200_000_000
+	key := laneKey{sessionID: 99, laneID: 1}
+	lane := newLaneRuntime(1, 1)
+	udp := udpLeg()
+	tcp := transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp0"}
+	lane.bindLeg(udp)
+	lane.bindLeg(tcp)
+	in.lanes[key] = lane
+
+	lane.recordBandwidthSampleWithReference(transport.KindUDP, 80_000_000, bandwidthProbeLossThreshold, in.bandwidthProbeCapBps)
+
+	_, udpQ, _, tcpQ := lane.legQualities()
+	if udpQ.ProbeSamples != 1 {
+		t.Fatalf("udp probe samples = %d, want 1", udpQ.ProbeSamples)
+	}
+	if tcpQ.ProbeSamples != 0 {
+		t.Fatalf("tcp probe samples = %d, want 0", tcpQ.ProbeSamples)
+	}
+	if !udpQ.BandwidthQoSLimited || !udpQ.BandwidthPreferTCP {
+		t.Fatalf("capped UDP QoS = limited %t prefer_tcp %t, want both true", udpQ.BandwidthQoSLimited, udpQ.BandwidthPreferTCP)
+	}
+	tcpQ.DeliveryRate = 1
+	useUDP, ok := in.legSelector(key.sessionID).Pick(udpQ, tcpQ)
+	if !ok || useUDP {
+		t.Fatalf("selector = useUDP %t ok %t, want TCP selected", useUDP, ok)
 	}
 }
 

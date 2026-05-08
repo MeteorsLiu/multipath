@@ -33,7 +33,7 @@ func logLaneHandshakeTimeout(sessionID uint64, laneID uint8, leg transport.LegRe
 	eventlog.Printf("lane_handshake_timeout", "session=%d lane=%d leg=%s timeout=%s ref={%s}", sessionID, laneID, kindMetricLabel(leg.Kind), timeout, debugLeg(leg))
 }
 
-func logBandwidthProbeDecision(sessionID uint64, laneID uint8, udp, tcp LegQuality, useUDP bool, ok bool) {
+func logBandwidthProbeDecision(sessionID uint64, laneID uint8, udp, tcp LegQuality, referenceBps uint64, useUDP bool, ok bool) {
 	selected := "none"
 	if ok {
 		selected = "tcp"
@@ -41,8 +41,11 @@ func logBandwidthProbeDecision(sessionID uint64, laneID uint8, udp, tcp LegQuali
 			selected = "udp"
 		}
 	}
-	tcpBetter := tcp.BandwidthBps > udp.BandwidthBps
-	eventlog.Printf("bandwidth_probe_decision", "session=%d lane=%d udp_active=%t tcp_active=%t udp_bps=%d udp_loss=%.3f udp_samples=%d tcp_bps=%d tcp_loss=%.3f tcp_samples=%d udp_qos_limited=%t tcp_better=%t selected_leg=%s", sessionID, laneID, udp.Active, tcp.Active, udp.BandwidthBps, udp.ProbeLoss, udp.ProbeSamples, tcp.BandwidthBps, tcp.ProbeLoss, tcp.ProbeSamples, udp.BandwidthQoSLimited, tcpBetter, selected)
+	if referenceBps == 0 {
+		referenceBps = tcp.BandwidthBps
+	}
+	tcpBetter := referenceBps > udp.BandwidthBps
+	eventlog.Printf("bandwidth_probe_decision", "session=%d lane=%d udp_active=%t tcp_active=%t udp_bps=%d udp_loss=%.3f udp_samples=%d tcp_bps=%d tcp_loss=%.3f tcp_samples=%d reference_bps=%d udp_qos_limited=%t tcp_better=%t selected_leg=%s", sessionID, laneID, udp.Active, tcp.Active, udp.BandwidthBps, udp.ProbeLoss, udp.ProbeSamples, tcp.BandwidthBps, tcp.ProbeLoss, tcp.ProbeSamples, referenceBps, udp.BandwidthQoSLimited, tcpBetter, selected)
 }
 
 func currentLegFromSnapshot(snap laneSnapshot, kind transport.Kind) transport.LegRef {

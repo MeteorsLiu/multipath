@@ -770,9 +770,11 @@ detection should use a data-plane bandwidth probe separate from PING/PONG.
 Recommended sender behavior:
 
 1. Keep TCP warm for lanes that negotiated TCP fallback and have a TCP remote.
-2. Establish a TCP reference first, using a paced TCP BW_PROBE ramp or
-   transport TCP_INFO where available. This reference is the comparison target
-   for the lane, not a global configured maximum.
+2. When no configured bandwidth cap is present, establish a TCP reference first,
+   using a paced TCP BW_PROBE ramp or transport TCP_INFO where available. This
+   reference is the comparison target for the lane, not a global configured
+   maximum. When a bandwidth cap is configured, use that cap as the reference
+   and do not run a TCP bandwidth-probe train.
 3. Wait for that TCP reference only when the lane already has a TCP leg or has
    a configured TCP remote that this peer can dial. Negotiated fallback
    capability alone is not evidence that a TCP reference path exists.
@@ -789,16 +791,19 @@ Recommended sender behavior:
    entire ramp from the minimum probe rate; the warmup ramp is control input,
    not the measured QoS sample.
 8. Treat UDP as QoS-limited when the UDP sample has loss/under-delivery evidence
-   and TCP's measured bandwidth is materially better than UDP's. Select TCP only
-   when that material difference exists, so small probe differences do not
-   override UDP preference.
+   and the active reference is materially better than UDP. In no-cap mode the
+   active reference is TCP's measured bandwidth; in capped mode it is the
+   configured bandwidth cap. Select TCP only when that material difference
+   exists, so small probe differences do not override UDP preference.
 
 The bandwidth probe is an initial capacity classification, not a continuous
-monitor. A QoS decision for lanes with TCP fallback requires a TCP reference and
-a UDP sample relative to that reference. Once a leg's ramp completes,
-implementations should not clear the QoS-limited state by periodic re-probing; a
-new concrete leg may be probed again. BW_PROBE/BW_PROBE_ACK must not replace
-PING/PONG liveness or Session HELLO state.
+monitor. A QoS decision for lanes with TCP fallback requires a UDP sample
+relative to the active reference. No-cap mode uses a TCP reference sample;
+capped mode uses the configured cap and does not wait for a TCP probe sample.
+Once a leg's ramp completes, implementations should not clear the QoS-limited
+state by periodic re-probing; a new concrete leg may be probed again.
+BW_PROBE/BW_PROBE_ACK must not replace PING/PONG liveness or Session HELLO
+state.
 
 Known precision caveat: ACKs may arrive after the pacing step that sent their
 BW_PROBE chunk. Implementations should attribute ACKed bytes to the step that

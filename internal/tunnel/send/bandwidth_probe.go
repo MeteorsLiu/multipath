@@ -1216,7 +1216,7 @@ func (l *Send) completeBandwidthProbeTrain(key laneKey, leg transport.LegRef, le
 	l.bandwidthMu.Unlock()
 
 	if lane := l.getLane(key); lane != nil {
-		lane.recordBandwidthSample(leg.Kind, bestBps, aggregateLoss)
+		lane.recordBandwidthSampleWithReference(leg.Kind, bestBps, aggregateLoss, state.capBps)
 	}
 	metrics.SetGauge(metrics.LaneBandwidthBps, float64(bestBps),
 		metrics.L("session", key.sessionID),
@@ -1281,7 +1281,7 @@ func (l *Send) completeBandwidthProbeLostLeg(key laneKey, leg transport.LegRef, 
 	l.bandwidthMu.Unlock()
 
 	if lane := l.getLane(key); lane != nil {
-		lane.recordBandwidthSample(leg.Kind, bestBps, aggregateLoss)
+		lane.recordBandwidthSampleWithReference(leg.Kind, bestBps, aggregateLoss, state.capBps)
 	}
 	l.logBandwidthProbeDecisionIfReady(key)
 	debuglog.Printf("send/bw_probe", "train_finish_lost session=%d lane=%d leg={%s} reason=%s loss=%.3f window_bps=%d", key.sessionID, key.laneID, debugLeg(leg), reason, aggregateLoss, bestBps)
@@ -1307,11 +1307,14 @@ func (l *Send) logBandwidthProbeDecisionIfReady(key laneKey) {
 		return
 	}
 	_, udpQ, _, tcpQ := lane.legQualities()
-	if udpQ.ProbeSamples < minBandwidthProbeSamples || tcpQ.ProbeSamples < minBandwidthProbeSamples {
+	if udpQ.ProbeSamples < minBandwidthProbeSamples {
+		return
+	}
+	if l.bandwidthProbeCapBps == 0 && tcpQ.ProbeSamples < minBandwidthProbeSamples {
 		return
 	}
 	useUDP, ok := l.legSelector(key.sessionID).Pick(udpQ, tcpQ)
-	logBandwidthProbeDecision(key.sessionID, key.laneID, udpQ, tcpQ, useUDP, ok)
+	logBandwidthProbeDecision(key.sessionID, key.laneID, udpQ, tcpQ, l.bandwidthProbeCapBps, useUDP, ok)
 }
 
 func (l *Send) clearBandwidthLeg(leg transport.LegRef) {
