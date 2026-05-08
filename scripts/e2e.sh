@@ -593,6 +593,21 @@ add_port_filter() {
     flowid "1:${band}"
 }
 
+add_udp_port_large_packet_filter() {
+  local ns="$1"
+  local dev="$2"
+  local prio="$3"
+  local field="$4"
+  local port="$5"
+  local band="$6"
+
+  ip netns exec "${ns}" tc filter replace dev "${dev}" protocol ip parent 1:0 prio "${prio}" u32 \
+    match ip protocol 17 0xff \
+    match ip "${field}" "${port}" 0xffff \
+    match u16 0x0400 0xfc00 at 2 \
+    flowid "1:${band}"
+}
+
 apply_path_loss() {
   local path="$1"
   local loss="$2"
@@ -700,6 +715,23 @@ apply_udp_partial_loss() {
   setup_prio_qdisc "${NS_S}" "${server_dev}"
   add_loss_band "${NS_S}" "${server_dev}" 3 30 "${loss}"
   add_port_filter "${NS_S}" "${server_dev}" 1 udp sport "${port}" 3
+}
+
+apply_udp_large_packet_partial_loss() {
+  local path="$1"
+  local port="$2"
+  local loss="$3"
+  local client_dev server_dev
+  client_dev="$(path_client_dev "${path}")"
+  server_dev="$(path_server_dev "${path}")"
+
+  setup_prio_qdisc "${NS_C}" "${client_dev}"
+  add_loss_band "${NS_C}" "${client_dev}" 3 30 "${loss}"
+  add_udp_port_large_packet_filter "${NS_C}" "${client_dev}" 1 dport "${port}" 3
+
+  setup_prio_qdisc "${NS_S}" "${server_dev}"
+  add_loss_band "${NS_S}" "${server_dev}" 3 30 "${loss}"
+  add_udp_port_large_packet_filter "${NS_S}" "${server_dev}" 1 sport "${port}" 3
 }
 
 apply_udp_tunnel_rate_path() {
@@ -883,8 +915,8 @@ run_leg_selector_case() {
   echo "==== ${name} e2e start ===="
   clear_loss
   write_one_lane_config "${name}" "${PORT_LEG_SELECTOR}" false false 200 600 -1
-  echo "[${name}] apply 50% UDP loss before startup; initial bandwidth probes should mark UDP QoS-limited"
-  apply_udp_partial_loss 1 "${PORT_LEG_SELECTOR}" 50%
+  echo "[${name}] apply 50% large-packet UDP loss before startup; bandwidth probes should mark UDP QoS-limited without tripping PING liveness"
+  apply_udp_large_packet_partial_loss 1 "${PORT_LEG_SELECTOR}" 50%
   local client_qos_start_line
   local server_qos_start_line
   local client_log_file="${WORKDIR}/${name}.client.log"
