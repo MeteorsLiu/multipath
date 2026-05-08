@@ -81,7 +81,7 @@ func (l *Send) writeTUNPacket(ctx context.Context, sessionID uint64, packet []by
 		state = fresh
 		l.activeSendState.Store(state)
 	}
-	packetID = state.peekPacketID()
+	packetID = state.reservePacketID()
 	fecProfile := uint8(l.fecProfile.Load())
 	if debuglog.Enabled() {
 		debuglog.Printf("send", "data_schedule session=%d packet_id=%d bytes=%d fec_profile=%d", sessionID, packetID, len(packet), fecProfile)

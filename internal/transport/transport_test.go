@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -51,6 +52,31 @@ func TestRunWriterDropsStaleTCPConn(t *testing.T) {
 				t.Fatal("packet was not released after stale TCP write")
 			}
 		})
+	}
+}
+
+func TestRunWriterDropsTransientUDPWriteError(t *testing.T) {
+	packet := packetbuf.Acquire(16)
+	packets := make(chan Payload, 1)
+	packets <- Payload{
+		Leg: LegRef{
+			Kind:       KindUDP,
+			EndpointID: "udp0",
+			RemoteAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1234},
+		},
+		Packet: packet,
+	}
+	close(packets)
+
+	writer := &runWriterPacket{err: syscall.ENETUNREACH}
+	if err := RunWriter(context.Background(), packets, writer, nil); err != nil {
+		t.Fatalf("RunWriter err = %v, want nil", err)
+	}
+	if writer.writes != 1 {
+		t.Fatalf("packet writes = %d, want 1", writer.writes)
+	}
+	if packet.Payload != nil {
+		t.Fatal("packet was not released after UDP write error")
 	}
 }
 
@@ -134,8 +160,10 @@ func (s *runWriterStream) Close(ctx context.Context, connID string) error {
 }
 
 type runWriterPacket struct {
-	once  sync.Once
-	wrote chan struct{}
+	once   sync.Once
+	wrote  chan struct{}
+	err    error
+	writes int
 }
 
 func (p *runWriterPacket) Run(ctx context.Context, writer PacketWriter) error {
@@ -144,8 +172,11 @@ func (p *runWriterPacket) Run(ctx context.Context, writer PacketWriter) error {
 }
 
 func (p *runWriterPacket) WriteTo(ctx context.Context, endpointID string, remote net.Addr, payload []byte) (int, error) {
+	p.writes++
 	p.once.Do(func() {
-		close(p.wrote)
+		if p.wrote != nil {
+			close(p.wrote)
+		}
 	})
-	return len(payload), nil
+	return len(payload), p.err
 }

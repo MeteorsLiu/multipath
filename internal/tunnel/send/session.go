@@ -12,8 +12,9 @@ import (
 )
 
 // sendState holds per-session send-side state. The monotonic counters
-// nextPacketID / nextRepairKey are atomic so the data-path peek+commit pair
-// does not need the mutex; mu is taken only when mutating the FEC tx window.
+// nextPacketID / nextRepairKey are atomic so the data path can reserve DATA and
+// REPAIR identifiers without taking the mutex; mu is taken only when mutating
+// the FEC tx window.
 type sendState struct {
 	nextPacketID  atomic.Uint32
 	nextRepairKey atomic.Uint32 // upper 16 bits unused; only low 16 bits encoded
@@ -24,17 +25,15 @@ type sendState struct {
 	fecFlushArmed bool
 }
 
-// peekPacketID returns the next packet id without advancing it.
-func (s *sendState) peekPacketID() uint32 {
-	return s.nextPacketID.Load()
+// reservePacketID reserves and returns the next DATA packet id. Gaps are
+// acceptable when a later send fails; duplicate packet ids are not.
+func (s *sendState) reservePacketID() uint32 {
+	return s.nextPacketID.Add(1) - 1
 }
 
-// commitPacket advances nextPacketID past packetID and, if requested, adds the
-// packet to the FEC window. Returns the repair group when a window completes.
+// commitPacket adds the packet to the FEC window when requested. Returns the
+// repair group when a window completes.
 func (s *sendState) commitPacket(packetID uint32, packet []byte, addToWindow bool) (txRepairGroup, bool, bool) {
-	// Atomic CAS preserves the "advance only if matches" contract while
-	// removing the mutex from the FEC-off hot path.
-	s.nextPacketID.CompareAndSwap(packetID, packetID+1)
 	if !addToWindow || s.txWindow == nil {
 		return txRepairGroup{}, false, false
 	}

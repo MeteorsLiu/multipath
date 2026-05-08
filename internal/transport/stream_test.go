@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -193,10 +194,29 @@ func TestStreamWriteCompletesPartialConnWrites(t *testing.T) {
 	}
 }
 
+func TestStreamWriteErrorClosesConn(t *testing.T) {
+	conn := &errorWriteConn{err: errors.New("write failed")}
+	stream := NewStream(nil)
+	connID := stream.addConn(conn)
+
+	if _, err := stream.Write(context.Background(), connID, []byte("payload")); err == nil {
+		t.Fatal("Write err = nil, want error")
+	}
+	if !conn.closed {
+		t.Fatal("conn was not closed after write error")
+	}
+}
+
 type partialWriteConn struct {
 	net.Conn
 	buf      bytes.Buffer
 	maxChunk int
+}
+
+type errorWriteConn struct {
+	net.Conn
+	err    error
+	closed bool
 }
 
 type legFailureHandlerFunc func(context.Context, LegRef, error)
@@ -215,4 +235,13 @@ func (c *partialWriteConn) Write(payload []byte) (int, error) {
 		n = c.maxChunk
 	}
 	return c.buf.Write(payload[:n])
+}
+
+func (c *errorWriteConn) Write(payload []byte) (int, error) {
+	return 0, c.err
+}
+
+func (c *errorWriteConn) Close() error {
+	c.closed = true
+	return nil
 }

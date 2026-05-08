@@ -252,6 +252,12 @@ func writePayload(ctx context.Context, payload Payload, packet PacketTransport, 
 			return ErrInvalidLeg
 		}
 		_, err := packet.WriteTo(ctx, payload.Leg.EndpointID, payload.Leg.RemoteAddr, payload.Packet.Payload)
+		if err != nil && !errors.Is(err, context.Canceled) {
+			if debuglog.Enabled() {
+				debuglog.Printf("transport", "drop failed udp payload endpoint=%s remote=%v bytes=%d err=%v", payload.Leg.EndpointID, payload.Leg.RemoteAddr, len(payload.Packet.Payload), err)
+			}
+			return nil
+		}
 		return err
 	case KindTCP:
 		if stream == nil || payload.Leg.ConnID == "" {

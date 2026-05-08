@@ -140,6 +140,7 @@ func (s *Stream) Write(ctx context.Context, connID string, payload []byte) (int,
 			metrics.L("operation", "write"),
 		)
 		s.deleteConn(connID, conn)
+		_ = conn.Close()
 		s.notifyLegFailure(ctx, connID, err)
 		return payloadBytesWritten(n), err
 	}

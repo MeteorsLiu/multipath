@@ -230,7 +230,7 @@ func TestSendWritePacketAllocatesPacketIDAfterSuccessfulWrite(t *testing.T) {
 	}
 }
 
-func TestSendWritePacketDoesNotAdvancePacketIDOnFailure(t *testing.T) {
+func TestSendWritePacketReservesPacketIDBeforeSend(t *testing.T) {
 	in := New()
 	session := mustSendState(t, in, 99)
 
@@ -241,8 +241,8 @@ func TestSendWritePacketDoesNotAdvancePacketIDOnFailure(t *testing.T) {
 	if packetID != 0 {
 		t.Fatalf("packetID = %d, want 0", packetID)
 	}
-	if got := session.nextPacketID.Load(); got != 0 {
-		t.Fatalf("nextPacketID = %d, want 0", got)
+	if got := session.nextPacketID.Load(); got != 1 {
+		t.Fatalf("nextPacketID = %d, want 1", got)
 	}
 }
 
@@ -269,6 +269,60 @@ func TestSendWritePacketDoesNotHardStopAtMaxPacketID(t *testing.T) {
 	written.Packet.Release()
 	if got := session.nextPacketID.Load(); got != 0 {
 		t.Fatalf("nextPacketID = %d, want 0 after uint32 wrap", got)
+	}
+}
+
+func TestSendWritePacketConcurrentPacketIDsUnique(t *testing.T) {
+	in := New()
+	mustSendState(t, in, 99)
+	lane := newLaneRuntime(3, 10)
+	lane.observeLeg(transport.LegRef{
+		Kind:       transport.KindUDP,
+		EndpointID: "udp0",
+		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
+	})
+	in.lanes[laneKey{sessionID: 99, laneID: 3}] = lane
+	in.activateSession(99)
+
+	const workers = 32
+	start := make(chan struct{})
+	errCh := make(chan error, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			packet := packetbuf.Acquire(1)
+			packet.Payload[0] = byte(i)
+			errCh <- in.Write(context.Background(), packet)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("Write failed: %v", err)
+		}
+	}
+
+	seen := make(map[uint32]bool, workers)
+	for i := 0; i < workers; i++ {
+		written := readSendPayload(t, in)
+		frame, err := protocol.Decode(written.Packet.Payload)
+		written.Packet.Release()
+		if err != nil {
+			t.Fatalf("Decode DATA %d: %v", i, err)
+		}
+		body, ok := frame.Body.(protocol.DataBody)
+		if !ok {
+			t.Fatalf("body type = %T, want DataBody", frame.Body)
+		}
+		if seen[body.PacketID] {
+			t.Fatalf("duplicate packetID %d", body.PacketID)
+		}
+		seen[body.PacketID] = true
 	}
 }
 
@@ -1179,6 +1233,95 @@ func TestSendHandleHELLOCreatesLaneAndRepliesOnObservedLeg(t *testing.T) {
 	}
 	if got := in.runnableLanes(99); len(got) != 1 || got[0].id != 3 {
 		t.Fatalf("runnable lanes = %+v, want lane 3", got)
+	}
+}
+
+func TestSendHandleHELLOSwitchesSessionClosesOldLanesButKeepsCurrentConn(t *testing.T) {
+	streamTransport := &fakeStreamTransport{}
+	in := New(Config{StreamTransport: streamTransport})
+	in.probeEvents = make(chan probe.Event, 16)
+	mustSendState(t, in, 99)
+	in.activateSession(99)
+
+	oldUDP := transport.LegRef{
+		Kind:       transport.KindUDP,
+		EndpointID: "udp-old",
+		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
+	}
+	oldTCP := transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp-old"}
+	currentTCP := transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp-current"}
+
+	oldLane1 := newLaneRuntime(1, 1)
+	oldLane1.bindLeg(oldUDP)
+	oldLane1.bindLeg(oldTCP)
+	oldLane2 := newLaneRuntime(2, 1)
+	oldLane2.bindLeg(currentTCP)
+	in.lanes[laneKey{sessionID: 99, laneID: 1}] = oldLane1
+	in.lanes[laneKey{sessionID: 99, laneID: 2}] = oldLane2
+	in.trackProbeTarget(context.Background(), 99, 1, oldUDP)
+	in.trackProbeTarget(context.Background(), 99, 1, oldTCP)
+	in.trackProbeTarget(context.Background(), 99, 2, currentTCP)
+	in.bandwidthLegs[newPingKey(oldUDP)] = &bandwidthLegState{key: laneKey{sessionID: 99, laneID: 1}}
+	in.bandwidthLegs[newPingKey(oldTCP)] = &bandwidthLegState{key: laneKey{sessionID: 99, laneID: 1}}
+	in.bandwidthLegs[newPingKey(currentTCP)] = &bandwidthLegState{key: laneKey{sessionID: 99, laneID: 2}}
+
+	payload, err := protocol.Encode(protocol.Frame{
+		Type:      protocol.TypeHELLO,
+		SessionID: 100,
+		LaneID:    2,
+		Body: protocol.HelloBody{
+			Nonce: 123,
+			Caps:  protocol.CapTCPFallback,
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+
+	if err := writeTestControl(context.Background(), in, testEvent(currentTCP, payload)); err != nil {
+		t.Fatalf("recv Write HELLO failed: %v", err)
+	}
+	written := readSendPayload(t, in)
+	defer written.Packet.Release()
+	if written.Leg.Kind != transport.KindTCP || written.Leg.ConnID != "tcp-current" {
+		t.Fatalf("reply leg = %+v, want tcp-current", written.Leg)
+	}
+
+	if getSendState(in, 99) != nil {
+		t.Fatal("old session state still exists after session switch")
+	}
+	if _, ok := in.lanes[laneKey{sessionID: 99, laneID: 1}]; ok {
+		t.Fatal("old session lane 1 still exists after session switch")
+	}
+	if _, ok := in.lanes[laneKey{sessionID: 99, laneID: 2}]; ok {
+		t.Fatal("old session lane 2 still exists after session switch")
+	}
+	if lane := in.lanes[laneKey{sessionID: 100, laneID: 2}]; lane == nil || !lane.tcpReady || lane.tcpLeg.ConnID != "tcp-current" {
+		t.Fatalf("new session lane = %+v, want tcp-current ready", lane)
+	}
+	if _, ok := in.probeKeys[newPingKey(oldUDP)]; ok {
+		t.Fatal("old UDP probe target still tracked")
+	}
+	if _, ok := in.probeKeys[newPingKey(oldTCP)]; ok {
+		t.Fatal("old TCP probe target still tracked")
+	}
+	if _, ok := in.probeKeys[newPingKey(currentTCP)]; !ok {
+		t.Fatal("current TCP probe target was not re-tracked for new session")
+	}
+	if _, ok := in.bandwidthLegs[newPingKey(oldUDP)]; ok {
+		t.Fatal("old UDP bandwidth state still exists")
+	}
+	if _, ok := in.bandwidthLegs[newPingKey(oldTCP)]; ok {
+		t.Fatal("old TCP bandwidth state still exists")
+	}
+	if _, ok := in.bandwidthLegs[newPingKey(currentTCP)]; ok {
+		t.Fatal("current TCP old-session bandwidth state still exists")
+	}
+	if got := streamTransport.closed["tcp-old"]; got != 1 {
+		t.Fatalf("closed tcp-old count = %d, want 1", got)
+	}
+	if got := streamTransport.closed["tcp-current"]; got != 0 {
+		t.Fatalf("closed tcp-current count = %d, want 0", got)
 	}
 }
 

@@ -33,6 +33,7 @@ func (i *Send) acceptHello(ctx context.Context, sessionID uint64, laneID uint8, 
 	}
 	if oldID, active := i.activeSession(); active && oldID != sessionID {
 		i.deleteSessionState(oldID)
+		i.closeSessionLanes(ctx, oldID, leg)
 	}
 	i.activateSession(sessionID)
 	i.negotiatedCaps.Store(uint32(caps))
@@ -198,24 +199,29 @@ func (i *Send) close(ctx context.Context, sessionID uint64, laneID uint8, scope 
 	case protocol.CloseScopeSession:
 		wasActive := i.deactivateSessionIfActive(sessionID)
 		i.deleteSessionState(sessionID)
-		// Snapshot lane keys for this session.
-		i.lanesMu.RLock()
-		keys := make([]laneKey, 0, len(i.lanes))
-		for key := range i.lanes {
-			if key.sessionID == sessionID {
-				keys = append(keys, key)
-			}
-		}
-		i.lanesMu.RUnlock()
-		for _, key := range keys {
-			i.closeLane(ctx, key)
-		}
+		i.closeSessionLanes(ctx, sessionID, transport.LegRef{})
 		i.deleteRunnableLanesCache(sessionID)
 		if reason == protocol.CloseReasonUnknownSession && wasActive {
 			return i.bootstrapNewSession(ctx, "rebootstrap")
 		}
 	}
 	return nil
+}
+
+func (i *Send) closeSessionLanes(ctx context.Context, sessionID uint64, keepLeg transport.LegRef) {
+	// Snapshot lane keys for this session.
+	i.lanesMu.RLock()
+	keys := make([]laneKey, 0, len(i.lanes))
+	for key := range i.lanes {
+		if key.sessionID != sessionID {
+			continue
+		}
+		keys = append(keys, key)
+	}
+	i.lanesMu.RUnlock()
+	for _, key := range keys {
+		i.closeLaneKeepingLeg(ctx, key, keepLeg)
+	}
 }
 
 func (i *Send) writeUnknownSessionClose(ctx context.Context, sessionID uint64, laneID uint8, leg transport.LegRef) error {
@@ -232,6 +238,10 @@ func (i *Send) writeUnknownSessionClose(ctx context.Context, sessionID uint64, l
 }
 
 func (i *Send) closeLane(ctx context.Context, key laneKey) {
+	i.closeLaneKeepingLeg(ctx, key, transport.LegRef{})
+}
+
+func (i *Send) closeLaneKeepingLeg(ctx context.Context, key laneKey, keepLeg transport.LegRef) {
 	i.lanesMu.Lock()
 	lane := i.lanes[key]
 	delete(i.lanes, key)
@@ -249,7 +259,8 @@ func (i *Send) closeLane(ctx context.Context, key laneKey) {
 	i.untrackProbeTarget(ctx, tcpLeg)
 	i.clearBandwidthLeg(udpLeg)
 	i.clearBandwidthLeg(tcpLeg)
-	if i.streamTransport != nil && tcpLeg.ConnID != "" {
+	keepTCP := keepLeg.Kind != 0 && newPingKey(tcpLeg) == newPingKey(keepLeg)
+	if i.streamTransport != nil && tcpLeg.ConnID != "" && !keepTCP {
 		_ = i.streamTransport.Close(ctx, tcpLeg.ConnID)
 	}
 }

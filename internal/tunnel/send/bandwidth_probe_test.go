@@ -294,6 +294,37 @@ func TestBandwidthProbeLostLegReleasesNextLane(t *testing.T) {
 	}
 }
 
+func TestBandwidthProbeTrainDoesNotCompleteAfterLostLeg(t *testing.T) {
+	in := New()
+	key := laneKey{sessionID: 99, laneID: 2}
+	leg := transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp2"}
+	legKey := newPingKey(leg)
+	lane := newLaneRuntime(2, 1)
+	lane.bindLeg(leg)
+	in.lanes[key] = lane
+	in.bandwidthLegs[legKey] = &bandwidthLegState{
+		key:         key,
+		rateBps:     bandwidthProbeMinRateBps,
+		inFlight:    true,
+		startedAt:   time.Now().Add(-time.Second),
+		sentFrames:  10,
+		ackedFrames: 5,
+		ackedBytes:  2048,
+		steps:       make(map[uint64]*bandwidthProbeStep),
+		stepOrder:   []uint64{1},
+	}
+
+	in.completeBandwidthProbeLostLeg(key, leg, "probe_timeout")
+	if completed := in.completeBandwidthProbeTrain(key, leg, legKey); completed {
+		t.Fatal("completeBandwidthProbeTrain completed after lost leg")
+	}
+
+	_, _, _, tcpQ := lane.legQualities()
+	if tcpQ.ProbeSamples != 1 {
+		t.Fatalf("tcp probe samples = %d, want 1", tcpQ.ProbeSamples)
+	}
+}
+
 func waitForBandwidthProbeComplete(t *testing.T, in *Send, legKey pingKey, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)

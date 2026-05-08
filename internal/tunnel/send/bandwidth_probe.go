@@ -842,7 +842,7 @@ func (l *Send) markBandwidthProbeSendComplete(legKey pingKey, endedAt time.Time)
 func (l *Send) completeBandwidthProbeTrain(key laneKey, leg transport.LegRef, legKey pingKey) bool {
 	l.bandwidthMu.Lock()
 	state := l.bandwidthLegs[legKey]
-	if state == nil {
+	if state == nil || state.complete {
 		l.bandwidthMu.Unlock()
 		return false
 	}

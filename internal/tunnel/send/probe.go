@@ -19,7 +19,7 @@ type pingKey struct {
 }
 
 func (l *Send) sendPING(ctx context.Context, sessionID uint64, laneID uint8, leg transport.LegRef, pingID uint64, timeMS uint64) error {
-	lane := l.lanes[laneKey{sessionID: sessionID, laneID: laneID}]
+	lane := l.getLane(laneKey{sessionID: sessionID, laneID: laneID})
 	if lane == nil {
 		return errUnknownLane
 	}
@@ -147,7 +147,9 @@ func (l *Send) handleProbeEvent(ctx context.Context, event probe.Event) error {
 	)
 	switch event.Type {
 	case probe.EventSendPing:
+		l.probeMu.Lock()
 		binding, ok := l.probeTargets[event.Target]
+		l.probeMu.Unlock()
 		if !ok {
 			debuglog.Printf("send/probe", "event_drop missing_target %s", debugProbeEvent(event))
 			return nil
