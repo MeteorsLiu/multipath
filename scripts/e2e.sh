@@ -266,6 +266,12 @@ write_one_lane_config() {
   local fec_flag="$4"
   local probe_interval_ms="${5:-200}"
   local probe_timeout_ms="${6:-600}"
+  local bandwidth_probe_cap_bps="${7:-}"
+  local bandwidth_probe_cap_json=""
+  if [[ -n "${bandwidth_probe_cap_bps}" ]]; then
+    bandwidth_probe_cap_json=",
+  \"bandwidthProbeCapBps\": ${bandwidth_probe_cap_bps}"
+  fi
 
   cat >"${WORKDIR}/server-${name}.json" <<EOF
 {
@@ -279,7 +285,7 @@ write_one_lane_config() {
   },
   "fec": ${fec_flag},
   "probeIntervalMS": ${probe_interval_ms},
-  "probeTimeoutMS": ${probe_timeout_ms}
+  "probeTimeoutMS": ${probe_timeout_ms}${bandwidth_probe_cap_json}
 }
 EOF
 
@@ -298,7 +304,7 @@ EOF
   },
   "fec": ${fec_flag},
   "probeIntervalMS": ${probe_interval_ms},
-  "probeTimeoutMS": ${probe_timeout_ms}
+  "probeTimeoutMS": ${probe_timeout_ms}${bandwidth_probe_cap_json}
 }
 EOF
 }
@@ -876,7 +882,7 @@ run_leg_selector_case() {
   local name="leg-selector"
   echo "==== ${name} e2e start ===="
   clear_loss
-  write_one_lane_config "${name}" "${PORT_LEG_SELECTOR}" false false 200 600
+  write_one_lane_config "${name}" "${PORT_LEG_SELECTOR}" false false 200 600 -1
   echo "[${name}] apply 50% UDP loss before startup; initial bandwidth probes should mark UDP QoS-limited"
   apply_udp_partial_loss 1 "${PORT_LEG_SELECTOR}" 50%
   local client_qos_start_line
@@ -906,7 +912,7 @@ run_bandwidth_probe_convergence_case() {
   local name="bandwidth-probe-convergence"
   echo "==== ${name} e2e start ===="
   clear_loss
-  write_one_lane_config "${name}" "${PORT_BW_PROBE_CONVERGENCE}" false false 200 1000
+  write_one_lane_config "${name}" "${PORT_BW_PROBE_CONVERGENCE}" false false 200 1000 -1
   echo "[${name}] rate-limit UDP tunnel before startup; bandwidth probe should classify UDP relative to TCP"
   apply_udp_tunnel_rate_path 1 "${PORT_BW_PROBE_CONVERGENCE}" 80mbit
   local client_start_line
@@ -928,7 +934,7 @@ run_bandwidth_probe_tcp_reference_case() {
   local name="bandwidth-probe-tcp-reference"
   echo "==== ${name} e2e start ===="
   clear_loss
-  write_one_lane_config "${name}" "${PORT_BW_PROBE_GUARD}" false false 200 1000
+  write_one_lane_config "${name}" "${PORT_BW_PROBE_GUARD}" false false 200 1000 -1
   echo "[${name}] apply 200mbit UDP tunnel bottleneck; bandwidth probe should classify UDP relative to TCP reference"
   apply_udp_tunnel_rate_path 1 "${PORT_BW_PROBE_GUARD}" 200mbit
   local client_start_line

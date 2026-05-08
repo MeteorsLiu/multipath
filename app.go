@@ -98,7 +98,7 @@ func buildServerRuntime(cfg Config, device *tun.Device) (*appRuntime, []io.Close
 		FECFlushMaxMs:        cfg.FECFlushMaxMs,
 		FECFlushColdStartMs:  cfg.FECFlushColdStartMs,
 		FECFlushFixedMs:      cfg.FECFlushFixedMs,
-		BandwidthProbeCapBps: uint64(cfg.BandwidthProbeCapBps),
+		BandwidthProbeCapBps: cfg.bandwidthProbeCapForSend(),
 	})
 	probeLoop := send.NewProbeLoop(in, send.ProbeLoopConfig{
 		Events:   probeEvents,
@@ -188,7 +188,7 @@ func buildClientRuntime(cfg Config, device *tun.Device) (*appRuntime, []io.Close
 		FECFlushMaxMs:        cfg.FECFlushMaxMs,
 		FECFlushColdStartMs:  cfg.FECFlushColdStartMs,
 		FECFlushFixedMs:      cfg.FECFlushFixedMs,
-		BandwidthProbeCapBps: uint64(cfg.BandwidthProbeCapBps),
+		BandwidthProbeCapBps: cfg.bandwidthProbeCapForSend(),
 		BootstrapLanes:       bootstrap,
 	})
 	probeLoop := send.NewProbeLoop(in, send.ProbeLoopConfig{

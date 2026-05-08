@@ -35,21 +35,21 @@ type TunConfig struct {
 }
 
 type Config struct {
-	Client              ClientConfig `json:"client,omitempty"`
-	Server              ServerConfig `json:"server,omitempty"`
-	Tun                 TunConfig    `json:"tun"`
-	PromListenAddr      string       `json:"promListenAddr"`
-	IsServerSide        bool         `json:"isServer"`
-	IsTCP               bool         `json:"tcp"`
-	FEC                 bool         `json:"fec"`
-	FECFlushAlpha       uint32       `json:"fecFlushAlpha,omitempty"`
-	FECFlushMinMs       uint32       `json:"fecFlushMinMs,omitempty"`
-	FECFlushMaxMs       uint32       `json:"fecFlushMaxMs,omitempty"`
-	FECFlushColdStartMs uint32       `json:"fecFlushColdStartMs,omitempty"`
-	FECFlushFixedMs     uint32       `json:"fecFlushFixedMs,omitempty"`
-	ProbeIntervalMS       int   `json:"probeIntervalMS"`
-	ProbeTimeoutMS        int   `json:"probeTimeoutMS"`
-	BandwidthProbeCapBps  int64 `json:"bandwidthProbeCapBps"`
+	Client               ClientConfig `json:"client,omitempty"`
+	Server               ServerConfig `json:"server,omitempty"`
+	Tun                  TunConfig    `json:"tun"`
+	PromListenAddr       string       `json:"promListenAddr"`
+	IsServerSide         bool         `json:"isServer"`
+	IsTCP                bool         `json:"tcp"`
+	FEC                  bool         `json:"fec"`
+	FECFlushAlpha        uint32       `json:"fecFlushAlpha,omitempty"`
+	FECFlushMinMs        uint32       `json:"fecFlushMinMs,omitempty"`
+	FECFlushMaxMs        uint32       `json:"fecFlushMaxMs,omitempty"`
+	FECFlushColdStartMs  uint32       `json:"fecFlushColdStartMs,omitempty"`
+	FECFlushFixedMs      uint32       `json:"fecFlushFixedMs,omitempty"`
+	ProbeIntervalMS      int          `json:"probeIntervalMS"`
+	ProbeTimeoutMS       int          `json:"probeTimeoutMS"`
+	BandwidthProbeCapBps int64        `json:"bandwidthProbeCapBps"`
 }
 
 func ParseConfig(path string) (Config, error) {
@@ -96,4 +96,11 @@ func (c Config) probeInterval() time.Duration {
 
 func (c Config) probeTimeout() time.Duration {
 	return time.Duration(c.ProbeTimeoutMS) * time.Millisecond
+}
+
+func (c Config) bandwidthProbeCapForSend() uint64 {
+	if c.BandwidthProbeCapBps <= 0 {
+		return 0
+	}
+	return uint64(c.BandwidthProbeCapBps)
 }

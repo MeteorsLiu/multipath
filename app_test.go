@@ -64,6 +64,34 @@ func TestParseConfigExplicitFECFalse(t *testing.T) {
 	}
 }
 
+func TestBandwidthProbeCapForSendTreatsNegativeAsNoCap(t *testing.T) {
+	cfg := Config{BandwidthProbeCapBps: -1}
+	if got := cfg.bandwidthProbeCapForSend(); got != 0 {
+		t.Fatalf("bandwidthProbeCapForSend = %d, want 0", got)
+	}
+}
+
+func TestParseConfigNegativeBandwidthProbeCapDisablesCap(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{
+		"client": {"remotePaths": [{"remoteAddr": "127.0.0.1:9000"}]},
+		"bandwidthProbeCapBps": -1
+	}`), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	cfg, err := ParseConfig(path)
+	if err != nil {
+		t.Fatalf("ParseConfig failed: %v", err)
+	}
+	if cfg.BandwidthProbeCapBps != -1 {
+		t.Fatalf("BandwidthProbeCapBps = %d, want -1", cfg.BandwidthProbeCapBps)
+	}
+	if got := cfg.bandwidthProbeCapForSend(); got != 0 {
+		t.Fatalf("bandwidthProbeCapForSend = %d, want 0", got)
+	}
+}
+
 func TestParseOldConfigShape(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	if err := os.WriteFile(path, []byte(`{

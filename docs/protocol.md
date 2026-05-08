@@ -624,6 +624,8 @@ Sender behavior:
    N, server lane N, client lane N+1, server lane N+1.
 8. When no configured bandwidth cap is present, each lane first runs TCP as a
    reference and then UDP. When a cap is present, only UDP is probed.
+   Application JSON uses `bandwidthProbeCapBps < 0` to request no cap; omitted
+   or zero values use the application default cap.
 
 Receiver behavior:
 
