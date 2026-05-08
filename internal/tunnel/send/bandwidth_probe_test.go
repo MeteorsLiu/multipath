@@ -44,6 +44,21 @@ func TestBandwidthProbePlateau(t *testing.T) {
 	}
 }
 
+func TestBandwidthProbeUDPUnderDeliveryRequiresPlateauBelowCap(t *testing.T) {
+	if !bandwidthProbeUDPUnderDelivery(100_000_000, 80_000_000, []uint64{40_000_000, 40_000_000, 41_000_000}) {
+		t.Fatal("want under-delivery for plateau below cap")
+	}
+	if bandwidthProbeUDPUnderDelivery(100_000_000, 100_000_000, []uint64{40_000_000, 40_000_000, 41_000_000}) {
+		t.Fatal("want no under-delivery once probe rate reached cap")
+	}
+	if bandwidthProbeUDPUnderDelivery(100_000_000, 80_000_000, []uint64{40_000_000, 50_000_000, 60_000_000}) {
+		t.Fatal("want no under-delivery while throughput is still growing")
+	}
+	if bandwidthProbeUDPUnderDelivery(0, 80_000_000, []uint64{40_000_000, 40_000_000, 41_000_000}) {
+		t.Fatal("want no under-delivery without a reference cap")
+	}
+}
+
 func TestNextBandwidthProbeRateUDPAdaptive(t *testing.T) {
 	cap := uint64(100_000_000)
 
@@ -161,6 +176,14 @@ func TestBandwidthProbeTrainBudgetFromCap(t *testing.T) {
 	want := uint64(200_000_000) * uint64(bandwidthProbeWindow) / uint64(time.Second) / 8
 	if budget != want {
 		t.Fatalf("budget = %d, want %d", budget, want)
+	}
+}
+
+func TestBandwidthProbeTrainBudgetForTCPReferenceAllowsRamp(t *testing.T) {
+	budget := bandwidthProbeTCPReferenceTrainBudgetBytes()
+	min := bandwidthProbeTrainBudgetBytes(200_000_000)
+	if budget < min {
+		t.Fatalf("tcp reference budget = %d, want at least %d", budget, min)
 	}
 }
 
@@ -285,6 +308,37 @@ func TestBandwidthProbeCandidateNoCapRunsTCPReferenceFirst(t *testing.T) {
 	leg, ok := in.bandwidthProbeCandidate(key, lane, udp, LegQuality{Active: true}, tcp, LegQuality{Active: true})
 	if !ok || leg.Kind != transport.KindTCP {
 		t.Fatalf("candidate = (%s,%t), want TCP reference", debugLeg(leg), ok)
+	}
+}
+
+func TestBandwidthProbeUDPAfterTCPReferenceUsesReferenceCap(t *testing.T) {
+	in := New()
+	key := laneKey{sessionID: 99, laneID: 1}
+	leg := udpLeg()
+	legKey := newPingKey(leg)
+	lane := newLaneRuntime(1, 1)
+	lane.bindLeg(leg)
+	lane.recordBandwidthSample(transport.KindTCP, 300_000_000, 0)
+	in.lanes[key] = lane
+
+	in.maybeStartBandwidthProbe(context.Background(), key, leg, time.Now())
+
+	in.bandwidthMu.Lock()
+	state := in.bandwidthLegs[legKey]
+	var capBps uint64
+	var trainBytesTotal uint64
+	if state != nil {
+		capBps = state.capBps
+		trainBytesTotal = state.trainBytesTotal
+		state.complete = true
+		state.inFlight = false
+	}
+	in.bandwidthMu.Unlock()
+	if capBps != 300_000_000 {
+		t.Fatalf("UDP capBps = %d, want TCP reference", capBps)
+	}
+	if want := bandwidthProbeTrainBudgetBytes(300_000_000); trainBytesTotal != want {
+		t.Fatalf("UDP train budget = %d, want %d", trainBytesTotal, want)
 	}
 }
 
