@@ -71,6 +71,7 @@ PORT_LEG_SELECTOR=5014
 PORT_SERVER_RESTART=5015
 PORT_BW_PROBE_CONVERGENCE=5016
 PORT_BW_PROBE_GUARD=5017
+PORT_BW_PROBE_DEFAULT_CAP=5018
 
 PATH1_C="10.201.1.1/24"
 PATH1_S="10.201.1.2/24"
@@ -983,6 +984,30 @@ run_bandwidth_probe_tcp_reference_case() {
   echo "==== ${name} e2e end ===="
 }
 
+run_bandwidth_probe_default_cap_case() {
+  local name="bandwidth-probe-default-cap"
+  echo "==== ${name} e2e start ===="
+  clear_loss
+  write_one_lane_config "${name}" "${PORT_BW_PROBE_DEFAULT_CAP}" false false 200 600
+  echo "[${name}] apply 50% large-packet UDP loss before startup; default 200mbit cap should classify UDP without TCP reference probe"
+  apply_udp_large_packet_partial_loss 1 "${PORT_BW_PROBE_DEFAULT_CAP}" 50%
+  local client_start_line
+  local client_log_file="${WORKDIR}/${name}.client.log"
+  client_start_line="$(current_log_file_line_count "${client_log_file}")"
+  start_multipath "${name}"
+
+  wait_log_pattern "${name}" "accept_hello_ack session=[0-9]+ lane=1 .*tcp conn=" 20 "warm TCP fallback leg reached HELLO_ACK"
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "send/bw_probe: train_start .*leg=\\{udp .*cap_bps=200000000" 20 "client started default-capped UDP bandwidth probe" "${client_start_line}"
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "bandwidth_probe_decision .*lane=1 .*udp_samples=1 .*tcp_samples=0 .*reference_bps=200000000 .*udp_qos_limited=true .*tcp_better=true selected_leg=tcp" 35 "client classified UDP against default bandwidth cap without TCP probe sample" "${client_start_line}"
+  local client_select_start_line
+  client_select_start_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
+  wait_log_file_pattern_while_ping_from "${name}" "${CURRENT_CLIENT_LOG}" "schedule_select.*leg=\\{tcp .*frame=type=DATA" 20 "client leg selector chose TCP after default-cap QoS detection" "${client_select_start_line}" "${NS_C}" "${TUN_C_REMOTE}"
+
+  stop_multipath
+  clear_loss
+  echo "==== ${name} e2e end ===="
+}
+
 run_nat_case() {
   local name="nat"
   echo "==== ${name} e2e start ===="
@@ -1730,6 +1755,7 @@ run_fallback_dial_error_case
 run_leg_selector_case
 run_bandwidth_probe_convergence_case
 run_bandwidth_probe_tcp_reference_case
+run_bandwidth_probe_default_cap_case
 run_nat_case
 run_fec_comparison
 run_fec_tcp_fallback_case
