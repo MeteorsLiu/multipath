@@ -93,17 +93,3 @@ func (s *RecvState) OnBandwidthProbeAck(ctx context.Context, leg transport.LegRe
 	}
 	return s.sender.receiveBandwidthProbeAck(frame.SessionID, frame.LaneID, leg, body)
 }
-
-func (s *RecvState) OnBandwidthProbeDone(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error {
-	if s == nil || s.sender == nil {
-		return nil
-	}
-	body, ok := frame.Body.(protocol.BandwidthProbeDoneBody)
-	if !ok {
-		debuglog.Printf("send/control", "invalid_body type=BW_PROBE_DONE")
-		return protocol.ErrInvalidFrame
-	}
-	s.sender.markBandwidthProbeDone(frame.SessionID, frame.LaneID)
-	debuglog.Printf("send/control", "bw_probe_done session=%d lane=%d client_bps=%d", frame.SessionID, frame.LaneID, body.ResultBps)
-	return nil
-}

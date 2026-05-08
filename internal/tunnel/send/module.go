@@ -46,21 +46,21 @@ var (
 //     fecProfile, negotiatedCaps, nextProbeTarget) need no lock.
 type Send struct {
 	// Immutable after construction.
-	sessionManager         *sessionpkg.Manager
-	streamTransport        transport.StreamTransport
-	probeInterval          time.Duration
-	probeTimeout           time.Duration
-	bandwidthProbe         bool
-	bandwidthProbeCapBps   uint64
-	fecFlushAlpha          uint32
-	fecFlushMinMs       uint32
-	fecFlushMaxMs       uint32
-	fecFlushColdStartMs uint32
-	fecFlushFixedMs     uint32
-	probeEvents         chan probe.Event
-	packets             chan transport.Payload
-	bootstrapLanes      []BootstrapLane
-	legController       legController
+	sessionManager       *sessionpkg.Manager
+	streamTransport      transport.StreamTransport
+	probeInterval        time.Duration
+	probeTimeout         time.Duration
+	bandwidthProbe       bool
+	bandwidthProbeCapBps uint64
+	fecFlushAlpha        uint32
+	fecFlushMinMs        uint32
+	fecFlushMaxMs        uint32
+	fecFlushColdStartMs  uint32
+	fecFlushFixedMs      uint32
+	probeEvents          chan probe.Event
+	packets              chan transport.Payload
+	bootstrapLanes       []BootstrapLane
+	legController        legController
 
 	// Mutable but lock-free.
 	fecCodec  fecCodec
@@ -100,12 +100,13 @@ type Send struct {
 	rttMu      sync.Mutex
 	rttPending map[rttPendingKey]rttPendingPing
 
-	bandwidthMu      sync.Mutex
-	bandwidthLegs    map[pingKey]*bandwidthLegState
-	bandwidthPending map[uint64]*bandwidthProbeRound
-	bandwidthRX      map[bandwidthRXKey]*bandwidthRXRound
+	bandwidthMu           sync.Mutex
+	bandwidthLegs         map[pingKey]*bandwidthLegState
+	bandwidthPending      map[uint64]*bandwidthProbeRound
+	bandwidthRX           map[bandwidthRXKey]*bandwidthRXRound
+	bandwidthRemoteTrains map[bandwidthRemoteTrainKey]*bandwidthRemoteTrain
 
-	bandwidthProbeServerReady map[laneKey]bool
+	bandwidthGates map[uint64]bandwidthProbeGate
 
 	runnableCachesMu sync.Mutex
 	runnableCaches   map[uint64]*runnableLaneCache
@@ -113,25 +114,27 @@ type Send struct {
 
 func New(configs ...Config) *Send {
 	in := &Send{
-		lanes:               make(map[laneKey]*laneRuntime),
-		sendStates:          make(map[*sessionpkg.Session]*sendState),
-		runnableCaches:      make(map[uint64]*runnableLaneCache),
-		helloRoutes:         make(map[laneKey]helloRoute),
-		strategies:          make(map[uint64]schedule.Strategy[*laneRuntime]),
-		legSelectors:        make(map[uint64]LegSelector),
-		probeTargets:        make(map[probe.Target]probeBinding),
-		probeKeys:           make(map[pingKey]probe.Target),
-		rttPending:          make(map[rttPendingKey]rttPendingPing),
-		bandwidthLegs:       make(map[pingKey]*bandwidthLegState),
-		bandwidthPending:    make(map[uint64]*bandwidthProbeRound),
-		bandwidthRX:         make(map[bandwidthRXKey]*bandwidthRXRound),
-		packets:             make(chan transport.Payload, defaultPacketQueueSize),
-		sessionManager:      &sessionpkg.Manager{},
-		bandwidthProbe:      bandwidthProbeEnabled(),
-		fecFlushAlpha:       defaultFECFlushAlpha,
-		fecFlushMinMs:       defaultFECFlushMinMs,
-		fecFlushMaxMs:       defaultFECFlushMaxMs,
-		fecFlushColdStartMs: defaultFECFlushColdStart,
+		lanes:                 make(map[laneKey]*laneRuntime),
+		sendStates:            make(map[*sessionpkg.Session]*sendState),
+		runnableCaches:        make(map[uint64]*runnableLaneCache),
+		helloRoutes:           make(map[laneKey]helloRoute),
+		strategies:            make(map[uint64]schedule.Strategy[*laneRuntime]),
+		legSelectors:          make(map[uint64]LegSelector),
+		probeTargets:          make(map[probe.Target]probeBinding),
+		probeKeys:             make(map[pingKey]probe.Target),
+		rttPending:            make(map[rttPendingKey]rttPendingPing),
+		bandwidthLegs:         make(map[pingKey]*bandwidthLegState),
+		bandwidthPending:      make(map[uint64]*bandwidthProbeRound),
+		bandwidthRX:           make(map[bandwidthRXKey]*bandwidthRXRound),
+		bandwidthRemoteTrains: make(map[bandwidthRemoteTrainKey]*bandwidthRemoteTrain),
+		bandwidthGates:        make(map[uint64]bandwidthProbeGate),
+		packets:               make(chan transport.Payload, defaultPacketQueueSize),
+		sessionManager:        &sessionpkg.Manager{},
+		bandwidthProbe:        bandwidthProbeEnabled(),
+		fecFlushAlpha:         defaultFECFlushAlpha,
+		fecFlushMinMs:         defaultFECFlushMinMs,
+		fecFlushMaxMs:         defaultFECFlushMaxMs,
+		fecFlushColdStartMs:   defaultFECFlushColdStart,
 	}
 	for _, cfg := range configs {
 		in.applyConfig(cfg)
@@ -547,19 +550,17 @@ func frameEncodeCapacity(frame protocol.Frame) (int, error) {
 		return headerSize + 2, validFrameBody(ok)
 	case protocol.TypeBandwidthProbe:
 		body, ok := frame.Body.(protocol.BandwidthProbeBody)
-		if !ok || body.Count == 0 || body.Count > 64 || body.Seq >= body.Count {
+		if !ok || body.Count == 0 || body.Count > 64 || body.Seq >= body.Count ||
+			body.TrainBytesTotal == 0 || body.TrainBytesRemaining > body.TrainBytesTotal {
 			return 0, protocol.ErrInvalidFrame
 		}
-		return headerSize + 20 + len(body.Payload), nil
+		return headerSize + 44 + len(body.Payload), nil
 	case protocol.TypeBandwidthProbeAck:
 		body, ok := frame.Body.(protocol.BandwidthProbeAckBody)
 		if !ok || body.Count == 0 || body.Count > 64 || body.BaseSeq != 0 {
 			return 0, protocol.ErrInvalidFrame
 		}
 		return headerSize + 36, nil
-	case protocol.TypeBandwidthProbeDone:
-		_, ok := frame.Body.(protocol.BandwidthProbeDoneBody)
-		return headerSize + 8, validFrameBody(ok)
 	default:
 		return 0, protocol.ErrInvalidFrame
 	}

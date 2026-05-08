@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MeteorsLiu/multipath/internal/protocol"
 	"github.com/MeteorsLiu/multipath/internal/transport"
 )
 
@@ -155,6 +156,52 @@ func TestBandwidthProbeFrameEncoding(t *testing.T) {
 	}
 }
 
+func TestBandwidthProbeTrainBudgetFromCap(t *testing.T) {
+	budget := bandwidthProbeTrainBudgetBytes(200_000_000)
+	want := uint64(200_000_000) * uint64(bandwidthProbeWindow) / uint64(time.Second) / 8
+	if budget != want {
+		t.Fatalf("budget = %d, want %d", budget, want)
+	}
+}
+
+func TestBandwidthProbeRoundCarriesTrainBudget(t *testing.T) {
+	in := New()
+	key := laneKey{sessionID: 99, laneID: 3}
+	leg := udpLeg()
+	legKey := newPingKey(leg)
+	budget := uint64(10_000)
+
+	in.bandwidthLegs[legKey] = &bandwidthLegState{
+		key:                 key,
+		rateBps:             bandwidthProbeMinRateBps,
+		capBps:              bandwidthProbeMinRateBps,
+		inFlight:            true,
+		trainID:             42,
+		trainBytesTotal:     budget,
+		trainBytesRemaining: budget,
+		steps:               make(map[uint64]*bandwidthProbeStep),
+	}
+
+	round := in.startBandwidthProbeRound(key, leg, legKey, 1, time.Now())
+	if round == nil {
+		t.Fatal("nil round")
+	}
+	if round.trainID != 42 || round.trainBytesTotal != budget || round.trainBytesRemaining != budget {
+		t.Fatalf("round train fields = id=%d total=%d remaining=%d, want 42/%d/%d", round.trainID, round.trainBytesTotal, round.trainBytesRemaining, budget, budget)
+	}
+}
+
+func TestBandwidthProbeConsumeTrainBudget(t *testing.T) {
+	remaining, last := bandwidthProbeConsumeBudget(1000, 300)
+	if remaining != 700 || last {
+		t.Fatalf("first consume = (%d,%t), want (700,false)", remaining, last)
+	}
+	remaining, last = bandwidthProbeConsumeBudget(200, 300)
+	if remaining != 0 || !last {
+		t.Fatalf("last consume = (%d,%t), want (0,true)", remaining, last)
+	}
+}
+
 func TestProbeFrameCount(t *testing.T) {
 	count := probeFrameCount(16_000_000, bandwidthProbeFrameBytes(1400))
 	if count < 2 || count > bandwidthProbeMaxFrames {
@@ -166,44 +213,85 @@ func TestProbeFrameCount(t *testing.T) {
 	}
 }
 
-func TestBandwidthProbeServerReadyNil(t *testing.T) {
-	in := New()
-	key := laneKey{sessionID: 99, laneID: 1}
-	if !in.isBandwidthProbeServerReady(key) {
-		t.Fatal("nil map should always return true")
-	}
-
-	in.markBandwidthProbeDone(99, 2)
-	if !in.isBandwidthProbeServerReady(key) {
-		t.Fatal("mark on disabled server-ready gate should keep all lanes ready")
-	}
-	if !in.isBandwidthProbeServerReady(laneKey{sessionID: 99, laneID: 3}) {
-		t.Fatal("disabled server-ready gate should not become lane-scoped after mark")
-	}
-}
-
-func TestBandwidthProbeServerReadyMarked(t *testing.T) {
-	in := New()
-	in.EnableBandwidthProbeServerReady()
-	key := laneKey{sessionID: 99, laneID: 1}
-
-	in.markBandwidthProbeDone(99, 1)
-
-	if !in.isBandwidthProbeServerReady(key) {
-		t.Fatal("marked lane should return true")
-	}
-	other := laneKey{sessionID: 99, laneID: 2}
-	if in.isBandwidthProbeServerReady(other) {
-		t.Fatal("unmarked lane should return false")
-	}
-}
-
-func TestBandwidthProbeCompletesZeroAckLaneAndAdvances(t *testing.T) {
+func TestBandwidthProbeGateClientWaitsForRemoteBeforeNextLane(t *testing.T) {
 	in := New()
 	in.activateSession(99)
 	in.bandwidthProbeCapBps = bandwidthProbeMinRateBps
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	key1 := laneKey{sessionID: 99, laneID: 1}
+	key2 := laneKey{sessionID: 99, laneID: 2}
+
+	in.advanceBandwidthProbeGateAfterLocal(key1, transport.KindUDP)
+	if in.bandwidthProbeGateAllowsLocal(key2, transport.KindUDP) {
+		t.Fatal("client gate allowed lane2 before remote lane1 completion")
+	}
+	if !in.bandwidthProbeGateAllowsRemote(key1, transport.KindUDP) {
+		t.Fatal("client gate should wait for remote lane1")
+	}
+}
+
+func TestBandwidthProbeGateAdvancesAfterRemoteCompletion(t *testing.T) {
+	in := New()
+	in.activateSession(99)
+	in.bandwidthProbeCapBps = bandwidthProbeMinRateBps
+	key1 := laneKey{sessionID: 99, laneID: 1}
+	key2 := laneKey{sessionID: 99, laneID: 2}
+
+	in.advanceBandwidthProbeGateAfterLocal(key1, transport.KindUDP)
+	in.advanceBandwidthProbeGateAfterRemote(key1, transport.KindUDP)
+	if !in.bandwidthProbeGateAllowsLocal(key2, transport.KindUDP) {
+		t.Fatal("client gate did not advance to local lane2")
+	}
+}
+
+func TestBandwidthProbeGateServerStartsRemotePhase(t *testing.T) {
+	in := New()
+	in.activateSession(99)
+	in.bandwidthProbeCapBps = bandwidthProbeMinRateBps
+	in.setBandwidthProbeGateMode(false)
+	key1 := laneKey{sessionID: 99, laneID: 1}
+	if in.bandwidthProbeGateAllowsLocal(key1, transport.KindUDP) {
+		t.Fatal("server should not start local train before client train")
+	}
+	if !in.bandwidthProbeGateAllowsRemote(key1, transport.KindUDP) {
+		t.Fatal("server should accept remote lane1 train first")
+	}
+}
+
+func TestBandwidthProbeCandidateWithCapSkipsTCP(t *testing.T) {
+	in := New()
+	in.bandwidthProbeCapBps = 200_000_000
+	key := laneKey{sessionID: 99, laneID: 1}
+	lane := newLaneRuntime(1, 1)
+	udp := udpLeg()
+	tcp := tcpLeg()
+	lane.bindLeg(udp)
+	lane.bindLeg(tcp)
+
+	leg, ok := in.bandwidthProbeCandidate(key, lane, udp, LegQuality{Active: true}, tcp, LegQuality{Active: true})
+	if !ok || leg.Kind != transport.KindUDP {
+		t.Fatalf("candidate = (%s,%t), want UDP", debugLeg(leg), ok)
+	}
+}
+
+func TestBandwidthProbeCandidateNoCapRunsTCPReferenceFirst(t *testing.T) {
+	in := New()
+	key := laneKey{sessionID: 99, laneID: 1}
+	lane := newLaneRuntime(1, 1)
+	udp := udpLeg()
+	tcp := tcpLeg()
+	lane.bindLeg(udp)
+	lane.bindLeg(tcp)
+
+	leg, ok := in.bandwidthProbeCandidate(key, lane, udp, LegQuality{Active: true}, tcp, LegQuality{Active: true})
+	if !ok || leg.Kind != transport.KindTCP {
+		t.Fatalf("candidate = (%s,%t), want TCP reference", debugLeg(leg), ok)
+	}
+}
+
+func TestBandwidthProbeCompletesZeroAckLaneWaitsForRemote(t *testing.T) {
+	in := New()
+	in.activateSession(99)
+	in.bandwidthProbeCapBps = bandwidthProbeMinRateBps
 
 	key1 := laneKey{sessionID: 99, laneID: 1}
 	lane1 := newLaneRuntime(1, 1)
@@ -225,33 +313,58 @@ func TestBandwidthProbeCompletesZeroAckLaneAndAdvances(t *testing.T) {
 	lane2.bindLeg(leg2)
 	in.lanes[key2] = lane2
 
-	in.maybeStartBandwidthProbe(ctx, key1, leg1, time.Now())
-	waitForBandwidthProbeComplete(t, in, newPingKey(leg1), 3*time.Second)
-
-	_, udpQ1, _, _ := lane1.legQualities()
-	if udpQ1.ProbeSamples != 1 || udpQ1.BandwidthBps != 0 || udpQ1.ProbeLoss != 1 {
-		t.Fatalf("lane1 UDP quality = samples=%d bps=%d loss=%.3f, want 1/0/1", udpQ1.ProbeSamples, udpQ1.BandwidthBps, udpQ1.ProbeLoss)
+	legKey1 := newPingKey(leg1)
+	in.bandwidthLegs[legKey1] = &bandwidthLegState{
+		key:         key1,
+		capBps:      bandwidthProbeMinRateBps,
+		rateBps:     bandwidthProbeMinRateBps,
+		inFlight:    true,
+		startedAt:   time.Now().Add(-time.Second),
+		endedAt:     time.Now(),
+		sentFrames:  10,
+		ackedFrames: 0,
+		ackedBytes:  0,
+		steps:       make(map[uint64]*bandwidthProbeStep),
 	}
+	if completed := in.completeBandwidthProbeTrain(key1, leg1, legKey1); !completed {
+		t.Fatal("lane1 bandwidth probe did not complete")
+	}
+	in.advanceBandwidthProbeGateAfterLocal(key1, transport.KindUDP)
 
-	in.probeBandwidth(ctx, time.Now())
-
+	in.probeBandwidth(context.Background(), time.Now())
 	in.bandwidthMu.Lock()
 	state2 := in.bandwidthLegs[newPingKey(leg2)]
 	started2 := state2 != nil && state2.inFlight
 	in.bandwidthMu.Unlock()
-	if !started2 {
-		t.Fatal("lane2 bandwidth probe did not start after lane1 zero-ack completion")
+	if started2 {
+		t.Fatal("lane2 bandwidth probe started before remote lane1 completion")
 	}
+
+	in.advanceBandwidthProbeGateAfterRemote(key1, transport.KindUDP)
+	in.probeBandwidth(context.Background(), time.Now())
+
+	waitForBandwidthProbeStarted(t, in, newPingKey(leg2), time.Second)
 }
 
-func TestBandwidthProbeLostLegReleasesNextLane(t *testing.T) {
+func TestBandwidthProbeLostLegWaitsForRemoteBeforeNextLane(t *testing.T) {
 	in := New()
 	in.activateSession(99)
 	in.bandwidthProbeCapBps = bandwidthProbeMinRateBps
+	in.bandwidthGates[99] = bandwidthProbeGate{
+		sessionID:  99,
+		laneID:     2,
+		legKind:    transport.KindUDP,
+		phase:      bandwidthProbePhaseLocal,
+		localFirst: true,
+	}
 
 	key2 := laneKey{sessionID: 99, laneID: 2}
 	lane2 := newLaneRuntime(2, 1)
-	leg2 := transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp2"}
+	leg2 := transport.LegRef{
+		Kind:       transport.KindUDP,
+		EndpointID: "udp2",
+		RemoteAddr: mustUDPAddr(t, "127.0.0.1:10002"),
+	}
 	lane2.bindLeg(leg2)
 	in.lanes[key2] = lane2
 	in.bandwidthLegs[newPingKey(leg2)] = &bandwidthLegState{
@@ -289,9 +402,14 @@ func TestBandwidthProbeLostLegReleasesNextLane(t *testing.T) {
 	state3 := in.bandwidthLegs[newPingKey(leg3)]
 	started3 := state3 != nil && state3.inFlight
 	in.bandwidthMu.Unlock()
-	if !started3 {
-		t.Fatal("lane3 bandwidth probe did not start after lane2 leg loss")
+	if started3 {
+		t.Fatal("lane3 bandwidth probe started before remote lane2 completion")
 	}
+
+	in.advanceBandwidthProbeGateAfterRemote(key2, transport.KindUDP)
+	in.probeBandwidth(context.Background(), time.Now())
+
+	waitForBandwidthProbeStarted(t, in, newPingKey(leg3), time.Second)
 }
 
 func TestBandwidthProbeTrainDoesNotCompleteAfterLostLeg(t *testing.T) {
@@ -325,6 +443,57 @@ func TestBandwidthProbeTrainDoesNotCompleteAfterLostLeg(t *testing.T) {
 	}
 }
 
+func TestReceiveBandwidthProbeRemainingZeroAdvancesGate(t *testing.T) {
+	in := New()
+	in.activateSession(99)
+	in.bandwidthProbeCapBps = bandwidthProbeMinRateBps
+	in.setBandwidthProbeGateMode(false)
+	if _, _, ok := in.getOrCreateSessionState(99); !ok {
+		t.Fatal("failed to create session state")
+	}
+	key := laneKey{sessionID: 99, laneID: 1}
+	leg := udpLeg()
+	lane := newLaneRuntime(1, 1)
+	lane.bindLeg(leg)
+	in.lanes[key] = lane
+
+	body := protocol.BandwidthProbeBody{
+		TrainID:             7,
+		ProbeID:             8,
+		Seq:                 0,
+		Count:               1,
+		SendMS:              1,
+		TrainBytesTotal:     100,
+		TrainBytesRemaining: 0,
+		Payload:             []byte("x"),
+	}
+	if err := in.receiveBandwidthProbe(context.Background(), 99, 1, leg, body); err != nil {
+		t.Fatalf("receiveBandwidthProbe failed: %v", err)
+	}
+	if !in.bandwidthProbeGateAllowsLocal(key, transport.KindUDP) {
+		t.Fatal("server gate did not advance to local after remote completion")
+	}
+}
+
+func TestRemoteTrainIdleTimeoutDoesNotMarkLaneDown(t *testing.T) {
+	in := New(Config{ProbeTimeout: time.Second})
+	key := laneKey{sessionID: 99, laneID: 1}
+	leg := udpLeg()
+	lane := newLaneRuntime(1, 1)
+	lane.bindLeg(leg)
+	in.lanes[key] = lane
+
+	timeout := in.remoteBandwidthTrainIdleTimeout(key, leg)
+	if timeout <= 0 {
+		t.Fatalf("timeout = %s, want positive", timeout)
+	}
+	in.completeRemoteBandwidthProbeTrain(key, leg, 7, "idle_timeout")
+	udpLeg, udpQ, _, _ := lane.legQualities()
+	if !udpQ.Active || newPingKey(udpLeg) != newPingKey(leg) {
+		t.Fatal("remote train timeout should not mark UDP leg down")
+	}
+}
+
 func waitForBandwidthProbeComplete(t *testing.T, in *Send, legKey pingKey, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -339,4 +508,20 @@ func waitForBandwidthProbeComplete(t *testing.T, in *Send, legKey pingKey, timeo
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatal("timed out waiting for bandwidth probe completion")
+}
+
+func waitForBandwidthProbeStarted(t *testing.T, in *Send, legKey pingKey, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		in.bandwidthMu.Lock()
+		state := in.bandwidthLegs[legKey]
+		started := state != nil && state.inFlight
+		in.bandwidthMu.Unlock()
+		if started {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("timed out waiting for bandwidth probe start")
 }

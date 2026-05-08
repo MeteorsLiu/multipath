@@ -26,7 +26,6 @@ type ControlState interface {
 	OnClose(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error
 	OnBandwidthProbe(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error
 	OnBandwidthProbeAck(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error
-	OnBandwidthProbeDone(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error
 }
 
 type Config struct {
@@ -151,8 +150,6 @@ func (o *Recv) WriteTo(ctx context.Context, leg transport.LegRef, packet *packet
 		return o.handleBandwidthProbe(ctx, leg, frame)
 	case protocol.TypeBandwidthProbeAck:
 		return o.handleBandwidthProbeAck(ctx, leg, frame)
-	case protocol.TypeBandwidthProbeDone:
-		return o.handleBandwidthProbeDone(ctx, leg, frame)
 	default:
 		return nil
 	}
@@ -234,19 +231,6 @@ func (o *Recv) handleBandwidthProbeAck(ctx context.Context, leg transport.LegRef
 		return nil
 	}
 	return o.control.OnBandwidthProbeAck(ctx, leg, frame)
-}
-
-func (o *Recv) handleBandwidthProbeDone(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error {
-	if _, ok := frame.Body.(protocol.BandwidthProbeDoneBody); !ok {
-		debuglog.Printf("recv/control", "bw_probe_done_invalid_body session=%d lane=%d", frame.SessionID, frame.LaneID)
-		return protocol.ErrInvalidFrame
-	}
-	debuglog.Printf("recv/control", "bw_probe_done session=%d lane=%d leg={%s}", frame.SessionID, frame.LaneID, debugLeg(leg))
-	if o.control == nil {
-		debuglog.Printf("recv/control", "bw_probe_done_drop no_control session=%d lane=%d", frame.SessionID, frame.LaneID)
-		return nil
-	}
-	return o.control.OnBandwidthProbeDone(ctx, leg, frame)
 }
 
 func (o *Recv) handleDATA(ctx context.Context, frame protocol.Frame, packet *packetbuf.Packet) (bool, error) {

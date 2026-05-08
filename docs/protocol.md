@@ -589,12 +589,20 @@ emitted to TUN and is not part of FEC.
 Body:
 
 ```text
-probe_id uint64
-seq      uint16
-count    uint16 // total frames in this probe round, 1..64
-send_ms  uint64
-payload  bytes
+train_id              uint64
+probe_id              uint64
+seq                   uint16
+count                 uint16 // total frames in this probe round, 1..64
+send_ms               uint64
+train_bytes_total     uint64
+train_bytes_remaining uint64
+payload               bytes
 ```
+
+`train_bytes_total` is the byte budget for one train. It must be non-zero.
+`train_bytes_remaining` is the byte budget remaining after this frame and must
+not exceed `train_bytes_total`. A value of zero marks normal train completion.
+The same `train_id` must not change `train_bytes_total`.
 
 Sender behavior:
 
@@ -612,14 +620,25 @@ Sender behavior:
    shaping or stalls.
 6. Do not keep sending periodic bandwidth probes after a leg's ramp completes.
    A new concrete leg may start a new ramp.
+7. Serialize bandwidth trains globally per session. The order is client lane
+   N, server lane N, client lane N+1, server lane N+1.
+8. When no configured bandwidth cap is present, each lane first runs TCP as a
+   reference and then UDP. When a cap is present, only UDP is probed.
 
 Receiver behavior:
 
 1. Validate session, lane, and body length.
-2. Drop frames with `count = 0`, `count > 64`, or `seq >= count`.
+2. Drop frames with `count = 0`, `count > 64`, `seq >= count`, zero
+   `train_bytes_total`, or `train_bytes_remaining > train_bytes_total`.
 3. Do not emit the payload to TUN.
 4. Maintain a per-leg cumulative receive bitmap for the current probe round.
 5. Reply with BW_PROBE_ACK on the same transport leg.
+6. When `train_bytes_remaining = 0`, release the bandwidth-probe gate for the
+   next local train phase.
+7. If the final train frame is lost, release only the bandwidth-probe gate
+   after an idle timeout of `clamp(8*SRTT, 500ms, 10s)`, falling back to the
+   configured probe timeout when SRTT is unavailable. This timeout does not
+   mark the lane or leg down.
 
 ## Type 0x9: BW_PROBE_ACK
 

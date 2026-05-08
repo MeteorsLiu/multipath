@@ -2416,8 +2416,6 @@ func writeTestControl(ctx context.Context, in *Send, event transport.Payload) er
 		return state.OnBandwidthProbe(ctx, event.Leg, frame)
 	case protocol.TypeBandwidthProbeAck:
 		return state.OnBandwidthProbeAck(ctx, event.Leg, frame)
-	case protocol.TypeBandwidthProbeDone:
-		return state.OnBandwidthProbeDone(ctx, event.Leg, frame)
 	default:
 		return nil
 	}

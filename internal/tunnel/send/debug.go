@@ -24,7 +24,7 @@ func debugFrameSummary(frame protocol.Frame) string {
 	case protocol.CloseBody:
 		return fmt.Sprintf("%s scope=%d reason=%d", base, body.Scope, body.Reason)
 	case protocol.BandwidthProbeBody:
-		return fmt.Sprintf("%s probe_id=%d seq=%d count=%d send_ms=%d payload_len=%d", base, body.ProbeID, body.Seq, body.Count, body.SendMS, len(body.Payload))
+		return fmt.Sprintf("%s train_id=%d probe_id=%d seq=%d count=%d send_ms=%d train_total=%d train_remaining=%d payload_len=%d", base, body.TrainID, body.ProbeID, body.Seq, body.Count, body.SendMS, body.TrainBytesTotal, body.TrainBytesRemaining, len(body.Payload))
 	case protocol.BandwidthProbeAckBody:
 		return fmt.Sprintf("%s probe_id=%d base_seq=%d count=%d received=%#x first_rx_ms=%d last_rx_ms=%d", base, body.ProbeID, body.BaseSeq, body.Count, body.Received, body.FirstRXMS, body.LastRXMS)
 	default:
@@ -52,8 +52,6 @@ func debugFrameType(frameType protocol.FrameType) string {
 		return "BW_PROBE"
 	case protocol.TypeBandwidthProbeAck:
 		return "BW_PROBE_ACK"
-	case protocol.TypeBandwidthProbeDone:
-		return "BW_PROBE_DONE"
 	default:
 		return fmt.Sprintf("UNKNOWN(%d)", frameType)
 	}

@@ -36,6 +36,7 @@ func (i *Send) acceptHello(ctx context.Context, sessionID uint64, laneID uint8, 
 		i.closeSessionLanes(ctx, oldID, leg)
 	}
 	i.activateSession(sessionID)
+	i.setBandwidthProbeGateMode(false)
 	i.negotiatedCaps.Store(uint32(caps))
 	i.fecProfile.Store(uint32(fecProfile))
 

@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"encoding/binary"
 	"errors"
 	"reflect"
 	"testing"
@@ -63,19 +64,22 @@ func TestTypedFramesRoundTrip(t *testing.T) {
 			Type:      TypeBandwidthProbe,
 			SessionID: 11,
 			LaneID:    1,
-			Body:      BandwidthProbeBody{ProbeID: 99, Seq: 2, Count: 4, SendMS: 12347, Payload: []byte("probe")},
+			Body: BandwidthProbeBody{
+				TrainID:             77,
+				ProbeID:             99,
+				Seq:                 2,
+				Count:               4,
+				SendMS:              12347,
+				TrainBytesTotal:     1000,
+				TrainBytesRemaining: 250,
+				Payload:             []byte("probe"),
+			},
 		},
 		{
 			Type:      TypeBandwidthProbeAck,
 			SessionID: 11,
 			LaneID:    1,
 			Body:      BandwidthProbeAckBody{ProbeID: 99, Count: 4, Received: 0x0d, FirstRXMS: 12350, LastRXMS: 12355},
-		},
-		{
-			Type:      TypeBandwidthProbeDone,
-			SessionID: 11,
-			LaneID:    1,
-			Body:      BandwidthProbeDoneBody{ResultBps: 123456789},
 		},
 	}
 
@@ -103,13 +107,49 @@ func TestBodyTooShort(t *testing.T) {
 		TypeCLOSE,
 		TypeBandwidthProbe,
 		TypeBandwidthProbeAck,
-		TypeBandwidthProbeDone,
 	} {
 		frame := make([]byte, headerSize+1)
 		frame[0] = Version<<4 | uint8(frameType)
 		if _, err := Decode(frame); !errors.Is(err, ErrBodyTooShort) {
 			t.Fatalf("Decode type %d err = %v, want ErrBodyTooShort", frameType, err)
 		}
+	}
+}
+
+func TestBandwidthProbeRejectsInvalidTrainBudget(t *testing.T) {
+	tests := []BandwidthProbeBody{
+		{TrainID: 1, ProbeID: 1, Seq: 0, Count: 1, SendMS: 1, TrainBytesTotal: 0, TrainBytesRemaining: 0},
+		{TrainID: 1, ProbeID: 1, Seq: 0, Count: 1, SendMS: 1, TrainBytesTotal: 100, TrainBytesRemaining: 101},
+	}
+	for _, body := range tests {
+		_, err := Encode(Frame{Type: TypeBandwidthProbe, SessionID: 1, LaneID: 1, Body: body}, nil)
+		if !errors.Is(err, ErrInvalidFrame) {
+			t.Fatalf("Encode(%+v) err = %v, want ErrInvalidFrame", body, err)
+		}
+	}
+}
+
+func TestBandwidthProbeDecodeRejectsInvalidTrainBudget(t *testing.T) {
+	encoded, err := Encode(Frame{
+		Type:      TypeBandwidthProbe,
+		SessionID: 1,
+		LaneID:    1,
+		Body: BandwidthProbeBody{
+			TrainID:             1,
+			ProbeID:             1,
+			Seq:                 0,
+			Count:               1,
+			SendMS:              1,
+			TrainBytesTotal:     100,
+			TrainBytesRemaining: 100,
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("Encode valid probe failed: %v", err)
+	}
+	binary.BigEndian.PutUint64(encoded[10+36:10+44], 101)
+	if _, err := Decode(encoded); !errors.Is(err, ErrInvalidFrame) {
+		t.Fatalf("Decode invalid remaining err = %v, want ErrInvalidFrame", err)
 	}
 }
 
