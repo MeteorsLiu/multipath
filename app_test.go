@@ -35,8 +35,8 @@ func TestParseConfigDefaults(t *testing.T) {
 	if cfg.PromListenAddr != defaultPromListen {
 		t.Fatalf("prom listen = %q, want %q", cfg.PromListenAddr, defaultPromListen)
 	}
-	if cfg.ProbeIntervalMS != 200 || cfg.ProbeTimeoutMS != 600 {
-		t.Fatalf("probe defaults = %d/%d, want 200/600", cfg.ProbeIntervalMS, cfg.ProbeTimeoutMS)
+	if cfg.ProbeIntervalMS != 200 || cfg.ProbeTimeoutMS != 1000 {
+		t.Fatalf("probe defaults = %d/%d, want 200/1000", cfg.ProbeIntervalMS, cfg.ProbeTimeoutMS)
 	}
 	if cfg.Client.RemotePaths[0].Weight != 1 {
 		t.Fatalf("weight = %d, want 1", cfg.Client.RemotePaths[0].Weight)
