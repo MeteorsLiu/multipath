@@ -216,6 +216,10 @@ func (l *Send) handleProbeTargetLostWithReason(ctx context.Context, target probe
 		l.markRunnableLanesDirty(key.sessionID)
 		l.maybeStartFallbackDial(ctx, key, lane)
 	case transport.KindTCP:
+		if reason == "probe_timeout" {
+			debuglog.Printf("send/probe", "target_lost_keep_tcp_alive target=%d session=%d lane=%d leg={%s}", target, key.sessionID, key.laneID, debugLeg(binding.leg))
+			return nil
+		}
 		lane.markTCPNotReady()
 		if shouldLogLaneDown(before, binding.leg) {
 			logLaneDown(key.sessionID, key.laneID, binding.leg, reason, err)

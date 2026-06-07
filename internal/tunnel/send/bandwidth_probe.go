@@ -12,6 +12,7 @@ import (
 	"github.com/MeteorsLiu/multipath/internal/metrics"
 	"github.com/MeteorsLiu/multipath/internal/protocol"
 	"github.com/MeteorsLiu/multipath/internal/transport"
+	"github.com/MeteorsLiu/multipath/internal/tunnel/send/leg"
 	"golang.org/x/time/rate"
 )
 
@@ -243,7 +244,7 @@ func (l *Send) probeBandwidth(ctx context.Context, now time.Time) {
 	}
 }
 
-func (l *Send) bandwidthProbeCandidate(key laneKey, lane *laneRuntime, udpLeg transport.LegRef, udpQ LegQuality, tcpLeg transport.LegRef, tcpQ LegQuality) (transport.LegRef, bool) {
+func (l *Send) bandwidthProbeCandidate(key laneKey, lane *laneRuntime, udpLeg transport.LegRef, udpQ leg.Quality, tcpLeg transport.LegRef, tcpQ leg.Quality) (transport.LegRef, bool) {
 	if l.bandwidthProbeCapBps > 0 {
 		if l.bandwidthProbeNeeded(udpLeg, udpQ) {
 			return udpLeg, true
@@ -262,7 +263,7 @@ func (l *Send) bandwidthProbeCandidate(key laneKey, lane *laneRuntime, udpLeg tr
 	return udpLeg, true
 }
 
-func (l *Send) bandwidthProbeAwaitingTCPReference(key laneKey, lane *laneRuntime, tcpLeg transport.LegRef, tcpQ LegQuality) bool {
+func (l *Send) bandwidthProbeAwaitingTCPReference(key laneKey, lane *laneRuntime, tcpLeg transport.LegRef, tcpQ leg.Quality) bool {
 	if tcpQ.ProbeSamples >= minBandwidthProbeSamples {
 		return false
 	}
@@ -297,11 +298,11 @@ func (l *Send) activeBandwidthLane(sessionID uint64) (laneKey, bool) {
 	return selected, true
 }
 
-func (l *Send) bandwidthProbeNeeded(leg transport.LegRef, quality LegQuality) bool {
-	if !quality.Active && !bandwidthProbeCanUseInactiveLeg(leg) {
+func (l *Send) bandwidthProbeNeeded(ref transport.LegRef, quality leg.Quality) bool {
+	if !quality.Active && !bandwidthProbeCanUseInactiveLeg(ref) {
 		return false
 	}
-	legKey := newPingKey(leg)
+	legKey := newPingKey(ref)
 	if legKey.kind == 0 {
 		return false
 	}

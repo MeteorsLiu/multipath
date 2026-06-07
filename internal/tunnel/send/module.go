@@ -19,6 +19,7 @@ import (
 	sessionpkg "github.com/MeteorsLiu/multipath/internal/session"
 	"github.com/MeteorsLiu/multipath/internal/transport"
 	probe "github.com/MeteorsLiu/multipath/internal/tunnel/probe/core"
+	"github.com/MeteorsLiu/multipath/internal/tunnel/send/leg"
 )
 
 var (
@@ -88,7 +89,7 @@ type Send struct {
 	sessionStatesMu sync.RWMutex
 	sendStates      map[*sessionpkg.Session]*sendState
 	strategies      map[uint64]schedule.Strategy[*laneRuntime]
-	legSelectors    map[uint64]LegSelector
+	legSelectors    map[uint64]leg.Selector
 
 	helloRoutesMu sync.Mutex
 	helloRoutes   map[laneKey]helloRoute
@@ -119,7 +120,7 @@ func New(configs ...Config) *Send {
 		runnableCaches:        make(map[uint64]*runnableLaneCache),
 		helloRoutes:           make(map[laneKey]helloRoute),
 		strategies:            make(map[uint64]schedule.Strategy[*laneRuntime]),
-		legSelectors:          make(map[uint64]LegSelector),
+		legSelectors:          make(map[uint64]leg.Selector),
 		probeTargets:          make(map[probe.Target]probeBinding),
 		probeKeys:             make(map[pingKey]probe.Target),
 		rttPending:            make(map[rttPendingKey]rttPendingPing),
@@ -337,7 +338,7 @@ func (l *Send) strategy(sessionID uint64) schedule.Strategy[*laneRuntime] {
 	return strategy
 }
 
-func (l *Send) legSelector(sessionID uint64) LegSelector {
+func (l *Send) legSelector(sessionID uint64) leg.Selector {
 	l.sessionStatesMu.RLock()
 	sel := l.legSelectors[sessionID]
 	l.sessionStatesMu.RUnlock()
@@ -349,7 +350,7 @@ func (l *Send) legSelector(sessionID uint64) LegSelector {
 	if sel := l.legSelectors[sessionID]; sel != nil {
 		return sel
 	}
-	sel = &QualityLegSelector{}
+	sel = leg.QualitySelector{}
 	l.legSelectors[sessionID] = sel
 	return sel
 }

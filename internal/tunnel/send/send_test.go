@@ -1921,6 +1921,43 @@ func TestSendLegFailureMarksTCPNotReadyAndBacksOffFallback(t *testing.T) {
 	}
 }
 
+func TestSendTCPProbeTimeoutDoesNotCloseOrRestartFallback(t *testing.T) {
+	streamTransport := &fakeStreamTransport{
+		dialLeg: transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp-new"},
+	}
+	in := New()
+	in.streamTransport = streamTransport
+	in.probeEvents = make(chan probe.Event, 4)
+	mustSendState(t, in, 99)
+	in.activateSession(99)
+	in.negotiatedCaps.Store(uint32(protocol.CapTCPFallback))
+	leg := transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp-old"}
+	lane := newLaneRuntime(3, 1)
+	lane.bindLeg(leg)
+	lane.tcpRemote = "127.0.0.1:4321"
+	in.lanes[laneKey{sessionID: 99, laneID: 3}] = lane
+	in.trackProbeTarget(context.Background(), 99, 3, leg)
+	readProbeEvent(t, in.probeEvents)
+	target := in.probeKeys[newPingKey(leg)]
+
+	if err := in.handleProbeEvent(context.Background(), probe.Event{Type: probe.EventTargetLost, Target: target}); err != nil {
+		t.Fatalf("handleProbeEvent failed: %v", err)
+	}
+
+	if !lane.tcpReady {
+		t.Fatal("tcpReady = false after TCP probe timeout")
+	}
+	if got := streamTransport.closed["tcp-old"]; got != 0 {
+		t.Fatalf("closed tcp-old count = %d, want 0", got)
+	}
+	if len(streamTransport.dialed) != 0 {
+		t.Fatalf("fallback dials = %d, want 0 after TCP probe timeout", len(streamTransport.dialed))
+	}
+	if _, ok := in.probeKeys[newPingKey(leg)]; !ok {
+		t.Fatal("TCP probe target was untracked after probe timeout")
+	}
+}
+
 func TestSendProbeTargetLostIgnoresStaleLeg(t *testing.T) {
 	streamTransport := &fakeStreamTransport{
 		dialLeg: transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp-next"},

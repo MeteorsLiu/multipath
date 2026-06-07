@@ -3,6 +3,7 @@ package send
 import (
 	"github.com/MeteorsLiu/multipath/internal/eventlog"
 	"github.com/MeteorsLiu/multipath/internal/transport"
+	"github.com/MeteorsLiu/multipath/internal/tunnel/send/leg"
 )
 
 func logTCPReconnectStart(sessionID uint64, laneID uint8, remote string) {
@@ -33,7 +34,7 @@ func logLaneHandshakeTimeout(sessionID uint64, laneID uint8, leg transport.LegRe
 	eventlog.Printf("lane_handshake_timeout", "session=%d lane=%d leg=%s timeout=%s ref={%s}", sessionID, laneID, kindMetricLabel(leg.Kind), timeout, debugLeg(leg))
 }
 
-func logBandwidthProbeDecision(sessionID uint64, laneID uint8, udp, tcp LegQuality, referenceBps uint64, useUDP bool, ok bool) {
+func logBandwidthProbeDecision(sessionID uint64, laneID uint8, udp, tcp leg.Quality, referenceBps uint64, useUDP bool, ok bool) {
 	selected := "none"
 	if ok {
 		selected = "tcp"

@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/MeteorsLiu/multipath/internal/protocol"
+	"github.com/MeteorsLiu/multipath/internal/tunnel/send/leg"
 )
 
 const (
@@ -33,6 +34,6 @@ func (legController) fallbackDialTimeout(probeTimeout time.Duration) time.Durati
 	return maxFallbackDialTimeout
 }
 
-func tcpWarmWanted(udp, tcp LegQuality) bool {
+func tcpWarmWanted(udp, tcp leg.Quality) bool {
 	return udp.Active && !tcp.Active
 }

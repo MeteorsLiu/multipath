@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/MeteorsLiu/multipath/internal/transport"
+	"github.com/MeteorsLiu/multipath/internal/tunnel/send/leg"
 	"github.com/MeteorsLiu/multipath/internal/tunnel/send/rtt"
 )
 
@@ -80,7 +81,7 @@ func (l *laneRuntime) ready() bool {
 		(l.tcpReady && l.tcpLeg.ConnID != "")
 }
 
-func (l *laneRuntime) legQualities() (udpLeg transport.LegRef, udpQ LegQuality, tcpLeg transport.LegRef, tcpQ LegQuality) {
+func (l *laneRuntime) legQualities() (udpLeg transport.LegRef, udpQ leg.Quality, tcpLeg transport.LegRef, tcpQ leg.Quality) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	udpLeg = l.udpLeg

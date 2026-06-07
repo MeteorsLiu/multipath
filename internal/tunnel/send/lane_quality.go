@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/MeteorsLiu/multipath/internal/transport"
+	"github.com/MeteorsLiu/multipath/internal/tunnel/send/leg"
 )
 
 const (
@@ -27,9 +28,9 @@ type laneQualityInput struct {
 	tcpRTTVar time.Duration
 }
 
-func (q *laneQualityState) legQualities(input laneQualityInput) (LegQuality, LegQuality) {
+func (q *laneQualityState) legQualities(input laneQualityInput) (leg.Quality, leg.Quality) {
 	udpBW, tcpBW := q.bandwidth.legQualities()
-	return LegQuality{
+	return leg.Quality{
 			Active:              input.udpActive,
 			DeliveryRate:        q.udpDelivery.deliveryRate(),
 			SmoothedRTT:         input.udpSRTT,
@@ -39,7 +40,7 @@ func (q *laneQualityState) legQualities(input laneQualityInput) (LegQuality, Leg
 			ProbeSamples:        udpBW.ProbeSamples,
 			BandwidthQoSLimited: udpBW.BandwidthQoSLimited,
 			BandwidthPreferTCP:  udpBW.BandwidthPreferTCP,
-		}, LegQuality{
+		}, leg.Quality{
 			Active:       input.tcpActive,
 			DeliveryRate: q.tcpDelivery.deliveryRate(),
 			SmoothedRTT:  input.tcpSRTT,
@@ -78,14 +79,14 @@ type bandwidthQualityState struct {
 	preferTCP       bool
 }
 
-func (q *bandwidthQualityState) legQualities() (LegQuality, LegQuality) {
-	return LegQuality{
+func (q *bandwidthQualityState) legQualities() (leg.Quality, leg.Quality) {
+	return leg.Quality{
 			BandwidthBps:        q.udpBandwidthBps,
 			ProbeLoss:           q.udpProbeLoss,
 			ProbeSamples:        q.udpProbeSamples,
 			BandwidthQoSLimited: q.qosLimited,
 			BandwidthPreferTCP:  q.preferTCP,
-		}, LegQuality{
+		}, leg.Quality{
 			BandwidthBps: q.tcpBandwidthBps,
 			ProbeLoss:    q.tcpProbeLoss,
 			ProbeSamples: q.tcpProbeSamples,

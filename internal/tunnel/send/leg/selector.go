@@ -1,10 +1,8 @@
-package send
+package leg
 
-import (
-	"time"
-)
+import "time"
 
-type LegQuality struct {
+type Quality struct {
 	Active              bool
 	DeliveryRate        float64
 	SmoothedRTT         time.Duration
@@ -16,8 +14,8 @@ type LegQuality struct {
 	BandwidthPreferTCP  bool
 }
 
-type LegSelector interface {
-	Pick(udp, tcp LegQuality) (useUDP bool, ok bool)
+type Selector interface {
+	Pick(udp, tcp Quality) (useUDP bool, ok bool)
 }
 
 const (
@@ -25,9 +23,9 @@ const (
 	minTCPDelivery = 0.90
 )
 
-type QualityLegSelector struct{}
+type QualitySelector struct{}
 
-func (QualityLegSelector) Pick(udp, tcp LegQuality) (useUDP bool, ok bool) {
+func (QualitySelector) Pick(udp, tcp Quality) (useUDP bool, ok bool) {
 	switch {
 	case !udp.Active && !tcp.Active:
 		return false, false
@@ -37,12 +35,10 @@ func (QualityLegSelector) Pick(udp, tcp LegQuality) (useUDP bool, ok bool) {
 		return false, true
 	}
 
-	// Delivery rate below threshold: token-bucket policer (drops excess).
 	if udp.DeliveryRate < minUDPDelivery && tcp.DeliveryRate >= minTCPDelivery {
 		return false, true
 	}
 
-	// RTT variance exceeds mean: shaper (bufferbloat, jitter).
 	if udp.RTTVariance > 0 && udp.RTTVariance >= udp.SmoothedRTT &&
 		tcp.DeliveryRate >= minTCPDelivery {
 		return false, true
@@ -55,9 +51,9 @@ func (QualityLegSelector) Pick(udp, tcp LegQuality) (useUDP bool, ok bool) {
 	return true, true
 }
 
-type UDPPreferssSelector struct{}
+type UDPPrefersSelector struct{}
 
-func (UDPPreferssSelector) Pick(udp, tcp LegQuality) (useUDP bool, ok bool) {
+func (UDPPrefersSelector) Pick(udp, tcp Quality) (useUDP bool, ok bool) {
 	switch {
 	case udp.Active:
 		return true, true

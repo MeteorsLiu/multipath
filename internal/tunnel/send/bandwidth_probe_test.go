@@ -8,6 +8,7 @@ import (
 
 	"github.com/MeteorsLiu/multipath/internal/protocol"
 	"github.com/MeteorsLiu/multipath/internal/transport"
+	"github.com/MeteorsLiu/multipath/internal/tunnel/send/leg"
 )
 
 func udpLeg() transport.LegRef {
@@ -290,9 +291,9 @@ func TestBandwidthProbeCandidateWithCapSkipsTCP(t *testing.T) {
 	lane.bindLeg(udp)
 	lane.bindLeg(tcp)
 
-	leg, ok := in.bandwidthProbeCandidate(key, lane, udp, LegQuality{Active: true}, tcp, LegQuality{Active: true})
-	if !ok || leg.Kind != transport.KindUDP {
-		t.Fatalf("candidate = (%s,%t), want UDP", debugLeg(leg), ok)
+	candidate, ok := in.bandwidthProbeCandidate(key, lane, udp, leg.Quality{Active: true}, tcp, leg.Quality{Active: true})
+	if !ok || candidate.Kind != transport.KindUDP {
+		t.Fatalf("candidate = (%s,%t), want UDP", debugLeg(candidate), ok)
 	}
 }
 
@@ -335,9 +336,9 @@ func TestBandwidthProbeCandidateNoCapRunsTCPReferenceFirst(t *testing.T) {
 	lane.bindLeg(udp)
 	lane.bindLeg(tcp)
 
-	leg, ok := in.bandwidthProbeCandidate(key, lane, udp, LegQuality{Active: true}, tcp, LegQuality{Active: true})
-	if !ok || leg.Kind != transport.KindTCP {
-		t.Fatalf("candidate = (%s,%t), want TCP reference", debugLeg(leg), ok)
+	candidate, ok := in.bandwidthProbeCandidate(key, lane, udp, leg.Quality{Active: true}, tcp, leg.Quality{Active: true})
+	if !ok || candidate.Kind != transport.KindTCP {
+		t.Fatalf("candidate = (%s,%t), want TCP reference", debugLeg(candidate), ok)
 	}
 }
 
