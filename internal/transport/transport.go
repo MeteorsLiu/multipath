@@ -34,7 +34,7 @@ type Payload struct {
 	Packet *packetbuf.Packet
 }
 
-const legWriterQueueSize = 128
+const legWriterQueueSize = 64*1024*1024/1500 + 1
 
 type PacketWriter interface {
 	WriteTo(ctx context.Context, leg LegRef, packet *packetbuf.Packet) error
@@ -131,14 +131,6 @@ func (d *legWriterDispatcher) dispatch(payload Payload) error {
 	case <-d.ctx.Done():
 		payload.Packet.Release()
 		return d.ctx.Err()
-	default:
-		debuglog.Printf("transport", "writer drop queue_full %s bytes=%d", debugLeg(payload.Leg), len(payload.Packet.Payload))
-		metrics.IncCounter(metrics.TransportErrorsTotal,
-			metrics.L("transport", kindLabel(payload.Leg.Kind)),
-			metrics.L("operation", "write_queue_full"),
-		)
-		payload.Packet.Release()
-		return nil
 	}
 }
 

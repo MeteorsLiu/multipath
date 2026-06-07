@@ -129,7 +129,7 @@ func TestRunWriterDoesNotBlockUDPBehindBlockedTCP(t *testing.T) {
 	}
 }
 
-func TestRunWriterDropsWhenLegQueueIsFull(t *testing.T) {
+func TestRunWriterBlocksWhenLegQueueIsFull(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -172,22 +172,19 @@ func TestRunWriterDropsWhenLegQueueIsFull(t *testing.T) {
 		}
 	}
 
-	probePacket := packetbuf.Acquire(16)
+	blockedPacket := packetbuf.Acquire(16)
 	packets <- Payload{
 		Leg:    LegRef{Kind: KindTCP, ConnID: "blocked"},
-		Packet: probePacket,
+		Packet: blockedPacket,
 	}
 
-	deadline = time.After(time.Second)
-	for probePacket.Payload != nil {
-		select {
-		case err := <-errCh:
-			t.Fatalf("RunWriter exited after queue pressure: %v", err)
-		case <-deadline:
-			t.Fatal("packet was not released after full leg queue drop")
-		default:
-			time.Sleep(time.Millisecond)
-		}
+	select {
+	case err := <-errCh:
+		t.Fatalf("RunWriter exited while dispatch was blocked: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	if blockedPacket.Payload == nil {
+		t.Fatal("packet was released while dispatch should be blocked on full leg queue")
 	}
 
 	cancel()
@@ -196,6 +193,9 @@ func TestRunWriterDropsWhenLegQueueIsFull(t *testing.T) {
 	case err := <-errCh:
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("RunWriter err = %v, want context canceled", err)
+		}
+		if blockedPacket.Payload != nil {
+			t.Fatal("packet was not released after blocked dispatch was canceled")
 		}
 	case <-time.After(time.Second):
 		t.Fatal("RunWriter did not stop after context cancellation")
