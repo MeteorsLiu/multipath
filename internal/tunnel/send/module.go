@@ -15,7 +15,7 @@ import (
 	"github.com/MeteorsLiu/multipath/internal/packetbuf"
 	"github.com/MeteorsLiu/multipath/internal/protocol"
 	"github.com/MeteorsLiu/multipath/internal/schedule"
-	"github.com/MeteorsLiu/multipath/internal/schedule/cfs"
+	"github.com/MeteorsLiu/multipath/internal/schedule/drr"
 	sessionpkg "github.com/MeteorsLiu/multipath/internal/session"
 	"github.com/MeteorsLiu/multipath/internal/transport"
 	probe "github.com/MeteorsLiu/multipath/internal/tunnel/probe/core"
@@ -29,6 +29,15 @@ var (
 	errSessionIDConflict = errors.New("tunnel: session id conflict")
 )
 
+const (
+	// defaultMTUBytes is the assumed tunnel MTU used to size the DRR base
+	// quantum. Per the DRR spec the base quantum is 4 * MTU so an equal-weight
+	// lane sends roughly one full 4-DATA FEC group before another lane becomes
+	// preferred.
+	defaultMTUBytes = 1500
+	drrBaseQuantum  = 4 * defaultMTUBytes
+)
+
 // Send owns the send-side runtime state for the multipath tunnel.
 //
 // Locking convention:
@@ -38,9 +47,10 @@ var (
 //     before any further work. They are NEVER held concurrently with each
 //     other except in runnableLanes recompute, which acquires
 //     runnableCachesMu -> lanesMu in a fixed direction.
-//   - laneRuntime.mu, sendState.mu, sessionpkg.Session.mu, sessionpkg.Hello.mu
-//     and cfs.Strategy.mu are owned by their respective structs and are taken
-//     after releasing all map mutexes.
+//   - laneRuntime.mu, laneRuntime.fecMu, sessionpkg.Session.mu,
+//     sessionpkg.Hello.mu and the schedule strategy's internal mutex are owned
+//     by their respective structs and are taken after releasing all map
+//     mutexes.
 //   - Channel sends on packets / probeEvents are NEVER performed while holding
 //     any of the above locks.
 //   - Atomic fields (activeSessionID, hasActiveSession, bootstrapped,
@@ -329,7 +339,7 @@ func (l *Send) strategy(sessionID uint64) schedule.Strategy[*laneRuntime] {
 	if strategy := l.strategies[sessionID]; strategy != nil {
 		return strategy
 	}
-	strategy = cfs.New[*laneRuntime]()
+	strategy = drr.New[*laneRuntime](drrBaseQuantum)
 	l.strategies[sessionID] = strategy
 	return strategy
 }
