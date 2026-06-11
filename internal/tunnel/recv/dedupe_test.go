@@ -102,10 +102,38 @@ func TestDuplicateDataDoesNotEnterRxWindow(t *testing.T) {
 
 	state := out.recvState(99)
 	state.mu.Lock()
-	n := len(state.rxWindow.data)
+	n := len(state.rxWindows[3].data)
 	state.mu.Unlock()
 	if n != 1 {
 		t.Fatalf("rxWindow data entries = %d, want 1 (duplicate must not enter window)", n)
+	}
+}
+
+// TestPerLaneReceiveWindowsAreSeparate verifies DATA for different lane ids
+// lands in distinct FEC receive windows so reconstruction never crosses lanes.
+func TestPerLaneReceiveWindowsAreSeparate(t *testing.T) {
+	state := &recvState{
+		rxWindows: make(map[uint8]*rxSLCWindow),
+		dedupe:    newEmitDedupe(0),
+	}
+	defer func() {
+		for _, w := range state.rxWindows {
+			w.releaseAll()
+		}
+	}()
+
+	// The same packet id on two different lanes must land in distinct windows.
+	state.windowFor(3).addData(100, []byte("lane3"))
+	state.windowFor(4).addData(100, []byte("lane4"))
+
+	if state.rxWindows[3] == state.rxWindows[4] {
+		t.Fatal("lanes 3 and 4 share a single rxWindow")
+	}
+	if got := state.windowFor(3).data[100]; got == nil || string(got.Payload) != "lane3" {
+		t.Fatalf("lane 3 window[100] = %v, want \"lane3\"", got)
+	}
+	if got := state.windowFor(4).data[100]; got == nil || string(got.Payload) != "lane4" {
+		t.Fatalf("lane 4 window[100] = %v, want \"lane4\"", got)
 	}
 }
 
