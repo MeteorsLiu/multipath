@@ -56,8 +56,8 @@ func (l *Send) computeFECFlushMs(sessionID uint64) uint32 {
 	return clampUint32(raw, l.fecFlushMinMs, l.fecFlushMaxMs)
 }
 
-func (l *Send) armFECFlushTimer(sessionID uint64, state *sendState) {
-	if state == nil {
+func (l *Send) armFECFlushTimer(sessionID uint64, lane *laneRuntime) {
+	if lane == nil {
 		return
 	}
 	flushMS := l.computeFECFlushMs(sessionID)
@@ -66,47 +66,47 @@ func (l *Send) armFECFlushTimer(sessionID uint64, state *sendState) {
 	}
 	d := time.Duration(flushMS) * time.Millisecond
 
-	state.mu.Lock()
-	defer state.mu.Unlock()
-	if state.txWindow == nil || len(state.txWindow.pending) == 0 {
+	lane.fecMu.Lock()
+	defer lane.fecMu.Unlock()
+	if lane.txWindow == nil || len(lane.txWindow.pending) == 0 {
 		return
 	}
-	if state.fecFlushTimer == nil {
-		state.fecFlushTimer = time.AfterFunc(d, func() {
-			l.handleFECFlush(sessionID, state)
+	if lane.fecFlushTimer == nil {
+		lane.fecFlushTimer = time.AfterFunc(d, func() {
+			l.handleFECFlush(sessionID, lane)
 		})
 	} else {
-		state.fecFlushTimer.Reset(d)
+		lane.fecFlushTimer.Reset(d)
 	}
-	state.fecFlushArmed = true
+	lane.fecFlushArmed = true
 	if debuglog.Enabled() {
-		debuglog.Printf("send", "fec_flush_arm session=%d flush_ms=%d pending=%d", sessionID, flushMS, len(state.txWindow.pending))
+		debuglog.Printf("send", "fec_flush_arm session=%d lane=%d flush_ms=%d pending=%d", sessionID, lane.id, flushMS, len(lane.txWindow.pending))
 	}
 }
 
-func (l *Send) handleFECFlush(sessionID uint64, state *sendState) {
-	if state == nil || uint8(l.fecProfile.Load()) != protocol.FECProfileSLCVariablePlus1 {
+func (l *Send) handleFECFlush(sessionID uint64, lane *laneRuntime) {
+	if lane == nil || uint8(l.fecProfile.Load()) != protocol.FECProfileSLCVariablePlus1 {
 		return
 	}
-	_, current, ok := l.getSessionState(sessionID)
-	if !ok || current != state {
+	// Ignore the timer if the lane was closed or replaced since it was armed.
+	if l.getLane(laneKey{sessionID: sessionID, laneID: lane.id}) != lane {
 		return
 	}
 
-	state.mu.Lock()
-	state.fecFlushArmed = false
+	lane.fecMu.Lock()
+	lane.fecFlushArmed = false
 	var group txRepairGroup
 	var ready bool
-	if state.txWindow != nil {
-		group, ready = state.txWindow.flush()
+	if lane.txWindow != nil {
+		group, ready = lane.txWindow.flush()
 	}
-	state.mu.Unlock()
+	lane.fecMu.Unlock()
 	if !ready {
 		return
 	}
 
 	if debuglog.Enabled() {
-		debuglog.Printf("send", "fec_flush_fire session=%d base_packet_id=%d source_span=%d", sessionID, group.basePacketID, group.sourceSpan)
+		debuglog.Printf("send", "fec_flush_fire session=%d lane=%d base_packet_id=%d source_span=%d", sessionID, lane.id, group.basePacketID, group.sourceSpan)
 	}
 	metrics.IncCounter(metrics.FECEventsTotal,
 		metrics.L("event", "repair_flush"),
@@ -119,14 +119,7 @@ func (l *Send) handleFECFlush(sessionID uint64, state *sendState) {
 	)
 	ctx, cancel := context.WithTimeout(context.Background(), fecFlushSendTimeout)
 	defer cancel()
-	l.maybeSendRepair(ctx, sessionID, group)
-}
-
-func (s *sendState) cancelFECFlushTimerLocked() {
-	if s.fecFlushTimer != nil {
-		s.fecFlushTimer.Stop()
-	}
-	s.fecFlushArmed = false
+	l.maybeSendRepair(ctx, sessionID, lane, group)
 }
 
 func clampUint32(v, min, max uint32) uint32 {

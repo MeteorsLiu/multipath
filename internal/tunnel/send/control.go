@@ -248,6 +248,7 @@ func (i *Send) closeLaneKeepingLeg(ctx context.Context, key laneKey, keepLeg tra
 		return
 	}
 	i.cancelHelloRoute(key)
+	lane.releaseFEC()
 	debuglog.Printf("send/control", "close_lane %s", debugLaneState(key, lane))
 	udpLeg, tcpLeg := lane.legs()
 	i.untrackProbeTarget(ctx, udpLeg)

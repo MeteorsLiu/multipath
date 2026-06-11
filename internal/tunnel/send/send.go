@@ -100,15 +100,19 @@ func (l *Send) writeTUNPacket(ctx context.Context, sessionID uint64, packet []by
 		return packetID, laneID, charge, err
 	}
 
-	addToWindow := fecProfileEnabled(fecProfile)
-	group, ready, armFlush := state.commitPacket(packetID, packet, addToWindow)
-	if ready {
-		if debuglog.Enabled() {
-			debuglog.Printf("send", "fec_group_ready session=%d base_packet_id=%d source_span=%d shards=%d", sessionID, group.basePacketID, group.sourceSpan, len(group.packets))
+	if fecProfileEnabled(fecProfile) {
+		lane := l.getLane(laneKey{sessionID: sessionID, laneID: laneID})
+		if lane != nil {
+			group, ready, armFlush := lane.commitPacket(packetID, packet)
+			if ready {
+				if debuglog.Enabled() {
+					debuglog.Printf("send", "fec_group_ready session=%d lane=%d base_packet_id=%d source_span=%d shards=%d", sessionID, laneID, group.basePacketID, group.sourceSpan, len(group.packets))
+				}
+				l.maybeSendRepair(ctx, sessionID, lane, group)
+			} else if armFlush && fecProfile == protocol.FECProfileSLCVariablePlus1 {
+				l.armFECFlushTimer(sessionID, lane)
+			}
 		}
-		l.maybeSendRepair(ctx, sessionID, group)
-	} else if armFlush && fecProfile == protocol.FECProfileSLCVariablePlus1 {
-		l.armFECFlushTimer(sessionID, state)
 	}
 	return packetID, laneID, charge, nil
 }
@@ -129,22 +133,29 @@ func (l *Send) writeScheduledFrame(ctx context.Context, frame protocol.Frame) (l
 		)
 		return 0, 0, errNoRunnableLane
 	}
+	charge, err = l.sendFrameOnLane(ctx, lane, frame, sizeHint)
+	return lane.id, charge, err
+}
 
-	laneID = lane.id
-	frame.LaneID = laneID
+// sendFrameOnLane encodes frame and enqueues it on the given lane, choosing the
+// lane's transport leg via the leg selector. It does NOT run
+// schedule.Strategy lane selection, so it is the path REPAIR and other
+// already-routed frames take. It sets frame.LaneID to the lane id.
+func (l *Send) sendFrameOnLane(ctx context.Context, lane *laneRuntime, frame protocol.Frame, sizeHint int) (uint32, error) {
+	frame.LaneID = lane.id
 
 	udpLeg, udpQ, tcpLeg, tcpQ := lane.legQualities()
 	useUDP, ok := l.legSelector(frame.SessionID).Pick(udpQ, tcpQ)
 	if !ok {
 		if debuglog.Enabled() {
-			debuglog.Printf("send", "schedule_skip no_leg %s", debugLaneState(laneKey{sessionID: frame.SessionID, laneID: laneID}, lane))
+			debuglog.Printf("send", "schedule_skip no_leg %s", debugLaneState(laneKey{sessionID: frame.SessionID, laneID: lane.id}, lane))
 		}
 		metrics.IncCounter(metrics.ScheduleSkipTotal,
 			metrics.L("session", frame.SessionID),
-			metrics.L("lane", laneID),
+			metrics.L("lane", lane.id),
 			metrics.L("reason", "no_leg"),
 		)
-		return 0, 0, errNoRunnableLane
+		return 0, errNoRunnableLane
 	}
 
 	var leg transport.LegRef
@@ -154,36 +165,39 @@ func (l *Send) writeScheduledFrame(ctx context.Context, frame protocol.Frame) (l
 		leg = tcpLeg
 	}
 	if debuglog.Enabled() {
-		debuglog.Printf("send", "schedule_select %s leg={%s} frame=%s", debugLaneState(laneKey{sessionID: frame.SessionID, laneID: laneID}, lane), debugLeg(leg), debugFrameSummary(frame))
+		debuglog.Printf("send", "schedule_select %s leg={%s} frame=%s", debugLaneState(laneKey{sessionID: frame.SessionID, laneID: lane.id}, lane), debugLeg(leg), debugFrameSummary(frame))
 	}
 	metrics.IncCounter(metrics.SchedulePickTotal,
 		metrics.LU64("session", frame.SessionID),
-		metrics.LU8("lane", laneID),
+		metrics.LU8("lane", lane.id),
 		metrics.LStr("frame_type", debugFrameType(frame.Type)),
 		metrics.LStr("leg", kindMetricLabel(leg.Kind)),
 	)
 	size, err := l.enqueueFrameWithSize(ctx, leg, frame, sizeHint)
 	if err != nil {
 		if debuglog.Enabled() {
-			debuglog.Printf("send", "schedule_enqueue_err session=%d lane=%d leg={%s} err=%v", frame.SessionID, laneID, debugLeg(leg), err)
+			debuglog.Printf("send", "schedule_enqueue_err session=%d lane=%d leg={%s} err=%v", frame.SessionID, lane.id, debugLeg(leg), err)
 		}
-		return laneID, 0, err
+		return 0, err
 	}
 
-	charge = legCharge(leg, size)
+	charge := legCharge(leg, size)
 	lane.quality.OnSent(leg.Kind, charge, time.Now())
 	if debuglog.Enabled() {
-		debuglog.Printf("send", "schedule_done session=%d lane=%d leg={%s} frame_bytes=%d charge=%d", frame.SessionID, laneID, debugLeg(leg), size, charge)
+		debuglog.Printf("send", "schedule_done session=%d lane=%d leg={%s} frame_bytes=%d charge=%d", frame.SessionID, lane.id, debugLeg(leg), size, charge)
 	}
-	return laneID, charge, nil
+	return charge, nil
 }
 
-func (l *Send) maybeSendRepair(ctx context.Context, sessionID uint64, group txRepairGroup) {
+func (l *Send) maybeSendRepair(ctx context.Context, sessionID uint64, lane *laneRuntime, group txRepairGroup) {
 	defer func() {
 		for _, pkt := range group.packets {
 			pkt.Release()
 		}
 	}()
+	if lane == nil {
+		return
+	}
 
 	_, state, ok := l.getSessionState(sessionID)
 	sourceSpan := len(group.packets)
@@ -235,7 +249,7 @@ func (l *Send) maybeSendRepair(ctx context.Context, sessionID uint64, group txRe
 		metrics.L("source_span", sourceSpan),
 	)
 
-	laneID, charge, err := l.writeScheduledFrame(ctx, protocol.Frame{
+	repairFrame := protocol.Frame{
 		Type:      protocol.TypeREPAIR,
 		SessionID: sessionID,
 		Body: protocol.RepairBody{
@@ -244,9 +258,17 @@ func (l *Send) maybeSendRepair(ctx context.Context, sessionID uint64, group txRe
 			SourceSpan:   uint8(sourceSpan),
 			Symbol:       shards[len(shards)-1],
 		},
-	})
+	}
+	sizeHint, err := frameEncodeCapacity(repairFrame)
+	if err != nil {
+		if debuglog.Enabled() {
+			debuglog.Printf("send", "repair_size_err session=%d base_packet_id=%d err=%v", sessionID, group.basePacketID, err)
+		}
+		return
+	}
+	charge, err := l.sendFrameOnLane(ctx, lane, repairFrame, sizeHint)
 	if debuglog.Enabled() {
-		debuglog.Printf("send", "repair_send session=%d base_packet_id=%d key=%d source_span=%d lane=%d charge=%d err=%v", sessionID, group.basePacketID, key, sourceSpan, laneID, charge, err)
+		debuglog.Printf("send", "repair_send session=%d base_packet_id=%d key=%d source_span=%d lane=%d charge=%d err=%v", sessionID, group.basePacketID, key, sourceSpan, lane.id, charge, err)
 	}
 }
 

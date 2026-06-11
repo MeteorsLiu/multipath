@@ -1,9 +1,7 @@
 package send
 
 import (
-	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/MeteorsLiu/multipath/internal/debuglog"
 	fecpkg "github.com/MeteorsLiu/multipath/internal/fec"
@@ -13,40 +11,17 @@ import (
 
 // sendState holds per-session send-side state. The monotonic counters
 // nextPacketID / nextRepairKey are atomic so the data path can reserve DATA and
-// REPAIR identifiers without taking the mutex; mu is taken only when mutating
-// the FEC tx window.
+// REPAIR identifiers without taking a lock. FEC transmit windows are owned by
+// lane runtime, not by the session.
 type sendState struct {
 	nextPacketID  atomic.Uint32
 	nextRepairKey atomic.Uint32 // upper 16 bits unused; only low 16 bits encoded
-
-	mu            sync.Mutex
-	txWindow      *txSLCWindow
-	fecFlushTimer *time.Timer
-	fecFlushArmed bool
 }
 
 // reservePacketID reserves and returns the next DATA packet id. Gaps are
 // acceptable when a later send fails; duplicate packet ids are not.
 func (s *sendState) reservePacketID() uint32 {
 	return s.nextPacketID.Add(1) - 1
-}
-
-// commitPacket adds the packet to the FEC window when requested. Returns the
-// repair group when a window completes.
-func (s *sendState) commitPacket(packetID uint32, packet []byte, addToWindow bool) (txRepairGroup, bool, bool) {
-	if !addToWindow || s.txWindow == nil {
-		return txRepairGroup{}, false, false
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	wasEmpty := len(s.txWindow.pending) == 0
-	group, ready := s.txWindow.add(packetID, packet)
-	if ready {
-		s.cancelFECFlushTimerLocked()
-		return group, true, false
-	}
-	shouldArmFlush := wasEmpty && len(s.txWindow.pending) > 0
-	return txRepairGroup{}, false, shouldArmFlush
 }
 
 // reserveRepairKey reserves and returns the next repair key.
@@ -113,9 +88,7 @@ func (l *Send) getOrCreateSendState(session *sessionpkg.Session) (*sendState, bo
 	if state := l.sendStates[session]; state != nil {
 		return state, true
 	}
-	state = &sendState{
-		txWindow: newTxSLCWindow(4),
-	}
+	state = &sendState{}
 	l.sendStates[session] = state
 	debuglog.Printf("send", "session_create session=%d", sessionID)
 	return state, true
@@ -127,19 +100,9 @@ func (l *Send) deleteSessionState(sessionID uint64) {
 	session, ok := l.sessionManager.Get(sessionID)
 	if ok {
 		l.sessionStatesMu.Lock()
-		state := l.sendStates[session]
 		delete(l.sendStates, session)
 		delete(l.strategies, sessionID)
 		l.sessionStatesMu.Unlock()
-
-		if state != nil {
-			state.mu.Lock()
-			state.cancelFECFlushTimerLocked()
-			if state.txWindow != nil {
-				state.txWindow.releaseAll()
-			}
-			state.mu.Unlock()
-		}
 
 		l.helloRoutesMu.Lock()
 		var pending []uint64

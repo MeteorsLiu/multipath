@@ -14,7 +14,8 @@ var errLaneUnavailable = errors.New("tunnel: lane has no usable transport leg")
 
 // laneRuntime carries the per-lane runtime state. All mutable fields are
 // guarded by mu; weight is exposed as an atomic so the schedule strategy can
-// read it without grabbing mu.
+// read it without grabbing mu. FEC transmit state has its own fecMu so the FEC
+// window and flush timer never nest with mu.
 type laneRuntime struct {
 	id     uint8
 	weight atomic.Uint32
@@ -32,6 +33,13 @@ type laneRuntime struct {
 	fallbackRetryAt time.Time
 
 	quality leg.Observer
+
+	// Lane-local FEC transmit state. DATA selected for this lane is committed
+	// to txWindow; a completed group produces a REPAIR owned by this lane.
+	fecMu         sync.Mutex
+	txWindow      *txSLCWindow
+	fecFlushTimer *time.Timer
+	fecFlushArmed bool
 }
 
 // laneSnapshot is a value-copy of laneRuntime mutable fields, returned by
@@ -49,9 +57,47 @@ type laneSnapshot struct {
 }
 
 func newLaneRuntime(id uint8, weight uint32) *laneRuntime {
-	l := &laneRuntime{id: id}
+	l := &laneRuntime{id: id, txWindow: newTxSLCWindow(maxFECSourceSpan)}
 	l.weight.Store(weight)
 	return l
+}
+
+// commitPacket adds packet to this lane's FEC transmit window. It returns the
+// completed repair group when the window fills, and otherwise reports whether
+// the flush timer should be armed (the window just went from empty to pending).
+func (l *laneRuntime) commitPacket(packetID uint32, packet []byte) (txRepairGroup, bool, bool) {
+	l.fecMu.Lock()
+	defer l.fecMu.Unlock()
+	if l.txWindow == nil {
+		return txRepairGroup{}, false, false
+	}
+	wasEmpty := len(l.txWindow.pending) == 0
+	group, ready := l.txWindow.add(packetID, packet)
+	if ready {
+		l.cancelFECFlushTimerLocked()
+		return group, true, false
+	}
+	shouldArmFlush := wasEmpty && len(l.txWindow.pending) > 0
+	return txRepairGroup{}, false, shouldArmFlush
+}
+
+// cancelFECFlushTimerLocked stops the flush timer. Callers must hold fecMu.
+func (l *laneRuntime) cancelFECFlushTimerLocked() {
+	if l.fecFlushTimer != nil {
+		l.fecFlushTimer.Stop()
+	}
+	l.fecFlushArmed = false
+}
+
+// releaseFEC cancels the flush timer and returns any pending FEC shards to the
+// pool. Called when the lane is closed.
+func (l *laneRuntime) releaseFEC() {
+	l.fecMu.Lock()
+	l.cancelFECFlushTimerLocked()
+	if l.txWindow != nil {
+		l.txWindow.releaseAll()
+	}
+	l.fecMu.Unlock()
 }
 
 func (l *laneRuntime) Weight() uint32 {

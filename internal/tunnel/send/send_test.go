@@ -218,15 +218,15 @@ func TestSendWritePacketAllocatesPacketIDAfterSuccessfulWrite(t *testing.T) {
 	if string(body.Packet) != "ip-packet" {
 		t.Fatalf("written packet = %q, want ip-packet", body.Packet)
 	}
-	if len(mustSendState(t, in, 99).txWindow.pending) != 0 {
+	if len(lane.txWindow.pending) != 0 {
 		t.Fatal("txWindow stored packet while FEC is off")
 	}
 	in.enableFEC()
 	if _, _, _, err := in.writeTUNPacket(context.Background(), 99, []byte("fec-packet")); err != nil {
 		t.Fatalf("writeTUNPacket with FEC failed: %v", err)
 	}
-	if len(mustSendState(t, in, 99).txWindow.pending) != 1 {
-		t.Fatalf("txWindow pending = %d, want 1", len(mustSendState(t, in, 99).txWindow.pending))
+	if len(lane.txWindow.pending) != 1 {
+		t.Fatalf("txWindow pending = %d, want 1", len(lane.txWindow.pending))
 	}
 }
 
@@ -329,7 +329,7 @@ func TestSendWritePacketConcurrentPacketIDsUnique(t *testing.T) {
 func TestSendWritePacketSendsRepairAfterFECGroup(t *testing.T) {
 	in := New()
 	in.enableFEC()
-	session := mustSendState(t, in, 99)
+	mustSendState(t, in, 99)
 	in.fecCodec = &fakeFECCodec{
 		encodeFunc: func(shards [][]byte, key uint16) error {
 			shards[len(shards)-1] = []byte("repair")
@@ -372,8 +372,127 @@ func TestSendWritePacketSendsRepairAfterFECGroup(t *testing.T) {
 	if repair.BasePacketID != 0 || repair.Key != 0 || repair.SourceSpan != 4 || string(repair.Symbol) != "repair" {
 		t.Fatalf("REPAIR = base %d key %d sourceSpan %d symbol %q", repair.BasePacketID, repair.Key, repair.SourceSpan, repair.Symbol)
 	}
-	if len(session.txWindow.pending) != 0 {
-		t.Fatalf("txWindow pending = %d, want 0", len(session.txWindow.pending))
+	if len(lane.txWindow.pending) != 0 {
+		t.Fatalf("txWindow pending = %d, want 0", len(lane.txWindow.pending))
+	}
+}
+
+func TestDATAOnLaneFeedsThatLaneTxWindow(t *testing.T) {
+	in := New()
+	in.enableFEC()
+	mustSendState(t, in, 99)
+	laneA := newLaneRuntime(3, 10)
+	laneA.observeLeg(transport.LegRef{
+		Kind:       transport.KindUDP,
+		EndpointID: "udp0",
+		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
+	})
+	laneB := newLaneRuntime(4, 10) // no leg: not runnable
+	in.lanes[laneKey{sessionID: 99, laneID: 3}] = laneA
+	in.lanes[laneKey{sessionID: 99, laneID: 4}] = laneB
+
+	if _, _, _, err := in.writeTUNPacket(context.Background(), 99, []byte("x")); err != nil {
+		t.Fatalf("writeTUNPacket failed: %v", err)
+	}
+	readSendPayload(t, in).Packet.Release()
+
+	if len(laneA.txWindow.pending) != 1 {
+		t.Fatalf("selected lane txWindow pending = %d, want 1", len(laneA.txWindow.pending))
+	}
+	if len(laneB.txWindow.pending) != 0 {
+		t.Fatalf("other lane txWindow pending = %d, want 0", len(laneB.txWindow.pending))
+	}
+}
+
+func TestRepairUsesOwningLaneID(t *testing.T) {
+	in := New()
+	in.enableFEC()
+	in.fecCodec = &fakeFECCodec{
+		encodeFunc: func(shards [][]byte, key uint16) error {
+			shards[len(shards)-1] = []byte("repair")
+			return nil
+		},
+	}
+	mustSendState(t, in, 99)
+	lane := newLaneRuntime(5, 10)
+	lane.observeLeg(transport.LegRef{
+		Kind:       transport.KindUDP,
+		EndpointID: "udp0",
+		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
+	})
+	in.lanes[laneKey{sessionID: 99, laneID: 5}] = lane
+
+	for i := 0; i < 4; i++ {
+		if _, _, _, err := in.writeTUNPacket(context.Background(), 99, []byte{byte('a' + i)}); err != nil {
+			t.Fatalf("writeTUNPacket %d failed: %v", i, err)
+		}
+	}
+
+	var repairFrame protocol.Frame
+	for i := 0; i < 5; i++ {
+		written := readSendPayload(t, in)
+		frame, err := protocol.Decode(written.Packet.Payload)
+		written.Packet.Release()
+		if err != nil {
+			t.Fatalf("Decode payload %d: %v", i, err)
+		}
+		if frame.Type == protocol.TypeREPAIR {
+			repairFrame = frame
+		}
+	}
+	if repairFrame.Type != protocol.TypeREPAIR {
+		t.Fatal("no REPAIR frame was emitted")
+	}
+	if repairFrame.LaneID != 5 {
+		t.Fatalf("REPAIR LaneID = %d, want 5 (owning lane)", repairFrame.LaneID)
+	}
+}
+
+type countingStrategy struct {
+	picks int
+}
+
+func (c *countingStrategy) Pick(lanes []*laneRuntime, cost uint32) (*laneRuntime, bool) {
+	c.picks++
+	for _, lane := range lanes {
+		if lane.Weight() != 0 {
+			return lane, true
+		}
+	}
+	return nil, false
+}
+
+func TestRepairDoesNotReenterScheduler(t *testing.T) {
+	in := New()
+	in.enableFEC()
+	in.fecCodec = &fakeFECCodec{
+		encodeFunc: func(shards [][]byte, key uint16) error {
+			shards[len(shards)-1] = []byte("repair")
+			return nil
+		},
+	}
+	mustSendState(t, in, 99)
+	cs := &countingStrategy{}
+	in.strategies[99] = cs
+	lane := newLaneRuntime(3, 10)
+	lane.observeLeg(transport.LegRef{
+		Kind:       transport.KindUDP,
+		EndpointID: "udp0",
+		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
+	})
+	in.lanes[laneKey{sessionID: 99, laneID: 3}] = lane
+
+	for i := 0; i < 4; i++ {
+		if _, _, _, err := in.writeTUNPacket(context.Background(), 99, []byte{byte('a' + i)}); err != nil {
+			t.Fatalf("writeTUNPacket %d failed: %v", i, err)
+		}
+	}
+	// Drain 4 DATA + 1 REPAIR.
+	for i := 0; i < 5; i++ {
+		readSendPayload(t, in).Packet.Release()
+	}
+	if cs.picks != 4 {
+		t.Fatalf("scheduler Pick calls = %d, want 4 (REPAIR must not re-enter the scheduler)", cs.picks)
 	}
 }
 
