@@ -12,7 +12,7 @@ import (
 	probe "github.com/MeteorsLiu/multipath/internal/tunnel/probe/core"
 )
 
-func (i *Send) acceptHello(ctx context.Context, sessionID uint64, laneID uint8, leg transport.LegRef, body protocol.HelloBody) error {
+func (i *Send) AcceptHello(ctx context.Context, sessionID uint64, laneID uint8, leg transport.LegRef, body protocol.HelloBody) error {
 	localFEC := uint8(i.fecProfile.Load())
 	caps := uint16(0)
 	fecProfile := protocol.FECProfileOff
@@ -66,7 +66,7 @@ func (i *Send) acceptHello(ctx context.Context, sessionID uint64, laneID uint8, 
 	})
 }
 
-func (i *Send) acceptHelloAck(ctx context.Context, sessionID uint64, laneID uint8, leg transport.LegRef, body protocol.HelloAckBody) error {
+func (i *Send) AcceptHelloAck(ctx context.Context, sessionID uint64, laneID uint8, leg transport.LegRef, body protocol.HelloAckBody) error {
 	localFEC := uint8(i.fecProfile.Load())
 	caps, fecProfile := negotiateCapabilities(body.Caps, body.FECProfile, localFEC)
 	debuglog.Printf("send/control", "accept_hello_ack session=%d lane=%d leg={%s} accepted=%d caps=%#x fec_profile=%d negotiated_caps=%#x negotiated_fec_profile=%d", sessionID, laneID, debugLeg(leg), body.Accepted, body.Caps, body.FECProfile, caps, fecProfile)
@@ -128,7 +128,7 @@ func (i *Send) acceptHelloAck(ctx context.Context, sessionID uint64, laneID uint
 	return nil
 }
 
-func (i *Send) receivePing(ctx context.Context, sessionID uint64, laneID uint8, leg transport.LegRef, body protocol.PingBody) error {
+func (i *Send) ReceivePing(ctx context.Context, sessionID uint64, laneID uint8, leg transport.LegRef, body protocol.PingBody) error {
 	if _, _, ok := i.getSessionState(sessionID); !ok {
 		debuglog.Printf("send/control", "ping_drop missing_session session=%d lane=%d ping_id=%d", sessionID, laneID, body.PingID)
 		return i.writeUnknownSessionClose(ctx, sessionID, laneID, leg)
@@ -147,7 +147,7 @@ func (i *Send) receivePing(ctx context.Context, sessionID uint64, laneID uint8, 
 	})
 }
 
-func (i *Send) receivePong(ctx context.Context, sessionID uint64, laneID uint8, leg transport.LegRef, body protocol.PingBody) error {
+func (i *Send) ReceivePong(ctx context.Context, sessionID uint64, laneID uint8, leg transport.LegRef, body protocol.PingBody) error {
 	if _, _, ok := i.getSessionState(sessionID); !ok {
 		debuglog.Printf("send/control", "pong_drop missing_session session=%d lane=%d ping_id=%d", sessionID, laneID, body.PingID)
 		return i.writeUnknownSessionClose(ctx, sessionID, laneID, leg)
@@ -186,7 +186,7 @@ func (i *Send) receivePong(ctx context.Context, sessionID uint64, laneID uint8, 
 	return nil
 }
 
-func (i *Send) close(ctx context.Context, sessionID uint64, laneID uint8, scope uint8, reason uint8) error {
+func (i *Send) ReceiveClose(ctx context.Context, sessionID uint64, laneID uint8, scope uint8, reason uint8) error {
 	debuglog.Printf("send/control", "close session=%d lane=%d scope=%d reason=%d", sessionID, laneID, scope, reason)
 	switch scope {
 	case protocol.CloseScopeLane:

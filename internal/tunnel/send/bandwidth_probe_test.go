@@ -552,7 +552,7 @@ func TestReceiveBandwidthProbeRemainingZeroAdvancesGate(t *testing.T) {
 		TrainBytesRemaining: 0,
 		Payload:             []byte("x"),
 	}
-	if err := in.receiveBandwidthProbe(context.Background(), 99, 1, leg, body); err != nil {
+	if err := in.ReceiveBandwidthProbe(context.Background(), 99, 1, leg, body); err != nil {
 		t.Fatalf("receiveBandwidthProbe failed: %v", err)
 	}
 	if !in.bandwidthProbeGateAllowsLocal(key, transport.KindUDP) {

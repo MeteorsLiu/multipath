@@ -1010,7 +1010,7 @@ func TestSendRepliesCloseForUnknownSessionPING(t *testing.T) {
 		EndpointID: "udp0",
 		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
 	}
-	if err := in.receivePing(context.Background(), 99, 3, leg, protocol.PingBody{PingID: 7, TimeMS: 1000}); err != nil {
+	if err := in.ReceivePing(context.Background(), 99, 3, leg, protocol.PingBody{PingID: 7, TimeMS: 1000}); err != nil {
 		t.Fatalf("receivePing failed: %v", err)
 	}
 	written := readSendPayload(t, in)
@@ -1791,6 +1791,68 @@ func TestSendHandlePONGDropsUnmatchedPING(t *testing.T) {
 	}
 }
 
+func TestSendWriteFrameUsesExplicitTransport(t *testing.T) {
+	in := New()
+	lane := newLaneRuntime(3, 1)
+	lane.bindLeg(transport.LegRef{
+		Kind:       transport.KindUDP,
+		EndpointID: "udp0",
+		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
+	})
+	lane.bindLeg(transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp0"})
+	in.lanes[laneKey{sessionID: 99, laneID: 3}] = lane
+
+	err := in.WriteFrame(context.Background(), protocol.Frame{
+		Type:      protocol.TypePING,
+		SessionID: 99,
+		LaneID:    3,
+		Body:      protocol.PingBody{PingID: 9, TimeMS: 12345},
+	}, transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp0"})
+	if err != nil {
+		t.Fatalf("WriteFrame failed: %v", err)
+	}
+
+	written := readSendPayload(t, in)
+	defer written.Packet.Release()
+	if written.Leg.Kind != transport.KindTCP || written.Leg.ConnID != "tcp0" {
+		t.Fatalf("written leg = %+v, want explicit TCP tcp0", written.Leg)
+	}
+	frame, err := protocol.Decode(written.Packet.Payload)
+	if err != nil {
+		t.Fatalf("Decode PING: %v", err)
+	}
+	if frame.Type != protocol.TypePING || frame.LaneID != 3 {
+		t.Fatalf("written frame = type %d lane %d, want PING lane 3", frame.Type, frame.LaneID)
+	}
+}
+
+func TestSendWriteFrameUsesLanePolicyWhenTransportIsZero(t *testing.T) {
+	in := New()
+	lane := newLaneRuntime(3, 1)
+	lane.observeLeg(transport.LegRef{
+		Kind:       transport.KindUDP,
+		EndpointID: "udp0",
+		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
+	})
+	in.lanes[laneKey{sessionID: 99, laneID: 3}] = lane
+
+	err := in.WriteFrame(context.Background(), protocol.Frame{
+		Type:      protocol.TypePING,
+		SessionID: 99,
+		LaneID:    3,
+		Body:      protocol.PingBody{PingID: 9, TimeMS: 12345},
+	}, transport.LegRef{})
+	if err != nil {
+		t.Fatalf("WriteFrame failed: %v", err)
+	}
+
+	written := readSendPayload(t, in)
+	defer written.Packet.Release()
+	if written.Leg.Kind != transport.KindUDP || written.Leg.EndpointID != "udp0" {
+		t.Fatalf("written leg = %+v, want lane-policy UDP udp0", written.Leg)
+	}
+}
+
 func TestSendSendPINGUsesSpecifiedLeg(t *testing.T) {
 	in := New()
 	lane := newLaneRuntime(3, 1)
@@ -2556,22 +2618,22 @@ func writeTestControl(ctx context.Context, in *Send, event transport.Payload) er
 	if err != nil {
 		return err
 	}
-	state := NewRecvState(in)
 	switch frame.Type {
 	case protocol.TypeHELLO:
-		return state.OnHello(ctx, event.Leg, frame)
+		return in.AcceptHello(ctx, frame.SessionID, frame.LaneID, event.Leg, frame.Body.(protocol.HelloBody))
 	case protocol.TypeHELLOACK:
-		return state.OnHelloAck(ctx, event.Leg, frame)
+		return in.AcceptHelloAck(ctx, frame.SessionID, frame.LaneID, event.Leg, frame.Body.(protocol.HelloAckBody))
 	case protocol.TypePING:
-		return state.OnPing(ctx, event.Leg, frame)
+		return in.ReceivePing(ctx, frame.SessionID, frame.LaneID, event.Leg, frame.Body.(protocol.PingBody))
 	case protocol.TypePONG:
-		return state.OnPong(ctx, event.Leg, frame)
+		return in.ReceivePong(ctx, frame.SessionID, frame.LaneID, event.Leg, frame.Body.(protocol.PingBody))
 	case protocol.TypeCLOSE:
-		return state.OnClose(ctx, event.Leg, frame)
+		body := frame.Body.(protocol.CloseBody)
+		return in.ReceiveClose(ctx, frame.SessionID, frame.LaneID, body.Scope, body.Reason)
 	case protocol.TypeBandwidthProbe:
-		return state.OnBandwidthProbe(ctx, event.Leg, frame)
+		return in.ReceiveBandwidthProbe(ctx, frame.SessionID, frame.LaneID, event.Leg, frame.Body.(protocol.BandwidthProbeBody))
 	case protocol.TypeBandwidthProbeAck:
-		return state.OnBandwidthProbeAck(ctx, event.Leg, frame)
+		return in.ReceiveBandwidthProbeAck(frame.SessionID, frame.LaneID, event.Leg, frame.Body.(protocol.BandwidthProbeAckBody))
 	default:
 		return nil
 	}
@@ -2671,6 +2733,43 @@ func assertNoSendPayload(t *testing.T, in *Send) {
 	}
 }
 
+// testRecvHandler implements recvpkg.Handler for tests by routing control
+// frames to Send's exported transitions. The send test package cannot import
+// the runtime package (which imports send), so it mirrors runtime.RecvHandler
+// here.
+type testRecvHandler struct {
+	in *Send
+}
+
+func (h testRecvHandler) OnHello(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error {
+	return h.in.AcceptHello(ctx, frame.SessionID, frame.LaneID, leg, frame.Body.(protocol.HelloBody))
+}
+
+func (h testRecvHandler) OnHelloAck(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error {
+	return h.in.AcceptHelloAck(ctx, frame.SessionID, frame.LaneID, leg, frame.Body.(protocol.HelloAckBody))
+}
+
+func (h testRecvHandler) OnPing(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error {
+	return h.in.ReceivePing(ctx, frame.SessionID, frame.LaneID, leg, frame.Body.(protocol.PingBody))
+}
+
+func (h testRecvHandler) OnPong(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error {
+	return h.in.ReceivePong(ctx, frame.SessionID, frame.LaneID, leg, frame.Body.(protocol.PingBody))
+}
+
+func (h testRecvHandler) OnClose(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error {
+	body := frame.Body.(protocol.CloseBody)
+	return h.in.ReceiveClose(ctx, frame.SessionID, frame.LaneID, body.Scope, body.Reason)
+}
+
+func (h testRecvHandler) OnBandwidthProbe(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error {
+	return h.in.ReceiveBandwidthProbe(ctx, frame.SessionID, frame.LaneID, leg, frame.Body.(protocol.BandwidthProbeBody))
+}
+
+func (h testRecvHandler) OnBandwidthProbeAck(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error {
+	return h.in.ReceiveBandwidthProbeAck(frame.SessionID, frame.LaneID, leg, frame.Body.(protocol.BandwidthProbeAckBody))
+}
+
 func newTestRecv(t *testing.T, in *Send) *recvpkg.Recv {
 	t.Helper()
 	if in == nil {
@@ -2680,7 +2779,7 @@ func newTestRecv(t *testing.T, in *Send) *recvpkg.Recv {
 		}
 		return recvpkg.New(recvpkg.Config{SessionManager: manager})
 	}
-	return recvpkg.New(recvpkg.Config{Control: NewRecvState(in), SessionManager: in.sessionManager})
+	return recvpkg.New(recvpkg.Config{Handler: testRecvHandler{in: in}, SessionManager: in.sessionManager})
 }
 
 type testProbeLoopRunner struct {

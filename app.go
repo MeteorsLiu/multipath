@@ -14,6 +14,7 @@ import (
 	"github.com/MeteorsLiu/multipath/internal/tun"
 	probecore "github.com/MeteorsLiu/multipath/internal/tunnel/probe/core"
 	"github.com/MeteorsLiu/multipath/internal/tunnel/recv"
+	tunnelruntime "github.com/MeteorsLiu/multipath/internal/tunnel/runtime"
 	"github.com/MeteorsLiu/multipath/internal/tunnel/send"
 )
 
@@ -37,13 +38,13 @@ func runWithConfig(ctx context.Context, cfg Config) error {
 		return err
 	}
 
-	runtime, closers, err := buildRuntime(cfg, device)
+	app, closers, err := buildRuntime(cfg, device)
 	if err != nil {
 		return err
 	}
 	defer closeAll(closers)
 
-	return runtime.Run(ctx)
+	return app.Run(ctx)
 }
 
 func buildRuntime(cfg Config, device *tun.Device) (*appRuntime, []io.Closer, error) {
@@ -105,7 +106,7 @@ func buildServerRuntime(cfg Config, device *tun.Device) (*appRuntime, []io.Close
 		Interval: cfg.probeInterval(),
 		Timeout:  cfg.probeTimeout(),
 	})
-	out := recv.New(recv.Config{Control: send.NewRecvState(in), SessionManager: sessions})
+	out := recv.New(recv.Config{Handler: tunnelruntime.NewRecvHandler(in), SessionManager: sessions})
 	return &appRuntime{
 		tunReader:       device,
 		tunWriter:       device,
@@ -196,7 +197,7 @@ func buildClientRuntime(cfg Config, device *tun.Device) (*appRuntime, []io.Close
 		Interval: cfg.probeInterval(),
 		Timeout:  cfg.probeTimeout(),
 	})
-	out := recv.New(recv.Config{Control: send.NewRecvState(in), SessionManager: sessions})
+	out := recv.New(recv.Config{Handler: tunnelruntime.NewRecvHandler(in), SessionManager: sessions})
 	return &appRuntime{
 		tunReader:       device,
 		tunWriter:       device,

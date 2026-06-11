@@ -59,7 +59,7 @@ probeLoop := send.NewProbeLoop(sender, send.ProbeLoopConfig{
 })
 
 receiver := recv.New(recv.Config{
-    Control:        send.NewRecvState(sender),
+    Handler:        runtime.NewRecvHandler(sender),
     SessionManager: sessions,
 })
 ```
@@ -219,12 +219,15 @@ Send.WriteTo takes ownership of an already encoded transport payload and emits
 it through Send.Packets().
 Send.Packets returns transport-bound packets. The consumer releases each packet
 after the transport write returns.
-Send does not expose control-plane maintenance methods on `Send` itself. The
-RecvState adapter lives in the send package so it can implement
-`recv.ControlState` using Send-owned lane/session/probe state without making
-those hooks methods on `Send`.
-Send does not expose semantic control methods such as AcceptHello,
-AcceptHelloAck, ObserveLane, ReceivePing, ReceivePong, or Close.
+Send.WriteFrame sends a caller-constructed control frame on an explicit
+transport ref or, when the ref is the zero value, via the target lane's
+transport policy. WriteFrame does not run schedule strategy lane selection.
+Send exposes exported control-frame transitions (AcceptHello, AcceptHelloAck,
+ReceivePing, ReceivePong, ReceiveClose, ReceiveBandwidthProbe,
+ReceiveBandwidthProbeAck) that mutate Send-owned lane/session/probe state. The
+recv.Handler implementation lives in the runtime glue package
+(runtime.RecvHandler), not in the send package, and routes decoded control
+frames to those transitions and to Send.WriteFrame.
 Send may keep a per-lane TCP fallback leg warm after UDP HELLO_ACK when TCP
 fallback is negotiated and a TCP remote is configured. A warm TCP leg is a
 candidate for probing and later leg selection; it does not make DATA use TCP by
@@ -263,7 +266,7 @@ Interface sketch:
 ```go
 package recv
 
-type ControlState interface {
+type Handler interface {
     OnHello(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error
     OnHelloAck(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error
     OnPing(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error
@@ -274,7 +277,7 @@ type ControlState interface {
 }
 
 type Config struct {
-    Control        ControlState
+    Handler        Handler
     SessionManager *session.Manager
 }
 
@@ -295,8 +298,8 @@ Recv.Write is a convenience for packet input when no transport leg is known.
 Recv.WriteTo decodes protocol frames from transport payloads with their leg.
 Recv emits received or recovered IP packets through Packets().
 Recv passes decoded HELLO, HELLO_ACK, PING, PONG, CLOSE, BW_PROBE, and
-BW_PROBE_ACK frames to the configured ControlState.
-Recv does not pass DATA or REPAIR to ControlState.
+BW_PROBE_ACK frames to the configured Handler.
+Recv does not pass DATA or REPAIR to Handler.
 Recv does not emit BW_PROBE payloads to TUN.
 Recv only accepts DATA or REPAIR for sessions admitted by the shared Session
 Manager. Unknown-session DATA or REPAIR is dropped.

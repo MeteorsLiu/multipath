@@ -451,7 +451,7 @@ func runE2ERuntime(ctx context.Context, in *Send, tunReader tunio.PacketReader, 
 		start(func() error { return tunio.Run(runCtx, tunReader, testSendPacketWriter{send: in}) })
 	}
 	start(func() error { return transport.RunWriter(runCtx, in.Packets(), packetTransport, streamTransport) })
-	out := recvpkg.New(recvpkg.Config{Control: NewRecvState(in), SessionManager: in.sessionManager})
+	out := recvpkg.New(recvpkg.Config{Handler: testRecvHandler{in: in}, SessionManager: in.sessionManager})
 	if tunWriter != nil {
 		start(func() error { return tunio.RunWriter(runCtx, out.Packets(), tunWriter) })
 	}

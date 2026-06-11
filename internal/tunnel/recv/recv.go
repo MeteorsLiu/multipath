@@ -18,7 +18,7 @@ const (
 	maxFECSourceSpan       = 4
 )
 
-type ControlState interface {
+type Handler interface {
 	OnHello(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error
 	OnHelloAck(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error
 	OnPing(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error
@@ -29,12 +29,12 @@ type ControlState interface {
 }
 
 type Config struct {
-	Control        ControlState
+	Handler        Handler
 	SessionManager *sessionpkg.Manager
 }
 
 // Recv decodes transport-bound frames into IP packets and dispatches control
-// frames to its ControlState.
+// frames to its Handler.
 //
 // Locking convention:
 //
@@ -45,7 +45,7 @@ type Config struct {
 //     It is taken AFTER releasing statesMu, never the other way around.
 type Recv struct {
 	statesMu  sync.RWMutex
-	control   ControlState
+	handler   Handler
 	manager   *sessionpkg.Manager
 	fecCodecs [maxFECSourceSpan + 1]fecCodec
 	packets   chan *packetbuf.Packet
@@ -97,8 +97,8 @@ func New(configs ...Config) *Recv {
 		out.fecCodecs[sourceSpan], _ = fecpkg.NewCodec(sourceSpan, 1)
 	}
 	for _, cfg := range configs {
-		if cfg.Control != nil {
-			out.control = cfg.Control
+		if cfg.Handler != nil {
+			out.handler = cfg.Handler
 		}
 		if cfg.SessionManager != nil {
 			out.manager = cfg.SessionManager
@@ -181,11 +181,11 @@ func (o *Recv) handleHELLO(ctx context.Context, leg transport.LegRef, frame prot
 		return protocol.ErrInvalidFrame
 	}
 	debuglog.Printf("recv/control", "hello session=%d lane=%d leg={%s}", frame.SessionID, frame.LaneID, debugLeg(leg))
-	if o.control == nil {
+	if o.handler == nil {
 		debuglog.Printf("recv/control", "hello_drop no_control session=%d lane=%d", frame.SessionID, frame.LaneID)
 		return nil
 	}
-	return o.control.OnHello(ctx, leg, frame)
+	return o.handler.OnHello(ctx, leg, frame)
 }
 
 func (o *Recv) handleHELLOACK(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error {
@@ -194,11 +194,11 @@ func (o *Recv) handleHELLOACK(ctx context.Context, leg transport.LegRef, frame p
 		return protocol.ErrInvalidFrame
 	}
 	debuglog.Printf("recv/control", "hello_ack session=%d lane=%d leg={%s}", frame.SessionID, frame.LaneID, debugLeg(leg))
-	if o.control == nil {
+	if o.handler == nil {
 		debuglog.Printf("recv/control", "hello_ack_drop no_control session=%d lane=%d", frame.SessionID, frame.LaneID)
 		return nil
 	}
-	return o.control.OnHelloAck(ctx, leg, frame)
+	return o.handler.OnHelloAck(ctx, leg, frame)
 }
 
 func (o *Recv) handlePING(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error {
@@ -207,11 +207,11 @@ func (o *Recv) handlePING(ctx context.Context, leg transport.LegRef, frame proto
 		return protocol.ErrInvalidFrame
 	}
 	debuglog.Printf("recv/control", "ping session=%d lane=%d leg={%s}", frame.SessionID, frame.LaneID, debugLeg(leg))
-	if o.control == nil {
+	if o.handler == nil {
 		debuglog.Printf("recv/control", "ping_drop no_control session=%d lane=%d", frame.SessionID, frame.LaneID)
 		return nil
 	}
-	return o.control.OnPing(ctx, leg, frame)
+	return o.handler.OnPing(ctx, leg, frame)
 }
 
 func (o *Recv) handlePONG(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error {
@@ -220,11 +220,11 @@ func (o *Recv) handlePONG(ctx context.Context, leg transport.LegRef, frame proto
 		return protocol.ErrInvalidFrame
 	}
 	debuglog.Printf("recv/control", "pong session=%d lane=%d leg={%s}", frame.SessionID, frame.LaneID, debugLeg(leg))
-	if o.control == nil {
+	if o.handler == nil {
 		debuglog.Printf("recv/control", "pong_drop no_control session=%d lane=%d", frame.SessionID, frame.LaneID)
 		return nil
 	}
-	return o.control.OnPong(ctx, leg, frame)
+	return o.handler.OnPong(ctx, leg, frame)
 }
 
 func (o *Recv) handleBandwidthProbe(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error {
@@ -233,11 +233,11 @@ func (o *Recv) handleBandwidthProbe(ctx context.Context, leg transport.LegRef, f
 		return protocol.ErrInvalidFrame
 	}
 	debuglog.Printf("recv/control", "bw_probe session=%d lane=%d leg={%s}", frame.SessionID, frame.LaneID, debugLeg(leg))
-	if o.control == nil {
+	if o.handler == nil {
 		debuglog.Printf("recv/control", "bw_probe_drop no_control session=%d lane=%d", frame.SessionID, frame.LaneID)
 		return nil
 	}
-	return o.control.OnBandwidthProbe(ctx, leg, frame)
+	return o.handler.OnBandwidthProbe(ctx, leg, frame)
 }
 
 func (o *Recv) handleBandwidthProbeAck(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error {
@@ -246,11 +246,11 @@ func (o *Recv) handleBandwidthProbeAck(ctx context.Context, leg transport.LegRef
 		return protocol.ErrInvalidFrame
 	}
 	debuglog.Printf("recv/control", "bw_probe_ack session=%d lane=%d leg={%s}", frame.SessionID, frame.LaneID, debugLeg(leg))
-	if o.control == nil {
+	if o.handler == nil {
 		debuglog.Printf("recv/control", "bw_probe_ack_drop no_control session=%d lane=%d", frame.SessionID, frame.LaneID)
 		return nil
 	}
-	return o.control.OnBandwidthProbeAck(ctx, leg, frame)
+	return o.handler.OnBandwidthProbeAck(ctx, leg, frame)
 }
 
 func (o *Recv) handleDATA(ctx context.Context, frame protocol.Frame, packet *packetbuf.Packet) (bool, error) {
@@ -364,9 +364,9 @@ func (o *Recv) handleCLOSE(ctx context.Context, leg transport.LegRef, frame prot
 		session, _ = o.manager.Get(frame.SessionID)
 	}
 	debuglog.Printf("recv/control", "close session=%d lane=%d scope=%d leg={%s}", frame.SessionID, frame.LaneID, body.Scope, debugLeg(leg))
-	if o.control == nil {
+	if o.handler == nil {
 		debuglog.Printf("recv/control", "close_drop no_control session=%d lane=%d", frame.SessionID, frame.LaneID)
-	} else if err := o.control.OnClose(ctx, leg, frame); err != nil {
+	} else if err := o.handler.OnClose(ctx, leg, frame); err != nil {
 		return err
 	}
 	if body.Scope == protocol.CloseScopeSession {

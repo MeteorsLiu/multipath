@@ -837,7 +837,7 @@ func bandwidthProbeLimiterBurst(rateBps uint64, payloadBytes int) int {
 	return burst
 }
 
-func (l *Send) receiveBandwidthProbe(ctx context.Context, sessionID uint64, laneID uint8, leg transport.LegRef, body protocol.BandwidthProbeBody) error {
+func (l *Send) ReceiveBandwidthProbe(ctx context.Context, sessionID uint64, laneID uint8, leg transport.LegRef, body protocol.BandwidthProbeBody) error {
 	if _, _, ok := l.getSessionState(sessionID); !ok {
 		debuglog.Printf("send/bw_probe", "probe_drop missing_session session=%d lane=%d probe_id=%d leg={%s}", sessionID, laneID, body.ProbeID, debugLeg(leg))
 		return l.writeUnknownSessionClose(ctx, sessionID, laneID, leg)
@@ -924,7 +924,7 @@ func (l *Send) receiveBandwidthProbe(ctx context.Context, sessionID uint64, lane
 	})
 }
 
-func (l *Send) receiveBandwidthProbeAck(sessionID uint64, laneID uint8, leg transport.LegRef, body protocol.BandwidthProbeAckBody) error {
+func (l *Send) ReceiveBandwidthProbeAck(sessionID uint64, laneID uint8, leg transport.LegRef, body protocol.BandwidthProbeAckBody) error {
 	legKey := newPingKey(leg)
 	l.bandwidthMu.Lock()
 	round := l.bandwidthPending[body.ProbeID]

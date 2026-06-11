@@ -49,6 +49,48 @@ func (i *Send) WriteTo(ctx context.Context, leg transport.LegRef, packet *packet
 	}
 }
 
+// WriteFrame sends a caller-constructed protocol frame. It never runs
+// schedule.Strategy lane selection, so it is the path control-plane callers use
+// to emit HELLO/HELLO_ACK/PING/PONG/CLOSE/BW_PROBE frames.
+//
+// When to is a concrete transport ref the frame is encoded and sent on exactly
+// that transport. For lane frames the ref must belong to the lane identified by
+// frame.SessionID/frame.LaneID; control-lane frames (LaneID == SessionControlLaneID)
+// may target any observed transport. When to is the zero transport.LegRef, the
+// lane identified by frame.SessionID/frame.LaneID chooses the transport per its
+// policy.
+//
+// WriteFrame returns an error without emitting a packet when the frame's lane
+// does not exist or a specified transport ref does not belong to that lane.
+func (l *Send) WriteFrame(ctx context.Context, frame protocol.Frame, to transport.LegRef) error {
+	if to.Kind != 0 {
+		if frame.LaneID != protocol.SessionControlLaneID {
+			lane := l.getLane(laneKey{sessionID: frame.SessionID, laneID: frame.LaneID})
+			if lane == nil || !lane.ownsLeg(to) {
+				if debuglog.Enabled() {
+					debuglog.Printf("send", "write_frame_reject session=%d lane=%d leg={%s} lane_nil=%t", frame.SessionID, frame.LaneID, debugLeg(to), lane == nil)
+				}
+				return errLaneUnavailable
+			}
+		}
+		return l.writeControlFrameOnLeg(ctx, to, frame)
+	}
+
+	lane := l.getLane(laneKey{sessionID: frame.SessionID, laneID: frame.LaneID})
+	if lane == nil {
+		if debuglog.Enabled() {
+			debuglog.Printf("send", "write_frame_reject session=%d lane=%d no_lane", frame.SessionID, frame.LaneID)
+		}
+		return errUnknownLane
+	}
+	sizeHint, err := frameEncodeCapacity(frame)
+	if err != nil {
+		return err
+	}
+	_, err = l.sendFrameOnLane(ctx, lane, frame, sizeHint)
+	return err
+}
+
 func (l *Send) handleTUNPacket(ctx context.Context, packet []byte) error {
 	sessionID, ok := l.activeSession()
 	if !ok {

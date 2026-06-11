@@ -271,6 +271,23 @@ func (l *laneRuntime) legs() (transport.LegRef, transport.LegRef) {
 	return l.udpLeg, l.tcpLeg
 }
 
+// ownsLeg reports whether leg is one of the lane's currently bound transport
+// legs. It is used by Send.WriteFrame to validate an explicitly requested
+// transport ref.
+func (l *laneRuntime) ownsLeg(leg transport.LegRef) bool {
+	udp, tcp := l.legs()
+	switch leg.Kind {
+	case transport.KindUDP:
+		return leg.EndpointID != "" && udp.EndpointID == leg.EndpointID &&
+			udp.RemoteAddr != nil && leg.RemoteAddr != nil &&
+			udp.RemoteAddr.String() == leg.RemoteAddr.String()
+	case transport.KindTCP:
+		return leg.ConnID != "" && tcp.ConnID == leg.ConnID
+	default:
+		return false
+	}
+}
+
 func (l *laneRuntime) snapshot() laneSnapshot {
 	l.mu.Lock()
 	defer l.mu.Unlock()
