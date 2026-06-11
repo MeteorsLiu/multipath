@@ -15,12 +15,15 @@ const (
 // pooled packetbuf.Packet buffers so steady-state operation does not allocate
 // per packet.
 //
+// The window is concerned only with FEC storage and recovery; deciding whether
+// a packet has already been emitted to TUN is the job of the session-scoped
+// emitDedupe, not the window.
+//
 // All methods must be called with the caller's per-session lock held.
 type rxSLCWindow struct {
 	sourceCount int
 	data        map[uint32]*packetbuf.Packet
 	repairs     map[uint32]rxRepair
-	emitted     map[uint32]bool
 	dataOrder   []uint32
 	repairOrder []uint32
 	maxData     int
@@ -49,7 +52,6 @@ func newRxSLCWindow(sourceCount int) *rxSLCWindow {
 		sourceCount: sourceCount,
 		data:        make(map[uint32]*packetbuf.Packet),
 		repairs:     make(map[uint32]rxRepair),
-		emitted:     make(map[uint32]bool),
 		maxData:     defaultRxSLCWindowDataLimit,
 		maxRepairs:  defaultRxSLCWindowRepairLimit,
 	}
@@ -189,20 +191,6 @@ func (w *rxSLCWindow) buildShardsLocked(r rxRecoverable, dst [][]byte) ([][]byte
 	return dst, true
 }
 
-func (w *rxSLCWindow) markEmitted(packetID uint32) bool {
-	if w.emitted[packetID] {
-		if debuglog.Enabled() {
-			debuglog.Printf("recv/fec_window", "rx_emit_skip duplicate packet_id=%d", packetID)
-		}
-		return false
-	}
-	w.emitted[packetID] = true
-	if debuglog.Enabled() {
-		debuglog.Printf("recv/fec_window", "rx_emit_mark packet_id=%d", packetID)
-	}
-	return true
-}
-
 func (w *rxSLCWindow) contains(repair rxRepair, packetID uint32) bool {
 	packet := uint64(packetID)
 	base := uint64(repair.basePacketID)
@@ -258,7 +246,6 @@ func (w *rxSLCWindow) prune() {
 				continue
 			}
 			delete(w.data, packetID)
-			delete(w.emitted, packetID)
 			pkt.Release()
 			if debuglog.Enabled() {
 				debuglog.Printf("recv/fec_window", "rx_prune_data packet_id=%d data=%d", packetID, len(w.data))
@@ -297,9 +284,6 @@ func (w *rxSLCWindow) releaseAll() {
 	}
 	w.dataOrder = w.dataOrder[:0]
 	w.repairOrder = w.repairOrder[:0]
-	for id := range w.emitted {
-		delete(w.emitted, id)
-	}
 }
 
 func (w *rxSLCWindow) dropStaleRepairOrder() {

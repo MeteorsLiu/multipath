@@ -110,13 +110,12 @@ func TestRxSLCWindowCopiesInputs(t *testing.T) {
 	}
 }
 
-func TestRxSLCWindowPrunesDataAndEmittedMarks(t *testing.T) {
+func TestRxSLCWindowPrunesData(t *testing.T) {
 	window := newRxSLCWindow(4)
 	window.maxData = 3
 
 	for packetID := uint32(100); packetID < 104; packetID++ {
 		window.addData(packetID, []byte{byte(packetID)})
-		window.markEmitted(packetID)
 	}
 
 	if len(window.data) != 3 {
@@ -124,9 +123,6 @@ func TestRxSLCWindowPrunesDataAndEmittedMarks(t *testing.T) {
 	}
 	if window.data[100] != nil {
 		t.Fatal("oldest data packet was not pruned")
-	}
-	if window.emitted[100] {
-		t.Fatal("oldest emitted marker was not pruned")
 	}
 	if window.data[101] == nil || window.data[102] == nil || window.data[103] == nil {
 		t.Fatalf("unexpected retained data: %#v", window.data)

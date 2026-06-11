@@ -57,6 +57,11 @@ type recvState struct {
 	closed   bool
 	rxWindow *rxSLCWindow
 
+	// dedupe is the session-scoped emit dedupe. It decides whether an
+	// original or FEC-recovered packet id has already been written to TUN; it
+	// is intentionally separate from the FEC receive window.
+	dedupe *emitDedupe
+
 	// shardScratch is reused by recoverPacket to materialize the shard
 	// slice for fec.Reconstruct without per-call allocation. Size is fixed
 	// at the maximum supported FEC group (sourceCount + 1 repair).
@@ -260,17 +265,17 @@ func (o *Recv) handleDATA(ctx context.Context, frame protocol.Frame, packet *pac
 		}
 		return false, nil
 	}
-	recoverable, recoverableOK := state.rxWindow.addData(body.PacketID, body.Packet)
-	emit := state.rxWindow.markEmitted(body.PacketID)
-	state.mu.Unlock()
-	if debuglog.Enabled() {
-		debuglog.Printf("recv", "data_fec_window session=%d packet_id=%d recoverable=%t emit=%t", frame.SessionID, body.PacketID, recoverableOK, emit)
-	}
-	if !emit {
+	if !state.dedupe.mark(body.PacketID) {
+		state.mu.Unlock()
 		if debuglog.Enabled() {
 			debuglog.Printf("recv", "data_drop_duplicate session=%d packet_id=%d", frame.SessionID, body.PacketID)
 		}
 		return false, nil
+	}
+	recoverable, recoverableOK := state.rxWindow.addData(body.PacketID, body.Packet)
+	state.mu.Unlock()
+	if debuglog.Enabled() {
+		debuglog.Printf("recv", "data_fec_window session=%d packet_id=%d recoverable=%t", frame.SessionID, body.PacketID, recoverableOK)
 	}
 	consumed, err := o.emitTransportPacket(ctx, packet, body.Packet)
 	if err != nil {
@@ -410,7 +415,7 @@ func (o *Recv) recoverPacket(sessionID uint64, state *recvState, recoverable rxR
 		return nil, false
 	}
 	state.rxWindow.addData(packetID, packet)
-	if !state.rxWindow.markEmitted(packetID) {
+	if !state.dedupe.mark(packetID) {
 		debuglog.Printf("recv", "recover_drop duplicate packet_id=%d", packetID)
 		return nil, false
 	}
@@ -476,6 +481,7 @@ func (o *Recv) recvState(sessionID uint64) *recvState {
 	}
 	state = &recvState{
 		rxWindow: newRxSLCWindow(4),
+		dedupe:   newEmitDedupe(0),
 	}
 	o.states[session] = state
 	debuglog.Printf("recv", "session_create session=%d", sessionID)
