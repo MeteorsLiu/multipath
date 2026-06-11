@@ -18,7 +18,7 @@ func TestComputeFECFlushMsUsesRTTMultiplier(t *testing.T) {
 		EndpointID: "udp0",
 		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
 	})
-	lane.rttUDP.Add(20)
+	lane.quality.OnPongSample(transport.KindUDP, 20)
 	in.lanes[laneKey{sessionID: 99, laneID: 1}] = lane
 
 	if got := in.computeFECFlushMs(99); got != 40 {

@@ -41,7 +41,7 @@ QoS 典型形态是掐大包/大流量（DPI 标记、令牌桶限速），放�
               ▼
 ┌─ 估计与决策 ───────────────────────────────────────────┐
 │ per-leg 丢包率 = 1 − recvΔ/sentΔ → EWMA(τ≈2s)           │
-│ 角色状态机：STEADY → SWITCHING → (驻留) → PROBING(灰度) │
+│ 角色状态机：STEADY →(原子切换+驻留)→ STEADY ⇄ PROBING    │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -128,29 +128,48 @@ type LinkReport struct {
 
 ### 5.1 差分
 
-发送端每收到 ReportSeq 更新的报告：
+计数器是二维的：`[leg ∈ {UDP,TCP}] × [class ∈ {DATA,REPAIR}]` 共 4 个，发送端、接收端各一套（LinkReport §4.2 的 4 个字段就是接收端这 4 格）。
+
+发送端每收到 ReportSeq 更新的报告，对每一格独立做差分：
 
 ```
-sentΔ[leg][class] = sent_now − sent_at_prev_report     // 发送端本地快照对
-recvΔ[leg][class] = report.recv − prev_report.recv     // 模 2^32
-loss[leg] = 1 − recvΔ/sentΔ                            // primary 用 DATA 行，shadow 用 REPAIR 行
+对每个 (leg, class) 格:
+  sentΔ(leg,class) = sent_now(leg,class) − sent_prev(leg,class)     // 发送端本地快照对
+  recvΔ(leg,class) = report(leg,class) − prev_report(leg,class)     // 模 2^32
+  lossRate(leg,class) = 1 − recvΔ(leg,class) / sentΔ(leg,class)
 ```
+
+状态机消费其中两格（由当前角色指派决定取哪两格）：
+
+```
+p = lossRate(primary leg, DATA)      // primary 丢包率：业务数据全在 primary，DATA 格样本最密
+s = lossRate(shadow leg, REPAIR)     // shadow 丢包率：repair 全在 shadow，是 shadow 唯一的流量
+
+例：UDP=primary 时  p = lossRate(UDP, DATA)，s = lossRate(TCP, REPAIR)
+    角色互换后      p = lossRate(TCP, DATA)，s = lossRate(UDP, REPAIR)
+```
+
+其余两格的 sentΔ 在稳态下为 0（DATA 不走 shadow、REPAIR 不走 primary），无定义也无消费者；灰度期 `lossRate(原primary, DATA)` 格重新有流量，PROBING 状态直接用它判档位成败（§6.2）。
 
 发送端须在收到报告时同步快照自己的 sent 计数，与 ReportSeq 配对存储（仅保留上一对，O(1) 内存）。
 
 ### 5.2 数值示例（含 QoS 触发全过程）
 
-场景：业务 2000 pps 走 UDP(primary)，repair 500 pps 走 TCP(shadow)，RTT 50ms。T=10.0s 起 UDP 遭 QoS 丢 30%。
+场景：业务 2000 pps 走 UDP(primary)，repair 500 pps 走 TCP(shadow)，RTT 50ms。T=10.0s 起 UDP 遭 QoS 丢 30%（TCP 不受影响）。
 
 ```
-发送端本地（每秒快照）:           接收端快照（随 pong 回流）:
-T=10.0  udp_data_sent=100000      seq=50 @T≈10.0  UDPDataRecv= 99900
-T=11.0  udp_data_sent=102000      seq=51 @T≈11.0  UDPDataRecv=101300
-T=12.0  udp_data_sent=104000      seq=52 @T≈12.0  UDPDataRecv=102700
+发送端本地（每秒快照）:               接收端快照（随 pong 回流）:
+T=10.0  sent(UDP,DATA)=100000         seq=50 @T≈10.0  recv(UDP,DATA)= 99900  recv(TCP,REPAIR)=24975
+T=11.0  sent(UDP,DATA)=102000         seq=51 @T≈11.0  recv(UDP,DATA)=101300  recv(TCP,REPAIR)=25475
+T=12.0  sent(UDP,DATA)=104000         seq=52 @T≈12.0  recv(UDP,DATA)=102700  recv(TCP,REPAIR)=25975
+        sent(TCP,REPAIR)=25000/25500/26000（每秒+500）
 
-窗口 50→51: sentΔ=2000, recvΔ=1400 → p=30%
-EWMA(α=0.39): P: 0 → 11.7% → 18.8% → 23.2% → ...
-T≈11s P 越过 5%，劣化计时器启动；每窗口 +1s；T≈16s 满 5s → 触发切换
+窗口 50→51:
+  p = lossRate(UDP,DATA)   = 1 − (101300−99900)/(102000−100000) = 1 − 1400/2000 = 30%
+  s = lossRate(TCP,REPAIR) = 1 − (25475−24975)/(25500−25000)    = 1 −  500/500  = 0%
+
+EWMA(α=0.39): P: 0 → 11.7% → 18.8% → 23.2% → ...    S 恒 ≈ 0%
+T≈11s P 越过 5% 且 S<1%（双条件成立），劣化计时器启动；每窗口 +1s；T≈16s 满 5s → 触发切换
 QoS 生效到切换完成 ≈ 6s（< 10s 目标）
 ```
 
@@ -193,25 +212,26 @@ QoS 生效到切换完成 ≈ 6s（< 10s 目标）
 | probeSteps | 10%→50%→100% | 灰度档位（DATA 按比例分流回原 primary） |
 | probeStepDwell | 5s/档 | 每档驻留与观察 |
 | reportStale | 3s | ReportSeq 停滞超时，按 primary 最坏情况处理 |
-| mbbDuration | 500ms | make-before-break 双发时长 |
 
 ### 6.2 状态与迁移
 
+记号：**P** = primary leg 丢包率的 EWMA 估计（由 DATA 行差分驱动）；**S** = shadow leg 丢包率的 EWMA 估计（由 REPAIR 行差分驱动）。两者绑定角色而非 leg 种类，角色互换后测量来源随之互换。
+
 ```
 STEADY（常态）
-  每新报告: 差分→EWMA 更新 P(primary)/S(shadow)
+  每新报告: 差分→EWMA 更新 P/S
   if P>degradeEnter 且 S<shadowHealthy 且样本≥minSamples:
       confirmTimer += 窗口时长
-      if confirmTimer ≥ confirmWindow → SWITCHING
+      if confirmTimer ≥ confirmWindow → 执行切换（原子动作，见下）
   elif P<degradeExit: confirmTimer=0
-  if ReportSeq 停滞≥reportStale → 视同 P=最坏 → SWITCHING
+  if ReportSeq 停滞≥reportStale → 视同 P=最坏 → 执行切换
   if 在驻留期后 S 持续<shadowHealthy 达 recoverObserve 且原 primary 为偏好 leg(UDP)
       → PROBING
 
-SWITCHING（过渡，mbbDuration）
-  DATA 双发到两条 leg（接收端 emitted 表去重，零丢包切换）
-  到时: 角色互换，repair 流向随动反转，confirmTimer=0，进入 dwellTime
-  → STEADY
+切换（原子动作，非状态）
+  角色互换标志位翻转：下一个 DATA 走新 primary，repair 流向随动反转
+  P/S 估计值随角色对调（新 primary 的估计延续自旧 S），confirmTimer=0
+  进入 dwellTime（期间禁止再次切换）
 
 PROBING（灰度回切试探，仅 TCP=primary 恢复 UDP 方向）
   档位 i ∈ {10%, 50%, 100%}: DATA 按比例分流至 UDP，驻留 probeStepDwell
@@ -224,13 +244,13 @@ PROBING（灰度回切试探，仅 TCP=primary 恢复 UDP 方向）
 
 - **双条件切换**（P 坏且 S 好）：两路同坏（整网故障）时切换无收益，原地不动靠 FEC 与上层重传扛。
 - **Schmitt 双阈值**：单阈值在 4.9%↔5.1% 抖动时计时器被反复清零，切换饿死。双阈值保证进入劣化区后轻微回落不重置进度。
+- **切换是原子动作而非过渡状态**：隧道是数据报模型，每包独立选 leg，无任何需要拆建的关联——"切换"只是标志位翻转，不存在 break，无需 make-before-break。切换瞬间旧 leg 上最后 ~RTT 在途包的丢失风险由 FEC 覆盖（方案 B 下 repair 此刻正在健康的新 primary 上 100% 到达，这恰是 FEC 的本职场景）。早期设计中的 500ms DATA 双发过渡经推演删除：双发期短于 EWMA 时间常数，起不到验证作用，纯冗余。
 - **灰度回切是对"纯限速型 QoS"的充分验证**：shadow 上 repair 流量小（~业务 1/4），令牌桶型限速可能放过它——shadow 健康只是必要条件（流未被标记），不是充分条件（容量可达）。灰度 10% 档若真有限速，秒级现形且只伤 10% 流量，TCP 仍承载主体，FEC 兜底，用户无感。
-- **make-before-break**：切换瞬间 DATA 双发 500ms，新路若意外不通旧路仍承载，切换本身零风险。依赖第 3.3 节去重。
 - **PROBING 仅回 UDP 方向**：UDP 是偏好 leg（无队头阻塞）。TCP=shadow 劣化驱动的反向切换走 STEADY 的正常判定（此时 primary=UDP 的劣化由 DATA 差分测出）。
 
 ### 6.3 与现有调度的接合
 
-`writeScheduledFrame`（send.go:137）的 `legSelector.Pick(udpQ, tcpQ)` 替换为查询 lane 的角色状态机：返回 primary leg（PROBING/SWITCHING 期按比例/双发分流）。`Selector` 接口保留，`QualitySelector` 实现改读角色；`UDPPrefersSelector` 不变（不协商 LinkReport 时的行为=现状，见 §8 兼容性）。REPAIR 路径（`maybeSendRepair`）不再走 `writeScheduledFrame` 的 leg 选择，改为显式取 shadow leg 入队。
+`writeScheduledFrame`（send.go:137）的 `legSelector.Pick(udpQ, tcpQ)` 替换为查询 lane 的角色状态机：返回 primary leg（PROBING 期按档位比例分流）。`Selector` 接口保留，`QualitySelector` 实现改读角色；`UDPPrefersSelector` 不变（不协商 LinkReport 时的行为=现状，见 §8 兼容性）。REPAIR 路径（`maybeSendRepair`）不再走 `writeScheduledFrame` 的 leg 选择，改为显式取 shadow leg 入队。
 
 ## 7. 旧机制处置（已确认决策）
 
@@ -260,7 +280,7 @@ PROBING（灰度回切试探，仅 TCP=primary 恢复 UDP 方向）
 | 发送计数 | `leg.Observer.OnSent` 扩展 | per-leg×类别累计；收到报告时快照配对 |
 | 差分估计器 | `internal/tunnel/send/leg`（新文件） | 差分、EWMA、样本门槛、断流检测 |
 | 角色状态机 | `internal/tunnel/send/leg`（新文件） | §6 状态机，驱动自报告事件 |
-| 调度接合 | send.go / 选择器 | Pick 改读角色；repair 显式走 shadow；灰度/双发分流 |
+| 调度接合 | send.go / 选择器 | Pick 改读角色；repair 显式走 shadow；灰度档位分流 |
 | 旧逻辑删除 | observer.go / selector.go / bandwidth_probe.go | §7 清单 |
 | metrics | metrics 包 | per-leg 丢包率、角色、状态机迁移事件、灰度档位 |
 

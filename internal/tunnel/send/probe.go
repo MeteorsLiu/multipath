@@ -184,7 +184,7 @@ func (l *Send) handleProbeTargetLostWithReason(ctx context.Context, target probe
 		debuglog.Printf("send/probe", "target_lost_drop missing_target target=%d", target)
 		return nil
 	}
-	l.clearRTTPendingTarget(target)
+	l.notifyProbeDown(target, binding)
 	key := laneKey{sessionID: binding.sessionID, laneID: binding.laneID}
 	lane := l.getLane(key)
 	if lane == nil {
@@ -347,7 +347,9 @@ func (l *Send) untrackProbeTarget(ctx context.Context, leg transport.LegRef) {
 
 	l.probeMu.Lock()
 	target, ok := l.probeKeys[pkey]
+	var binding probeBinding
 	if ok {
+		binding = l.probeTargets[target]
 		delete(l.probeKeys, pkey)
 		delete(l.probeTargets, target)
 	}
@@ -357,7 +359,7 @@ func (l *Send) untrackProbeTarget(ctx context.Context, leg transport.LegRef) {
 		debuglog.Printf("send/probe", "untrack_skip missing_target leg={%s}", debugLeg(leg))
 		return
 	}
-	l.clearRTTPendingTarget(target)
+	l.notifyProbeDown(target, binding)
 	debuglog.Printf("send/probe", "untrack target=%d leg={%s}", target, debugLeg(leg))
 	l.sendProbeEvent(ctx, probe.Event{Type: probe.EventUntrack, Target: target})
 }

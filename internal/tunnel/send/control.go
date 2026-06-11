@@ -165,22 +165,16 @@ func (i *Send) receivePong(ctx context.Context, sessionID uint64, laneID uint8, 
 		return nil
 	}
 
-	// Read deadline before acceptRTTPong consumes the pending entry.
 	nowMS := uint64(time.Now().UnixMilli())
-	var deadlineMS uint64
-	i.rttMu.Lock()
-	if p, ok := i.rttPending[rttPendingKey{target: target, pingID: body.PingID}]; ok {
-		deadlineMS = p.deadlineMS
-	}
-	i.rttMu.Unlock()
+	if sample, deadlineMS, ok := i.acceptRTTPong(lane, sessionID, laneID, leg, target, body, nowMS); ok {
+		debuglog.Printf("send/control", "rtt_sample session=%d lane=%d leg=%s sample_ms=%d srtt_ms=%d rttvar_ms=%d samples=%d", sessionID, laneID, kindMetricLabel(leg.Kind), sample.SampleMS, sample.SRTTMS, sample.RTTVarMS, sample.Samples)
 
-	if sample, ok := i.acceptRTTPong(lane, sessionID, laneID, leg, target, body, nowMS); ok {
-		debuglog.Printf("send/control", "rtt_sample session=%d lane=%d leg=%s sample_ms=%d srtt_ms=%d rttvar_ms=%d samples=%d", sessionID, laneID, kindMetricLabel(leg.Kind), sample.sampleMS, sample.srttMS, sample.rttvarMS, sample.samples)
+		// Record delivery for leg quality tracking. Pings that timed out are
+		// already counted as failures when pruned, so a pong that was rejected
+		// here must not add an on-time sample on top of that.
+		arrivedOnTime := deadlineMS == 0 || nowMS <= body.TimeMS+deadlineMS
+		lane.quality.OnDelivery(leg.Kind, arrivedOnTime)
 	}
-
-	// Record delivery for leg quality tracking.
-	arrivedOnTime := deadlineMS == 0 || nowMS <= body.TimeMS+deadlineMS
-	lane.recordDelivery(leg.Kind, arrivedOnTime)
 
 	debuglog.Printf("send/control", "pong session=%d lane=%d target=%d ping_id=%d leg={%s}", sessionID, laneID, target, body.PingID, debugLeg(leg))
 	i.sendProbeEvent(ctx, probe.Event{

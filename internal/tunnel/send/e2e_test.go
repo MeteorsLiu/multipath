@@ -15,6 +15,7 @@ import (
 	"github.com/MeteorsLiu/multipath/internal/transport"
 	tunio "github.com/MeteorsLiu/multipath/internal/tun"
 	recvpkg "github.com/MeteorsLiu/multipath/internal/tunnel/recv"
+	"github.com/MeteorsLiu/multipath/internal/tunnel/send/leg"
 )
 
 func TestEndToEndUDPDataAcrossTwoLanes(t *testing.T) {
@@ -264,7 +265,7 @@ func TestEndToEndBandwidthProbeSelectsTCPWhenUDPQoSLimited(t *testing.T) {
 
 	waitForE2ELane(t, clientIn, key, func(lane *laneRuntime) bool {
 		_, udpQ, _, tcpQ := lane.legQualities()
-		return udpQ.BandwidthQoSLimited && udpQ.BandwidthPreferTCP && tcpQ.ProbeSamples >= minBandwidthProbeSamples
+		return udpQ.BandwidthQoSLimited && udpQ.BandwidthPreferTCP && tcpQ.ProbeSamples >= leg.MinBandwidthProbeSamples
 	}, 35*time.Second)
 
 	serverConn.dropData.Store(true)
@@ -272,7 +273,7 @@ func TestEndToEndBandwidthProbeSelectsTCPWhenUDPQoSLimited(t *testing.T) {
 
 	waitForE2ELane(t, serverIn, key, func(lane *laneRuntime) bool {
 		_, udpQ, _, tcpQ := lane.legQualities()
-		return udpQ.BandwidthQoSLimited && udpQ.BandwidthPreferTCP && tcpQ.ProbeSamples >= minBandwidthProbeSamples
+		return udpQ.BandwidthQoSLimited && udpQ.BandwidthPreferTCP && tcpQ.ProbeSamples >= leg.MinBandwidthProbeSamples
 	}, 35*time.Second)
 
 	clientConn.dropData.Store(true)

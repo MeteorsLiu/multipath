@@ -69,8 +69,8 @@ func TestSendWriteScheduledFrameUsesTCPAfterBandwidthQoSDecision(t *testing.T) {
 		Kind:   transport.KindTCP,
 		ConnID: "tcp0",
 	})
-	lane.recordBandwidthSample(transport.KindUDP, 50_000_000, 0.10)
-	lane.recordBandwidthSample(transport.KindTCP, 100_000_000, 0)
+	lane.quality.OnBandwidth(transport.KindUDP, 50_000_000, 0.10, 0)
+	lane.quality.OnBandwidth(transport.KindTCP, 100_000_000, 0, 0)
 	in.lanes[laneKey{sessionID: 99, laneID: 3}] = lane
 
 	_, _, err := in.writeScheduledFrame(context.Background(), protocol.Frame{
@@ -647,7 +647,7 @@ func TestSendTCPHELLOTimeoutUsesRTTEstimate(t *testing.T) {
 	in.probeTimeout = 600 * time.Millisecond
 	key := laneKey{sessionID: 99, laneID: 3}
 	lane := newLaneRuntime(3, 10)
-	lane.rttTCP.Add(800)
+	lane.quality.OnPongSample(transport.KindTCP, 800)
 	in.lanes[key] = lane
 
 	err := in.startLane(context.Background(), startLaneConfig{
@@ -681,7 +681,7 @@ func TestSendTCPHELLOTimeoutUsesSessionRTTEstimate(t *testing.T) {
 		EndpointID: "udp0",
 		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
 	})
-	udpLane.rttUDP.Add(1500)
+	udpLane.quality.OnPongSample(transport.KindUDP, 1500)
 	in.lanes[laneKey{sessionID: 99, laneID: 1}] = udpLane
 
 	tcpKey := laneKey{sessionID: 99, laneID: 3}
@@ -792,7 +792,7 @@ func TestSendRetryFallbackDialsWarmsTCPWhenUDPDegraded(t *testing.T) {
 		RemoteAddr: mustUDPAddr(t, "127.0.0.1:1234"),
 	}
 	lane.bindLeg(udpLeg)
-	lane.recordDelivery(transport.KindUDP, false)
+	lane.quality.OnDelivery(transport.KindUDP, false)
 	lane.setTCPRemote("127.0.0.1:4321")
 	in.lanes[laneKey{sessionID: 99, laneID: 3}] = lane
 

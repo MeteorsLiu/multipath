@@ -34,7 +34,7 @@ var (
 // Locking convention:
 //
 //   - The map mutexes (lanesMu, sessionStatesMu, helloRoutesMu, probeMu,
-//     rttMu, runnableCachesMu) protect the map containers and a hold is released
+//     runnableCachesMu) protect the map containers and a hold is released
 //     before any further work. They are NEVER held concurrently with each
 //     other except in runnableLanes recompute, which acquires
 //     runnableCachesMu -> lanesMu in a fixed direction.
@@ -98,9 +98,6 @@ type Send struct {
 	probeTargets map[probe.Target]probeBinding
 	probeKeys    map[pingKey]probe.Target
 
-	rttMu      sync.Mutex
-	rttPending map[rttPendingKey]rttPendingPing
-
 	bandwidthMu           sync.Mutex
 	bandwidthLegs         map[pingKey]*bandwidthLegState
 	bandwidthPending      map[uint64]*bandwidthProbeRound
@@ -123,7 +120,6 @@ func New(configs ...Config) *Send {
 		legSelectors:          make(map[uint64]leg.Selector),
 		probeTargets:          make(map[probe.Target]probeBinding),
 		probeKeys:             make(map[pingKey]probe.Target),
-		rttPending:            make(map[rttPendingKey]rttPendingPing),
 		bandwidthLegs:         make(map[pingKey]*bandwidthLegState),
 		bandwidthPending:      make(map[uint64]*bandwidthProbeRound),
 		bandwidthRX:           make(map[bandwidthRXKey]*bandwidthRXRound),

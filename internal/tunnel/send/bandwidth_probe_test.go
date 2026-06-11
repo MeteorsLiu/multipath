@@ -308,7 +308,7 @@ func TestBandwidthProbeCappedUDPDecisionDoesNotWaitForTCPReference(t *testing.T)
 	lane.bindLeg(tcp)
 	in.lanes[key] = lane
 
-	lane.recordBandwidthSampleWithReference(transport.KindUDP, 80_000_000, bandwidthProbeLossThreshold, in.bandwidthProbeCapBps)
+	lane.quality.OnBandwidth(transport.KindUDP, 80_000_000, leg.BandwidthProbeLossThreshold, in.bandwidthProbeCapBps)
 
 	_, udpQ, _, tcpQ := lane.legQualities()
 	if udpQ.ProbeSamples != 1 {
@@ -349,7 +349,7 @@ func TestBandwidthProbeUDPAfterTCPReferenceUsesReferenceCap(t *testing.T) {
 	legKey := newPingKey(leg)
 	lane := newLaneRuntime(1, 1)
 	lane.bindLeg(leg)
-	lane.recordBandwidthSample(transport.KindTCP, 300_000_000, 0)
+	lane.quality.OnBandwidth(transport.KindTCP, 300_000_000, 0, 0)
 	in.lanes[key] = lane
 
 	in.maybeStartBandwidthProbe(context.Background(), key, leg, time.Now())

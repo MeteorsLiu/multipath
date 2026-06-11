@@ -3,6 +3,7 @@ package send
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/MeteorsLiu/multipath/internal/debuglog"
 	"github.com/MeteorsLiu/multipath/internal/metrics"
@@ -170,6 +171,7 @@ func (l *Send) writeScheduledFrame(ctx context.Context, frame protocol.Frame) (l
 	}
 
 	charge = legCharge(leg, size)
+	lane.quality.OnSent(leg.Kind, charge, time.Now())
 	if debuglog.Enabled() {
 		debuglog.Printf("send", "schedule_done session=%d lane=%d leg={%s} frame_bytes=%d charge=%d", frame.SessionID, laneID, debugLeg(leg), size, charge)
 	}

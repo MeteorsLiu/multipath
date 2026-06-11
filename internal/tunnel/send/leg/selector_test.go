@@ -89,6 +89,62 @@ func TestQualitySelectorKeepsUDPWhenQoSConfidenceLow(t *testing.T) {
 	}
 }
 
+func TestQualitySelectorBalancesPassiveBytesBeforeBandwidthReady(t *testing.T) {
+	sel := QualitySelector{}
+	udp := Quality{Active: true, DeliveryRate: 1.0, PassiveBytes: 10_000}
+	tcp := Quality{Active: true, DeliveryRate: 1.0, PassiveBytes: 3_000}
+
+	useUDP, ok := sel.Pick(udp, tcp)
+	if !ok {
+		t.Fatal("Pick returned false, want true")
+	}
+	if useUDP {
+		t.Fatal("Pick returned UDP, want TCP while TCP has fewer passive bytes")
+	}
+}
+
+func TestQualitySelectorKeepsUDPWhenPassiveBytesTied(t *testing.T) {
+	sel := QualitySelector{}
+	udp := Quality{Active: true, DeliveryRate: 1.0, PassiveBytes: 10_000}
+	tcp := Quality{Active: true, DeliveryRate: 1.0, PassiveBytes: 10_000}
+
+	useUDP, ok := sel.Pick(udp, tcp)
+	if !ok {
+		t.Fatal("Pick returned false, want true")
+	}
+	if !useUDP {
+		t.Fatal("Pick returned TCP, want UDP on passive byte tie")
+	}
+}
+
+func TestQualitySelectorFallsBackToTCPWhenPassiveBandwidthMuchHigher(t *testing.T) {
+	sel := QualitySelector{}
+	udp := Quality{Active: true, DeliveryRate: 1.0, PassiveBandwidthBps: 10_000_000, PassiveSamples: 10}
+	tcp := Quality{Active: true, DeliveryRate: 1.0, PassiveBandwidthBps: 16_000_000, PassiveSamples: 10}
+
+	useUDP, ok := sel.Pick(udp, tcp)
+	if !ok {
+		t.Fatal("Pick returned false, want true")
+	}
+	if useUDP {
+		t.Fatal("Pick returned UDP, want TCP when passive TCP bandwidth is much higher")
+	}
+}
+
+func TestQualitySelectorKeepsUDPWhenPassiveBandwidthClose(t *testing.T) {
+	sel := QualitySelector{}
+	udp := Quality{Active: true, DeliveryRate: 1.0, PassiveBandwidthBps: 10_000_000, PassiveSamples: 10}
+	tcp := Quality{Active: true, DeliveryRate: 1.0, PassiveBandwidthBps: 14_000_000, PassiveSamples: 10}
+
+	useUDP, ok := sel.Pick(udp, tcp)
+	if !ok {
+		t.Fatal("Pick returned false, want true")
+	}
+	if !useUDP {
+		t.Fatal("Pick returned TCP, want UDP when passive bandwidth is close")
+	}
+}
+
 func TestQualitySelectorOnlyUDP(t *testing.T) {
 	sel := QualitySelector{}
 	udp := Quality{Active: true, DeliveryRate: 1.0}

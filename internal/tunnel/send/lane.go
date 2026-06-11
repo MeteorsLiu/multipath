@@ -8,7 +8,6 @@ import (
 
 	"github.com/MeteorsLiu/multipath/internal/transport"
 	"github.com/MeteorsLiu/multipath/internal/tunnel/send/leg"
-	"github.com/MeteorsLiu/multipath/internal/tunnel/send/rtt"
 )
 
 var errLaneUnavailable = errors.New("tunnel: lane has no usable transport leg")
@@ -25,8 +24,6 @@ type laneRuntime struct {
 	udpLeg          transport.LegRef
 	tcpReady        bool
 	tcpLeg          transport.LegRef
-	rttUDP          rtt.Estimator
-	rttTCP          rtt.Estimator
 	tcpRemote       string
 	helloCaps       uint16
 	helloFECProfile uint8
@@ -34,7 +31,7 @@ type laneRuntime struct {
 	fallbackBackoff time.Duration
 	fallbackRetryAt time.Time
 
-	quality laneQualityState
+	quality leg.Observer
 }
 
 // laneSnapshot is a value-copy of laneRuntime mutable fields, returned by
@@ -83,36 +80,15 @@ func (l *laneRuntime) ready() bool {
 
 func (l *laneRuntime) legQualities() (udpLeg transport.LegRef, udpQ leg.Quality, tcpLeg transport.LegRef, tcpQ leg.Quality) {
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	udpLeg = l.udpLeg
 	tcpLeg = l.tcpLeg
-	udpQ, tcpQ = l.quality.legQualities(laneQualityInput{
-		udpActive: l.udpReady && l.udpLeg.EndpointID != "" && l.udpLeg.RemoteAddr != nil,
-		udpSRTT:   durationOrZero(l.rttUDP.SRTT()),
-		udpRTTVar: durationOrZero(l.rttUDP.RTTVAR()),
-		tcpActive: l.tcpReady && l.tcpLeg.ConnID != "",
-		tcpSRTT:   durationOrZero(l.rttTCP.SRTT()),
-		tcpRTTVar: durationOrZero(l.rttTCP.RTTVAR()),
-	})
+	udpActive := l.udpReady && l.udpLeg.EndpointID != "" && l.udpLeg.RemoteAddr != nil
+	tcpActive := l.tcpReady && l.tcpLeg.ConnID != ""
+	l.mu.Unlock()
+
+	udpQ = l.quality.UDP(udpActive)
+	tcpQ = l.quality.TCP(tcpActive)
 	return
-}
-
-func (l *laneRuntime) recordBandwidthSample(kind transport.Kind, bandwidthBps uint64, loss float64) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.quality.recordBandwidthSample(kind, bandwidthBps, loss)
-}
-
-func (l *laneRuntime) recordBandwidthSampleWithReference(kind transport.Kind, bandwidthBps uint64, loss float64, referenceBps uint64) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.quality.recordBandwidthSampleWithReference(kind, bandwidthBps, loss, referenceBps)
-}
-
-func (l *laneRuntime) recordDelivery(kind transport.Kind, onTime bool) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.quality.recordDelivery(kind, onTime)
 }
 
 func legCharge(leg transport.LegRef, payloadLen int) uint32 {
@@ -120,13 +96,6 @@ func legCharge(leg transport.LegRef, payloadLen int) uint32 {
 		return uint32(payloadLen + 2)
 	}
 	return uint32(payloadLen)
-}
-
-func durationOrZero(ms uint32, ok bool) time.Duration {
-	if !ok {
-		return 0
-	}
-	return time.Duration(ms) * time.Millisecond
 }
 
 // observeLeg records the latest leg observed for this lane and marks readiness

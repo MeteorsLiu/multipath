@@ -18,31 +18,23 @@ func (l *Send) helloTimeoutForRoute(sessionID uint64, lane *laneRuntime, leg tra
 		return l.probeTimeout
 	}
 	timeoutMS := uint32(tcpHelloInitialTimeoutMS)
-	if srttMS, rttvarMS, ok := laneRTTLocked(lane, transport.KindTCP); ok {
-		timeoutMS = helloRTOMs(srttMS, rttvarMS)
-	} else if srttMS, ok := l.sessionMaxRTTMs(sessionID); ok {
-		timeoutMS = helloRTOMs(srttMS, 0)
+	ok := false
+	if lane != nil {
+		tcpQ := lane.quality.TCP(false)
+		if tcpQ.SmoothedRTT > 0 {
+			srttMS := uint32(tcpQ.SmoothedRTT / time.Millisecond)
+			rttvarMS := uint32(tcpQ.RTTVariance / time.Millisecond)
+			timeoutMS = helloRTOMs(srttMS, rttvarMS)
+			ok = true
+		}
+	}
+	if !ok {
+		if srttMS, sampleOK := l.sessionMaxRTTMs(sessionID); sampleOK {
+			timeoutMS = helloRTOMs(srttMS, 0)
+		}
 	}
 	timeoutMS = clampUint32(timeoutMS, tcpHelloMinTimeoutMS, tcpHelloMaxTimeoutMS)
 	return time.Duration(timeoutMS) * time.Millisecond
-}
-
-func laneRTTLocked(lane *laneRuntime, kind transport.Kind) (uint32, uint32, bool) {
-	if lane == nil {
-		return 0, 0, false
-	}
-	lane.mu.Lock()
-	defer lane.mu.Unlock()
-	estimator := laneRTTEstimatorLocked(lane, kind)
-	if estimator == nil {
-		return 0, 0, false
-	}
-	srttMS, ok := estimator.SRTT()
-	if !ok {
-		return 0, 0, false
-	}
-	rttvarMS, _ := estimator.RTTVAR()
-	return srttMS, rttvarMS, true
 }
 
 func helloRTOMs(srttMS uint32, rttvarMS uint32) uint32 {

@@ -12,6 +12,9 @@ type Quality struct {
 	ProbeSamples        uint32
 	BandwidthQoSLimited bool
 	BandwidthPreferTCP  bool
+	PassiveBandwidthBps uint64
+	PassiveSamples      uint32
+	PassiveBytes        uint64
 }
 
 type Selector interface {
@@ -19,8 +22,9 @@ type Selector interface {
 }
 
 const (
-	minUDPDelivery = 0.80
-	minTCPDelivery = 0.90
+	minUDPDelivery       = 0.80
+	minTCPDelivery       = 0.90
+	passiveExploreRatio  = 4
 )
 
 type QualitySelector struct{}
@@ -48,7 +52,21 @@ func (QualitySelector) Pick(udp, tcp Quality) (useUDP bool, ok bool) {
 		return false, true
 	}
 
+	if passiveUnderExplored(udp.PassiveBytes, tcp.PassiveBytes) {
+		return true, true
+	}
+	if passiveUnderExplored(tcp.PassiveBytes, udp.PassiveBytes) {
+		return false, true
+	}
+
 	return true, true
+}
+
+func passiveUnderExplored(candidateBytes uint64, otherBytes uint64) bool {
+	if otherBytes == 0 {
+		return false
+	}
+	return candidateBytes*passiveExploreRatio < otherBytes
 }
 
 type UDPPrefersSelector struct{}
