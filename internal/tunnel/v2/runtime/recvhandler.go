@@ -93,6 +93,13 @@ func (h *RecvHandler) OnHello(ctx context.Context, leg transport.LegRef, frame p
 	// Session owns the HELLO lifecycle.
 	h.sessions.GetOrCreate(frame.SessionID)
 
+	caps := uint16(0)
+	fecProfile := protocol.FECProfileOff
+	if h.send.FECEnabled() && body.Caps&protocol.CapFEC != 0 && body.FECProfile == protocol.FECProfileSLC4Plus1 {
+		caps = protocol.CapFEC
+		fecProfile = protocol.FECProfileSLC4Plus1
+	}
+
 	ackFrame := protocol.Frame{
 		Version:   protocol.Version,
 		Type:      protocol.TypeHELLOACK,
@@ -101,8 +108,8 @@ func (h *RecvHandler) OnHello(ctx context.Context, leg transport.LegRef, frame p
 		Body: protocol.HelloAckBody{
 			Nonce:      body.Nonce,
 			Accepted:   1,
-			Caps:       body.Caps & protocol.SupportedCaps,
-			FECProfile: body.FECProfile,
+			Caps:       caps,
+			FECProfile: fecProfile,
 		},
 	}
 
@@ -111,10 +118,8 @@ func (h *RecvHandler) OnHello(ctx context.Context, leg transport.LegRef, frame p
 }
 
 // OnHelloAck handles incoming HELLO_ACK frames (spec 7.3). Session.Ack validates
-// the nonce and stops the Hello retry loop. Marking the leg active (spec 6.2:
-// active标准是收到HELLO_ACK或PONG) is wired through laneManager in stage③ — the
-// recv glue never calls Send transport methods directly. Until then this only
-// validates the nonce and stops the retry loop.
+// the nonce and stops the Hello retry loop; send registers the OnAck closure
+// that activates the leg. The recv glue does not touch lane/leg internals.
 func (h *RecvHandler) OnHelloAck(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error {
 	body, ok := frame.Body.(protocol.HelloAckBody)
 	if !ok {
@@ -132,8 +137,10 @@ func (h *RecvHandler) OnHelloAck(ctx context.Context, leg transport.LegRef, fram
 		return nil
 	}
 
-	// markActive is wired through laneManager in stage③ (closure registered by
-	// send when it creates the lane's ping). Stub for now per plan stage①.
+	if h.send.FECEnabled() && body.Caps&protocol.CapFEC != 0 && body.FECProfile == protocol.FECProfileSLC4Plus1 {
+		h.send.EnableFEC()
+	}
+
 	debuglog.Printf("runtime", "hello_ack session=%d lane=%d kind=%d", frame.SessionID, frame.LaneID, leg.Kind)
 	return nil
 }

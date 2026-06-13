@@ -90,11 +90,13 @@ func buildServerRuntime(cfg Config, device *tun.Device) (*appRuntime, []io.Close
 		SessionManager:       sessions,
 		ProbeInterval:        cfg.probeInterval(),
 		ProbeTimeout:         cfg.probeTimeout(),
-		EnableFEC:            cfg.FEC,
 		IsClient:             false, // server: gate starts in the Remote phase (spec 7.5)
 		EnableBandwidthProbe: true,
 		BWCapBps:             cfg.bandwidthProbeCapForSend(),
 	})
+	if cfg.FEC {
+		in.EnableFEC()
+	}
 	out := recv.New(recv.Config{
 		Handler:        tunnelruntime.NewRecvHandler(in, sessions),
 		SessionManager: sessions,
@@ -172,12 +174,14 @@ func buildClientRuntime(cfg Config, device *tun.Device) (*appRuntime, []io.Close
 		SessionManager:       sessions,
 		ProbeInterval:        cfg.probeInterval(),
 		ProbeTimeout:         cfg.probeTimeout(),
-		EnableFEC:            cfg.FEC,
 		IsClient:             true, // client sent HELLO: gate starts in the Local phase (spec 7.5)
 		EnableBandwidthProbe: true,
 		BWCapBps:             cfg.bandwidthProbeCapForSend(),
 		BootstrapLanes:       bootstrap,
 	})
+	if cfg.FEC {
+		in.EnableFEC()
+	}
 	out := recv.New(recv.Config{
 		Handler:        tunnelruntime.NewRecvHandler(in, sessions),
 		SessionManager: sessions,

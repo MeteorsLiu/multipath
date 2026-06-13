@@ -116,6 +116,61 @@ func drainSendFrames(t *testing.T, s *Send) []protocol.Frame {
 	}
 }
 
+func TestBootstrapHelloAdvertisesFECOnlyWhenEnabled(t *testing.T) {
+	tests := []struct {
+		name        string
+		enableFEC   bool
+		wantCaps    uint16
+		wantProfile uint8
+	}{
+		{
+			name:        "disabled",
+			enableFEC:   false,
+			wantCaps:    0,
+			wantProfile: protocol.FECProfileOff,
+		},
+		{
+			name:        "enabled",
+			enableFEC:   true,
+			wantCaps:    protocol.CapFEC,
+			wantProfile: protocol.FECProfileSLC4Plus1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sessions := &sessionpkg.Manager{}
+			s := New(Config{
+				SessionManager: sessions,
+				BootstrapLanes: []BootstrapLane{{LaneID: 1, Weight: 100, Leg: e2eUDP()}},
+				ProbeInterval:  time.Hour,
+				ProbeTimeout:   time.Hour,
+			})
+			if tt.enableFEC {
+				s.EnableFEC()
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if err := s.Bootstrap(ctx); err != nil {
+				t.Fatalf("bootstrap: %v", err)
+			}
+			sessionID, ok := s.activeSession()
+			if !ok {
+				t.Fatal("no active session after bootstrap")
+			}
+
+			hello := waitForHello(t, s, sessionID, 1)
+			if hello.Caps != tt.wantCaps {
+				t.Fatalf("HELLO caps = %#x, want %#x", hello.Caps, tt.wantCaps)
+			}
+			if hello.FECProfile != tt.wantProfile {
+				t.Fatalf("HELLO FEC profile = %d, want %d", hello.FECProfile, tt.wantProfile)
+			}
+		})
+	}
+}
+
 // TestSendToRecvFECRecovery is the end-to-end data path: Send.Write produces a
 // FEC'd group (4 DATA + 1 REPAIR); we drop one DATA and feed the rest into Recv,
 // which must reconstruct the missing packet and dedupe a late duplicate.
@@ -128,9 +183,9 @@ func TestSendToRecvFECRecovery(t *testing.T) {
 	sessions := &sessionpkg.Manager{}
 	s := New(Config{
 		SessionManager: sessions,
-		EnableFEC:      true,
 		BootstrapLanes: []BootstrapLane{{LaneID: 1, Weight: 100, Leg: e2eUDP()}},
 	})
+	s.EnableFEC()
 
 	ctx := context.Background()
 	if err := s.Bootstrap(ctx); err != nil {
@@ -148,6 +203,7 @@ func TestSendToRecvFECRecovery(t *testing.T) {
 		lane.markActive(transport.KindUDP)
 	}
 	s.lanesMu.RUnlock()
+	s.EnableFEC()
 
 	// Drain the bootstrap HELLO frame.
 	for {

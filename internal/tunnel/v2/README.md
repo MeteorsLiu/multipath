@@ -135,7 +135,7 @@ internal/tunnel/v2/
 │   └── recvhandler.go          recv.Handler: owns probes, adapters, dispatch
 ├── send/
 │   ├── ref.go                  type Ref = transport.LegRef
-│   ├── config.go               SessionManager / EnableFEC / BootstrapLanes
+│   ├── config.go               SessionManager / BootstrapLanes
 │   ├── lane.go                 unexported laneRuntime, primary/shadow, FEC txWindow
 │   ├── send.go                 Write / WriteFrame / WriteTo / Packets
 │   └── e2e_test.go             Send→Recv FEC recovery + dedupe

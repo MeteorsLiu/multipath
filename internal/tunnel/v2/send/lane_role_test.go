@@ -146,7 +146,8 @@ func TestLaneSetPrimaryRejectsInvalidKind(t *testing.T) {
 // TestRepairUsesShadowLeg verifies that with FEC on, a full 4-DATA group emits
 // DATA on the primary leg (UDP) and the REPAIR on the shadow leg (TCP).
 func TestRepairUsesShadowLeg(t *testing.T) {
-	s := New(Config{EnableFEC: true})
+	s := New()
+	s.EnableFEC()
 
 	session, err := sessionpkg.New()
 	if err != nil {
@@ -161,6 +162,7 @@ func TestRepairUsesShadowLeg(t *testing.T) {
 	s.sendStatesMu.Lock()
 	s.sendStates[sessionID] = &sendState{}
 	s.sendStatesMu.Unlock()
+	s.EnableFEC()
 
 	lane := newLaneRuntime(1, 100)
 	bindBoth(lane)

@@ -81,6 +81,12 @@ func TestRecvHandlerOnHelloRepliesWithHelloAckThroughSession(t *testing.T) {
 		if body.Caps&protocol.CapTCPFallback != 0 {
 			t.Errorf("HELLO_ACK caps include TCP fallback: %#x", body.Caps)
 		}
+		if body.Caps&protocol.CapFEC != 0 {
+			t.Errorf("HELLO_ACK negotiated FEC while local FEC is disabled: %#x", body.Caps)
+		}
+		if body.FECProfile != protocol.FECProfileOff {
+			t.Errorf("HELLO_ACK FEC profile = %d, want off", body.FECProfile)
+		}
 		payload.Packet.Release()
 	default:
 		t.Error("expected HELLO_ACK in output queue")

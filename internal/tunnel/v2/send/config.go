@@ -22,7 +22,6 @@ type Config struct {
 	// TCPRemote starts a dialer that establishes + redials the TCP leg off the data
 	// path. nil disables TCP (UDP-only).
 	StreamTransport transport.StreamTransport
-	EnableFEC       bool
 
 	// ProbeInterval/ProbeTimeout tune the active ping (spec 5.5). Zero falls back
 	// to ping defaults.

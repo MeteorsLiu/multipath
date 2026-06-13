@@ -184,7 +184,6 @@ type Config struct {
     ProbeInterval   time.Duration
     ProbeTimeout    time.Duration
     ProbeEvents     chan core.Event
-    EnableFEC       bool
     FECFlushAlpha       uint32
     FECFlushMinMs       uint32
     FECFlushMaxMs       uint32

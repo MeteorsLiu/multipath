@@ -48,7 +48,7 @@ type Send struct {
 	streamTransport transport.StreamTransport
 	bootstrapLanes  []BootstrapLane
 	packets         chan transport.Payload
-	fecEnabled      atomic.Bool
+	fecConfigured   atomic.Bool
 	fecFlushMin     time.Duration
 	fecFlushMax     time.Duration
 
@@ -115,6 +115,7 @@ type runnableCache struct {
 type sendState struct {
 	nextPacketID  atomic.Uint32
 	nextRepairKey atomic.Uint32
+	fecEnabled    atomic.Bool
 }
 
 // New creates a new Send instance.
@@ -161,9 +162,6 @@ func (s *Send) applyConfig(cfg Config) {
 	if cfg.StreamTransport != nil {
 		s.streamTransport = cfg.StreamTransport
 	}
-	if cfg.EnableFEC {
-		s.enableFEC()
-	}
 	if cfg.ProbeInterval > 0 {
 		s.probeInterval = cfg.ProbeInterval
 	}
@@ -185,14 +183,37 @@ func (s *Send) applyConfig(cfg Config) {
 	s.bootstrapLanes = append(s.bootstrapLanes, cfg.BootstrapLanes...)
 }
 
-func (s *Send) enableFEC() {
-	s.fecEnabled.Store(true)
+func (s *Send) FECEnabled() bool {
+	return s.fecConfigured.Load()
+}
+
+func (s *Send) EnableFEC() {
+	s.fecConfigured.Store(true)
 	// Create 4+1 SLC codec (hardcoded per spec)
 	codec, _ := fec.NewCodec(4, 1)
 	s.fecCodec = codec
 	for i := 1; i <= maxFECSourceSpan; i++ {
 		s.fecCodecs[i], _ = fec.NewCodec(i, 1)
 	}
+	if sessionID, ok := s.activeSession(); ok {
+		s.enableSessionFEC(sessionID)
+	}
+}
+
+func (s *Send) enableSessionFEC(sessionID uint64) {
+	if !s.FECEnabled() {
+		return
+	}
+	state := s.getSendState(sessionID)
+	if state == nil {
+		return
+	}
+	state.fecEnabled.Store(true)
+}
+
+func (s *Send) sessionFECEnabled(sessionID uint64) bool {
+	state := s.getSendState(sessionID)
+	return state != nil && state.fecEnabled.Load()
 }
 
 // Packets returns the transport output channel.
@@ -416,6 +437,12 @@ func (s *Send) openLaneHello(ctx context.Context, session *sessionpkg.Session, s
 		return
 	}
 	sender := func(ctx context.Context, v sessionpkg.View) error {
+		caps := uint16(0)
+		fecProfile := protocol.FECProfileOff
+		if s.FECEnabled() {
+			caps = protocol.CapFEC
+			fecProfile = protocol.FECProfileSLC4Plus1
+		}
 		frame := protocol.Frame{
 			Version:   protocol.Version,
 			Type:      protocol.TypeHELLO,
@@ -423,8 +450,8 @@ func (s *Send) openLaneHello(ctx context.Context, session *sessionpkg.Session, s
 			LaneID:    laneID,
 			Body: protocol.HelloBody{
 				Nonce:      v.Nonce(),
-				Caps:       protocol.CapFEC,
-				FECProfile: protocol.FECProfileSLC4Plus1,
+				Caps:       caps,
+				FECProfile: fecProfile,
 			},
 		}
 		return s.WriteFrame(ctx, frame, legRef)
@@ -556,6 +583,9 @@ func (s *Send) admitPassiveHelloAck(ctx context.Context, frame protocol.Frame, l
 		lane.bindTCP(legRef)
 	}
 	lane.markActive(legRef.Kind)
+	if body.Caps&protocol.CapFEC != 0 && body.FECProfile == protocol.FECProfileSLC4Plus1 {
+		s.enableSessionFEC(frame.SessionID)
+	}
 
 	if s.laneManager.LookupPing(KeyForLeg(frame.SessionID, frame.LaneID, legRef)) == nil {
 		s.startLanePing(sessionCtx, frame.SessionID, lane, legRef)
@@ -691,7 +721,7 @@ func (s *Send) sendDataFrame(ctx context.Context, lane *laneRuntime, frame proto
 	}
 
 	// Add to FEC window if enabled
-	if s.fecEnabled.Load() {
+	if s.sessionFECEnabled(frame.SessionID) {
 		group, ready, shouldArmFlush := lane.commitPacket(packetID, payload)
 		if ready {
 			// Send REPAIR immediately
@@ -873,7 +903,7 @@ func (s *Send) armFECFlushTimer(sessionID uint64, lane *laneRuntime) {
 }
 
 func (s *Send) handleFECFlush(sessionID uint64, lane *laneRuntime) {
-	if !s.fecEnabled.Load() {
+	if !s.sessionFECEnabled(sessionID) {
 		return
 	}
 
