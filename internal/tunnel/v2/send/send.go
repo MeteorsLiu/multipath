@@ -200,6 +200,12 @@ func (s *Send) EnableFEC() {
 	}
 }
 
+func (s *Send) LinkStatus(sessionID uint64, laneID uint8, body protocol.LinkStatusBody) {
+	_ = sessionID
+	_ = laneID
+	_ = body
+}
+
 func (s *Send) enableSessionFEC(sessionID uint64) {
 	if !s.FECEnabled() {
 		return

@@ -37,6 +37,7 @@ type Handler interface {
 	OnClose(ctx context.Context, from Ref, frame protocol.Frame) error
 	OnBandwidthProbe(ctx context.Context, from Ref, frame protocol.Frame) error
 	OnBandwidthProbeAck(ctx context.Context, from Ref, frame protocol.Frame) error
+	OnLinkStatus(ctx context.Context, from Ref, frame protocol.Frame) error
 }
 
 type Config struct {
@@ -225,6 +226,8 @@ func (o *Recv) WriteTo(ctx context.Context, leg Ref, packet *packetbuf.Packet) e
 		return o.handleControl(ctx, leg, frame)
 	case protocol.TypeBandwidthProbeAck:
 		return o.handleControl(ctx, leg, frame)
+	case protocol.TypeLinkStatus:
+		return o.handleControl(ctx, leg, frame)
 	default:
 		return nil
 	}
@@ -253,6 +256,8 @@ func (o *Recv) handleControl(ctx context.Context, leg Ref, frame protocol.Frame)
 		return o.handler.OnBandwidthProbe(ctx, leg, frame)
 	case protocol.TypeBandwidthProbeAck:
 		return o.handler.OnBandwidthProbeAck(ctx, leg, frame)
+	case protocol.TypeLinkStatus:
+		return o.handler.OnLinkStatus(ctx, leg, frame)
 	default:
 		return nil
 	}
@@ -273,6 +278,8 @@ func validateControlBody(frame protocol.Frame) error {
 		_, ok = frame.Body.(protocol.BandwidthProbeBody)
 	case protocol.TypeBandwidthProbeAck:
 		_, ok = frame.Body.(protocol.BandwidthProbeAckBody)
+	case protocol.TypeLinkStatus:
+		_, ok = frame.Body.(protocol.LinkStatusBody)
 	default:
 		ok = true
 	}

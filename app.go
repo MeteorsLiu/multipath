@@ -9,6 +9,7 @@ import (
 	"os"
 
 	"github.com/MeteorsLiu/multipath/internal/metrics"
+	"github.com/MeteorsLiu/multipath/internal/protocol"
 	"github.com/MeteorsLiu/multipath/internal/session"
 	"github.com/MeteorsLiu/multipath/internal/transport"
 	"github.com/MeteorsLiu/multipath/internal/tun"
@@ -97,9 +98,13 @@ func buildServerRuntime(cfg Config, device *tun.Device) (*appRuntime, []io.Close
 	if cfg.FEC {
 		in.EnableFEC()
 	}
+	handler := tunnelruntime.NewRecvHandler(in, sessions)
 	out := recv.New(recv.Config{
-		Handler:        tunnelruntime.NewRecvHandler(in, sessions),
+		Handler:        handler,
 		SessionManager: sessions,
+		LinkStatus: func(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error {
+			return in.WriteFrame(ctx, frame, leg)
+		},
 	})
 	return &appRuntime{
 		tunReader:       device,
@@ -182,9 +187,13 @@ func buildClientRuntime(cfg Config, device *tun.Device) (*appRuntime, []io.Close
 	if cfg.FEC {
 		in.EnableFEC()
 	}
+	handler := tunnelruntime.NewRecvHandler(in, sessions)
 	out := recv.New(recv.Config{
-		Handler:        tunnelruntime.NewRecvHandler(in, sessions),
+		Handler:        handler,
 		SessionManager: sessions,
+		LinkStatus: func(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error {
+			return in.WriteFrame(ctx, frame, leg)
+		},
 	})
 	return &appRuntime{
 		tunReader:       device,

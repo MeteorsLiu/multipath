@@ -43,6 +43,10 @@ func (h *recordingHandler) OnBandwidthProbeAck(ctx context.Context, leg Ref, fra
 	h.calls = append(h.calls, "OnBandwidthProbeAck")
 	return nil
 }
+func (h *recordingHandler) OnLinkStatus(ctx context.Context, leg Ref, frame protocol.Frame) error {
+	h.calls = append(h.calls, "OnLinkStatus")
+	return nil
+}
 
 func encodedTestFrame(t *testing.T, frame protocol.Frame) *packetbuf.Packet {
 	t.Helper()
@@ -96,6 +100,7 @@ func TestRecvDispatchesControlFramesToHandler(t *testing.T) {
 		{Type: protocol.TypeCLOSE, SessionID: 1, LaneID: 1, Body: protocol.CloseBody{Scope: protocol.CloseScopeLane}},
 		{Type: protocol.TypeBandwidthProbe, SessionID: 1, LaneID: 1, Body: protocol.BandwidthProbeBody{Count: 1, TrainBytesTotal: 1}},
 		{Type: protocol.TypeBandwidthProbeAck, SessionID: 1, LaneID: 1, Body: protocol.BandwidthProbeAckBody{Count: 1}},
+		{Type: protocol.TypeLinkStatus, SessionID: 1, LaneID: 1, Body: protocol.LinkStatusBody{LegKind: protocol.LinkStatusLegUDP, Reason: protocol.LinkStatusReasonLimited, DeliveredBps: 1}},
 	}
 	for _, frame := range frames {
 		if err := out.Write(context.Background(), encodedTestFrame(t, frame)); err != nil {
@@ -103,7 +108,7 @@ func TestRecvDispatchesControlFramesToHandler(t *testing.T) {
 		}
 	}
 
-	want := []string{"OnHello", "OnHelloAck", "OnPing", "OnPong", "OnClose", "OnBandwidthProbe", "OnBandwidthProbeAck"}
+	want := []string{"OnHello", "OnHelloAck", "OnPing", "OnPong", "OnClose", "OnBandwidthProbe", "OnBandwidthProbeAck", "OnLinkStatus"}
 	if len(handler.calls) != len(want) {
 		t.Fatalf("handler calls = %v, want %v", handler.calls, want)
 	}
