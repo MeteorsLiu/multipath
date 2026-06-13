@@ -360,3 +360,7 @@ func maxInt(a, b int) int {
 	}
 	return b
 }
+
+func qosNow() time.Time {
+	return time.Now()
+}

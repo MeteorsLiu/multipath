@@ -253,26 +253,6 @@ func TestRecvHandlerDispatchesControlFramesWithoutTouchingDATAorREPAIR(t *testin
 	// RecvHandler has no OnData or OnRepair methods - those stay in Recv
 }
 
-func TestRecvHandlerOnLinkStatusUpdatesSend(t *testing.T) {
-	s := send.New()
-	sessions := &sessionpkg.Manager{}
-	sessions.GetOrCreate(55)
-	handler := NewRecvHandler(s, sessions)
-	frame := protocol.Frame{
-		Type:      protocol.TypeLinkStatus,
-		SessionID: 55,
-		LaneID:    1,
-		Body: protocol.LinkStatusBody{
-			LegKind:      protocol.LinkStatusLegUDP,
-			Reason:       protocol.LinkStatusReasonLimited,
-			DeliveredBps: 2_000_000,
-		},
-	}
-	if err := handler.OnLinkStatus(context.Background(), transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp"}, frame); err != nil {
-		t.Fatalf("OnLinkStatus: %v", err)
-	}
-}
-
 // TestOnPingUnknownSessionRepliesClose verifies the peer-restart self-heal: a
 // PING for a session this end does not know yields CLOSE{Session, UnknownSession}
 // (not a bare PONG that would let the peer believe the dead session is alive).

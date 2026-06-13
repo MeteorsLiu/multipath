@@ -354,15 +354,3 @@ func (h *RecvHandler) OnBandwidthProbeAck(ctx context.Context, leg transport.Leg
 	})
 	return nil
 }
-
-func (h *RecvHandler) OnLinkStatus(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error {
-	body, ok := frame.Body.(protocol.LinkStatusBody)
-	if !ok {
-		return protocol.ErrInvalidFrame
-	}
-	if !h.sessionKnown(frame.SessionID) {
-		return h.closeUnknownSession(ctx, leg, frame.SessionID)
-	}
-	h.send.LinkStatus(frame.SessionID, frame.LaneID, body)
-	return nil
-}
