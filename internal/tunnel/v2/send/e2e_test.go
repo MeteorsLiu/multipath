@@ -1,0 +1,542 @@
+package send
+
+import (
+	"context"
+	"encoding/binary"
+	"testing"
+	"time"
+
+	"github.com/MeteorsLiu/multipath/internal/packetbuf"
+	"github.com/MeteorsLiu/multipath/internal/protocol"
+	sessionpkg "github.com/MeteorsLiu/multipath/internal/session"
+	"github.com/MeteorsLiu/multipath/internal/transport"
+	"github.com/MeteorsLiu/multipath/internal/tunnel/v2/probe/ping"
+	"github.com/MeteorsLiu/multipath/internal/tunnel/v2/recv"
+)
+
+type e2eAddr struct{ addr string }
+
+func (a *e2eAddr) Network() string { return "udp" }
+func (a *e2eAddr) String() string  { return a.addr }
+
+func e2eUDP() transport.LegRef {
+	return transport.LegRef{Kind: transport.KindUDP, EndpointID: "ep", RemoteAddr: &e2eAddr{addr: "127.0.0.1:9000"}}
+}
+
+// makeIPv4 builds a minimal valid IPv4 packet of totalLen bytes; byte 20 encodes
+// id so recovered packets are identifiable.
+func makeIPv4(id byte, totalLen int) []byte {
+	if totalLen < 21 {
+		totalLen = 21
+	}
+	p := make([]byte, totalLen)
+	p[0] = 0x45
+	binary.BigEndian.PutUint16(p[2:4], uint16(totalLen))
+	p[20] = id
+	return p
+}
+
+func drainRecv(r *recv.Recv) int {
+	n := 0
+	for {
+		select {
+		case p := <-r.Packets():
+			p.Release()
+			n++
+		default:
+			return n
+		}
+	}
+}
+
+func drainSendFrames(t *testing.T, s *Send) []protocol.Frame {
+	t.Helper()
+	var frames []protocol.Frame
+	for {
+		select {
+		case payload := <-s.Packets():
+			f, err := protocol.Decode(payload.Packet.Payload)
+			payload.Packet.Release()
+			if err == nil {
+				frames = append(frames, f)
+			}
+		default:
+			return frames
+		}
+	}
+}
+
+// TestSendToRecvFECRecovery is the end-to-end data path: Send.Write produces a
+// FEC'd group (4 DATA + 1 REPAIR); we drop one DATA and feed the rest into Recv,
+// which must reconstruct the missing packet and dedupe a late duplicate.
+//
+// The lane runs single-transport (UDP only), so DATA and REPAIR share the UDP
+// link — a valid degraded path. FEC recovery is independent of which leg
+// carries the frames. It uses the public Bootstrap path to stand up the
+// active session + lane.
+func TestSendToRecvFECRecovery(t *testing.T) {
+	sessions := &sessionpkg.Manager{}
+	s := New(Config{
+		SessionManager: sessions,
+		EnableFEC:      true,
+		BootstrapLanes: []BootstrapLane{{LaneID: 1, Weight: 100, Leg: e2eUDP()}},
+	})
+
+	ctx := context.Background()
+	if err := s.Bootstrap(ctx); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+
+	// Bootstrap binds the UDP transport but does NOT mark it active: under plan
+	// 6.2, active flips only on peer reply (PONG, via the ping OnUp closure).
+	// This FEC recovery test focuses on the data path, not the handshake, so we
+	// activate the lane directly to simulate a path that has already come up.
+	// The real PONG→OnUp→markActive activation path is covered by
+	// TestLaneActivatesViaPongThroughLaneManager below.
+	s.lanesMu.RLock()
+	for _, lane := range s.lanes {
+		lane.markActive(transport.KindUDP)
+	}
+	s.lanesMu.RUnlock()
+
+	// Drain the bootstrap HELLO frame.
+	for {
+		select {
+		case p := <-s.Packets():
+			p.Packet.Release()
+			continue
+		default:
+		}
+		break
+	}
+
+	const group = 4
+	for i := 0; i < group; i++ {
+		pkt := packetbuf.Acquire(40)
+		pkt.Payload = makeIPv4(byte(i+1), 40)
+		if err := s.Write(ctx, pkt); err != nil {
+			t.Fatalf("Write %d: %v", i, err)
+		}
+	}
+
+	var dataFrames []protocol.Frame
+	var repairFrame *protocol.Frame
+	for {
+		select {
+		case payload := <-s.Packets():
+			f, derr := protocol.Decode(payload.Packet.Payload)
+			if derr == nil {
+				// Deep-copy the body slices before releasing the packet: Decode
+				// aliases the packet buffer, which the pool reuses after Release.
+				switch b := f.Body.(type) {
+				case protocol.DataBody:
+					b.Packet = append([]byte(nil), b.Packet...)
+					f.Body = b
+					dataFrames = append(dataFrames, f)
+				case protocol.RepairBody:
+					b.Symbol = append([]byte(nil), b.Symbol...)
+					f.Body = b
+					cp := f
+					repairFrame = &cp
+				}
+			}
+			payload.Packet.Release()
+			continue
+		default:
+		}
+		break
+	}
+
+	if len(dataFrames) != group {
+		t.Fatalf("got %d DATA frames, want %d", len(dataFrames), group)
+	}
+	if repairFrame == nil {
+		t.Fatal("no REPAIR frame produced")
+	}
+
+	r := recv.New(recv.Config{SessionManager: sessions})
+	encode := func(f protocol.Frame) *packetbuf.Packet {
+		b, e := protocol.Encode(f, nil)
+		if e != nil {
+			t.Fatalf("encode: %v", e)
+		}
+		p := packetbuf.Acquire(len(b))
+		copy(p.Payload, b)
+		return p
+	}
+
+	// Deliver DATA 0,1,2 (drop DATA 3), then REPAIR.
+	for i := 0; i < group-1; i++ {
+		if err := r.WriteTo(ctx, e2eUDP(), encode(dataFrames[i])); err != nil {
+			t.Fatalf("recv DATA %d: %v", i, err)
+		}
+		drainRecv(r)
+	}
+	if err := r.WriteTo(ctx, e2eUDP(), encode(*repairFrame)); err != nil {
+		t.Fatalf("recv REPAIR: %v", err)
+	}
+
+	if recovered := drainRecv(r); recovered == 0 {
+		t.Fatal("expected FEC to recover the dropped DATA packet")
+	}
+
+	// Late duplicate of DATA 3 must be deduped.
+	if err := r.WriteTo(ctx, e2eUDP(), encode(dataFrames[group-1])); err != nil {
+		t.Fatalf("recv late DATA: %v", err)
+	}
+	if extra := drainRecv(r); extra != 0 {
+		t.Errorf("late duplicate produced %d TUN packets, want 0", extra)
+	}
+}
+
+// TestLaneActivatesViaPongThroughLaneManager verifies the stage③ liveness path
+// end to end: Bootstrap registers a dead ping per lane in the shared LaneManager
+// (startLanePing). A lane starts NOT ready (active flips only on peer reply,
+// spec 6.2). Feeding RecoverSuccess PONGs through LaneManager.LookupPing(...).Pong
+// crosses the recovery threshold, fires the ping's OnUp closure (leg.markActive),
+// and the lane becomes ready — all without the recv side touching lane/leg state.
+func TestLaneActivatesViaPongThroughLaneManager(t *testing.T) {
+	sessions := &sessionpkg.Manager{}
+	s := New(Config{
+		SessionManager: sessions,
+		BootstrapLanes: []BootstrapLane{{LaneID: 1, Weight: 100, Leg: e2eUDP()}},
+		ProbeInterval:  20 * time.Millisecond,
+		ProbeTimeout:   time.Second,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := s.Bootstrap(ctx); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+
+	sessionID, ok := s.activeSession()
+	if !ok {
+		t.Fatal("no active session after bootstrap")
+	}
+	lane := s.getLane(laneKey{sessionID: sessionID, laneID: 1})
+	if lane == nil {
+		t.Fatal("bootstrap lane not found")
+	}
+
+	// A freshly bootstrapped lane is bound but not active: not ready yet.
+	if lane.ready() {
+		t.Fatal("lane should NOT be ready before any PONG (spec 6.2)")
+	}
+
+	// The send side registered a dead ping for this leg in the LaneManager.
+	key := KeyForLeg(sessionID, 1, e2eUDP())
+	p := s.LaneManager().LookupPing(key)
+	if p == nil {
+		t.Fatal("expected a ping registered in LaneManager for the bootstrap leg")
+	}
+
+	// Feed PONGs the way the recv glue does: read each emitted PING and echo a
+	// matching PONG into the same ping via Pong. Default RecoverSuccess is 3, so
+	// at least 3 valid pongs bring the dead ping (and thus the leg) up.
+	deadline := time.Now().Add(2 * time.Second)
+	for !lane.ready() && time.Now().Before(deadline) {
+		msg := waitForPing(t, s, sessionID, 1)
+		p.Pong(msg, msg.TimeMS+5)
+	}
+
+	if !lane.ready() {
+		t.Fatal("lane did not become ready after feeding recovery PONGs through LaneManager")
+	}
+}
+
+// waitForPing blocks until a PING frame for the given session/lane is emitted by
+// the send side, returning its ping.Message fields. It fails the test on timeout.
+func waitForPing(t *testing.T, s *Send, sessionID uint64, laneID uint8) ping.Message {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case payload := <-s.Packets():
+			f, err := protocol.Decode(payload.Packet.Payload)
+			payload.Packet.Release()
+			if err != nil {
+				continue
+			}
+			if f.Type == protocol.TypePING && f.SessionID == sessionID && f.LaneID == laneID {
+				b := f.Body.(protocol.PingBody)
+				return ping.Message{ID: b.PingID, TimeMS: b.TimeMS}
+			}
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	t.Fatal("timed out waiting for a PING frame")
+	return ping.Message{}
+}
+
+// TestLaneGoesDownViaPingTimeout verifies the OnDown→markDown wiring end to end:
+// once a lane is up, ceasing to answer its pings lets consecutive timeouts cross
+// MaxLoss, firing the ping's OnDown closure (leg.markDown) so the lane stops being
+// ready. The recv side is not involved — death is driven entirely by the send-side
+// ping's own timeout accounting (spec 6.2: UDP 靠 ping 连续超时判死).
+func TestLaneGoesDownViaPingTimeout(t *testing.T) {
+	sessions := &sessionpkg.Manager{}
+	s := New(Config{
+		SessionManager: sessions,
+		BootstrapLanes: []BootstrapLane{{LaneID: 1, Weight: 100, Leg: e2eUDP()}},
+		ProbeInterval:  15 * time.Millisecond,
+		ProbeTimeout:   20 * time.Millisecond,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := s.Bootstrap(ctx); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+
+	sessionID, _ := s.activeSession()
+	lane := s.getLane(laneKey{sessionID: sessionID, laneID: 1})
+	key := KeyForLeg(sessionID, 1, e2eUDP())
+	p := s.LaneManager().LookupPing(key)
+	if p == nil {
+		t.Fatal("expected a registered ping")
+	}
+
+	// Bring the lane up by answering a few pings.
+	deadline := time.Now().Add(2 * time.Second)
+	for !lane.ready() && time.Now().Before(deadline) {
+		msg := waitForPing(t, s, sessionID, 1)
+		p.Pong(msg, msg.TimeMS+2)
+	}
+	if !lane.ready() {
+		t.Fatal("lane never came up")
+	}
+
+	// Stop answering. The ping's Start loop accumulates timeouts; after MaxLoss
+	// (default 3) consecutive losses it fires OnDown → leg.markDown → not ready.
+	downDeadline := time.Now().Add(2 * time.Second)
+	for lane.ready() && time.Now().Before(downDeadline) {
+		// Drain (and discard) emitted PINGs without answering, so each one times out.
+		select {
+		case payload := <-s.Packets():
+			payload.Packet.Release()
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	if lane.ready() {
+		t.Fatal("lane did not go down after MaxLoss consecutive ping timeouts")
+	}
+}
+
+// TestRebootstrapBuildsFreshSession verifies the unknown-session self-heal on the
+// client side: after a Rebootstrap, the active session id changes, the old
+// session is removed from the manager, and a fresh lane + ping is registered.
+// The old session's goroutines are cancelled via its per-session context.
+func TestRebootstrapBuildsFreshSession(t *testing.T) {
+	sessions := &sessionpkg.Manager{}
+	s := New(Config{
+		SessionManager: sessions,
+		BootstrapLanes: []BootstrapLane{{LaneID: 1, Weight: 100, Leg: e2eUDP()}},
+		ProbeInterval:  time.Hour, // keep pings quiet; we only check identity
+		ProbeTimeout:   time.Hour,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := s.Bootstrap(ctx); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+
+	oldID, ok := s.activeSession()
+	if !ok {
+		t.Fatal("no active session after bootstrap")
+	}
+	if _, known := sessions.Get(oldID); !known {
+		t.Fatal("bootstrap session not in manager")
+	}
+
+	if err := s.Rebootstrap(); err != nil {
+		t.Fatalf("rebootstrap: %v", err)
+	}
+
+	newID, ok := s.activeSession()
+	if !ok {
+		t.Fatal("no active session after rebootstrap")
+	}
+	if newID == oldID {
+		t.Fatalf("rebootstrap reused session id %d, want a fresh one", oldID)
+	}
+	if _, known := sessions.Get(oldID); known {
+		t.Error("old session still in manager after rebootstrap")
+	}
+	if _, known := sessions.Get(newID); !known {
+		t.Error("new session missing from manager after rebootstrap")
+	}
+
+	// A fresh lane + ping must exist for the new session.
+	lane := s.getLane(laneKey{sessionID: newID, laneID: 1})
+	if lane == nil {
+		t.Fatal("no lane for the rebuilt session")
+	}
+	if p := s.LaneManager().LookupPing(KeyForLeg(newID, 1, e2eUDP())); p == nil {
+		t.Error("no ping registered for the rebuilt session")
+	}
+	// The old session's ping must be gone (LaneManager was reset).
+	if p := s.LaneManager().LookupPing(KeyForLeg(oldID, 1, e2eUDP())); p != nil {
+		t.Error("stale ping for the old session survived rebootstrap")
+	}
+}
+
+// TestRebootstrapServerSideNoOp verifies that an end with no bootstrap lanes
+// (server) does not rebuild on Rebootstrap — it awaits the peer's fresh HELLO.
+func TestRebootstrapServerSideNoOp(t *testing.T) {
+	sessions := &sessionpkg.Manager{}
+	s := New(Config{SessionManager: sessions}) // no bootstrap lanes
+
+	if err := s.Rebootstrap(); err != nil {
+		t.Fatalf("server-side Rebootstrap should be a no-op, got: %v", err)
+	}
+	if _, ok := s.activeSession(); ok {
+		t.Error("server-side Rebootstrap should not activate a session")
+	}
+}
+
+// TestAcceptedHelloAckPassivelyAdmitsServerLane verifies the server-side passive
+// HELLO path: an end with no BootstrapLanes accepts a peer HELLO by writing an
+// accepted HELLO_ACK on the observed leg. That outbound ACK is the admission
+// point for creating this end's send-side lane, so later TUN packets can be sent
+// back through Send.Write.
+func TestAcceptedHelloAckPassivelyAdmitsServerLane(t *testing.T) {
+	sessions := &sessionpkg.Manager{}
+	s := New(Config{
+		SessionManager: sessions,
+		ProbeInterval:  time.Hour,
+		ProbeTimeout:   time.Hour,
+	})
+
+	const sessionID = uint64(77)
+	const laneID = uint8(4)
+	if _, ok := sessions.GetOrCreate(sessionID); !ok {
+		t.Fatal("failed to create passive session")
+	}
+
+	leg := e2eUDP()
+	ack := protocol.Frame{
+		Version:   protocol.Version,
+		Type:      protocol.TypeHELLOACK,
+		SessionID: sessionID,
+		LaneID:    laneID,
+		Body: protocol.HelloAckBody{
+			Nonce:      12,
+			Accepted:   1,
+			Caps:       protocol.CapFEC,
+			FECProfile: protocol.FECProfileSLC4Plus1,
+		},
+	}
+	if err := s.WriteFrame(context.Background(), ack, leg); err != nil {
+		t.Fatalf("WriteFrame HELLO_ACK: %v", err)
+	}
+
+	if cur, ok := s.activeSession(); !ok || cur != sessionID {
+		t.Fatalf("passive HELLO_ACK did not activate session: ok=%v cur=%d want %d", ok, cur, sessionID)
+	}
+	lane := s.getLane(laneKey{sessionID: sessionID, laneID: laneID})
+	if lane == nil {
+		t.Fatal("passive HELLO_ACK did not create lane")
+	}
+	if !lane.ready() {
+		t.Fatal("passive HELLO_ACK did not mark observed leg active")
+	}
+
+	pkt := packetbuf.Acquire(40)
+	pkt.Payload = makeIPv4(9, 40)
+	if err := s.Write(context.Background(), pkt); err != nil {
+		t.Fatalf("Write after passive admission: %v", err)
+	}
+
+	frames := drainSendFrames(t, s)
+	var sawData bool
+	for _, f := range frames {
+		if f.Type == protocol.TypeDATA && f.SessionID == sessionID && f.LaneID == laneID {
+			sawData = true
+		}
+	}
+	if !sawData {
+		t.Fatal("expected DATA after passive admission")
+	}
+}
+
+// TestCloseSessionClearsState verifies a plain session CLOSE releases all
+// send-side per-session state (lane, sendState, ping) so it does not leak under
+// session churn (spec 7). Unlike Rebootstrap, it does not rebuild.
+func TestCloseSessionClearsState(t *testing.T) {
+	sessions := &sessionpkg.Manager{}
+	s := New(Config{
+		SessionManager: sessions,
+		BootstrapLanes: []BootstrapLane{{LaneID: 1, Weight: 100, Leg: e2eUDP()}},
+		ProbeInterval:  time.Hour,
+		ProbeTimeout:   time.Hour,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := s.Bootstrap(ctx); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+
+	id, ok := s.activeSession()
+	if !ok {
+		t.Fatal("no active session after bootstrap")
+	}
+	// State present before close.
+	if s.getLane(laneKey{sessionID: id, laneID: 1}) == nil {
+		t.Fatal("lane missing before close")
+	}
+	if s.LaneManager().LookupPing(KeyForLeg(id, 1, e2eUDP())) == nil {
+		t.Fatal("ping missing before close")
+	}
+
+	s.CloseSession(id)
+
+	// All per-session state must be gone, and no active session remains.
+	if _, ok := s.activeSession(); ok {
+		t.Error("session still active after CloseSession")
+	}
+	if s.getLane(laneKey{sessionID: id, laneID: 1}) != nil {
+		t.Error("lane survived CloseSession")
+	}
+	if s.getSendState(id) != nil {
+		t.Error("sendState survived CloseSession")
+	}
+	if s.LaneManager().LookupPing(KeyForLeg(id, 1, e2eUDP())) != nil {
+		t.Error("ping survived CloseSession (LaneManager not reset)")
+	}
+	if _, known := sessions.Get(id); known {
+		t.Error("session survived in manager after CloseSession")
+	}
+}
+
+// TestCloseSessionWrongIDNoOp verifies CloseSession for a session this end does
+// not hold is a no-op (does not tear down the active session).
+func TestCloseSessionWrongIDNoOp(t *testing.T) {
+	sessions := &sessionpkg.Manager{}
+	s := New(Config{
+		SessionManager: sessions,
+		BootstrapLanes: []BootstrapLane{{LaneID: 1, Weight: 100, Leg: e2eUDP()}},
+		ProbeInterval:  time.Hour,
+		ProbeTimeout:   time.Hour,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := s.Bootstrap(ctx); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	id, _ := s.activeSession()
+
+	s.CloseSession(id + 99) // not the held session
+
+	if cur, ok := s.activeSession(); !ok || cur != id {
+		t.Fatalf("active session changed after wrong-id CloseSession: ok=%v cur=%d want %d", ok, cur, id)
+	}
+	if s.getLane(laneKey{sessionID: id, laneID: 1}) == nil {
+		t.Error("lane wrongly torn down by wrong-id CloseSession")
+	}
+}

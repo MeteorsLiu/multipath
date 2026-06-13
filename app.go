@@ -12,10 +12,9 @@ import (
 	"github.com/MeteorsLiu/multipath/internal/session"
 	"github.com/MeteorsLiu/multipath/internal/transport"
 	"github.com/MeteorsLiu/multipath/internal/tun"
-	probecore "github.com/MeteorsLiu/multipath/internal/tunnel/probe/core"
-	"github.com/MeteorsLiu/multipath/internal/tunnel/recv"
-	tunnelruntime "github.com/MeteorsLiu/multipath/internal/tunnel/runtime"
-	"github.com/MeteorsLiu/multipath/internal/tunnel/send"
+	"github.com/MeteorsLiu/multipath/internal/tunnel/v2/recv"
+	tunnelruntime "github.com/MeteorsLiu/multipath/internal/tunnel/v2/runtime"
+	"github.com/MeteorsLiu/multipath/internal/tunnel/v2/send"
 )
 
 var (
@@ -85,33 +84,25 @@ func buildServerRuntime(cfg Config, device *tun.Device) (*appRuntime, []io.Close
 		_ = tcpListener.Close()
 		return nil, nil, err
 	}
-	probeEvents := make(chan probecore.Event, 128)
 	sessions := &session.Manager{}
 	in := send.New(send.Config{
 		StreamTransport:      streamTransport,
 		SessionManager:       sessions,
 		ProbeInterval:        cfg.probeInterval(),
 		ProbeTimeout:         cfg.probeTimeout(),
-		ProbeEvents:          probeEvents,
 		EnableFEC:            cfg.FEC,
-		FECFlushAlpha:        cfg.FECFlushAlpha,
-		FECFlushMinMs:        cfg.FECFlushMinMs,
-		FECFlushMaxMs:        cfg.FECFlushMaxMs,
-		FECFlushColdStartMs:  cfg.FECFlushColdStartMs,
-		FECFlushFixedMs:      cfg.FECFlushFixedMs,
-		BandwidthProbeCapBps: cfg.bandwidthProbeCapForSend(),
+		IsClient:             false, // server: gate starts in the Remote phase (spec 7.5)
+		EnableBandwidthProbe: true,
+		BWCapBps:             cfg.bandwidthProbeCapForSend(),
 	})
-	probeLoop := send.NewProbeLoop(in, send.ProbeLoopConfig{
-		Events:   probeEvents,
-		Interval: cfg.probeInterval(),
-		Timeout:  cfg.probeTimeout(),
+	out := recv.New(recv.Config{
+		Handler:        tunnelruntime.NewRecvHandler(in, sessions),
+		SessionManager: sessions,
 	})
-	out := recv.New(recv.Config{Handler: tunnelruntime.NewRecvHandler(in), SessionManager: sessions})
 	return &appRuntime{
 		tunReader:       device,
 		tunWriter:       device,
 		send:            in,
-		probeLoop:       probeLoop,
 		recv:            out,
 		packetTransport: packetTransport,
 		streamTransport: streamTransport,
@@ -175,34 +166,26 @@ func buildClientRuntime(cfg Config, device *tun.Device) (*appRuntime, []io.Close
 		closeAll(closers)
 		return nil, nil, err
 	}
-	probeEvents := make(chan probecore.Event, 128)
 	sessions := &session.Manager{}
 	in := send.New(send.Config{
 		StreamTransport:      streamTransport,
 		SessionManager:       sessions,
 		ProbeInterval:        cfg.probeInterval(),
 		ProbeTimeout:         cfg.probeTimeout(),
-		ProbeEvents:          probeEvents,
 		EnableFEC:            cfg.FEC,
-		FECFlushAlpha:        cfg.FECFlushAlpha,
-		FECFlushMinMs:        cfg.FECFlushMinMs,
-		FECFlushMaxMs:        cfg.FECFlushMaxMs,
-		FECFlushColdStartMs:  cfg.FECFlushColdStartMs,
-		FECFlushFixedMs:      cfg.FECFlushFixedMs,
-		BandwidthProbeCapBps: cfg.bandwidthProbeCapForSend(),
+		IsClient:             true, // client sent HELLO: gate starts in the Local phase (spec 7.5)
+		EnableBandwidthProbe: true,
+		BWCapBps:             cfg.bandwidthProbeCapForSend(),
 		BootstrapLanes:       bootstrap,
 	})
-	probeLoop := send.NewProbeLoop(in, send.ProbeLoopConfig{
-		Events:   probeEvents,
-		Interval: cfg.probeInterval(),
-		Timeout:  cfg.probeTimeout(),
+	out := recv.New(recv.Config{
+		Handler:        tunnelruntime.NewRecvHandler(in, sessions),
+		SessionManager: sessions,
 	})
-	out := recv.New(recv.Config{Handler: tunnelruntime.NewRecvHandler(in), SessionManager: sessions})
 	return &appRuntime{
 		tunReader:       device,
 		tunWriter:       device,
 		send:            in,
-		probeLoop:       probeLoop,
 		recv:            out,
 		packetTransport: packetTransport,
 		streamTransport: streamTransport,

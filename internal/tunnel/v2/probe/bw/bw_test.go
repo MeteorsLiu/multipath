@@ -1,0 +1,455 @@
+package bw
+
+import (
+	"context"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+// TestBWStartActiveSendsProbes verifies an active train emits probe frames with
+// a well-formed structure through the SendProbe callback.
+func TestBWStartActiveSendsProbes(t *testing.T) {
+	var sentProbes []Probe
+	var mu sync.Mutex
+
+	sendProbe := func(p Probe) error {
+		mu.Lock()
+		sentProbes = append(sentProbes, p)
+		mu.Unlock()
+		return nil
+	}
+
+	b := New(Config{
+		ReferenceBps: 1_000_000,
+		CapBps:       32_000_000, // bounded so the train terminates quickly
+		SendProbe:    sendProbe,
+		OnSample:     func(Sample) {},
+		StepWindow:   40 * time.Millisecond,
+		AckGrace:     20 * time.Millisecond,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	loop, err := b.Start(ctx)
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	if loop == nil {
+		t.Fatal("expected non-nil loop")
+	}
+
+	time.Sleep(300 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(sentProbes) < 2 {
+		t.Fatalf("expected at least 2 probes, got %d", len(sentProbes))
+	}
+	first := sentProbes[0]
+	if first.ID != loop.TrainID() {
+		t.Errorf("probe train ID = %d, want %d", first.ID, loop.TrainID())
+	}
+	if first.Count == 0 {
+		t.Error("expected non-zero count")
+	}
+	if first.Bytes == 0 {
+		t.Error("expected non-zero probe bytes")
+	}
+}
+
+// TestBwLoopAckYieldsSample verifies that fully acking each step yields a
+// non-zero bandwidth sample with zero loss.
+func TestBwLoopAckYieldsSample(t *testing.T) {
+	var samples []Sample
+	var mu sync.Mutex
+	onSample := func(s Sample) {
+		mu.Lock()
+		samples = append(samples, s)
+		mu.Unlock()
+	}
+
+	var lastProbe Probe
+	var pmu sync.Mutex
+	var loop atomic.Pointer[BwLoop]
+
+	b := New(Config{
+		ReferenceBps: 1_000_000,
+		CapBps:       16_000_000, // single step at cap → terminates fast
+		OnSample:     onSample,
+		StepWindow:   40 * time.Millisecond,
+		AckGrace:     200 * time.Millisecond,
+		SendProbe: func(p Probe) error {
+			pmu.Lock()
+			lastProbe = p
+			pmu.Unlock()
+			// Immediately ack the whole step: mark every seq as received.
+			if l := loop.Load(); l != nil {
+				full := uint64(0)
+				for i := uint16(0); i < p.Count; i++ {
+					full |= 1 << i
+				}
+				now := uint64(time.Now().UnixMilli())
+				l.Ack(Ack{ID: p.ID, Count: p.Count, Received: full, FirstRXMS: now - 10, LastRXMS: now})
+			}
+			return nil
+		},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	started, err := b.Start(ctx)
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	loop.Store(started)
+
+	// Wait for the train to finish (cap reached → one step → sample).
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := len(samples)
+		mu.Unlock()
+		if n > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(samples) != 1 {
+		t.Fatalf("expected 1 sample, got %d", len(samples))
+	}
+	s := samples[0]
+	if s.BandwidthBps == 0 {
+		t.Error("expected non-zero bandwidth")
+	}
+	if s.Loss != 0.0 {
+		t.Errorf("expected zero loss, got %f", s.Loss)
+	}
+	if s.ReferenceBps != 1_000_000 {
+		t.Errorf("expected reference 1000000, got %d", s.ReferenceBps)
+	}
+	pmu.Lock()
+	_ = lastProbe
+	pmu.Unlock()
+}
+
+// TestBwLoopAckWithLoss verifies the aggregate loss reflects partial acks.
+func TestBwLoopAckWithLoss(t *testing.T) {
+	var samples []Sample
+	var mu sync.Mutex
+	onSample := func(s Sample) {
+		mu.Lock()
+		samples = append(samples, s)
+		mu.Unlock()
+	}
+
+	var loop atomic.Pointer[BwLoop]
+	b := New(Config{
+		ReferenceBps: 1_000_000,
+		CapBps:       16_000_000,
+		OnSample:     onSample,
+		StepWindow:   40 * time.Millisecond,
+		AckGrace:     200 * time.Millisecond,
+		SendProbe: func(p Probe) error {
+			if l := loop.Load(); l != nil {
+				// Ack only even sequences: ~50% loss.
+				received := uint64(0)
+				for i := uint16(0); i < p.Count; i += 2 {
+					received |= 1 << i
+				}
+				now := uint64(time.Now().UnixMilli())
+				l.Ack(Ack{ID: p.ID, Count: p.Count, Received: received, FirstRXMS: now - 10, LastRXMS: now})
+			}
+			return nil
+		},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	started, err := b.Start(ctx)
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	loop.Store(started)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := len(samples)
+		mu.Unlock()
+		if n > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(samples) != 1 {
+		t.Fatalf("expected 1 sample, got %d", len(samples))
+	}
+	if s := samples[0]; s.Loss < 0.3 || s.Loss > 0.7 {
+		t.Errorf("expected loss around 0.5, got %f", s.Loss)
+	}
+}
+
+// TestReceiveProbeSendsAck verifies the passive side returns an ack to send for
+// inbound probes and a complete bitmap once the train fills.
+func TestReceiveProbeSendsAck(t *testing.T) {
+	r := NewReceive(ReceiveConfig{AckEvery: 16})
+
+	const trainID = 42
+	const count = 10
+
+	var lastAck Ack
+	acked := false
+	for seq := uint16(0); seq < count; seq++ {
+		ack, send := r.Probe(Probe{
+			ID:        trainID,
+			Seq:       seq,
+			Count:     count,
+			SendMS:    uint64(time.Now().UnixMilli()),
+			Total:     12000,
+			Remaining: 12000 - uint64(seq+1)*1200,
+			Bytes:     1200,
+		})
+		if send {
+			acked = true
+			lastAck = ack
+		}
+	}
+
+	if !acked {
+		t.Fatal("expected at least one ack to send")
+	}
+	if lastAck.ID != trainID {
+		t.Errorf("ack train ID = %d, want %d", lastAck.ID, trainID)
+	}
+	if lastAck.Count != count {
+		t.Errorf("ack count = %d, want %d", lastAck.Count, count)
+	}
+	// All 10 received → bitmap is the low 10 bits set.
+	want := uint64((1 << count) - 1)
+	if lastAck.Received != want {
+		t.Errorf("ack received = %#x, want %#x", lastAck.Received, want)
+	}
+}
+
+// TestReceiveProbeInvalid verifies malformed probes produce no ack.
+func TestReceiveProbeInvalid(t *testing.T) {
+	r := NewReceive(ReceiveConfig{})
+
+	cases := []Probe{
+		{ID: 1, Seq: 0, Count: 0},   // count 0
+		{ID: 1, Seq: 10, Count: 10}, // seq >= count
+		{ID: 1, Seq: 0, Count: 65},  // count > 64
+	}
+	for i, p := range cases {
+		if _, send := r.Probe(p); send {
+			t.Errorf("case %d: expected no ack for invalid probe %+v", i, p)
+		}
+	}
+}
+
+// TestNextRatePlateauStops verifies the pure rate functions: growth doubles
+// toward a cap, and plateau detection halts growth.
+func TestNextRateAndPlateau(t *testing.T) {
+	// No cap, not stalled: additive step.
+	if got := nextRate(16_000_000, 0, false); got != 16_000_000+additiveStepBps {
+		t.Errorf("nextRate additive = %d, want %d", got, 16_000_000+additiveStepBps)
+	}
+	// No cap, stalled: hold.
+	if got := nextRate(50_000_000, 0, true); got != 50_000_000 {
+		t.Errorf("nextRate stalled should hold, got %d", got)
+	}
+	// Capped at/above cap: clamp to cap.
+	if got := nextRate(100_000_000, 80_000_000, false); got != 80_000_000 {
+		t.Errorf("nextRate over cap = %d, want cap 80000000", got)
+	}
+	// Big gap below cap: doubles.
+	if got := nextRate(10_000_000, 80_000_000, false); got != 20_000_000 {
+		t.Errorf("nextRate doubling = %d, want 20000000", got)
+	}
+
+	// plateau: needs plateauSteps+1 samples; flat series stalls.
+	if plateau([]uint64{10, 10}) {
+		t.Error("plateau should be false with too few samples")
+	}
+	if !plateau([]uint64{100_000_000, 101_000_000, 101_500_000}) {
+		t.Error("plateau should be true for a flat series within growth bound")
+	}
+	if plateau([]uint64{10_000_000, 20_000_000, 45_000_000}) {
+		t.Error("plateau should be false for a growing series")
+	}
+}
+// TestPayloadSizeRandomizesWithinBounds verifies the per-probe payload size is
+// fixed when min==max and varies deterministically within [min,max] otherwise
+// (spec: UDP randomizes 1200-1400, TCP fixes 32KB). Pure function.
+func TestPayloadSizeRandomizesWithinBounds(t *testing.T) {
+	// Fixed: min==max always returns min.
+	for seq := uint16(0); seq < 20; seq++ {
+		if got := payloadSize(32768, 32768, 7, seq); got != 32768 {
+			t.Fatalf("fixed payload seq=%d = %d, want 32768", seq, got)
+		}
+	}
+
+	// Randomized: stays within bounds and is not all-identical.
+	const min, max = 1200, 1400
+	seen := map[int]bool{}
+	for seq := uint16(0); seq < 64; seq++ {
+		got := payloadSize(min, max, 42, seq)
+		if got < min || got > max {
+			t.Fatalf("payload seq=%d = %d, out of [%d,%d]", seq, got, min, max)
+		}
+		seen[got] = true
+	}
+	if len(seen) < 4 {
+		t.Fatalf("payload barely varied: only %d distinct sizes over 64 probes", len(seen))
+	}
+
+	// Deterministic: same (train,seq) → same size.
+	if payloadSize(min, max, 42, 5) != payloadSize(min, max, 42, 5) {
+		t.Fatal("payloadSize not deterministic for the same train/seq")
+	}
+}
+
+// TestRateLimiterPacesSends verifies that with RateLimit on, a low step rate
+// makes the train take measurably longer than with limiting off (the limiter
+// throttles the byte rate). Uses a small cap so the train is a single step.
+func TestRateLimiterPacesSends(t *testing.T) {
+	run := func(rateLimit bool) time.Duration {
+		var done sync.WaitGroup
+		done.Add(1)
+		var loop *BwLoop
+		var loopMu sync.Mutex
+		b := New(Config{
+			ReferenceBps: 1_000_000,
+			CapBps:       2_000_000, // tiny cap → 1 short step → fast terminate
+			MinRateBps:   1_000_000,
+			StepWindow:   20 * time.Millisecond,
+			AckGrace:     20 * time.Millisecond,
+			PayloadMin:   1200,
+			PayloadMax:   1200,
+			RateLimit:    rateLimit,
+			OnSample:     func(Sample) { done.Done() },
+			SendProbe: func(p Probe) error {
+				loopMu.Lock()
+				l := loop
+				loopMu.Unlock()
+				if l != nil {
+					full := uint64(0)
+					for i := uint16(0); i < p.Count; i++ {
+						full |= 1 << i
+					}
+					now := uint64(time.Now().UnixMilli())
+					l.Ack(Ack{ID: p.ID, Count: p.Count, Received: full, FirstRXMS: now - 1, LastRXMS: now})
+				}
+				return nil
+			},
+		})
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		start := time.Now()
+		l, err := b.Start(ctx)
+		if err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		loopMu.Lock()
+		loop = l
+		loopMu.Unlock()
+		done.Wait()
+		return time.Since(start)
+	}
+
+	// Both should complete; we only assert the limited run is not faster than the
+	// unlimited one (limiting can only add delay). A loose check avoids flakiness.
+	limited := run(true)
+	unlimited := run(false)
+	if limited+50*time.Millisecond < unlimited {
+		t.Fatalf("limited run (%v) unexpectedly much faster than unlimited (%v)", limited, unlimited)
+	}
+}
+
+// TestLossStopEndsTrainEarly verifies a UDP-style train with a loss-stop
+// threshold ends sooner under high loss than a TCP-style train (lossStop=0) that
+// only stops when it climbs to the cap. Both are capped so neither waits out the
+// full 10s budget window; the loss-stop just cuts the UDP-style train short.
+func TestLossStopEndsTrainEarly(t *testing.T) {
+	// runWithLossStop runs one train (capped so it always terminates) acking only
+	// ~25% of each step, and returns how many steps it took. The SendProbe closure
+	// acks via the loop captured from Start's return; a tiny settle loop ensures
+	// the loop pointer is set before the first probes arrive.
+	runWithLossStop := func(lossStop float64) int {
+		var steps int
+		var stepsMu sync.Mutex
+		var loop atomic.Pointer[BwLoop]
+		b := New(Config{
+			ReferenceBps:      1_000_000,
+			CapBps:            500_000_000, // large cap → many steps without a loss stop
+			MinRateBps:        16_000_000,
+			StepWindow:        5 * time.Millisecond,
+			AckGrace:          15 * time.Millisecond,
+			PayloadMin:        1200,
+			PayloadMax:        1200,
+			LossStopThreshold: lossStop,
+			OnSample:          func(Sample) {},
+			SendProbe: func(p Probe) error {
+				if p.Seq == 0 {
+					stepsMu.Lock()
+					steps++ // one per step (first frame)
+					stepsMu.Unlock()
+				}
+				if l := loop.Load(); l != nil {
+					// Ack only ~25% → high loss, above the UDP threshold.
+					received := uint64(0)
+					for i := uint16(0); i < p.Count; i += 4 {
+						received |= 1 << i
+					}
+					now := uint64(time.Now().UnixMilli())
+					l.Ack(Ack{ID: p.ID, Count: p.Count, Received: received, FirstRXMS: now - 1, LastRXMS: now})
+				}
+				return nil
+			},
+		})
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		l, err := b.Start(ctx)
+		if err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		loop.Store(l)
+
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			b.mu.Lock()
+			_, active := b.activeLoops[l.TrainID()]
+			b.mu.Unlock()
+			if !active {
+				stepsMu.Lock()
+				n := steps
+				stepsMu.Unlock()
+				return n
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+		t.Fatal("train did not complete in time")
+		return 0
+	}
+
+	udpSteps := runWithLossStop(bwTestLossStop) // loss-stop on → stops early
+	tcpSteps := runWithLossStop(0)              // loss-stop off → climbs to cap
+
+	if udpSteps >= tcpSteps {
+		t.Fatalf("loss-stop did not shorten the train: udp steps=%d, tcp steps=%d", udpSteps, tcpSteps)
+	}
+}
+
+const bwTestLossStop = 0.01

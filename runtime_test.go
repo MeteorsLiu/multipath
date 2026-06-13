@@ -6,9 +6,7 @@ import (
 	"net"
 	"testing"
 
-	"github.com/MeteorsLiu/multipath/internal/protocol"
 	"github.com/MeteorsLiu/multipath/internal/transport"
-	"github.com/MeteorsLiu/multipath/internal/tunnel/send"
 )
 
 func TestRuntimeReturnsContextWhenNoLoops(t *testing.T) {
@@ -56,32 +54,6 @@ func TestRuntimeCancelsOtherLoopsAfterError(t *testing.T) {
 	assertClosed(t, packet.started, "packet transport start")
 	assertClosed(t, stream.started, "stream transport start")
 	assertClosed(t, stream.canceled, "stream transport cancel")
-}
-
-func TestRuntimeBootstrapFailureDoesNotStartLoops(t *testing.T) {
-	sender := send.New(send.Config{
-		BootstrapLanes: []send.BootstrapLane{
-			{
-				LaneID: protocol.SessionControlLaneID,
-				Weight: 1,
-			},
-		},
-	})
-	packet := &runtimePacketTransport{started: make(chan struct{})}
-
-	err := (&appRuntime{
-		send:            sender,
-		probeLoop:       send.NewProbeLoop(sender),
-		packetTransport: packet,
-	}).Run(context.Background())
-	if err == nil {
-		t.Fatal("Run err = nil, want bootstrap error")
-	}
-	select {
-	case <-packet.started:
-		t.Fatal("packet transport started after bootstrap failure")
-	default:
-	}
 }
 
 type runtimePacketTransport struct {
