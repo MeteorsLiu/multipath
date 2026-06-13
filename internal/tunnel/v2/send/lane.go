@@ -144,6 +144,15 @@ func (l *laneRuntime) cancelFECFlushTimerLocked() {
 	l.fecFlushArmed = false
 }
 
+func (l *laneRuntime) releaseFEC() {
+	l.fecMu.Lock()
+	defer l.fecMu.Unlock()
+	l.cancelFECFlushTimerLocked()
+	if l.txWindow != nil {
+		l.txWindow.releaseAll()
+	}
+}
+
 // txSLCWindow is the per-lane FEC transmit window (spec 9.1).
 type txSLCWindow struct {
 	sourceCount int
@@ -218,6 +227,13 @@ func (w *txSLCWindow) flush() (txRepairGroup, bool) {
 	copy(w.pending, w.pending[count:])
 	w.pending = w.pending[:len(w.pending)-count]
 	return group, true
+}
+
+func (w *txSLCWindow) releaseAll() {
+	for i := range w.pending {
+		w.pending[i].packet.Release()
+	}
+	w.pending = w.pending[:0]
 }
 
 func (w *txSLCWindow) firstGroupContiguous() bool {

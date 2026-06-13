@@ -15,7 +15,7 @@ const (
 	FECProfileSLC4Plus1        uint8 = 1
 	FECProfileSLCVariablePlus1 uint8 = 2
 
-	SupportedCaps        = CapTCPFallback | CapFEC
+	SupportedCaps        = CapFEC
 	SessionControlLaneID = 0xff
 
 	CloseScopeLane    uint8 = 1

@@ -3,6 +3,7 @@ package send
 import (
 	"context"
 	"encoding/binary"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,6 +22,55 @@ func (a *e2eAddr) String() string  { return a.addr }
 
 func e2eUDP() transport.LegRef {
 	return transport.LegRef{Kind: transport.KindUDP, EndpointID: "ep", RemoteAddr: &e2eAddr{addr: "127.0.0.1:9000"}}
+}
+
+func e2eTCP(connID string) transport.LegRef {
+	return transport.LegRef{Kind: transport.KindTCP, ConnID: connID}
+}
+
+type fakeStreamTransport struct {
+	mu      sync.Mutex
+	dials   []string
+	closed  []string
+	nextRef transport.LegRef
+}
+
+func (f *fakeStreamTransport) Run(ctx context.Context, writer transport.PacketWriter) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (f *fakeStreamTransport) Dial(ctx context.Context, remote string) (transport.LegRef, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.dials = append(f.dials, remote)
+	ref := f.nextRef
+	if ref.Kind == 0 {
+		ref = e2eTCP(remote)
+	}
+	return ref, nil
+}
+
+func (f *fakeStreamTransport) Write(ctx context.Context, connID string, payload []byte) (int, error) {
+	return len(payload), nil
+}
+
+func (f *fakeStreamTransport) Close(ctx context.Context, connID string) error {
+	f.mu.Lock()
+	f.closed = append(f.closed, connID)
+	f.mu.Unlock()
+	return nil
+}
+
+func (f *fakeStreamTransport) closedConn(connID string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, closed := range f.closed {
+		if closed == connID {
+			return true
+		}
+	}
+	return false
 }
 
 // makeIPv4 builds a minimal valid IPv4 packet of totalLen bytes; byte 20 encodes
@@ -245,6 +295,118 @@ func TestLaneActivatesViaPongThroughLaneManager(t *testing.T) {
 	}
 }
 
+func TestBootstrapLaneActivatesOnAcceptedHelloAck(t *testing.T) {
+	sessions := &sessionpkg.Manager{}
+	s := New(Config{
+		SessionManager: sessions,
+		BootstrapLanes: []BootstrapLane{{LaneID: 1, Weight: 100, Leg: e2eUDP()}},
+		ProbeInterval:  time.Hour,
+		ProbeTimeout:   time.Hour,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := s.Bootstrap(ctx); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+
+	sessionID, ok := s.activeSession()
+	if !ok {
+		t.Fatal("no active session after bootstrap")
+	}
+	lane := s.getLane(laneKey{sessionID: sessionID, laneID: 1})
+	if lane == nil {
+		t.Fatal("bootstrap lane not found")
+	}
+	if lane.ready() {
+		t.Fatal("lane should not be ready before HELLO_ACK")
+	}
+
+	hello := waitForHello(t, s, sessionID, 1)
+	if _, ok := sessions.Get(sessionID); !ok {
+		t.Fatal("bootstrap session missing")
+	}
+	if !sessionsAckHello(t, sessions, sessionID, hello.Nonce) {
+		t.Fatal("session Ack rejected accepted HELLO_ACK")
+	}
+	if !lane.ready() {
+		t.Fatal("accepted HELLO_ACK did not mark bootstrap leg active")
+	}
+}
+
+func TestTCPFallbackRequiresHelloAckBeforeActive(t *testing.T) {
+	sessions := &sessionpkg.Manager{}
+	stream := &fakeStreamTransport{nextRef: e2eTCP("tcp-1")}
+	s := New(Config{
+		SessionManager:  sessions,
+		StreamTransport: stream,
+		BootstrapLanes: []BootstrapLane{{
+			LaneID:    1,
+			Weight:    100,
+			Leg:       e2eUDP(),
+			TCPRemote: "tcp-remote",
+		}},
+		ProbeInterval: time.Hour,
+		ProbeTimeout:  time.Hour,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := s.Bootstrap(ctx); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+
+	sessionID, ok := s.activeSession()
+	if !ok {
+		t.Fatal("no active session after bootstrap")
+	}
+	lane := s.getLane(laneKey{sessionID: sessionID, laneID: 1})
+	if lane == nil {
+		t.Fatal("bootstrap lane not found")
+	}
+
+	hello := waitForHelloOnLeg(t, s, sessionID, 1, transport.KindTCP)
+	if lane.leg.isActive(transport.KindTCP) {
+		t.Fatal("TCP fallback became active before TCP HELLO_ACK")
+	}
+	if !sessionsAckHello(t, sessions, sessionID, hello.Nonce) {
+		t.Fatal("session Ack rejected TCP HELLO_ACK")
+	}
+	if !lane.leg.isActive(transport.KindTCP) {
+		t.Fatal("TCP fallback did not become active after TCP HELLO_ACK")
+	}
+}
+
+func TestOnLegFailureOnlyMarksMatchingTCPConnDown(t *testing.T) {
+	s := New()
+	const sessionID = uint64(91)
+	s.activateSession(sessionID)
+
+	lane1 := newLaneRuntime(1, 100)
+	lane1.bindTCP(e2eTCP("tcp-1"))
+	lane1.markActive(transport.KindTCP)
+	lane1.dialer = newDialer("remote-1", nil, nil)
+
+	lane2 := newLaneRuntime(2, 100)
+	lane2.bindTCP(e2eTCP("tcp-2"))
+	lane2.markActive(transport.KindTCP)
+	lane2.dialer = newDialer("remote-2", nil, nil)
+
+	s.lanesMu.Lock()
+	s.lanes[laneKey{sessionID: sessionID, laneID: 1}] = lane1
+	s.lanes[laneKey{sessionID: sessionID, laneID: 2}] = lane2
+	s.lanesMu.Unlock()
+
+	s.OnLegFailure(context.Background(), e2eTCP("tcp-1"), context.Canceled)
+
+	if lane1.leg.isActive(transport.KindTCP) {
+		t.Fatal("failed TCP conn stayed active")
+	}
+	if !lane2.leg.isActive(transport.KindTCP) {
+		t.Fatal("unrelated TCP conn was marked down")
+	}
+}
+
 // waitForPing blocks until a PING frame for the given session/lane is emitted by
 // the send side, returning its ping.Message fields. It fails the test on timeout.
 func waitForPing(t *testing.T, s *Send, sessionID uint64, laneID uint8) ping.Message {
@@ -268,6 +430,60 @@ func waitForPing(t *testing.T, s *Send, sessionID uint64, laneID uint8) ping.Mes
 	}
 	t.Fatal("timed out waiting for a PING frame")
 	return ping.Message{}
+}
+
+func waitForHello(t *testing.T, s *Send, sessionID uint64, laneID uint8) protocol.HelloBody {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case payload := <-s.Packets():
+			f, err := protocol.Decode(payload.Packet.Payload)
+			payload.Packet.Release()
+			if err != nil {
+				continue
+			}
+			if f.Type == protocol.TypeHELLO && f.SessionID == sessionID && f.LaneID == laneID {
+				return f.Body.(protocol.HelloBody)
+			}
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	t.Fatal("timed out waiting for a HELLO frame")
+	return protocol.HelloBody{}
+}
+
+func waitForHelloOnLeg(t *testing.T, s *Send, sessionID uint64, laneID uint8, kind transport.Kind) protocol.HelloBody {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case payload := <-s.Packets():
+			f, err := protocol.Decode(payload.Packet.Payload)
+			legKind := payload.Leg.Kind
+			payload.Packet.Release()
+			if err != nil {
+				continue
+			}
+			if f.Type == protocol.TypeHELLO && f.SessionID == sessionID && f.LaneID == laneID && legKind == kind {
+				return f.Body.(protocol.HelloBody)
+			}
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	t.Fatalf("timed out waiting for a HELLO frame on leg kind %d", kind)
+	return protocol.HelloBody{}
+}
+
+func sessionsAckHello(t *testing.T, sessions *sessionpkg.Manager, sessionID uint64, nonce uint64) bool {
+	t.Helper()
+	sess, ok := sessions.Get(sessionID)
+	if !ok {
+		return false
+	}
+	return sess.Ack(nonce, true)
 }
 
 // TestLaneGoesDownViaPingTimeout verifies the OnDown→markDown wiring end to end:
@@ -469,11 +685,13 @@ func TestAcceptedHelloAckPassivelyAdmitsServerLane(t *testing.T) {
 // session churn (spec 7). Unlike Rebootstrap, it does not rebuild.
 func TestCloseSessionClearsState(t *testing.T) {
 	sessions := &sessionpkg.Manager{}
+	stream := &fakeStreamTransport{}
 	s := New(Config{
-		SessionManager: sessions,
-		BootstrapLanes: []BootstrapLane{{LaneID: 1, Weight: 100, Leg: e2eUDP()}},
-		ProbeInterval:  time.Hour,
-		ProbeTimeout:   time.Hour,
+		SessionManager:  sessions,
+		StreamTransport: stream,
+		BootstrapLanes:  []BootstrapLane{{LaneID: 1, Weight: 100, Leg: e2eUDP()}},
+		ProbeInterval:   time.Hour,
+		ProbeTimeout:    time.Hour,
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -487,9 +705,13 @@ func TestCloseSessionClearsState(t *testing.T) {
 		t.Fatal("no active session after bootstrap")
 	}
 	// State present before close.
-	if s.getLane(laneKey{sessionID: id, laneID: 1}) == nil {
+	lane := s.getLane(laneKey{sessionID: id, laneID: 1})
+	if lane == nil {
 		t.Fatal("lane missing before close")
 	}
+	lane.bindTCP(e2eTCP("tcp-close"))
+	lane.markActive(transport.KindTCP)
+	lane.commitPacket(1, []byte("pending-fec"))
 	if s.LaneManager().LookupPing(KeyForLeg(id, 1, e2eUDP())) == nil {
 		t.Fatal("ping missing before close")
 	}
@@ -511,6 +733,12 @@ func TestCloseSessionClearsState(t *testing.T) {
 	}
 	if _, known := sessions.Get(id); known {
 		t.Error("session survived in manager after CloseSession")
+	}
+	if !stream.closedConn("tcp-close") {
+		t.Error("TCP conn was not closed during CloseSession")
+	}
+	if len(lane.txWindow.pending) != 0 {
+		t.Error("pending FEC packets survived CloseSession")
 	}
 }
 

@@ -179,6 +179,39 @@ func TestHelloAckStopsBeforeExpire(t *testing.T) {
 	}
 }
 
+func TestHelloAckCallbackFiresOnlyWhenAccepted(t *testing.T) {
+	var manager Manager
+	s, ok := manager.GetOrCreate(13)
+	if !ok {
+		t.Fatal("GetOrCreate failed")
+	}
+
+	var callbacks atomic.Int32
+	sender := func(ctx context.Context, v View) error { return nil }
+
+	s.Open(context.Background(),
+		HelloConfig{RetryInterval: time.Hour, OnAck: func() { callbacks.Add(1) }},
+		sender, nil)
+
+	if !s.Ack(0, true) {
+		t.Fatal("accepted Ack returned false, want true")
+	}
+	if got := callbacks.Load(); got != 1 {
+		t.Fatalf("onAck callbacks after accepted Ack = %d, want 1", got)
+	}
+
+	s.Open(context.Background(),
+		HelloConfig{RetryInterval: time.Hour, OnAck: func() { callbacks.Add(1) }},
+		sender, nil)
+
+	if s.Ack(1, false) {
+		t.Fatal("rejected Ack returned true, want false")
+	}
+	if got := callbacks.Load(); got != 1 {
+		t.Fatalf("onAck callbacks after rejected Ack = %d, want still 1", got)
+	}
+}
+
 func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)

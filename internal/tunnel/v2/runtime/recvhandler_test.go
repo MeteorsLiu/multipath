@@ -77,6 +77,10 @@ func TestRecvHandlerOnHelloRepliesWithHelloAckThroughSession(t *testing.T) {
 		if decoded.Type != protocol.TypeHELLOACK {
 			t.Errorf("expected HELLO_ACK, got %v", decoded.Type)
 		}
+		body := decoded.Body.(protocol.HelloAckBody)
+		if body.Caps&protocol.CapTCPFallback != 0 {
+			t.Errorf("HELLO_ACK caps include TCP fallback: %#x", body.Caps)
+		}
 		payload.Packet.Release()
 	default:
 		t.Error("expected HELLO_ACK in output queue")

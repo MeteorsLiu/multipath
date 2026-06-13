@@ -116,6 +116,7 @@ type HelloConfig struct {
 	RetryInterval time.Duration
 	MaxRetries    int
 	TimeoutMS     uint64
+	OnAck         func()
 }
 
 // FrameSender sends one HELLO frame. The View carries the sessionID and nonce
@@ -170,6 +171,9 @@ func (s *Session) Ack(nonce uint64, accepted bool) bool {
 
 	if hello != nil {
 		hello.Ack()
+	}
+	if accepted && hello != nil && hello.cfg.OnAck != nil {
+		hello.cfg.OnAck()
 	}
 	return accepted
 }

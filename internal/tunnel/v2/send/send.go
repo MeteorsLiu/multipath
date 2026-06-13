@@ -273,35 +273,10 @@ func (s *Send) bootstrapSession(ctx context.Context) error {
 
 		// Open Hello with a self-driven retry loop (spec 5.1, 7.2). The sender
 		// closure builds the HELLO frame and writes it on this lane's bootstrap
-		// transport; nonce is delivered via the View. onExpire marks the leg
-		// down — TCP redial is triggered there once the dialer is wired (stage②).
+		// transport; nonce is delivered via the View. onExpire marks the leg down.
 		laneID := bl.LaneID
 		legRef := bl.Leg
-		sender := func(ctx context.Context, v sessionpkg.View) error {
-			frame := protocol.Frame{
-				Version:   protocol.Version,
-				Type:      protocol.TypeHELLO,
-				SessionID: v.SessionID(),
-				LaneID:    laneID,
-				Body: protocol.HelloBody{
-					Nonce:      v.Nonce(),
-					Caps:       protocol.CapFEC | protocol.CapTCPFallback,
-					FECProfile: protocol.FECProfileSLC4Plus1,
-				},
-			}
-			return s.WriteFrame(ctx, frame, legRef)
-		}
-		onExpire := func() {
-			debuglog.Printf("send", "hello_expired session=%d lane=%d", sessionID, laneID)
-			lane.markDown(legRef.Kind)
-		}
-
-		cfg := sessionpkg.HelloConfig{
-			RetryInterval: 500 * time.Millisecond,
-			MaxRetries:    10,
-			TimeoutMS:     30000,
-		}
-		_ = session.Open(sessionCtx, cfg, sender, onExpire)
+		s.openLaneHello(sessionCtx, session, sessionID, lane, laneID, legRef)
 
 		// Create and drive the active ping for this lane's UDP leg (spec 5.5, 7.3).
 		// The ping starts dead; its first RecoverSuccess pongs fire OnUp →
@@ -313,14 +288,14 @@ func (s *Send) bootstrapSession(ctx context.Context) error {
 
 		// Start the TCP dialer for this lane if a TCP remote is configured and a
 		// stream transport is available (spec 5.6). The dial runs off the data
-		// path; on success it binds the TCP ref and marks it active immediately
-		// (spec 6.2: dial 成功即 active — TCP liveness is I/O-error driven, not
-		// probe driven). Write keeps using UDP until TCP comes up.
+		// path; on success it binds the TCP ref and opens a HELLO handshake on that
+		// ref. The TCP leg becomes active only when the matching HELLO_ACK is
+		// accepted by Session.Ack via the OnAck closure.
 		if bl.TCPRemote != "" && s.streamTransport != nil {
 			ln := lane
 			d := newDialer(bl.TCPRemote, s.streamTransport.Dial, func(ref transport.LegRef) {
 				ln.bindTCP(ref)
-				ln.markActive(transport.KindTCP)
+				s.openLaneHello(sessionCtx, session, sessionID, ln, ln.id, ref)
 				debuglog.Printf("send", "tcp_dialed session=%d lane=%d conn=%s", sessionID, ln.id, ref.ConnID)
 			})
 			lane.dialer = d
@@ -388,12 +363,25 @@ func (s *Send) teardownSession(sessionID uint64) {
 	s.sessionManager.Delete(sessionID)
 
 	s.lanesMu.Lock()
+	var closedTCP []transport.LegRef
 	for key := range s.lanes {
 		if key.sessionID == sessionID {
+			lane := s.lanes[key]
+			if lane != nil {
+				lane.releaseFEC()
+				if ref := lane.leg.refForKind(transport.KindTCP); ref.ConnID != "" {
+					closedTCP = append(closedTCP, ref)
+				}
+			}
 			delete(s.lanes, key)
 		}
 	}
 	s.lanesMu.Unlock()
+	if s.streamTransport != nil {
+		for _, ref := range closedTCP {
+			_ = s.streamTransport.Close(context.Background(), ref.ConnID)
+		}
+	}
 
 	s.strategiesMu.Lock()
 	delete(s.strategies, sessionID)
@@ -421,6 +409,44 @@ func (s *Send) CloseSession(sessionID uint64) {
 	}
 	s.teardownSession(sessionID)
 	debuglog.Printf("send", "close_session session=%d", sessionID)
+}
+
+func (s *Send) openLaneHello(ctx context.Context, session *sessionpkg.Session, sessionID uint64, lane *laneRuntime, laneID uint8, legRef transport.LegRef) {
+	if session == nil || lane == nil || legRef.Kind == 0 {
+		return
+	}
+	sender := func(ctx context.Context, v sessionpkg.View) error {
+		frame := protocol.Frame{
+			Version:   protocol.Version,
+			Type:      protocol.TypeHELLO,
+			SessionID: v.SessionID(),
+			LaneID:    laneID,
+			Body: protocol.HelloBody{
+				Nonce:      v.Nonce(),
+				Caps:       protocol.CapFEC,
+				FECProfile: protocol.FECProfileSLC4Plus1,
+			},
+		}
+		return s.WriteFrame(ctx, frame, legRef)
+	}
+	onExpire := func() {
+		debuglog.Printf("send", "hello_expired session=%d lane=%d", sessionID, laneID)
+		lane.markDown(legRef.Kind)
+		if legRef.Kind == transport.KindTCP && lane.dialer != nil {
+			lane.dialer.redial()
+		}
+	}
+	cfg := sessionpkg.HelloConfig{
+		RetryInterval: 500 * time.Millisecond,
+		MaxRetries:    10,
+		TimeoutMS:     30000,
+		OnAck: func() {
+			lane.markActive(legRef.Kind)
+			s.markRunnableLanesDirty(sessionID)
+			debuglog.Printf("send", "hello_ack_active session=%d lane=%d kind=%d", sessionID, laneID, legRef.Kind)
+		},
+	}
+	_ = session.Open(ctx, cfg, sender, onExpire)
 }
 
 // Write is the TUN DATA entry point (spec 6.1).
@@ -874,15 +900,11 @@ func (s *Send) OnLegFailure(ctx context.Context, legRef transport.LegRef, err er
 		return // Only TCP legs report I/O failures; UDP liveness is ping-driven.
 	}
 
-	// Find the lane(s) holding this TCP connID and mark TCP down.
+	// Find the lane holding this TCP connID and mark TCP down.
 	s.lanesMu.RLock()
 	var affected []*laneRuntime
 	for _, lane := range s.lanes {
-		// Simple match: if this lane has a dialer (TCP-capable) and its TCP leg
-		// could be this conn, mark it down. Stage② doesn't track per-lane connID
-		// precisely yet, so we mark down any lane that could plausibly own it.
-		// Stage③ will refine this with legKey-based lookup via laneManager.
-		if lane.dialer != nil {
+		if ref := lane.leg.refForKind(transport.KindTCP); ref.ConnID == legRef.ConnID {
 			affected = append(affected, lane)
 		}
 	}
