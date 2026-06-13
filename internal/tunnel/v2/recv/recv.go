@@ -11,6 +11,7 @@ package recv
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/MeteorsLiu/multipath/internal/debuglog"
 	fecpkg "github.com/MeteorsLiu/multipath/internal/fec"
@@ -39,8 +40,10 @@ type Handler interface {
 }
 
 type Config struct {
-	Handler        Handler
-	SessionManager *sessionpkg.Manager
+	Handler          Handler
+	SessionManager   *sessionpkg.Manager
+	LinkStatus       func(ctx context.Context, leg Ref, frame protocol.Frame) error
+	QoSConfigForTest qosConfig
 }
 
 // Recv decodes transport-bound frames into IP packets and dispatches control
@@ -60,6 +63,9 @@ type Recv struct {
 	fecCodecs [maxFECSourceSpan + 1]fecCodec
 	packets   chan *packetbuf.Packet
 	states    map[*sessionpkg.Session]*recvState
+
+	linkStatus func(ctx context.Context, leg Ref, frame protocol.Frame) error
+	qosConfig  qosConfig
 }
 
 type recvState struct {
@@ -79,6 +85,11 @@ type recvState struct {
 	// written on every wire arrival but read by nothing this round; not exported
 	// (spec 8.1).
 	accounting map[uint8]*laneArrivalStats
+
+	// qos holds the receive-side FEC differential detector per lane. It sits next
+	// to rxWindows because it observes the same DATA/REPAIR stream but produces
+	// only LINK_STATUS control feedback.
+	qos map[uint8]*qosWindow
 
 	// shardScratch is reused by recoverPacket to materialize the shard slice for
 	// fec.Reconstruct without per-call allocation.
@@ -107,6 +118,15 @@ func (s *recvState) statsFor(laneID uint8) *laneArrivalStats {
 	return st
 }
 
+func (s *recvState) qosFor(laneID uint8, cfg qosConfig) *qosWindow {
+	q := s.qos[laneID]
+	if q == nil {
+		q = newQoSWindow(cfg)
+		s.qos[laneID] = q
+	}
+	return q
+}
+
 type fecCodec interface {
 	Reconstruct(shards [][]byte, key uint16) error
 }
@@ -126,6 +146,14 @@ func New(configs ...Config) *Recv {
 		}
 		if cfg.SessionManager != nil {
 			out.manager = cfg.SessionManager
+		}
+		if cfg.LinkStatus != nil {
+			out.linkStatus = cfg.LinkStatus
+		}
+		if cfg.QoSConfigForTest.Window > 0 || cfg.QoSConfigForTest.Sustain > 0 ||
+			cfg.QoSConfigForTest.SampleFloor > 0 || cfg.QoSConfigForTest.LagSlack > 0 ||
+			cfg.QoSConfigForTest.Now != nil {
+			out.qosConfig = cfg.QoSConfigForTest
 		}
 	}
 	return out
@@ -282,8 +310,14 @@ func (o *Recv) handleDATA(ctx context.Context, leg Ref, frame protocol.Frame, pa
 	}
 	// First arrival: record link-delivery accounting, then store in the window.
 	state.statsFor(frame.LaneID).recordArrival(leg.Kind, catData, len(body.Packet))
+	now := o.now()
+	statuses := state.qosFor(frame.LaneID, o.qosConfig).ObserveDataAndEvaluate(leg.Kind, body.PacketID, len(body.Packet), now)
 	recoverable, recoverableOK := state.windowFor(frame.LaneID).addData(body.PacketID, body.Packet)
 	state.mu.Unlock()
+
+	if err := o.emitLinkStatuses(ctx, leg, frame.SessionID, frame.LaneID, statuses); err != nil {
+		return false, err
+	}
 
 	consumed, err := o.emitTransportPacket(ctx, packet, body.Packet)
 	if err != nil {
@@ -321,8 +355,13 @@ func (o *Recv) handleREPAIR(ctx context.Context, leg Ref, frame protocol.Frame) 
 	}
 	// REPAIR has no dedupe identity; account it on arrival (spec 8.4).
 	state.statsFor(frame.LaneID).recordArrival(leg.Kind, catRepair, len(body.Symbol))
+	now := o.now()
+	statuses := state.qosFor(frame.LaneID, o.qosConfig).ObserveRepairAndEvaluate(leg.Kind, body.BasePacketID, body.SourceSpan, len(body.Symbol), now)
 	recoverable, ok := state.windowFor(frame.LaneID).addRepair(body.BasePacketID, body.Key, int(body.SourceSpan), body.Symbol)
 	state.mu.Unlock()
+	if err := o.emitLinkStatuses(ctx, leg, frame.SessionID, frame.LaneID, statuses); err != nil {
+		return err
+	}
 	if ok {
 		metrics.IncCounter(metrics.FECEventsTotal,
 			metrics.L("event", "repair_recoverable"),
@@ -441,6 +480,36 @@ func (o *Recv) emitTransportPacket(ctx context.Context, packet *packetbuf.Packet
 	}
 }
 
+func (o *Recv) emitLinkStatuses(ctx context.Context, leg Ref, sessionID uint64, laneID uint8, statuses []qosStatus) error {
+	if o.linkStatus == nil || len(statuses) == 0 {
+		return nil
+	}
+	for _, status := range statuses {
+		frame := protocol.Frame{
+			Version:   protocol.Version,
+			Type:      protocol.TypeLinkStatus,
+			SessionID: sessionID,
+			LaneID:    laneID,
+			Body: protocol.LinkStatusBody{
+				LegKind:      status.LegKind,
+				Reason:       status.Reason,
+				DeliveredBps: status.DeliveredBps,
+			},
+		}
+		if err := o.linkStatus(ctx, leg, frame); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (o *Recv) now() time.Time {
+	if o.qosConfig.Now != nil {
+		return o.qosConfig.Now()
+	}
+	return time.Now()
+}
+
 func (o *Recv) recvState(sessionID uint64) *recvState {
 	o.statesMu.RLock()
 	session, ok := o.manager.Get(sessionID)
@@ -467,6 +536,7 @@ func (o *Recv) recvState(sessionID uint64) *recvState {
 		rxWindows:  make(map[uint8]*rxSLCWindow),
 		dedupe:     newEmitDedupe(0),
 		accounting: make(map[uint8]*laneArrivalStats),
+		qos:        make(map[uint8]*qosWindow),
 	}
 	o.states[session] = state
 	debuglog.Printf("recv", "session_create session=%d", sessionID)

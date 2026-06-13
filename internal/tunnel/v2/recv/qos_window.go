@@ -114,6 +114,11 @@ func (w *qosWindow) ObserveData(kind transport.Kind, packetID uint32, bytes int,
 	g.dataSeen++
 }
 
+func (w *qosWindow) ObserveDataAndEvaluate(kind transport.Kind, packetID uint32, bytes int, at time.Time) []qosStatus {
+	w.ObserveData(kind, packetID, bytes, at)
+	return w.Evaluate(at)
+}
+
 func (w *qosWindow) ObserveRepair(kind transport.Kind, basePacketID uint32, span uint8, bytes int, at time.Time) {
 	if !qosKnownKind(kind) || span == 0 || span > maxFECSourceSpan {
 		return
@@ -131,6 +136,11 @@ func (w *qosWindow) ObserveRepair(kind transport.Kind, basePacketID uint32, span
 	g.span = span
 	g.repairKind = kind
 	g.repairAt = at
+}
+
+func (w *qosWindow) ObserveRepairAndEvaluate(kind transport.Kind, basePacketID uint32, span uint8, bytes int, at time.Time) []qosStatus {
+	w.ObserveRepair(kind, basePacketID, span, bytes, at)
+	return w.Evaluate(at)
 }
 
 func (w *qosWindow) Evaluate(now time.Time) []qosStatus {

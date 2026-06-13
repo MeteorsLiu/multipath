@@ -3,6 +3,7 @@ package recv
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/MeteorsLiu/multipath/internal/packetbuf"
 	"github.com/MeteorsLiu/multipath/internal/protocol"
@@ -287,6 +288,51 @@ func TestRecvDropsDataForUnknownSession(t *testing.T) {
 		t.Fatalf("Write DATA: %v", err)
 	}
 	assertNoRecvPacket(t, out)
+}
+
+func TestRecvEmitsLinkStatusWhenQoSWindowDetectsLimit(t *testing.T) {
+	var manager session.Manager
+	if _, ok := manager.Create(77); !ok {
+		t.Fatal("Create session failed")
+	}
+	var statuses []protocol.Frame
+	now := time.Unix(0, 0)
+	out := New(Config{
+		SessionManager: &manager,
+		LinkStatus: func(ctx context.Context, leg Ref, frame protocol.Frame) error {
+			statuses = append(statuses, frame)
+			return nil
+		},
+		QoSConfigForTest: qosConfig{
+			Window:      time.Hour,
+			Sustain:     time.Millisecond,
+			SampleFloor: 4,
+			Now:         func() time.Time { return now },
+		},
+	})
+	ctx := context.Background()
+	for group := uint32(0); group < 8; group++ {
+		now = now.Add(time.Millisecond)
+		base := group * 4
+		repair := protocol.Frame{Type: protocol.TypeREPAIR, SessionID: 77, LaneID: 1, Body: protocol.RepairBody{BasePacketID: base, Key: uint16(group), SourceSpan: 4, Symbol: []byte("rrrr")}}
+		if err := out.WriteTo(ctx, tcpLeg(), encodedTestFrame(t, repair)); err != nil {
+			t.Fatalf("Write REPAIR: %v", err)
+		}
+		if group%4 == 0 {
+			data := protocol.Frame{Type: protocol.TypeDATA, SessionID: 77, LaneID: 1, Body: protocol.DataBody{PacketID: base, Packet: []byte("data")}}
+			if err := out.WriteTo(ctx, udpLeg(), encodedTestFrame(t, data)); err != nil {
+				t.Fatalf("Write DATA: %v", err)
+			}
+			readRecvPacket(t, out).Release()
+		}
+	}
+	if len(statuses) == 0 {
+		t.Fatal("expected at least one LINK_STATUS")
+	}
+	body := statuses[len(statuses)-1].Body.(protocol.LinkStatusBody)
+	if body.LegKind != protocol.LinkStatusLegUDP || body.Reason != protocol.LinkStatusReasonLimited {
+		t.Fatalf("status body = %+v, want UDP limited", body)
+	}
 }
 
 // statsForTest exposes a lane's arrival ledger for white-box assertions.
