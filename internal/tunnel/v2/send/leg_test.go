@@ -12,7 +12,7 @@ import (
 // and a healthy TCP path makes selectRef switch DATA from UDP to TCP — the
 // loss-shaped QoS (selector rule 3) that was dead before delivery was wired.
 func TestLegDeliveryRateDrivesSelector(t *testing.T) {
-	g := newLeg(transport.KindUDP, selector.QualitySelector{})
+	g := newLeg(transport.KindUDP, &selector.QualitySelector{})
 	g.bindUDP(transport.LegRef{Kind: transport.KindUDP, EndpointID: "u"})
 	g.bindTCP(transport.LegRef{Kind: transport.KindTCP, ConnID: "t"})
 	g.markActive(transport.KindUDP)
@@ -44,7 +44,7 @@ func TestLegDeliveryRateDrivesSelector(t *testing.T) {
 // TestLegDeliveryHealthyStaysUDP verifies the inverse: when both paths deliver
 // well, the selector keeps DATA on UDP (the fix must not spuriously switch).
 func TestLegDeliveryHealthyStaysUDP(t *testing.T) {
-	g := newLeg(transport.KindUDP, selector.QualitySelector{})
+	g := newLeg(transport.KindUDP, &selector.QualitySelector{})
 	g.bindUDP(transport.LegRef{Kind: transport.KindUDP, EndpointID: "u"})
 	g.bindTCP(transport.LegRef{Kind: transport.KindTCP, ConnID: "t"})
 	g.markActive(transport.KindUDP)

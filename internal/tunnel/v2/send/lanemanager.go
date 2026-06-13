@@ -2,6 +2,7 @@ package send
 
 import (
 	"sync"
+	"time"
 
 	"github.com/MeteorsLiu/multipath/internal/transport"
 	"github.com/MeteorsLiu/multipath/internal/tunnel/v2/probe/bw"
@@ -18,6 +19,15 @@ type LegKey struct {
 	Kind      transport.Kind
 	Endpoint  string // UDP endpoint id
 	Conn      string // TCP conn id
+}
+
+type LaneKey struct {
+	SessionID uint64
+	LaneID    uint8
+}
+
+type QoSInput interface {
+	OnQoS(kind transport.Kind, reason uint8, deliveredBps uint32, now time.Time)
 }
 
 // KeyForLeg builds a LegKey from a session/lane/leg triple.
@@ -52,14 +62,16 @@ type LaneManager struct {
 	mu             sync.Mutex
 	pings          map[LegKey]*ping.Ping
 	bwLoops        map[uint64]*bw.BwLoop
+	qosInputs      map[LaneKey]QoSInput
 	remoteComplete func(key LegKey)
 }
 
 // NewLaneManager returns an empty LaneManager ready for shared use.
 func NewLaneManager() *LaneManager {
 	return &LaneManager{
-		pings:   make(map[LegKey]*ping.Ping),
-		bwLoops: make(map[uint64]*bw.BwLoop),
+		pings:     make(map[LegKey]*ping.Ping),
+		bwLoops:   make(map[uint64]*bw.BwLoop),
+		qosInputs: make(map[LaneKey]QoSInput),
 	}
 }
 
@@ -154,6 +166,33 @@ func (m *LaneManager) DeleteBwLoop(trainID uint64) {
 	m.mu.Unlock()
 }
 
+func (m *LaneManager) RegisterQoS(key LaneKey, input QoSInput) {
+	if m == nil || input == nil {
+		return
+	}
+	m.mu.Lock()
+	m.qosInputs[key] = input
+	m.mu.Unlock()
+}
+
+func (m *LaneManager) LookupQoS(key LaneKey) QoSInput {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.qosInputs[key]
+}
+
+func (m *LaneManager) DeleteQoS(key LaneKey) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	delete(m.qosInputs, key)
+	m.mu.Unlock()
+}
+
 // Reset drops all registered pings and BwLoops (unknown-session rebuild, spec 7:
 // 重启→重连 自愈). The old session's goroutines are cancelled separately by the
 // caller; this clears the stale instances so a rebuilt session starts clean. The
@@ -165,5 +204,6 @@ func (m *LaneManager) Reset() {
 	m.mu.Lock()
 	m.pings = make(map[LegKey]*ping.Ping)
 	m.bwLoops = make(map[uint64]*bw.BwLoop)
+	m.qosInputs = make(map[LaneKey]QoSInput)
 	m.mu.Unlock()
 }

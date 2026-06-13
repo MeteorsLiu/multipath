@@ -97,10 +97,12 @@ func buildServerRuntime(cfg Config, device *tun.Device) (*appRuntime, []io.Close
 	if cfg.FEC {
 		in.EnableFEC()
 	}
-	handler := tunnelruntime.NewRecvHandler(in, sessions)
+	qosWriter := tunnelruntime.NewQoSWriter(in)
+	handler := tunnelruntime.NewRecvHandler(in, sessions, tunnelruntime.Config{QoSWriter: qosWriter})
 	out := recv.New(recv.Config{
 		Handler:        handler,
 		SessionManager: sessions,
+		OnQoSStatus:    qosWriter.Write,
 	})
 	return &appRuntime{
 		tunReader:       device,
@@ -183,10 +185,12 @@ func buildClientRuntime(cfg Config, device *tun.Device) (*appRuntime, []io.Close
 	if cfg.FEC {
 		in.EnableFEC()
 	}
-	handler := tunnelruntime.NewRecvHandler(in, sessions)
+	qosWriter := tunnelruntime.NewQoSWriter(in)
+	handler := tunnelruntime.NewRecvHandler(in, sessions, tunnelruntime.Config{QoSWriter: qosWriter})
 	out := recv.New(recv.Config{
 		Handler:        handler,
 		SessionManager: sessions,
+		OnQoSStatus:    qosWriter.Write,
 	})
 	return &appRuntime{
 		tunReader:       device,

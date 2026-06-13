@@ -78,3 +78,15 @@ func TestObserverPreferTCP(t *testing.T) {
 		t.Fatal("PreferTCP not cleared after SetPreferTCP(false)")
 	}
 }
+
+func TestObserverQoSExpiresByTTL(t *testing.T) {
+	var o Observer
+	now := time.Unix(0, 0)
+	o.OnQoS(transport.KindUDP, 1, 2_000_000, now)
+	if q := o.UDPAt(now.Add(2 * time.Second)); !q.QoSActive || q.QoSReason != 1 || q.QoSDeliveredBps != 2_000_000 {
+		t.Fatalf("UDP QoS before TTL = %+v, want active", q)
+	}
+	if q := o.UDPAt(now.Add(4 * time.Second)); q.QoSActive {
+		t.Fatalf("UDP QoS after TTL = %+v, want inactive", q)
+	}
+}

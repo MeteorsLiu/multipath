@@ -45,7 +45,7 @@ func newLaneRuntime(id uint8, weight uint32) *laneRuntime {
 	l := &laneRuntime{
 		id:       id,
 		txWindow: newTxSLCWindow(maxFECSourceSpan),
-		leg:      newLeg(transport.KindUDP, selector.QualitySelector{}),
+		leg:      newLeg(transport.KindUDP, &selector.QualitySelector{}),
 	}
 	l.weight.Store(weight)
 	return l
@@ -111,10 +111,21 @@ func (l *laneRuntime) markDown(kind transport.Kind) {
 	l.leg.markDown(kind)
 }
 
-// setPrimary flips the leg's nominal primary orientation. Reserved entry point
-// for future QoS-driven reversal; nothing flips it this round.
+// setPrimary flips the leg's nominal primary orientation. Runtime DATA/REPAIR
+// routing is selector-driven; QoS status enters through laneQoSInput below.
 func (l *laneRuntime) setPrimary(kind transport.Kind) {
 	l.leg.setPrimary(kind)
+}
+
+type laneQoSInput struct {
+	lane *laneRuntime
+}
+
+func (i laneQoSInput) OnQoS(kind transport.Kind, reason uint8, deliveredBps uint32, now time.Time) {
+	if i.lane == nil {
+		return
+	}
+	i.lane.leg.observeQoS(kind, reason, deliveredBps, now)
 }
 
 // commitPacket adds a DATA packet to this lane's FEC transmit window (spec 9.1).

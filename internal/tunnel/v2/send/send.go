@@ -291,6 +291,7 @@ func (s *Send) bootstrapSession(ctx context.Context) error {
 		s.lanesMu.Lock()
 		s.lanes[key] = lane
 		s.lanesMu.Unlock()
+		s.registerLaneQoS(sessionID, lane)
 
 		// Open Hello with a self-driven retry loop (spec 5.1, 7.2). The sender
 		// closure builds the HELLO frame and writes it on this lane's bootstrap
@@ -575,6 +576,7 @@ func (s *Send) admitPassiveHelloAck(ctx context.Context, frame protocol.Frame, l
 		}
 		s.lanesMu.Unlock()
 	}
+	s.registerLaneQoS(frame.SessionID, lane)
 
 	switch legRef.Kind {
 	case transport.KindUDP:
@@ -595,6 +597,13 @@ func (s *Send) admitPassiveHelloAck(ctx context.Context, frame protocol.Frame, l
 	if s.enableBW && s.bwSched == nil {
 		s.startBwScheduler(sessionCtx, frame.SessionID)
 	}
+}
+
+func (s *Send) registerLaneQoS(sessionID uint64, lane *laneRuntime) {
+	if lane == nil {
+		return
+	}
+	s.laneManager.RegisterQoS(LaneKey{SessionID: sessionID, LaneID: lane.id}, laneQoSInput{lane: lane})
 }
 
 func (s *Send) ensurePassiveSessionContext(ctx context.Context, sessionID uint64) context.Context {

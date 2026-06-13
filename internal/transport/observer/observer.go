@@ -14,6 +14,7 @@ import (
 const (
 	deliveryWindowSize = 32
 	deliveryMinSamples = 8
+	qosTTL             = 3 * time.Second
 )
 
 // Observer tracks delivery rate and RTT for UDP and TCP (spec 5.4). It exposes
@@ -25,6 +26,8 @@ type Observer struct {
 	udpRTT      rtt.Estimator
 	tcpRTT      rtt.Estimator
 	preferTCP   bool // set by bw Sample (stage④): probeBW cold-start lock
+	udpQoS      qosStatus
+	tcpQoS      qosStatus
 }
 
 // Quality holds the observed metrics for one transport (spec 5.4).
@@ -33,10 +36,25 @@ type Quality struct {
 	SmoothedRTT  time.Duration
 	RTTVariance  time.Duration
 	PreferTCP    bool // probeBW cold-start lock (UDP-side only)
+
+	QoSActive       bool
+	QoSReason       uint8
+	QoSDeliveredBps uint32
+}
+
+type qosStatus struct {
+	active       bool
+	reason       uint8
+	deliveredBps uint32
+	updatedAt    time.Time
 }
 
 // UDP returns the current UDP quality snapshot.
 func (o *Observer) UDP() Quality {
+	return o.UDPAt(time.Now())
+}
+
+func (o *Observer) UDPAt(now time.Time) Quality {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	q := Quality{
@@ -45,6 +63,7 @@ func (o *Observer) UDP() Quality {
 	}
 	q.SmoothedRTT = durationOrZero(o.udpRTT.SRTT())
 	q.RTTVariance = durationOrZero(o.udpRTT.RTTVAR())
+	q.applyQoS(o.udpQoS, now)
 	return q
 }
 
@@ -59,6 +78,10 @@ func (o *Observer) SetPreferTCP(prefer bool) {
 
 // TCP returns the current TCP quality snapshot.
 func (o *Observer) TCP() Quality {
+	return o.TCPAt(time.Now())
+}
+
+func (o *Observer) TCPAt(now time.Time) Quality {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	q := Quality{
@@ -66,7 +89,17 @@ func (o *Observer) TCP() Quality {
 	}
 	q.SmoothedRTT = durationOrZero(o.tcpRTT.SRTT())
 	q.RTTVariance = durationOrZero(o.tcpRTT.RTTVAR())
+	q.applyQoS(o.tcpQoS, now)
 	return q
+}
+
+func (q *Quality) applyQoS(status qosStatus, now time.Time) {
+	if !status.active || now.Sub(status.updatedAt) > qosTTL {
+		return
+	}
+	q.QoSActive = true
+	q.QoSReason = status.reason
+	q.QoSDeliveredBps = status.deliveredBps
 }
 
 // OnDelivery records a delivery sample (onTime=true if within deadline, false if late/lost).
@@ -78,6 +111,23 @@ func (o *Observer) OnDelivery(kind transport.Kind, onTime bool) {
 		o.udpDelivery.record(onTime)
 	case transport.KindTCP:
 		o.tcpDelivery.record(onTime)
+	}
+}
+
+func (o *Observer) OnQoS(kind transport.Kind, reason uint8, deliveredBps uint32, now time.Time) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	status := qosStatus{
+		active:       true,
+		reason:       reason,
+		deliveredBps: deliveredBps,
+		updatedAt:    now,
+	}
+	switch kind {
+	case transport.KindUDP:
+		o.udpQoS = status
+	case transport.KindTCP:
+		o.tcpQoS = status
 	}
 }
 

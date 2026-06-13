@@ -57,7 +57,7 @@ type leg struct {
 // newLeg builds a leg with the given primary orientation and selector.
 func newLeg(primaryKind transport.Kind, sel selector.Selector) leg {
 	if sel == nil {
-		sel = selector.QualitySelector{}
+		sel = &selector.QualitySelector{}
 	}
 	return leg{
 		primaryKind: primaryKind,
@@ -111,6 +111,10 @@ func (g *leg) observeDelivery(k transport.Kind, onTime bool) {
 // the bwScheduler's onSample closure when a UDP sample decides TCP is preferred.
 func (g *leg) setPreferTCP(prefer bool) {
 	g.observer.SetPreferTCP(prefer)
+}
+
+func (g *leg) observeQoS(k transport.Kind, reason uint8, deliveredBps uint32, now time.Time) {
+	g.observer.OnQoS(k, reason, deliveredBps, now)
 }
 
 // srtt returns the smoothed RTT for kind (0 if no samples). Used by the
@@ -241,12 +245,16 @@ func (g *leg) qualityLocked(k transport.Kind) selector.Quality {
 		SmoothedRTT:  oq.SmoothedRTT,
 		RTTVariance:  oq.RTTVariance,
 		PreferTCP:    oq.PreferTCP,
+
+		QoSActive:       oq.QoSActive,
+		QoSReason:       oq.QoSReason,
+		QoSDeliveredBps: oq.QoSDeliveredBps,
 	}
 }
 
-// setPrimary flips the nominal primary orientation. Reserved entry point for
-// future QoS-driven reversal; nothing flips it to a non-initial value this
-// round, and it carries no switching policy, LINK_STATUS, or TTL machinery.
+// setPrimary flips the nominal primary orientation. The active DATA/REPAIR role
+// is selected by the selector from observer quality, including received QoS
+// status.
 func (g *leg) setPrimary(k transport.Kind) {
 	if k != transport.KindUDP && k != transport.KindTCP {
 		return

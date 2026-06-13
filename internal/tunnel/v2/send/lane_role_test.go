@@ -3,6 +3,7 @@ package send
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/MeteorsLiu/multipath/internal/packetbuf"
 	"github.com/MeteorsLiu/multipath/internal/protocol"
@@ -79,6 +80,20 @@ func TestLaneSetPrimaryFlipsRoles(t *testing.T) {
 	}
 	if shadow.Kind != transport.KindTCP {
 		t.Errorf("shadow kind = %v, want TCP (selector rule 6)", shadow.Kind)
+	}
+}
+
+func TestLaneQoSOverridesSelector(t *testing.T) {
+	l := newLaneRuntime(1, 100)
+	bindBoth(l)
+
+	laneQoSInput{lane: l}.OnQoS(transport.KindUDP, protocol.LinkStatusReasonLimited, 2_000_000, time.Now())
+
+	if got := l.primaryTransport(); got.Kind != transport.KindTCP {
+		t.Fatalf("primary kind = %v, want TCP after UDP QoS", got.Kind)
+	}
+	if got := l.shadowTransport(); got.Kind != transport.KindUDP {
+		t.Fatalf("shadow kind = %v, want UDP after UDP QoS", got.Kind)
 	}
 }
 

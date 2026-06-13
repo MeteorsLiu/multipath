@@ -3,6 +3,7 @@ package recv
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/MeteorsLiu/multipath/internal/packetbuf"
 	"github.com/MeteorsLiu/multipath/internal/protocol"
@@ -40,6 +41,10 @@ func (h *recordingHandler) OnBandwidthProbe(ctx context.Context, leg Ref, frame 
 }
 func (h *recordingHandler) OnBandwidthProbeAck(ctx context.Context, leg Ref, frame protocol.Frame) error {
 	h.calls = append(h.calls, "OnBandwidthProbeAck")
+	return nil
+}
+func (h *recordingHandler) OnQoS(ctx context.Context, leg Ref, frame protocol.Frame) error {
+	h.calls = append(h.calls, "OnQoS")
 	return nil
 }
 
@@ -95,6 +100,7 @@ func TestRecvDispatchesControlFramesToHandler(t *testing.T) {
 		{Type: protocol.TypeCLOSE, SessionID: 1, LaneID: 1, Body: protocol.CloseBody{Scope: protocol.CloseScopeLane}},
 		{Type: protocol.TypeBandwidthProbe, SessionID: 1, LaneID: 1, Body: protocol.BandwidthProbeBody{Count: 1, TrainBytesTotal: 1}},
 		{Type: protocol.TypeBandwidthProbeAck, SessionID: 1, LaneID: 1, Body: protocol.BandwidthProbeAckBody{Count: 1}},
+		{Type: protocol.TypeLinkStatus, SessionID: 1, LaneID: 1, Body: protocol.LinkStatusBody{LegKind: protocol.LinkStatusLegUDP, Reason: protocol.LinkStatusReasonLimited, DeliveredBps: 1}},
 	}
 	for _, frame := range frames {
 		if err := out.Write(context.Background(), encodedTestFrame(t, frame)); err != nil {
@@ -102,7 +108,7 @@ func TestRecvDispatchesControlFramesToHandler(t *testing.T) {
 		}
 	}
 
-	want := []string{"OnHello", "OnHelloAck", "OnPing", "OnPong", "OnClose", "OnBandwidthProbe", "OnBandwidthProbeAck"}
+	want := []string{"OnHello", "OnHelloAck", "OnPing", "OnPong", "OnClose", "OnBandwidthProbe", "OnBandwidthProbeAck", "OnQoS"}
 	if len(handler.calls) != len(want) {
 		t.Fatalf("handler calls = %v, want %v", handler.calls, want)
 	}
@@ -274,6 +280,70 @@ func TestRecvSingleTransportSameKind(t *testing.T) {
 	}
 	if st.arrival(transport.KindTCP, catData).count != 0 || st.arrival(transport.KindTCP, catRepair).count != 0 {
 		t.Error("TCP cells should be empty in single-UDP-transport case")
+	}
+}
+
+func TestRecvReportsQoSStatusThroughCallback(t *testing.T) {
+	var manager session.Manager
+	if _, ok := manager.Create(10); !ok {
+		t.Fatal("Create session failed")
+	}
+	var statuses []QoSStatus
+	ctx := context.Background()
+	out := New(Config{
+		SessionManager: &manager,
+		OnQoSStatus: func(ctx context.Context, status QoSStatus) error {
+			statuses = append(statuses, status)
+			return nil
+		},
+	})
+	state := out.recvState(10)
+	state.mu.Lock()
+	state.qos[1] = newQoSEstimator(qosConfig{
+		Sustain:     time.Second,
+		SampleFloor: 4,
+		Refresh:     time.Second,
+	}, func(status qosStatus) {
+		statuses = append(statuses, QoSStatus{
+			SessionID:    10,
+			LaneID:       1,
+			Kind:         status.Kind,
+			Reason:       status.Reason,
+			DeliveredBps: status.DeliveredBps,
+		})
+	})
+	state.mu.Unlock()
+
+	for group := uint32(0); group < 4; group++ {
+		repair := protocol.Frame{Type: protocol.TypeREPAIR, SessionID: 10, LaneID: 1, Body: protocol.RepairBody{BasePacketID: group * 4, Key: uint16(group), SourceSpan: 4, Symbol: []byte("rrrr")}}
+		if err := out.WriteTo(ctx, tcpLeg(), encodedTestFrame(t, repair)); err != nil {
+			t.Fatalf("Write REPAIR %d: %v", group, err)
+		}
+	}
+	state.mu.Lock()
+	state.qos[1].Observe(qosSample{
+		At:           time.Now(),
+		Duration:     time.Second,
+		DataKind:     transport.KindUDP,
+		RepairKind:   transport.KindTCP,
+		DataArrived:  0,
+		DataExpected: 16,
+	})
+	state.qos[1].Observe(qosSample{
+		At:           time.Now().Add(2 * time.Second),
+		Duration:     time.Second,
+		DataKind:     transport.KindUDP,
+		RepairKind:   transport.KindTCP,
+		DataArrived:  0,
+		DataExpected: 16,
+	})
+	state.mu.Unlock()
+
+	if len(statuses) != 1 {
+		t.Fatalf("statuses = %+v, want one", statuses)
+	}
+	if statuses[0].SessionID != 10 || statuses[0].LaneID != 1 || statuses[0].Kind != transport.KindUDP || statuses[0].Reason != protocol.LinkStatusReasonLimited {
+		t.Fatalf("status = %+v, want UDP limited for session 10 lane 1", statuses[0])
 	}
 }
 

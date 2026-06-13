@@ -59,12 +59,13 @@ Public architecture boundaries:
 ```text
 Send
 Recv
-ProbeLoop
+Runtime RecvHandler
 Session
 Schedule Strategy
 Transport
 Protocol
 FEC
+Probe packages
 ```
 
 Do not introduce public `Path` or `Lane` modules unless the design docs are
@@ -82,7 +83,7 @@ Important constraints:
   `Get`, `Create`, `GetOrCreate`, and `Delete`.
 - Session only owns session id, nonce, and HELLO open/ack/retry state:
   `Open`, `Ack`, and `Do`.
-- Hello only exposes `Do` and `Retry`.
+- Hello only exposes `Do` and `Ack`.
 - View has no exported fields and only exposes `SessionID()` and `Nonce()`.
 - Session must not know lanes, transport legs, protocol frames, FEC, schedule
   strategy, caps, fallback, or packet output.
@@ -104,28 +105,40 @@ Important constraints:
   waits for cancellation or errors.
 - The TUN read loop belongs in `internal/tun`. Send must not own a
   `TUNReader` or application lifecycle loop.
-- Send has one TUN input method: `Write`, one direct transport-bound output
-  method: `WriteTo`, and one transport output channel: `Packets`. Send must not
-  expose control-plane maintenance methods; the ProbeLoop adapter lives in the
-  send package and uses Send's unexported control hooks.
+- Send has one TUN input method: `Write`, one caller-constructed frame output
+  method: `WriteFrame`, one direct transport-bound output method: `WriteTo`,
+  and one transport output channel: `Packets`.
+- Send owns v2 bootstrap, rebootstrap, active ping, TCP redial, optional
+  bandwidth probe scheduling, and FEC capability state. Narrow exported seams
+  for those runtime facts are allowed when required by transport/runtime glue:
+  `Bootstrap`, `Rebootstrap`, `CloseSession`, `LaneManager`, `FECEnabled`,
+  `EnableFEC`, and `OnLegFailure`.
 - Do not expose semantic
   control methods such as `AcceptHello`, `AcceptHelloAck`, `ObserveLane`,
   `ReceivePing`, `ReceivePong`, or `Close` on Send.
 - HELLO and HELLO_ACK state transitions must go through Session. Protocol frame
   construction stays in the caller's callback; Session must not encode frames or
   write transport packets.
-- Send must not participate in HELLO_ACK admission/decision logic. The caller
-  updates Send-owned lane readiness, negotiated caps, FEC profile, and probe
-  state only after `Session.Ack` accepts the nonce and accepted flag.
+- Send must not participate in HELLO_ACK admission/decision logic. `Session.Ack`
+  is the nonce/accepted gate; Send-owned lane readiness is updated only by
+  Send-registered callbacks after that gate accepts.
 - Transport loops call `Recv.WriteTo`. The TUN write loop consumes
   `Recv.Packets()`. Recv must not write TUN directly.
 - Recv must not own transport writers. Control replies use caller-owned protocol
   frame construction and the runtime transport-bound output path.
 - Do not reintroduce a tunnel loop object inside `internal/tunnel`. `Send`,
-  `Recv`, and ProbeLoop are separate runtime roles and should own only
+  `Recv`, and runtime RecvHandler are separate runtime roles and should own only
   the runtime data/dependencies they directly need.
-- ProbeLoop drives probe, HELLO retry, and fallback flow. It must not become a
-  raw decoded-control-frame forwarder.
+- v2 has no public ProbeLoop. Send starts its own HELLO retry loops, active
+  ping loops, TCP dialers, and optional bandwidth-probe scheduler.
+- Runtime RecvHandler is the decoded-control-frame dispatcher. It builds
+  control replies through `Send.WriteFrame`, routes PONG/BW_ACK/LINK_STATUS into
+  the shared LaneManager, and must not touch lane/leg internals directly.
+- Runtime RecvHandler handles inbound control frames only. Local receive-side
+  QoS feedback uses a separate runtime QoS writer callback injected into Recv;
+  do not add outbound feedback methods to RecvHandler.
+- v2 negotiates `CapLinkStatus` only with FEC. `LINK_STATUS` carries receive-side
+  QoS status; it must not reintroduce global TCP fallback semantics.
 - Recv packets may reuse transport read buffers; the TUN write loop must
   release each packet after writing. Transport
   `Write`/`WriteTo` implementations must finish using the provided payload
@@ -162,4 +175,9 @@ go test ./...
   unless the design documents require a real semantic boundary.
 - Remove type aliases and helper wrappers that do not provide ownership,
   semantic separation, or meaningful simplification.
-- After code edits, run `gofmt` and at least `go build ./...`.
+- After code edits, run `gofmt` and at least `go build ./...`. During the v2
+  migration, if `go build ./...` fails only because old `internal/tunnel/send`
+  still references removed session APIs, do not change Session for old-send
+  compatibility; verify with
+  `go test ./internal/protocol ./internal/session ./internal/tunnel/v2/... -count=1`
+  and report the old-send build gap.

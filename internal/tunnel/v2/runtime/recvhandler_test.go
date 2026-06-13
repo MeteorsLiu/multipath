@@ -253,6 +253,59 @@ func TestRecvHandlerDispatchesControlFramesWithoutTouchingDATAorREPAIR(t *testin
 	// RecvHandler has no OnData or OnRepair methods - those stay in Recv
 }
 
+func TestRecvHandlerOnQoSFeedsQoSInput(t *testing.T) {
+	sessions := &sessionpkg.Manager{}
+	s := send.New(send.Config{
+		SessionManager: sessions,
+		BootstrapLanes: []send.BootstrapLane{{
+			LaneID: 1,
+			Weight: 100,
+			Leg:    transport.LegRef{Kind: transport.KindUDP, EndpointID: "ep", RemoteAddr: &testAddr{addr: "127.0.0.1:9000"}},
+		}},
+		ProbeInterval: time.Hour,
+		ProbeTimeout:  time.Hour,
+	})
+	if err := s.Bootstrap(context.Background()); err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+	var sessionID uint64
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case payload := <-s.Packets():
+			decoded, err := protocol.Decode(payload.Packet.Payload)
+			payload.Packet.Release()
+			if err == nil && decoded.Type == protocol.TypeHELLO {
+				sessionID = decoded.SessionID
+				goto found
+			}
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	t.Fatal("missing bootstrap HELLO")
+found:
+	handler := NewRecvHandler(s, sessions)
+	qos := s.LaneManager().LookupQoS(send.LaneKey{SessionID: sessionID, LaneID: 1})
+	if qos == nil {
+		t.Fatal("missing QoS input")
+	}
+
+	frame := protocol.Frame{
+		Type:      protocol.TypeLinkStatus,
+		SessionID: sessionID,
+		LaneID:    1,
+		Body: protocol.LinkStatusBody{
+			LegKind:      protocol.LinkStatusLegUDP,
+			Reason:       protocol.LinkStatusReasonLimited,
+			DeliveredBps: 2_000_000,
+		},
+	}
+	if err := handler.OnQoS(context.Background(), transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp"}, frame); err != nil {
+		t.Fatalf("OnQoS: %v", err)
+	}
+}
+
 // TestOnPingUnknownSessionRepliesClose verifies the peer-restart self-heal: a
 // PING for a session this end does not know yields CLOSE{Session, UnknownSession}
 // (not a bare PONG that would let the peer believe the dead session is alive).

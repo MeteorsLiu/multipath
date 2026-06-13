@@ -41,6 +41,7 @@ type RecvHandler struct {
 
 	bwReferenceBps uint64
 	bwCapBps       uint64
+	qosWriter      *QoSWriter
 
 	// receive is the passive bandwidth side (spec 5.8): it tracks per-train
 	// received bitmaps and returns the Ack to send for each inbound probe. The
@@ -53,6 +54,7 @@ type RecvHandler struct {
 type Config struct {
 	BWReferenceBps uint64
 	BWCapBps       uint64
+	QoSWriter      *QoSWriter
 }
 
 // NewRecvHandler returns a recv.Handler backed by s and sessions. It shares s's
@@ -71,6 +73,9 @@ func NewRecvHandler(s *send.Send, sessions *sessionpkg.Manager, configs ...Confi
 		}
 		if cfg.BWCapBps > 0 {
 			h.bwCapBps = cfg.BWCapBps
+		}
+		if cfg.QoSWriter != nil {
+			h.qosWriter = cfg.QoSWriter
 		}
 	}
 	return h
@@ -117,7 +122,13 @@ func (h *RecvHandler) OnHello(ctx context.Context, leg transport.LegRef, frame p
 	}
 
 	debuglog.Printf("runtime", "hello session=%d lane=%d", frame.SessionID, frame.LaneID)
-	return h.send.WriteFrame(ctx, ackFrame, leg)
+	if err := h.send.WriteFrame(ctx, ackFrame, leg); err != nil {
+		return err
+	}
+	if caps&protocol.CapLinkStatus != 0 && h.qosWriter != nil {
+		h.qosWriter.Enable(frame.SessionID, frame.LaneID)
+	}
+	return nil
 }
 
 // OnHelloAck handles incoming HELLO_ACK frames (spec 7.3). Session.Ack validates
@@ -142,6 +153,9 @@ func (h *RecvHandler) OnHelloAck(ctx context.Context, leg transport.LegRef, fram
 
 	if h.send.FECEnabled() && body.Caps&protocol.CapFEC != 0 && body.FECProfile == protocol.FECProfileSLC4Plus1 {
 		h.send.EnableFEC()
+	}
+	if body.Caps&protocol.CapLinkStatus != 0 && body.Caps&protocol.CapFEC != 0 && h.qosWriter != nil {
+		h.qosWriter.Enable(frame.SessionID, frame.LaneID)
 	}
 
 	debuglog.Printf("runtime", "hello_ack session=%d lane=%d kind=%d", frame.SessionID, frame.LaneID, leg.Kind)
@@ -352,5 +366,31 @@ func (h *RecvHandler) OnBandwidthProbeAck(ctx context.Context, leg transport.Leg
 		FirstRXMS: body.FirstRXMS,
 		LastRXMS:  body.LastRXMS,
 	})
+	return nil
+}
+
+func (h *RecvHandler) OnQoS(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error {
+	body, ok := frame.Body.(protocol.LinkStatusBody)
+	if !ok {
+		return protocol.ErrInvalidFrame
+	}
+	if !h.sessionKnown(frame.SessionID) {
+		return h.closeUnknownSession(ctx, leg, frame.SessionID)
+	}
+	kind := transport.Kind(0)
+	switch body.LegKind {
+	case protocol.LinkStatusLegUDP:
+		kind = transport.KindUDP
+	case protocol.LinkStatusLegTCP:
+		kind = transport.KindTCP
+	default:
+		return protocol.ErrInvalidFrame
+	}
+	qos := h.lanes.LookupQoS(send.LaneKey{SessionID: frame.SessionID, LaneID: frame.LaneID})
+	if qos == nil {
+		debuglog.Printf("runtime", "link_status_drop no_qos session=%d lane=%d", frame.SessionID, frame.LaneID)
+		return nil
+	}
+	qos.OnQoS(kind, body.Reason, body.DeliveredBps, time.Now())
 	return nil
 }
