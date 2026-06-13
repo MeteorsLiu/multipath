@@ -210,35 +210,3 @@ func TestQoSEstimatorRefreshesSustainedStatus(t *testing.T) {
 		t.Fatalf("refresh statuses = %+v, want refreshed status", got)
 	}
 }
-
-func TestLaneArrivalStatsBuildsDeltaQoSSample(t *testing.T) {
-	now := time.Unix(0, 0)
-	stats := &laneArrivalStats{}
-	stats.recordArrival(transport.KindUDP, catData, 1000)
-	stats.recordArrival(transport.KindTCP, catRepair, 1000)
-	stats.recordRecovered(transport.KindUDP, 500)
-
-	if sample, ok := stats.qosDelta(transport.KindUDP, now); ok {
-		t.Fatalf("first sample = %+v, want cursor initialization only", sample)
-	}
-	if sample, ok := stats.qosDelta(transport.KindUDP, now.Add(time.Second)); ok {
-		t.Fatalf("early sample = %+v, want no sample before interval", sample)
-	}
-
-	stats.recordArrival(transport.KindUDP, catData, 1200)
-	stats.recordArrival(transport.KindTCP, catRepair, 1200)
-	stats.recordRecovered(transport.KindUDP, 700)
-	sample, ok := stats.qosDelta(transport.KindUDP, now.Add(3*time.Second))
-	if !ok {
-		t.Fatal("missing delta sample")
-	}
-	if sample.DataArrived != 1 || sample.DataExpected != maxFECSourceSpan {
-		t.Fatalf("sample counts = got arrived %d expected %d", sample.DataArrived, sample.DataExpected)
-	}
-	if sample.DataBytes != 1200 || sample.RepairBytes != 1200 || sample.RecoveredBytes != 700 {
-		t.Fatalf("sample bytes = %+v, want data=1200 repair=1200 recovered=700", sample)
-	}
-	if sample.Duration != 3*time.Second {
-		t.Fatalf("duration = %s, want 3s", sample.Duration)
-	}
-}

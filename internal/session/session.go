@@ -91,6 +91,23 @@ func (m *Manager) GetOrCreate(id uint64) (*Session, bool) {
 	return s, true
 }
 
+func (m *Manager) GetOrDelete(id uint64) (*Session, bool) {
+	if m == nil {
+		return nil, false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.sessions == nil {
+		return nil, false
+	}
+	s := m.sessions[id]
+	if s == nil {
+		return nil, false
+	}
+	delete(m.sessions, id)
+	return s, true
+}
+
 func (m *Manager) Delete(id uint64) {
 	if m == nil {
 		return

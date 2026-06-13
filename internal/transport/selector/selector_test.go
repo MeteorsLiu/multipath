@@ -134,6 +134,27 @@ func TestQualitySelectorQoSHonorsHold(t *testing.T) {
 	}
 }
 
+func TestQualitySelectorQoSHoldBlocksFailedReturnEscape(t *testing.T) {
+	now := time.Unix(0, 0)
+	sel := NewQualitySelectorForTest(func() time.Time { return now })
+	udpBad := Quality{Active: true, DeliveryRate: 1.0, QoSActive: true, QoSReason: QoSReasonLimited, QoSDeliveredBps: 2_000_000}
+	udpGood := Quality{Active: true, DeliveryRate: 1.0}
+	tcpGood := Quality{Active: true, DeliveryRate: 1.0}
+
+	if useUDP, ok := sel.Pick(udpBad, tcpGood); !ok || useUDP {
+		t.Fatalf("first Pick = %v/%v, want TCP", useUDP, ok)
+	}
+	now = now.Add(11 * time.Second)
+	if useUDP, ok := sel.Pick(udpGood, tcpGood); !ok || !useUDP {
+		t.Fatalf("return Pick = %v/%v, want UDP", useUDP, ok)
+	}
+
+	now = now.Add(time.Second)
+	if useUDP, ok := sel.Pick(udpBad, tcpGood); !ok || !useUDP {
+		t.Fatalf("Pick during UDP hold after failed return = %v/%v, want held UDP", useUDP, ok)
+	}
+}
+
 func TestQualitySelectorQoSReturnsToUDPAfterPreferWait(t *testing.T) {
 	now := time.Unix(0, 0)
 	sel := NewQualitySelectorForTest(func() time.Time { return now })
@@ -165,8 +186,12 @@ func TestQualitySelectorQoSBacksOffPreferWaitAfterFailedReturn(t *testing.T) {
 	}
 
 	now = now.Add(time.Second)
+	if useUDP, ok := sel.Pick(udpBad, tcpGood); !ok || !useUDP {
+		t.Fatalf("failed return during hold Pick = %v/%v, want held UDP", useUDP, ok)
+	}
+	now = now.Add(10 * time.Second)
 	if useUDP, ok := sel.Pick(udpBad, tcpGood); !ok || useUDP {
-		t.Fatalf("failed return Pick = %v/%v, want TCP", useUDP, ok)
+		t.Fatalf("failed return after hold Pick = %v/%v, want TCP", useUDP, ok)
 	}
 	now = now.Add(11 * time.Second)
 	if useUDP, ok := sel.Pick(udpGood, tcpGood); !ok || useUDP {

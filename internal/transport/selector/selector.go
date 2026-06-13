@@ -125,7 +125,7 @@ func (s *QualitySelector) pickQoS(udp, tcp Quality, now time.Time) (bool, bool) 
 	if s.preferWait == 0 {
 		s.preferWait = qosPreferWait
 	}
-	if s.hasCurrent && now.Before(s.holdUntil) && !(s.currentUDP && udp.QoSActive) {
+	if s.hasCurrent && now.Before(s.holdUntil) {
 		return s.currentUDP, true
 	}
 

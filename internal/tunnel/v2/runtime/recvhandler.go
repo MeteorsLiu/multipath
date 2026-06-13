@@ -269,10 +269,9 @@ func (h *RecvHandler) OnClose(ctx context.Context, leg transport.LegRef, frame p
 
 	// Only act on a CLOSE for the session we currently hold; a stale CLOSE for an
 	// already-gone session must not trigger a rebuild (avoids CLOSE loops).
-	if _, known := h.sessions.Get(frame.SessionID); !known {
+	if _, known := h.sessions.GetOrDelete(frame.SessionID); !known {
 		return nil
 	}
-	h.sessions.Delete(frame.SessionID)
 
 	if body.Reason == protocol.CloseReasonUnknownSession {
 		// The peer forgot our session (it restarted). Rebuild a fresh one. Only

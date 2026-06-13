@@ -113,6 +113,19 @@ func (m *LaneManager) RegisterPing(key LegKey, p *ping.Ping) {
 	m.mu.Unlock()
 }
 
+func (m *LaneManager) registerPingIfAbsent(key LegKey, p *ping.Ping) bool {
+	if m == nil || p == nil {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if existing := m.pings[key]; existing != nil {
+		return false
+	}
+	m.pings[key] = p
+	return true
+}
+
 // LookupPing returns the active ping for key, or nil. The recv glue calls this
 // on inbound PONG to feed the matching ping.
 func (m *LaneManager) LookupPing(key LegKey) *ping.Ping {

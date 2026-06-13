@@ -322,6 +322,7 @@ func (m *Manager) Get(id uint64) (*Session, bool)
 func (m *Manager) Add(s *Session) bool
 func (m *Manager) Create(id uint64) (*Session, bool)
 func (m *Manager) GetOrCreate(id uint64) (*Session, bool)
+func (m *Manager) GetOrDelete(id uint64) (*Session, bool)
 func (m *Manager) Delete(id uint64)
 
 type HelloConfig struct {

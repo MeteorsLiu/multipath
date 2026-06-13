@@ -374,6 +374,44 @@ func TestOnCloseUnknownSessionStaleIsNoOp(t *testing.T) {
 	// Nothing to assert beyond "no panic / no error": the stale CLOSE is dropped.
 }
 
+func TestOnCloseConsumesSessionOnlyOnce(t *testing.T) {
+	s := send.New()
+	sessions := &sessionpkg.Manager{}
+	if _, ok := sessions.GetOrCreate(999); !ok {
+		t.Fatal("GetOrCreate failed")
+	}
+	handler := NewRecvHandler(s, sessions)
+
+	leg := transport.LegRef{Kind: transport.KindUDP, EndpointID: "ep", RemoteAddr: &testAddr{addr: "127.0.0.1:9000"}}
+	frame := protocol.Frame{
+		Version:   protocol.Version,
+		Type:      protocol.TypeCLOSE,
+		SessionID: 999,
+		LaneID:    protocol.SessionControlLaneID,
+		Body:      protocol.CloseBody{Scope: protocol.CloseScopeSession, Reason: protocol.CloseReasonUnknownSession},
+	}
+
+	const workers = 16
+	start := make(chan struct{})
+	done := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			<-start
+			done <- handler.OnClose(context.Background(), leg, frame)
+		}()
+	}
+	close(start)
+
+	for i := 0; i < workers; i++ {
+		if err := <-done; err != nil {
+			t.Fatalf("OnClose failed: %v", err)
+		}
+	}
+	if _, known := sessions.Get(999); known {
+		t.Fatal("session survived concurrent CLOSE handling")
+	}
+}
+
 type testAddr struct {
 	addr string
 }

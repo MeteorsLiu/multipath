@@ -31,6 +31,43 @@ func TestManagerLifecycle(t *testing.T) {
 	}
 }
 
+func TestManagerGetOrDeleteIsAtomic(t *testing.T) {
+	var manager Manager
+	created, ok := manager.Create(99)
+	if !ok || created == nil {
+		t.Fatalf("Create = (%v,%v), want session,true", created, ok)
+	}
+
+	const workers = 16
+	start := make(chan struct{})
+	results := make(chan *Session, workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			<-start
+			s, ok := manager.GetOrDelete(99)
+			if !ok {
+				results <- nil
+				return
+			}
+			results <- s
+		}()
+	}
+	close(start)
+
+	var got []*Session
+	for i := 0; i < workers; i++ {
+		if s := <-results; s != nil {
+			got = append(got, s)
+		}
+	}
+	if len(got) != 1 || got[0] != created {
+		t.Fatalf("GetOrDelete winners = %d (%v), want exactly original session", len(got), got)
+	}
+	if _, ok := manager.Get(99); ok {
+		t.Fatal("Get after GetOrDelete ok = true, want false")
+	}
+}
+
 func TestNewGeneratesSessionID(t *testing.T) {
 	s, err := New()
 	if err != nil {

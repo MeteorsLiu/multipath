@@ -136,32 +136,32 @@ func (s *recvState) qosFor(laneID uint8, emit func(qosStatus)) *qosEstimator {
 	return q
 }
 
-func (s *recvState) observeQoS(laneID uint8, dataKind transport.Kind, now time.Time) {
+func (s *recvState) observeQoS(laneID uint8, now time.Time) {
 	stats := s.accounting[laneID]
 	if stats == nil {
 		return
 	}
-	sample, ok := stats.qosDelta(dataKind, now)
-	if !ok {
-		return
+	for _, sample := range stats.qosSamples(now) {
+		s.qosFor(laneID, s.emitQoS).Observe(sample)
 	}
-	s.qosFor(laneID, s.emitQoS).Observe(sample)
 }
 
-func (s *recvState) observeQoSRecovery(laneID uint8, recoveredBytes uint64, now time.Time) {
+func (s *recvState) observeQoSRecovery(laneID uint8, basePacketID uint32, recoveredBytes uint64, now time.Time) {
 	stats := s.accounting[laneID]
 	if stats == nil || recoveredBytes == 0 {
 		return
 	}
-	for _, dataKind := range []transport.Kind{transport.KindUDP, transport.KindTCP} {
-		repair := stats.arrival(otherTransportKind(dataKind), catRepair)
-		if repair.count == 0 {
-			continue
+	if !stats.recordRecoveredGroup(basePacketID, recoveredBytes) {
+		for _, dataKind := range []transport.Kind{transport.KindUDP, transport.KindTCP} {
+			repair := stats.arrival(otherTransportKind(dataKind), catRepair)
+			if repair.count == 0 {
+				continue
+			}
+			stats.recordRecovered(dataKind, recoveredBytes)
+			break
 		}
-		stats.recordRecovered(dataKind, recoveredBytes)
-		s.observeQoS(laneID, dataKind, now)
-		return
 	}
+	s.observeQoS(laneID, now)
 }
 
 func (s *recvState) emitQoS(status qosStatus) {
@@ -348,19 +348,24 @@ func (o *Recv) handleDATA(ctx context.Context, leg Ref, frame protocol.Frame, pa
 		state.mu.Unlock()
 		return false, nil
 	}
+	// Account DATA before emit dedupe so the ledger keeps wire-delivery
+	// semantics; duplicates are still suppressed before TUN/window emission.
+	now := time.Now()
+	state.statsFor(frame.LaneID).recordData(leg.Kind, body.PacketID, len(body.Packet), now)
+	state.observeQoS(frame.LaneID, now)
+	statuses := state.takeQoSStatuses()
 	if !state.dedupe.mark(body.PacketID) {
-		// Duplicate: drop before window and before TUN; do NOT account (spec 8.3).
+		// Duplicate: already accounted as a wire arrival above, but still drop
+		// before the FEC window and before TUN emission.
 		state.mu.Unlock()
 		if debuglog.Enabled() {
 			debuglog.Printf("recv", "data_drop_duplicate session=%d packet_id=%d", frame.SessionID, body.PacketID)
 		}
+		if err := o.reportQoS(ctx, frame.SessionID, frame.LaneID, statuses); err != nil {
+			return false, err
+		}
 		return false, nil
 	}
-	// First arrival: record link-delivery accounting, then store in the window.
-	now := time.Now()
-	state.statsFor(frame.LaneID).recordArrival(leg.Kind, catData, len(body.Packet))
-	state.observeQoS(frame.LaneID, leg.Kind, now)
-	statuses := state.takeQoSStatuses()
 	recoverable, recoverableOK := state.windowFor(frame.LaneID).addData(body.PacketID, body.Packet)
 	state.mu.Unlock()
 	if err := o.reportQoS(ctx, frame.SessionID, frame.LaneID, statuses); err != nil {
@@ -403,10 +408,10 @@ func (o *Recv) handleREPAIR(ctx context.Context, leg Ref, frame protocol.Frame) 
 	}
 	// REPAIR has no dedupe identity; account it on arrival (spec 8.4).
 	now := time.Now()
-	state.statsFor(frame.LaneID).recordArrival(leg.Kind, catRepair, len(body.Symbol))
+	state.statsFor(frame.LaneID).recordRepair(leg.Kind, body.BasePacketID, body.SourceSpan, len(body.Symbol), now)
 	window := state.windowFor(frame.LaneID)
 	recoverable, ok := window.addRepair(body.BasePacketID, body.Key, int(body.SourceSpan), body.Symbol)
-	state.observeQoS(frame.LaneID, otherTransportKind(leg.Kind), now)
+	state.observeQoS(frame.LaneID, now)
 	statuses := state.takeQoSStatuses()
 	state.mu.Unlock()
 	if err := o.reportQoS(ctx, frame.SessionID, frame.LaneID, statuses); err != nil {
@@ -472,7 +477,7 @@ func (o *Recv) maybeRecover(ctx context.Context, sessionID uint64, laneID uint8,
 	}
 	state.mu.Lock()
 	if !state.closed {
-		state.observeQoSRecovery(laneID, uint64(len(pkt.Payload)), time.Now())
+		state.observeQoSRecovery(laneID, recoverable.basePacketID, uint64(len(pkt.Payload)), time.Now())
 	}
 	statuses := state.takeQoSStatuses()
 	state.mu.Unlock()
@@ -594,14 +599,15 @@ func (o *Recv) recvState(sessionID uint64) *recvState {
 func (o *Recv) closeRecvState(sessionID uint64, session *sessionpkg.Session) {
 	o.statesMu.Lock()
 	if session == nil {
-		session, _ = o.manager.Get(sessionID)
+		session, _ = o.manager.GetOrDelete(sessionID)
+	} else {
+		o.manager.Delete(sessionID)
 	}
 	var state *recvState
 	if session != nil {
 		state = o.states[session]
 		delete(o.states, session)
 	}
-	o.manager.Delete(sessionID)
 	o.statesMu.Unlock()
 	if state == nil {
 		return

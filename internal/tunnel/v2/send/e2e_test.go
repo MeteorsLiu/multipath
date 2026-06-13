@@ -73,6 +73,34 @@ func (f *fakeStreamTransport) closedConn(connID string) bool {
 	return false
 }
 
+type blockingCloseStreamTransport struct {
+	closeStarted chan struct{}
+	releaseClose chan struct{}
+}
+
+func (f *blockingCloseStreamTransport) Run(ctx context.Context, writer transport.PacketWriter) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (f *blockingCloseStreamTransport) Dial(ctx context.Context, remote string) (transport.LegRef, error) {
+	return e2eTCP(remote), nil
+}
+
+func (f *blockingCloseStreamTransport) Write(ctx context.Context, connID string, payload []byte) (int, error) {
+	return len(payload), nil
+}
+
+func (f *blockingCloseStreamTransport) Close(ctx context.Context, connID string) error {
+	close(f.closeStarted)
+	select {
+	case <-f.releaseClose:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return nil
+}
+
 // makeIPv4 builds a minimal valid IPv4 packet of totalLen bytes; byte 20 encodes
 // id so recovered packets are identifiable.
 func makeIPv4(id byte, totalLen int) []byte {
@@ -185,6 +213,7 @@ func TestBootstrapHelloAdvertisesLinkStatusOnlyWithFEC(t *testing.T) {
 	if err := s.Bootstrap(ctx); err != nil {
 		t.Fatalf("bootstrap: %v", err)
 	}
+	_ = drainSendFrames(t, s)
 	sessionID, ok := s.activeSession()
 	if !ok {
 		t.Fatal("no active session")
@@ -682,6 +711,66 @@ func TestRebootstrapBuildsFreshSession(t *testing.T) {
 	}
 }
 
+func TestRebootstrapSerializesConcurrentCalls(t *testing.T) {
+	sessions := &sessionpkg.Manager{}
+	s := New(Config{
+		SessionManager: sessions,
+		BootstrapLanes: []BootstrapLane{{LaneID: 1, Weight: 100, Leg: e2eUDP()}},
+		ProbeInterval:  time.Hour,
+		ProbeTimeout:   time.Hour,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := s.Bootstrap(ctx); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+
+	const workers = 8
+	start := make(chan struct{})
+	done := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			<-start
+			done <- s.Rebootstrap()
+		}()
+	}
+	close(start)
+	for i := 0; i < workers; i++ {
+		if err := <-done; err != nil {
+			t.Fatalf("rebootstrap failed: %v", err)
+		}
+	}
+
+	active, ok := s.activeSession()
+	if !ok {
+		t.Fatal("no active session after concurrent rebootstrap")
+	}
+	seenActive := false
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		select {
+		case payload := <-s.Packets():
+			frame, err := protocol.Decode(payload.Packet.Payload)
+			payload.Packet.Release()
+			if err == nil && frame.Type == protocol.TypeHELLO {
+				if frame.SessionID == active {
+					seenActive = true
+					continue
+				}
+				if _, known := sessions.Get(frame.SessionID); known {
+					t.Fatalf("stale rebootstrap session %d remains known; active=%d", frame.SessionID, active)
+				}
+			}
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	if !seenActive {
+		t.Fatal("did not observe HELLO for active session")
+	}
+}
+
 // TestRebootstrapServerSideNoOp verifies that an end with no bootstrap lanes
 // (server) does not rebuild on Rebootstrap — it awaits the peer's fresh HELLO.
 func TestRebootstrapServerSideNoOp(t *testing.T) {
@@ -758,6 +847,291 @@ func TestAcceptedHelloAckPassivelyAdmitsServerLane(t *testing.T) {
 	}
 	if !sawData {
 		t.Fatal("expected DATA after passive admission")
+	}
+}
+
+func TestStartLanePingIsIdempotentForSameLeg(t *testing.T) {
+	sessions := &sessionpkg.Manager{}
+	s := New(Config{
+		SessionManager: sessions,
+		ProbeInterval:  time.Hour,
+		ProbeTimeout:   time.Hour,
+	})
+
+	const sessionID = uint64(91)
+	const laneID = uint8(2)
+	if _, ok := sessions.GetOrCreate(sessionID); !ok {
+		t.Fatal("failed to create session")
+	}
+	lane := newLaneRuntime(laneID, 1)
+	leg := e2eUDP()
+	lane.bindUDP(leg)
+	s.lanesMu.Lock()
+	s.lanes[laneKey{sessionID: sessionID, laneID: laneID}] = lane
+	s.lanesMu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	for i := 0; i < 8; i++ {
+		s.startLanePing(ctx, sessionID, lane, leg)
+	}
+
+	deadline := time.After(500 * time.Millisecond)
+	pingFrames := 0
+	for pingFrames == 0 {
+		select {
+		case payload := <-s.Packets():
+			frame, err := protocol.Decode(payload.Packet.Payload)
+			payload.Packet.Release()
+			if err != nil {
+				t.Fatalf("decode sent frame: %v", err)
+			}
+			if frame.Type == protocol.TypePING {
+				pingFrames++
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for initial ping")
+		}
+	}
+
+	quiet := time.NewTimer(50 * time.Millisecond)
+	defer quiet.Stop()
+	for {
+		select {
+		case payload := <-s.Packets():
+			frame, err := protocol.Decode(payload.Packet.Payload)
+			payload.Packet.Release()
+			if err != nil {
+				t.Fatalf("decode sent frame: %v", err)
+			}
+			if frame.Type == protocol.TypePING {
+				pingFrames++
+			}
+		case <-quiet.C:
+			if pingFrames != 1 {
+				t.Fatalf("duplicate ping loops started: got %d initial PING frames, want 1", pingFrames)
+			}
+			return
+		}
+	}
+}
+
+func TestStartBwSchedulerIsIdempotent(t *testing.T) {
+	s := New(Config{
+		EnableBandwidthProbe: true,
+	})
+
+	const sessionID = uint64(92)
+	const laneID = uint8(3)
+	lane := newLaneRuntime(laneID, 1)
+	lane.bindUDP(e2eUDP())
+	s.lanesMu.Lock()
+	s.lanes[laneKey{sessionID: sessionID, laneID: laneID}] = lane
+	s.lanesMu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s.startBwScheduler(ctx, sessionID)
+	if s.bwSched == nil {
+		t.Fatal("bandwidth scheduler was not started")
+	}
+	first := s.bwSched
+
+	for i := 0; i < 8; i++ {
+		s.startBwScheduler(ctx, sessionID)
+	}
+	if s.bwSched != first {
+		t.Fatal("duplicate bandwidth scheduler start replaced the active scheduler")
+	}
+}
+
+func TestConcurrentPassiveAdmissionsLeaveOnlyActiveSessionState(t *testing.T) {
+	sessions := &sessionpkg.Manager{}
+	s := New(Config{
+		SessionManager: sessions,
+		ProbeInterval:  time.Hour,
+		ProbeTimeout:   time.Hour,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	const calls = 64
+	var wg sync.WaitGroup
+	wg.Add(calls)
+	for i := 0; i < calls; i++ {
+		sessionID := uint64(1000 + i)
+		if _, ok := sessions.GetOrCreate(sessionID); !ok {
+			t.Fatalf("failed to create session %d", sessionID)
+		}
+		go func(sessionID uint64) {
+			defer wg.Done()
+			ack := protocol.Frame{
+				Version:   protocol.Version,
+				Type:      protocol.TypeHELLOACK,
+				SessionID: sessionID,
+				LaneID:    1,
+				Body: protocol.HelloAckBody{
+					Nonce:    1,
+					Accepted: 1,
+				},
+			}
+			if err := s.WriteFrame(ctx, ack, e2eUDP()); err != nil {
+				t.Errorf("WriteFrame HELLO_ACK session=%d: %v", sessionID, err)
+			}
+		}(sessionID)
+	}
+	wg.Wait()
+
+	active, ok := s.activeSession()
+	if !ok {
+		t.Fatal("no active session after passive admissions")
+	}
+	s.lanesMu.RLock()
+	laneSessions := make(map[uint64]struct{})
+	for key := range s.lanes {
+		laneSessions[key.sessionID] = struct{}{}
+	}
+	s.lanesMu.RUnlock()
+	if len(laneSessions) != 1 {
+		t.Fatalf("passive admissions left %d session lane sets, want 1: %#v", len(laneSessions), laneSessions)
+	}
+	if _, ok := laneSessions[active]; !ok {
+		t.Fatalf("only lane session does not match active session %d: %#v", active, laneSessions)
+	}
+
+	s.sendStatesMu.RLock()
+	sendStates := make(map[uint64]struct{})
+	for sessionID := range s.sendStates {
+		sendStates[sessionID] = struct{}{}
+	}
+	s.sendStatesMu.RUnlock()
+	if len(sendStates) != 1 {
+		t.Fatalf("passive admissions left %d send states, want 1: %#v", len(sendStates), sendStates)
+	}
+	if _, ok := sendStates[active]; !ok {
+		t.Fatalf("only send state does not match active session %d: %#v", active, sendStates)
+	}
+}
+
+func TestBandwidthSchedulerTeardownCanRaceWithRemoteComplete(t *testing.T) {
+	sessions := &sessionpkg.Manager{}
+	s := New(Config{
+		SessionManager:       sessions,
+		EnableBandwidthProbe: true,
+	})
+
+	const sessionID = uint64(93)
+	const laneID = uint8(1)
+	if _, ok := sessions.GetOrCreate(sessionID); !ok {
+		t.Fatal("failed to create session")
+	}
+	s.activateSession(sessionID)
+	lane := newLaneRuntime(laneID, 1)
+	leg := e2eUDP()
+	lane.bindUDP(leg)
+	s.lanesMu.Lock()
+	s.lanes[laneKey{sessionID: sessionID, laneID: laneID}] = lane
+	s.lanesMu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.startBwScheduler(ctx, sessionID)
+	if s.bwSched == nil {
+		t.Fatal("bandwidth scheduler was not started")
+	}
+
+	key := KeyForLeg(sessionID, laneID, leg)
+	start := make(chan struct{})
+	done := make(chan struct{}, 2)
+	go func() {
+		<-start
+		for i := 0; i < 1000; i++ {
+			s.LaneManager().RemoteComplete(key)
+		}
+		done <- struct{}{}
+	}()
+	go func() {
+		<-start
+		for i := 0; i < 1000; i++ {
+			s.teardownSession(sessionID)
+			s.activateSession(sessionID)
+			s.startBwScheduler(ctx, sessionID)
+		}
+		done <- struct{}{}
+	}()
+	close(start)
+	<-done
+	<-done
+}
+
+func TestCloseSessionDoesNotResetNewPassiveAdmission(t *testing.T) {
+	sessions := &sessionpkg.Manager{}
+	stream := &blockingCloseStreamTransport{
+		closeStarted: make(chan struct{}),
+		releaseClose: make(chan struct{}),
+	}
+	s := New(Config{
+		SessionManager:  sessions,
+		StreamTransport: stream,
+		ProbeInterval:   time.Hour,
+		ProbeTimeout:    time.Hour,
+	})
+
+	const oldSessionID = uint64(94)
+	const newSessionID = uint64(95)
+	const laneID = uint8(1)
+	if _, ok := sessions.GetOrCreate(oldSessionID); !ok {
+		t.Fatal("failed to create old session")
+	}
+	if _, ok := sessions.GetOrCreate(newSessionID); !ok {
+		t.Fatal("failed to create new session")
+	}
+	s.activateSession(oldSessionID)
+	oldLane := newLaneRuntime(laneID, 1)
+	oldLane.bindUDP(e2eUDP())
+	oldLane.bindTCP(e2eTCP("old-tcp"))
+	s.lanesMu.Lock()
+	s.lanes[laneKey{sessionID: oldSessionID, laneID: laneID}] = oldLane
+	s.lanesMu.Unlock()
+	s.registerLaneQoS(oldSessionID, oldLane)
+	s.startLanePing(context.Background(), oldSessionID, oldLane, e2eUDP())
+
+	doneClose := make(chan struct{})
+	go func() {
+		s.CloseSession(oldSessionID)
+		close(doneClose)
+	}()
+	<-stream.closeStarted
+
+	ack := protocol.Frame{
+		Version:   protocol.Version,
+		Type:      protocol.TypeHELLOACK,
+		SessionID: newSessionID,
+		LaneID:    laneID,
+		Body: protocol.HelloAckBody{
+			Nonce:    1,
+			Accepted: 1,
+		},
+	}
+	if err := s.WriteFrame(context.Background(), ack, e2eUDP()); err != nil {
+		t.Fatalf("passive admission while close is blocked: %v", err)
+	}
+
+	close(stream.releaseClose)
+	<-doneClose
+
+	if active, ok := s.activeSession(); !ok || active != newSessionID {
+		t.Fatalf("active session = %d/%v, want new session %d", active, ok, newSessionID)
+	}
+	if s.getLane(laneKey{sessionID: newSessionID, laneID: laneID}) == nil {
+		t.Fatal("new passive lane was removed by old CloseSession")
+	}
+	if s.LaneManager().LookupPing(KeyForLeg(newSessionID, laneID, e2eUDP())) == nil {
+		t.Fatal("new passive ping registration was reset by old CloseSession")
+	}
+	if s.LaneManager().LookupQoS(LaneKey{SessionID: newSessionID, LaneID: laneID}) == nil {
+		t.Fatal("new passive QoS registration was reset by old CloseSession")
 	}
 }
 

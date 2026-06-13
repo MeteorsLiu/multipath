@@ -80,7 +80,7 @@ Important constraints:
 - Session exposes only `Manager`, `Session`, `Hello`, and `View` with the
   interface in `docs/architecture.md`.
 - Manager only owns session lifetime and creation admission:
-  `Get`, `Create`, `GetOrCreate`, and `Delete`.
+  `Get`, `Create`, `GetOrCreate`, `GetOrDelete`, and `Delete`.
 - Session only owns session id, nonce, and HELLO open/ack/retry state:
   `Open`, `Ack`, and `Do`.
 - Hello only exposes `Do` and `Ack`.

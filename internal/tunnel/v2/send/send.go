@@ -81,6 +81,7 @@ type Send struct {
 	// session's goroutines (Hello loop, ping, dialer, bwScheduler) before a
 	// rebuild so a forgotten session does not get resurrected by stale loops.
 	rebootMu      sync.Mutex
+	rebootstrapMu sync.Mutex
 	baseCtx       context.Context
 	sessionCtx    context.Context
 	sessionCancel context.CancelFunc
@@ -231,11 +232,7 @@ func (s *Send) Bootstrap(ctx context.Context) error {
 		return nil
 	}
 
-	// Remember the long-lived context so Rebootstrap can derive fresh per-session
-	// contexts from it after an unknown-session CLOSE.
-	s.rebootMu.Lock()
-	s.baseCtx = ctx
-	s.rebootMu.Unlock()
+	s.setBaseContext(ctx)
 
 	return s.bootstrapSession(ctx)
 }
@@ -248,10 +245,7 @@ func (s *Send) bootstrapSession(ctx context.Context) error {
 	// Derive a per-session context. Cancelling it tears down every goroutine this
 	// session starts, so a forgotten session is not resurrected by stale loops.
 	sessionCtx, cancel := context.WithCancel(ctx)
-	s.rebootMu.Lock()
-	s.sessionCtx = sessionCtx
-	s.sessionCancel = cancel
-	s.rebootMu.Unlock()
+	s.setSessionContext(sessionCtx, cancel)
 
 	// Create local session
 	session, err := sessionpkg.New()
@@ -348,19 +342,54 @@ func (s *Send) Rebootstrap() error {
 		return nil // server side: nothing to drive; await the peer's new HELLO.
 	}
 
-	s.rebootMu.Lock()
-	baseCtx := s.baseCtx
-	s.rebootMu.Unlock()
+	s.rebootstrapMu.Lock()
+
+	baseCtx := s.getBaseContext()
 	if baseCtx == nil {
+		s.rebootstrapMu.Unlock()
 		return nil // never bootstrapped; nothing to rebuild.
 	}
 
 	// 1+2. Tear down the old session (cancel goroutines + clear all per-session
 	// state), then 3. build a fresh session from the long-lived base context.
 	oldSessionID, _ := s.activeSession()
-	s.teardownSession(oldSessionID)
+	closedTCP := s.teardownSession(oldSessionID)
 	debuglog.Printf("send", "rebootstrap old_session=%d", oldSessionID)
-	return s.bootstrapSession(baseCtx)
+	err := s.bootstrapSession(baseCtx)
+	s.rebootstrapMu.Unlock()
+	s.closeTCPRefs(closedTCP)
+	return err
+}
+
+func (s *Send) setBaseContext(ctx context.Context) {
+	s.rebootMu.Lock()
+	s.baseCtx = ctx
+	s.rebootMu.Unlock()
+}
+
+func (s *Send) getBaseContext() context.Context {
+	s.rebootMu.Lock()
+	defer s.rebootMu.Unlock()
+	return s.baseCtx
+}
+
+func (s *Send) setSessionContext(ctx context.Context, cancel context.CancelFunc) {
+	s.rebootMu.Lock()
+	s.sessionCtx = ctx
+	s.sessionCancel = cancel
+	s.rebootMu.Unlock()
+}
+
+func (s *Send) getBwScheduler() *bwScheduler {
+	s.rebootMu.Lock()
+	defer s.rebootMu.Unlock()
+	return s.bwSched
+}
+
+func (s *Send) setBwScheduler(sched *bwScheduler) {
+	s.rebootMu.Lock()
+	s.bwSched = sched
+	s.rebootMu.Unlock()
 }
 
 // teardownSession cancels the current session's goroutines (Hello loop, ping,
@@ -368,7 +397,7 @@ func (s *Send) Rebootstrap() error {
 // strategies, runnableCache, LaneManager pings/BwLoops, bwScheduler). It bounds
 // memory under session churn (spec 7: 重启→重连 自愈 and plain session CLOSE).
 // Idempotent: a second call for an already-cleared session is a no-op.
-func (s *Send) teardownSession(sessionID uint64) {
+func (s *Send) teardownSession(sessionID uint64) []transport.LegRef {
 	// Cancel the session's goroutines so stale loops cannot resurrect it.
 	s.rebootMu.Lock()
 	cancel := s.sessionCancel
@@ -399,11 +428,6 @@ func (s *Send) teardownSession(sessionID uint64) {
 		}
 	}
 	s.lanesMu.Unlock()
-	if s.streamTransport != nil {
-		for _, ref := range closedTCP {
-			_ = s.streamTransport.Close(context.Background(), ref.ConnID)
-		}
-	}
 
 	s.strategiesMu.Lock()
 	delete(s.strategies, sessionID)
@@ -418,7 +442,17 @@ func (s *Send) teardownSession(sessionID uint64) {
 	s.runnableCacheMu.Unlock()
 
 	s.laneManager.Reset()
-	s.bwSched = nil
+	s.setBwScheduler(nil)
+	return closedTCP
+}
+
+func (s *Send) closeTCPRefs(refs []transport.LegRef) {
+	if s.streamTransport == nil {
+		return
+	}
+	for _, ref := range refs {
+		_ = s.streamTransport.Close(context.Background(), ref.ConnID)
+	}
 }
 
 // CloseSession tears down a session on a plain session-scope CLOSE (spec 7). It
@@ -426,10 +460,14 @@ func (s *Send) teardownSession(sessionID uint64) {
 // session WITHOUT the UnknownSession reason (which instead triggers Rebootstrap).
 // Only acts on the session this end currently holds.
 func (s *Send) CloseSession(sessionID uint64) {
+	s.rebootstrapMu.Lock()
 	if active, ok := s.activeSession(); !ok || active != sessionID {
+		s.rebootstrapMu.Unlock()
 		return
 	}
-	s.teardownSession(sessionID)
+	closedTCP := s.teardownSession(sessionID)
+	s.rebootstrapMu.Unlock()
+	s.closeTCPRefs(closedTCP)
 	debuglog.Printf("send", "close_session session=%d", sessionID)
 }
 
@@ -556,7 +594,8 @@ func (s *Send) admitPassiveHelloAck(ctx context.Context, frame protocol.Frame, l
 		return
 	}
 
-	sessionCtx := s.ensurePassiveSessionContext(ctx, frame.SessionID)
+	s.rebootstrapMu.Lock()
+	sessionCtx, closedTCP := s.ensurePassiveSessionContext(ctx, frame.SessionID)
 
 	s.sendStatesMu.Lock()
 	if s.sendStates[frame.SessionID] == nil {
@@ -594,9 +633,9 @@ func (s *Send) admitPassiveHelloAck(ctx context.Context, frame protocol.Frame, l
 	}
 	s.activateSession(frame.SessionID)
 	s.markRunnableLanesDirty(frame.SessionID)
-	if s.enableBW && s.bwSched == nil {
-		s.startBwScheduler(sessionCtx, frame.SessionID)
-	}
+	s.startBwScheduler(sessionCtx, frame.SessionID)
+	s.rebootstrapMu.Unlock()
+	s.closeTCPRefs(closedTCP)
 }
 
 func (s *Send) registerLaneQoS(sessionID uint64, lane *laneRuntime) {
@@ -606,24 +645,25 @@ func (s *Send) registerLaneQoS(sessionID uint64, lane *laneRuntime) {
 	s.laneManager.RegisterQoS(LaneKey{SessionID: sessionID, LaneID: lane.id}, laneQoSInput{lane: lane})
 }
 
-func (s *Send) ensurePassiveSessionContext(ctx context.Context, sessionID uint64) context.Context {
+func (s *Send) ensurePassiveSessionContext(ctx context.Context, sessionID uint64) (context.Context, []transport.LegRef) {
 	s.rebootMu.Lock()
 	defer s.rebootMu.Unlock()
 	if active, ok := s.activeSession(); ok && active == sessionID && s.sessionCancel != nil {
 		if s.sessionCtx != nil {
-			return s.sessionCtx
+			return s.sessionCtx, nil
 		}
-		return ctx
+		return ctx, nil
 	}
+	var closedTCP []transport.LegRef
 	if active, ok := s.activeSession(); ok && active != sessionID {
 		s.rebootMu.Unlock()
-		s.teardownSession(active)
+		closedTCP = s.teardownSession(active)
 		s.rebootMu.Lock()
 	}
 	sessionCtx, cancel := context.WithCancel(ctx)
 	s.sessionCtx = sessionCtx
 	s.sessionCancel = cancel
-	return sessionCtx
+	return sessionCtx, closedTCP
 }
 
 // WriteTo enqueues a transport payload.
@@ -1017,7 +1057,9 @@ func (s *Send) startLanePing(ctx context.Context, sessionID uint64, lane *laneRu
 	})
 
 	key := KeyForLeg(sessionID, laneID, legRef)
-	s.laneManager.RegisterPing(key, p)
+	if !s.laneManager.registerPingIfAbsent(key, p) {
+		return
+	}
 
 	go func() {
 		if err := p.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
@@ -1079,6 +1121,12 @@ func (s *Send) startBwScheduler(ctx context.Context, sessionID uint64) {
 	if !s.enableBW {
 		return
 	}
+	s.rebootMu.Lock()
+	if s.bwSched != nil {
+		s.rebootMu.Unlock()
+		return
+	}
+	s.rebootMu.Unlock()
 
 	snapshot := func() []bwTarget {
 		s.lanesMu.RLock()
@@ -1126,8 +1174,8 @@ func (s *Send) startBwScheduler(ctx context.Context, sessionID uint64) {
 				if l := loopPtr.Load(); l != nil {
 					s.laneManager.DeleteBwLoop(l.TrainID())
 				}
-				if s.bwSched != nil {
-					s.bwSched.advanceAfterLocal(t.key)
+				if sched := s.getBwScheduler(); sched != nil {
+					sched.advanceAfterLocal(t.key)
 				}
 				debuglog.Printf("send/bw", "sample session=%d lane=%d kind=%d bps=%d loss=%.3f",
 					sessionID, t.laneID, t.kind, sample.BandwidthBps, sample.Loss)
@@ -1150,11 +1198,18 @@ func (s *Send) startBwScheduler(ctx context.Context, sessionID uint64) {
 		return lane.leg.srtt(t.kind) * 8
 	}
 
-	s.bwSched = newBwScheduler(s.isClient, s.bwCapBps, snapshot, newLoop, timeout)
+	sched := newBwScheduler(s.isClient, s.bwCapBps, snapshot, newLoop, timeout)
+	s.rebootMu.Lock()
+	if s.bwSched != nil {
+		s.rebootMu.Unlock()
+		return
+	}
+	s.bwSched = sched
 	s.laneManager.SetRemoteComplete(func(key LegKey) {
-		if s.bwSched != nil {
-			s.bwSched.advanceAfterRemote(key)
+		if sched := s.getBwScheduler(); sched != nil {
+			sched.advanceAfterRemote(key)
 		}
 	})
-	go s.bwSched.Start(ctx)
+	s.rebootMu.Unlock()
+	go sched.Start(ctx)
 }

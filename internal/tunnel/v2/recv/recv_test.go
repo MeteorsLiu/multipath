@@ -141,7 +141,7 @@ func TestRecvKeepsDATAAndREPAIROutOfHandler(t *testing.T) {
 	}
 }
 
-func TestRecvDuplicateDATADroppedAndNotAccounted(t *testing.T) {
+func TestRecvDuplicateDATAIsAccountedButNotEmitted(t *testing.T) {
 	var manager session.Manager
 	if _, ok := manager.Create(7); !ok {
 		t.Fatal("Create session failed")
@@ -168,17 +168,19 @@ func TestRecvDuplicateDATADroppedAndNotAccounted(t *testing.T) {
 	}
 	assertNoRecvPacket(t, out)
 
-	// Accounting: DATA on UDP counted exactly once (duplicate not counted).
+	// Accounting tracks wire delivery before DATA dedupe, so the duplicate is
+	// counted even though it was not emitted to TUN or inserted into the FEC
+	// window again.
 	st := out.statsForTest(7, 1)
 	if st == nil {
 		t.Fatal("missing lane stats")
 	}
 	got := st.arrival(transport.KindUDP, catData)
-	if got.count != 1 {
-		t.Errorf("DATA count = %d, want 1 (duplicate must not be accounted)", got.count)
+	if got.count != 2 {
+		t.Errorf("DATA count = %d, want 2 (duplicate must be accounted as wire arrival)", got.count)
 	}
-	if got.bytes != uint64(len("packet")) {
-		t.Errorf("DATA bytes = %d, want %d", got.bytes, len("packet"))
+	if got.bytes != uint64(2*len("packet")) {
+		t.Errorf("DATA bytes = %d, want %d", got.bytes, 2*len("packet"))
 	}
 }
 
@@ -344,6 +346,43 @@ func TestRecvReportsQoSStatusThroughCallback(t *testing.T) {
 	}
 	if statuses[0].SessionID != 10 || statuses[0].LaneID != 1 || statuses[0].Kind != transport.KindUDP || statuses[0].Reason != protocol.LinkStatusReasonLimited {
 		t.Fatalf("status = %+v, want UDP limited for session 10 lane 1", statuses[0])
+	}
+}
+
+func TestRecvCloseStateConsumesSessionOnce(t *testing.T) {
+	var manager session.Manager
+	sess, ok := manager.Create(12)
+	if !ok {
+		t.Fatal("Create session failed")
+	}
+	out := New(Config{SessionManager: &manager})
+	if st := out.recvState(12); st == nil {
+		t.Fatal("missing recv state")
+	}
+
+	const workers = 16
+	start := make(chan struct{})
+	done := make(chan struct{}, workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			<-start
+			out.closeRecvState(12, sess)
+			done <- struct{}{}
+		}()
+	}
+	close(start)
+	for i := 0; i < workers; i++ {
+		<-done
+	}
+
+	if _, known := manager.Get(12); known {
+		t.Fatal("session survived concurrent closeRecvState")
+	}
+	out.statesMu.RLock()
+	_, exists := out.states[sess]
+	out.statesMu.RUnlock()
+	if exists {
+		t.Fatal("recv state survived concurrent closeRecvState")
 	}
 }
 
