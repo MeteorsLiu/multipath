@@ -97,6 +97,9 @@ func (h *RecvHandler) OnHello(ctx context.Context, leg transport.LegRef, frame p
 	fecProfile := protocol.FECProfileOff
 	if h.send.FECEnabled() && body.Caps&protocol.CapFEC != 0 && body.FECProfile == protocol.FECProfileSLC4Plus1 {
 		caps = protocol.CapFEC
+		if body.Caps&protocol.CapLinkStatus != 0 {
+			caps |= protocol.CapLinkStatus
+		}
 		fecProfile = protocol.FECProfileSLC4Plus1
 	}
 

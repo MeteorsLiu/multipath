@@ -93,6 +93,39 @@ func TestRecvHandlerOnHelloRepliesWithHelloAckThroughSession(t *testing.T) {
 	}
 }
 
+func TestRecvHandlerOnHelloNegotiatesLinkStatusWithFEC(t *testing.T) {
+	s := send.New()
+	s.EnableFEC()
+	sessions := &sessionpkg.Manager{}
+	handler := NewRecvHandler(s, sessions)
+	leg := transport.LegRef{Kind: transport.KindUDP, EndpointID: "ep", RemoteAddr: &testAddr{addr: "127.0.0.1:9000"}}
+	frame := protocol.Frame{
+		Version:   protocol.Version,
+		Type:      protocol.TypeHELLO,
+		SessionID: 44,
+		LaneID:    1,
+		Body: protocol.HelloBody{
+			Nonce:      9,
+			Caps:       protocol.CapFEC | protocol.CapLinkStatus,
+			FECProfile: protocol.FECProfileSLC4Plus1,
+		},
+	}
+	if err := handler.OnHello(context.Background(), leg, frame); err != nil {
+		t.Fatalf("OnHello: %v", err)
+	}
+	payload := <-s.Packets()
+	defer payload.Packet.Release()
+	decoded, err := protocol.Decode(payload.Packet.Payload)
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	body := decoded.Body.(protocol.HelloAckBody)
+	want := protocol.CapFEC | protocol.CapLinkStatus
+	if body.Caps != want {
+		t.Fatalf("ACK caps = %#x, want %#x", body.Caps, want)
+	}
+}
+
 func TestRecvHandlerOnHelloAckAcceptsNonceBeforeLaneStateUpdate(t *testing.T) {
 	s := send.New()
 	sessions := &sessionpkg.Manager{}

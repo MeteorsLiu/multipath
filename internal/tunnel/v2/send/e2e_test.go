@@ -132,7 +132,7 @@ func TestBootstrapHelloAdvertisesFECOnlyWhenEnabled(t *testing.T) {
 		{
 			name:        "enabled",
 			enableFEC:   true,
-			wantCaps:    protocol.CapFEC,
+			wantCaps:    protocol.CapFEC | protocol.CapLinkStatus,
 			wantProfile: protocol.FECProfileSLC4Plus1,
 		},
 	}
@@ -168,6 +168,31 @@ func TestBootstrapHelloAdvertisesFECOnlyWhenEnabled(t *testing.T) {
 				t.Fatalf("HELLO FEC profile = %d, want %d", hello.FECProfile, tt.wantProfile)
 			}
 		})
+	}
+}
+
+func TestBootstrapHelloAdvertisesLinkStatusOnlyWithFEC(t *testing.T) {
+	sessions := &sessionpkg.Manager{}
+	s := New(Config{
+		SessionManager: sessions,
+		BootstrapLanes: []BootstrapLane{{LaneID: 1, Weight: 100, Leg: e2eUDP()}},
+		ProbeInterval:  time.Hour,
+		ProbeTimeout:   time.Hour,
+	})
+	s.EnableFEC()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := s.Bootstrap(ctx); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	sessionID, ok := s.activeSession()
+	if !ok {
+		t.Fatal("no active session")
+	}
+	hello := waitForHello(t, s, sessionID, 1)
+	want := protocol.CapFEC | protocol.CapLinkStatus
+	if hello.Caps != want {
+		t.Fatalf("HELLO caps = %#x, want %#x", hello.Caps, want)
 	}
 }
 

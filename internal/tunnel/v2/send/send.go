@@ -440,7 +440,7 @@ func (s *Send) openLaneHello(ctx context.Context, session *sessionpkg.Session, s
 		caps := uint16(0)
 		fecProfile := protocol.FECProfileOff
 		if s.FECEnabled() {
-			caps = protocol.CapFEC
+			caps = protocol.CapFEC | protocol.CapLinkStatus
 			fecProfile = protocol.FECProfileSLC4Plus1
 		}
 		frame := protocol.Frame{
