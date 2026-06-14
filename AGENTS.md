@@ -19,6 +19,14 @@ This project is a TUN-based multipath tunnel. It carries complete IP packets
 between TUN interfaces across multiple independently scheduled lanes. It is not
 an end-to-end reliable transport protocol.
 
+FEC exists to reduce loss recovery latency for upper-layer reliable protocols
+carried inside the layer-3 tunnel. Those protocols can eventually recover with
+their own ARQ, but the tunnel sees that recovery only after a larger end-to-end
+delay. FEC should opportunistically repair recoverable packet loss before that
+upper-layer ARQ delay is paid; it must not turn the tunnel into a fully reliable
+transport, add tunnel-level retransmission semantics, or chase unrecoverable loss
+with reliability machinery.
+
 Do not reduce this project to a single-path transport with a global UDP/TCP
 fallback. Multiple lanes may be active at the same time, and the scheduler
 distributes TUN packets across runnable lanes.

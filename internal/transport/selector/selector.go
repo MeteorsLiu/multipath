@@ -30,6 +30,7 @@ type Selector interface {
 const (
 	minUDPDelivery = 0.80
 	minTCPDelivery = 0.90
+	minUDPJitter   = 10 * time.Millisecond
 
 	QoSReasonLimited    uint8 = 1
 	QoSReasonBacklogged uint8 = 2
@@ -93,7 +94,7 @@ func (s *QualitySelector) Pick(udp, tcp Quality) (useUDP bool, ok bool) {
 		return false, true
 	}
 	// 4. UDP RTT variance too high & TCP healthy → TCP.
-	if udp.RTTVariance > 0 && udp.RTTVariance >= udp.SmoothedRTT &&
+	if udp.RTTVariance >= minUDPJitter && udp.RTTVariance >= udp.SmoothedRTT &&
 		tcp.DeliveryRate >= minTCPDelivery {
 		s.recordPick(false, now)
 		return false, true

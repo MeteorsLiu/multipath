@@ -141,7 +141,7 @@ func TestRecvKeepsDATAAndREPAIROutOfHandler(t *testing.T) {
 	}
 }
 
-func TestRecvDuplicateDATAIsAccountedButNotEmitted(t *testing.T) {
+func TestRecvDuplicateDATAIsNotEmittedOrInsertedIntoWindow(t *testing.T) {
 	var manager session.Manager
 	if _, ok := manager.Create(7); !ok {
 		t.Fatal("Create session failed")
@@ -168,19 +168,19 @@ func TestRecvDuplicateDATAIsAccountedButNotEmitted(t *testing.T) {
 	}
 	assertNoRecvPacket(t, out)
 
-	// Accounting tracks wire delivery before DATA dedupe, so the duplicate is
-	// counted even though it was not emitted to TUN or inserted into the FEC
-	// window again.
-	st := out.statsForTest(7, 1)
+	st := out.recvState(7)
 	if st == nil {
-		t.Fatal("missing lane stats")
+		t.Fatal("missing recv state")
 	}
-	got := st.arrival(transport.KindUDP, catData)
-	if got.count != 2 {
-		t.Errorf("DATA count = %d, want 2 (duplicate must be accounted as wire arrival)", got.count)
+	st.mu.Lock()
+	window := st.rxWindows[1]
+	var dataCount int
+	if window != nil {
+		dataCount = len(window.data)
 	}
-	if got.bytes != uint64(2*len("packet")) {
-		t.Errorf("DATA bytes = %d, want %d", got.bytes, 2*len("packet"))
+	st.mu.Unlock()
+	if dataCount != 1 {
+		t.Fatalf("window DATA entries = %d, want 1", dataCount)
 	}
 }
 
@@ -209,79 +209,6 @@ func TestRecvPerLaneWindowIsolation(t *testing.T) {
 	}
 	if lane2HasWindow {
 		t.Error("lane 2 should not have a window (no frame on it)")
-	}
-}
-
-func TestRecvAccountingByKindAndCategory(t *testing.T) {
-	var manager session.Manager
-	if _, ok := manager.Create(8); !ok {
-		t.Fatal("Create session failed")
-	}
-	out := New(Config{SessionManager: &manager})
-	ctx := context.Background()
-
-	// 3 DATA on UDP (lane 1), distinct packet ids.
-	for i := uint32(0); i < 3; i++ {
-		f := protocol.Frame{Type: protocol.TypeDATA, SessionID: 8, LaneID: 1, Body: protocol.DataBody{PacketID: i, Packet: []byte("dddd")}}
-		if err := out.WriteTo(ctx, udpLeg(), encodedTestFrame(t, f)); err != nil {
-			t.Fatalf("Write DATA %d: %v", i, err)
-		}
-		readRecvPacket(t, out).Release()
-	}
-	// 2 REPAIR on TCP (lane 1).
-	for i := uint32(0); i < 2; i++ {
-		f := protocol.Frame{Type: protocol.TypeREPAIR, SessionID: 8, LaneID: 1, Body: protocol.RepairBody{BasePacketID: i * 4, Key: uint16(i), SourceSpan: 4, Symbol: []byte("rr")}}
-		if err := out.WriteTo(ctx, tcpLeg(), encodedTestFrame(t, f)); err != nil {
-			t.Fatalf("Write REPAIR %d: %v", i, err)
-		}
-	}
-
-	st := out.statsForTest(8, 1)
-	if st == nil {
-		t.Fatal("missing lane stats")
-	}
-	if d := st.arrival(transport.KindUDP, catData); d.count != 3 || d.bytes != 12 {
-		t.Errorf("UDP DATA = %+v, want count=3 bytes=12", d)
-	}
-	if r := st.arrival(transport.KindTCP, catRepair); r.count != 2 || r.bytes != 4 {
-		t.Errorf("TCP REPAIR = %+v, want count=2 bytes=4", r)
-	}
-	// Cross cells stay zero.
-	if d := st.arrival(transport.KindTCP, catData); d.count != 0 {
-		t.Errorf("TCP DATA count = %d, want 0", d.count)
-	}
-}
-
-func TestRecvSingleTransportSameKind(t *testing.T) {
-	var manager session.Manager
-	if _, ok := manager.Create(9); !ok {
-		t.Fatal("Create session failed")
-	}
-	out := New(Config{SessionManager: &manager})
-	ctx := context.Background()
-
-	// Degraded lane: DATA and REPAIR both arrive on UDP.
-	data := protocol.Frame{Type: protocol.TypeDATA, SessionID: 9, LaneID: 1, Body: protocol.DataBody{PacketID: 0, Packet: []byte("dddd")}}
-	if err := out.WriteTo(ctx, udpLeg(), encodedTestFrame(t, data)); err != nil {
-		t.Fatalf("Write DATA: %v", err)
-	}
-	readRecvPacket(t, out).Release()
-	repair := protocol.Frame{Type: protocol.TypeREPAIR, SessionID: 9, LaneID: 1, Body: protocol.RepairBody{BasePacketID: 0, Key: 0, SourceSpan: 4, Symbol: []byte("rr")}}
-	if err := out.WriteTo(ctx, udpLeg(), encodedTestFrame(t, repair)); err != nil {
-		t.Fatalf("Write REPAIR: %v", err)
-	}
-
-	st := out.statsForTest(9, 1)
-	// Both categories landed on UDP (kind index 0); TCP cells empty -> the
-	// reserved single-transport precondition that QoS detection will check.
-	if st.arrival(transport.KindUDP, catData).count != 1 {
-		t.Error("UDP DATA count != 1")
-	}
-	if st.arrival(transport.KindUDP, catRepair).count != 1 {
-		t.Error("UDP REPAIR count != 1")
-	}
-	if st.arrival(transport.KindTCP, catData).count != 0 || st.arrival(transport.KindTCP, catRepair).count != 0 {
-		t.Error("TCP cells should be empty in single-UDP-transport case")
 	}
 }
 
@@ -396,15 +323,4 @@ func TestRecvDropsDataForUnknownSession(t *testing.T) {
 		t.Fatalf("Write DATA: %v", err)
 	}
 	assertNoRecvPacket(t, out)
-}
-
-// statsForTest exposes a lane's arrival ledger for white-box assertions.
-func (o *Recv) statsForTest(sessionID uint64, laneID uint8) *laneArrivalStats {
-	st := o.recvState(sessionID)
-	if st == nil {
-		return nil
-	}
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	return st.accounting[laneID]
 }

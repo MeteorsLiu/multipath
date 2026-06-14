@@ -10,7 +10,7 @@ import (
 
 const (
 	defaultQoSSustain     = 3 * time.Second
-	defaultQoSSampleFloor = 100
+	defaultQoSSampleFloor = 4
 	defaultQoSLagSlack    = 300 * time.Millisecond
 	defaultQoSRefresh     = time.Second
 
@@ -52,6 +52,7 @@ type qosEstimator struct {
 	backlogSince map[transport.Kind]time.Time
 	lagBaseline  map[transport.Kind]time.Duration
 	lastEmit     map[transport.Kind]map[uint8]time.Time
+	pending      map[transport.Kind]qosSample
 }
 
 func newQoSEstimator(cfg qosConfig, emit func(qosStatus)) *qosEstimator {
@@ -74,6 +75,7 @@ func newQoSEstimator(cfg qosConfig, emit func(qosStatus)) *qosEstimator {
 		backlogSince: make(map[transport.Kind]time.Time),
 		lagBaseline:  make(map[transport.Kind]time.Duration),
 		lastEmit:     make(map[transport.Kind]map[uint8]time.Time),
+		pending:      make(map[transport.Kind]qosSample),
 	}
 }
 
@@ -81,8 +83,8 @@ func (e *qosEstimator) Observe(sample qosSample) {
 	if !qosKnownKind(sample.DataKind) {
 		return
 	}
-	if sample.DataExpected < e.cfg.SampleFloor {
-		e.resetTransientState()
+	sample, ok := e.floorSample(sample)
+	if !ok {
 		return
 	}
 	for _, status := range e.evaluate(sample) {
@@ -90,6 +92,30 @@ func (e *qosEstimator) Observe(sample qosSample) {
 			e.emit(status)
 		}
 	}
+}
+
+func (e *qosEstimator) floorSample(sample qosSample) (qosSample, bool) {
+	if sample.DataExpected >= e.cfg.SampleFloor {
+		if pending, ok := e.pending[sample.DataKind]; ok && qosSamplesCompatible(pending, sample) {
+			delete(e.pending, sample.DataKind)
+			return mergeQoSSamples(pending, sample), true
+		}
+		delete(e.pending, sample.DataKind)
+		return sample, true
+	}
+
+	pending, ok := e.pending[sample.DataKind]
+	if !ok || !qosSamplesCompatible(pending, sample) || qosSampleGapTooLarge(pending, sample, e.cfg.Sustain) {
+		pending = sample
+	} else {
+		pending = mergeQoSSamples(pending, sample)
+	}
+	if pending.DataExpected < e.cfg.SampleFloor {
+		e.pending[sample.DataKind] = pending
+		return qosSample{}, false
+	}
+	delete(e.pending, sample.DataKind)
+	return pending, true
 }
 
 func (e *qosEstimator) evaluate(sample qosSample) []qosStatus {
@@ -196,6 +222,7 @@ func deliveredBps(bytes uint64, duration time.Duration) uint32 {
 func (e *qosEstimator) resetTransientState() {
 	clear(e.limitedSince)
 	clear(e.backlogSince)
+	clear(e.pending)
 }
 
 func (e *qosEstimator) hasPendingState() bool {
@@ -211,4 +238,52 @@ func otherTransportKind(kind transport.Kind) transport.Kind {
 		return transport.KindTCP
 	}
 	return transport.KindUDP
+}
+
+func qosSamplesCompatible(a, b qosSample) bool {
+	return a.DataKind == b.DataKind && a.RepairKind == b.RepairKind
+}
+
+func qosSampleGapTooLarge(a, b qosSample, maxGap time.Duration) bool {
+	if maxGap <= 0 || a.At.IsZero() || b.At.IsZero() {
+		return false
+	}
+	if b.At.Before(a.At) {
+		return true
+	}
+	return b.At.Sub(a.At) > maxGap
+}
+
+func mergeQoSSamples(a, b qosSample) qosSample {
+	start := qosSampleStart(a)
+	if bStart := qosSampleStart(b); start.IsZero() || (!bStart.IsZero() && bStart.Before(start)) {
+		start = bStart
+	}
+	end := a.At
+	if b.At.After(end) {
+		end = b.At
+	}
+	out := qosSample{
+		At:             end,
+		DataKind:       a.DataKind,
+		DataArrived:    a.DataArrived + b.DataArrived,
+		DataExpected:   a.DataExpected + b.DataExpected,
+		DataBytes:      a.DataBytes + b.DataBytes,
+		RecoveredBytes: a.RecoveredBytes + b.RecoveredBytes,
+		RepairKind:     a.RepairKind,
+		RepairBytes:    a.RepairBytes + b.RepairBytes,
+		Lag:            a.Lag,
+	}
+	if b.Lag > out.Lag {
+		out.Lag = b.Lag
+	}
+	out.Duration = sampleDuration(start, end)
+	return out
+}
+
+func qosSampleStart(sample qosSample) time.Time {
+	if sample.At.IsZero() || sample.Duration <= 0 {
+		return sample.At
+	}
+	return sample.At.Add(-sample.Duration)
 }

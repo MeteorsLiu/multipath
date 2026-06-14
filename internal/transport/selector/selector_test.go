@@ -50,6 +50,20 @@ func TestQualitySelectorFallsBackToTCPWhenUDPJitterHigh(t *testing.T) {
 	}
 }
 
+func TestQualitySelectorIgnoresTinyUDPJitter(t *testing.T) {
+	sel := QualitySelector{}
+	udp := Quality{Active: true, DeliveryRate: 0.95, SmoothedRTT: time.Millisecond, RTTVariance: time.Millisecond}
+	tcp := Quality{Active: true, DeliveryRate: 0.95, SmoothedRTT: 100 * time.Millisecond}
+
+	useUDP, ok := sel.Pick(udp, tcp)
+	if !ok {
+		t.Fatal("Pick returned false, want true")
+	}
+	if !useUDP {
+		t.Fatal("Pick returned TCP, want UDP for tiny absolute jitter")
+	}
+}
+
 // Rule 5 (PreferTCP cold-start lock): quality normal but PreferTCP set → TCP.
 func TestQualitySelectorHonorsPreferTCP(t *testing.T) {
 	sel := QualitySelector{}
