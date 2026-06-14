@@ -515,9 +515,7 @@ func (s *Send) openLaneHello(ctx context.Context, session *sessionpkg.Session, s
 		OnAck: func() {
 			lane.markActive(legRef.Kind)
 			s.markRunnableLanesDirty(sessionID)
-			if legRef.Kind == transport.KindTCP {
-				s.startBwScheduler(ctx, sessionID)
-			}
+			s.syncBwSchedulerAfterLegActive(ctx, sessionID)
 			debuglog.Printf("send", "hello_ack_active session=%d lane=%d kind=%d", sessionID, laneID, legRef.Kind)
 		},
 	}
@@ -540,6 +538,33 @@ func (s *Send) startBwSchedulerAtBootstrap() bool {
 		}
 	}
 	return true
+}
+
+func (s *Send) syncBwSchedulerAfterLegActive(ctx context.Context, sessionID uint64) {
+	if !s.enableBW || s.startBwSchedulerAtBootstrap() {
+		return
+	}
+	if !s.allBootstrapTCPActive(sessionID) {
+		return
+	}
+	s.startBwScheduler(ctx, sessionID)
+}
+
+func (s *Send) allBootstrapTCPActive(sessionID uint64) bool {
+	expectedTCP := false
+	s.lanesMu.RLock()
+	defer s.lanesMu.RUnlock()
+	for _, bl := range s.bootstrapLanes {
+		if bl.TCPRemote == "" {
+			continue
+		}
+		expectedTCP = true
+		lane := s.lanes[laneKey{sessionID: sessionID, laneID: bl.LaneID}]
+		if lane == nil || !lane.leg.isActive(transport.KindTCP) {
+			return false
+		}
+	}
+	return expectedTCP
 }
 
 // Write is the TUN DATA entry point (spec 6.1).
