@@ -142,6 +142,7 @@ func New(configs ...Config) *Send {
 	if s.laneManager == nil {
 		s.laneManager = NewLaneManager()
 	}
+	s.installBandwidthRemoteProbe()
 
 	return s
 }
@@ -632,7 +633,6 @@ func (s *Send) admitPassiveHelloAck(ctx context.Context, frame protocol.Frame, l
 	}
 	s.activateSession(frame.SessionID)
 	s.markRunnableLanesDirty(frame.SessionID)
-	s.startBwScheduler(sessionCtx, frame.SessionID)
 	s.rebootstrapMu.Unlock()
 	s.closeTCPRefs(closedTCP)
 }
@@ -1226,4 +1226,32 @@ func (s *Send) startBwScheduler(ctx context.Context, sessionID uint64) {
 	})
 	s.rebootMu.Unlock()
 	go sched.Start(ctx)
+}
+
+func (s *Send) installBandwidthRemoteProbe() {
+	if s.laneManager == nil {
+		return
+	}
+	s.laneManager.SetRemoteProbe(func(key LegKey) {
+		if !s.enableBW || s.isClient {
+			return
+		}
+		ctx, ok := s.currentSessionContext(key.SessionID)
+		if !ok {
+			return
+		}
+		s.startBwScheduler(ctx, key.SessionID)
+	})
+}
+
+func (s *Send) currentSessionContext(sessionID uint64) (context.Context, bool) {
+	if active, ok := s.activeSession(); !ok || active != sessionID {
+		return nil, false
+	}
+	s.rebootMu.Lock()
+	defer s.rebootMu.Unlock()
+	if s.sessionCtx == nil {
+		return nil, false
+	}
+	return s.sessionCtx, true
 }

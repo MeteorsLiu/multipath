@@ -51,6 +51,9 @@ func KeyForLeg(sessionID uint64, laneID uint8, leg transport.LegRef) LegKey {
 //   - pings:   active ping per leg. Send registers; the recv glue feeds PONG.
 //   - bwLoops: active BwLoop per probe train id. The bwScheduler stores
 //     (stage④); the recv glue feeds BW_PROBE_ACK.
+//   - remoteProbe: opaque closure the send side registers; the recv glue invokes
+//     it when an inbound BW_PROBE is observed, allowing passive send state to arm
+//     its scheduler only after the peer actually starts probing.
 //   - remoteComplete: opaque closure the send side registers (it captures the
 //     bwScheduler); the recv glue invokes it when an inbound BW_PROBE reports the
 //     peer's train is done (remaining==0), driving advanceAfterRemote without the
@@ -63,6 +66,7 @@ type LaneManager struct {
 	pings          map[LegKey]*ping.Ping
 	bwLoops        map[uint64]*bw.BwLoop
 	qosInputs      map[LaneKey]QoSInput
+	remoteProbe    func(key LegKey)
 	remoteComplete func(key LegKey)
 }
 
@@ -72,6 +76,32 @@ func NewLaneManager() *LaneManager {
 		pings:     make(map[LegKey]*ping.Ping),
 		bwLoops:   make(map[uint64]*bw.BwLoop),
 		qosInputs: make(map[LaneKey]QoSInput),
+	}
+}
+
+// SetRemoteProbe registers the opaque closure invoked when a peer BW_PROBE is
+// observed. Send registers a closure that may lazily arm the passive-side
+// bwScheduler; the recv glue never sees the scheduler.
+func (m *LaneManager) SetRemoteProbe(fn func(key LegKey)) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.remoteProbe = fn
+	m.mu.Unlock()
+}
+
+// RemoteProbe invokes the registered remote-probe closure for key, if any.
+// Called by the recv glue when an inbound BW_PROBE is observed.
+func (m *LaneManager) RemoteProbe(key LegKey) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	fn := m.remoteProbe
+	m.mu.Unlock()
+	if fn != nil {
+		fn(key)
 	}
 }
 
@@ -209,7 +239,7 @@ func (m *LaneManager) DeleteQoS(key LaneKey) {
 // Reset drops all registered pings and BwLoops (unknown-session rebuild, spec 7:
 // 重启→重连 自愈). The old session's goroutines are cancelled separately by the
 // caller; this clears the stale instances so a rebuilt session starts clean. The
-// remoteComplete closure is left intact — the caller re-registers it.
+// remote probe/complete closures are left intact.
 func (m *LaneManager) Reset() {
 	if m == nil {
 		return

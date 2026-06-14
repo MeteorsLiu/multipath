@@ -987,6 +987,44 @@ func TestStartBwSchedulerIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestPassiveHelloAckWaitsForRemoteBandwidthProbe(t *testing.T) {
+	sessions := &sessionpkg.Manager{}
+	s := New(Config{
+		SessionManager:       sessions,
+		EnableBandwidthProbe: true,
+	})
+
+	const sessionID = uint64(940)
+	if _, ok := sessions.GetOrCreate(sessionID); !ok {
+		t.Fatal("failed to create session")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ack := protocol.Frame{
+		Version:   protocol.Version,
+		Type:      protocol.TypeHELLOACK,
+		SessionID: sessionID,
+		LaneID:    1,
+		Body: protocol.HelloAckBody{
+			Nonce:    1,
+			Accepted: 1,
+		},
+	}
+	tcp := e2eTCP("passive-tcp")
+	if err := s.WriteFrame(ctx, ack, tcp); err != nil {
+		t.Fatalf("WriteFrame TCP HELLO_ACK: %v", err)
+	}
+	if s.bwSched != nil {
+		t.Fatal("passive HELLO_ACK started bandwidth scheduler")
+	}
+
+	s.LaneManager().RemoteProbe(KeyForLeg(sessionID, 1, tcp))
+	if s.bwSched == nil {
+		t.Fatal("remote BW_PROBE did not start passive bandwidth scheduler")
+	}
+}
+
 func TestConcurrentPassiveAdmissionsLeaveOnlyActiveSessionState(t *testing.T) {
 	sessions := &sessionpkg.Manager{}
 	s := New(Config{

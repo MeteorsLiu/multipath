@@ -292,9 +292,10 @@ func (h *RecvHandler) OnClose(ctx context.Context, leg transport.LegRef, frame p
 
 // OnBandwidthProbe handles incoming BW_PROBE frames (spec 7.5). It feeds the
 // probe to the passive Receive, which returns the Ack to send (and whether one
-// is due now); the recv glue writes that Ack as a BW_PROBE_ACK frame. When the
-// peer's train is done (TrainBytesRemaining==0) it notifies the send-side
-// bwScheduler via the LaneManager's remote-complete closure (advanceAfterRemote).
+// is due now); the recv glue writes that Ack as a BW_PROBE_ACK frame. Observed
+// BW_PROBE frames arm the passive-side bwScheduler through LaneManager; when the
+// peer's train is done (TrainBytesRemaining==0), RemoteComplete releases the
+// scheduler's remote phase.
 func (h *RecvHandler) OnBandwidthProbe(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error {
 	body, ok := frame.Body.(protocol.BandwidthProbeBody)
 	if !ok {
@@ -304,6 +305,9 @@ func (h *RecvHandler) OnBandwidthProbe(ctx context.Context, leg transport.LegRef
 	if !h.sessionKnown(frame.SessionID) {
 		return h.closeUnknownSession(ctx, leg, frame.SessionID)
 	}
+
+	key := send.KeyForLeg(frame.SessionID, frame.LaneID, leg)
+	h.lanes.RemoteProbe(key)
 
 	probe := bw.Probe{
 		ID:        body.ProbeID,
@@ -318,7 +322,7 @@ func (h *RecvHandler) OnBandwidthProbe(ctx context.Context, leg transport.LegRef
 
 	// Peer's train finished: release the gate's remote phase (spec 7.5).
 	if body.TrainBytesRemaining == 0 {
-		h.lanes.RemoteComplete(send.KeyForLeg(frame.SessionID, frame.LaneID, leg))
+		h.lanes.RemoteComplete(key)
 	}
 
 	if !shouldAck {
