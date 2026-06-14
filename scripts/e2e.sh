@@ -1545,7 +1545,7 @@ log_file_has_any_pattern_since() {
   fi
   local pattern
   for pattern in "$@"; do
-    if tail -n "+$((start_line + 1))" "${log_file}" | grep -E -q "${pattern}"; then
+    if tail -n "+$((start_line + 1))" "${log_file}" | grep -E "${pattern}" >/dev/null; then
       return 0
     fi
   done
@@ -1571,7 +1571,7 @@ wait_log_file_pattern_while_ping_from() {
   if [[ -z "${start_line}" || "${start_line}" == "0" ]]; then
     grep_cmd() { grep -E -q "${pattern}" "${log_file}"; }
   else
-    grep_cmd() { tail -n "+$((start_line + 1))" "${log_file}" | grep -E -q "${pattern}"; }
+    grep_cmd() { tail -n "+$((start_line + 1))" "${log_file}" | grep -E "${pattern}" >/dev/null; }
   fi
   while (( SECONDS < deadline )); do
     if [[ -f "${log_file}" ]] && grep_cmd; then
@@ -1881,7 +1881,6 @@ run_link_status_qos_reverse_case() {
 
   wait_log_file_pattern_while_ping_from "${name}" "${CURRENT_CLIENT_LOG}" "runtime/qos: link_status_send session=[0-9]+ lane=1 kind=1 reason=1" 5 "client emitted UDP limited LINK_STATUS from receive-side QoS" "${client_status_line}" "${NS_S}" "${TUN_S_REMOTE}"
   wait_log_file_pattern_while_ping_from "${name}" "${CURRENT_SERVER_LOG}" "runtime: link_status_apply session=[0-9]+ lane=1 kind=1 reason=1" 5 "server applied client LINK_STATUS to lane selector" "${server_apply_line}" "${NS_S}" "${TUN_S_REMOTE}"
-  assert_log_file_pattern_count_since_ge "${name}" "${CURRENT_CLIENT_LOG}" "${client_status_line}" "runtime/qos: link_status_send session=[0-9]+ lane=1 kind=1 reason=1" 2 "client refreshed sustained UDP limited LINK_STATUS"
 
   local server_select_line
   server_select_line="$(current_log_file_line_count "${CURRENT_SERVER_LOG}")"

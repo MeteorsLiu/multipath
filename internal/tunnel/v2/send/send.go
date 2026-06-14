@@ -59,7 +59,8 @@ type Send struct {
 
 	// Bandwidth probing (spec 5.8). isClient (the端 that sent HELLO) starts the
 	// gate in the Local phase; bwCapBps>0 restricts probing to UDP. The
-	// bwScheduler is created at bootstrap and cold-starts once when enabled.
+	// bwScheduler cold-starts once when enabled; uncapped client probes wait for
+	// the TCP reference leg before taking the scheduler snapshot.
 	isClient    bool
 	enableBW    bool
 	bwCapBps    uint64
@@ -324,7 +325,11 @@ func (s *Send) bootstrapSession(ctx context.Context) error {
 
 	// Cold-start the bandwidth probe sweep once (spec 5.8, 7.5), if enabled. The
 	// scheduler walks every lane×kind serially, gated in lockstep with the peer.
-	s.startBwScheduler(sessionCtx, sessionID)
+	// Uncapped client probes need the TCP reference leg in the initial snapshot,
+	// so those are synchronized from the TCP HELLO_ACK path below.
+	if s.startBwSchedulerAtBootstrap() {
+		s.startBwScheduler(sessionCtx, sessionID)
+	}
 	return nil
 }
 
@@ -510,10 +515,31 @@ func (s *Send) openLaneHello(ctx context.Context, session *sessionpkg.Session, s
 		OnAck: func() {
 			lane.markActive(legRef.Kind)
 			s.markRunnableLanesDirty(sessionID)
+			if legRef.Kind == transport.KindTCP {
+				s.startBwScheduler(ctx, sessionID)
+			}
 			debuglog.Printf("send", "hello_ack_active session=%d lane=%d kind=%d", sessionID, laneID, legRef.Kind)
 		},
 	}
 	_ = session.Open(ctx, cfg, sender, onExpire)
+}
+
+func (s *Send) startBwSchedulerAtBootstrap() bool {
+	if !s.enableBW {
+		return false
+	}
+	if s.bwCapBps > 0 || s.bwReference > 0 {
+		return true
+	}
+	if s.streamTransport == nil {
+		return true
+	}
+	for _, lane := range s.bootstrapLanes {
+		if lane.TCPRemote != "" {
+			return false
+		}
+	}
+	return true
 }
 
 // Write is the TUN DATA entry point (spec 6.1).
