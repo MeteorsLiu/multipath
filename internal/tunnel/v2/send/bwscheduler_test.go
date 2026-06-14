@@ -192,7 +192,7 @@ func TestBuildBwTargetsOrder(t *testing.T) {
 	lanes[laneKey{sessionID: 1, laneID: 1}] = mk(1)
 
 	// capBps==0: TCP then UDP per lane, lanes ascending.
-	got := buildBwTargets(1, lanes, 0, 0)
+	got := buildBwTargets(1, lanes, 0)
 	want := []struct {
 		lane uint8
 		kind transport.Kind
@@ -210,7 +210,7 @@ func TestBuildBwTargetsOrder(t *testing.T) {
 	}
 
 	// capBps>0: UDP only.
-	gotCap := buildBwTargets(1, lanes, 50_000_000, 0)
+	gotCap := buildBwTargets(1, lanes, 50_000_000)
 	for _, target := range gotCap {
 		if target.kind != transport.KindUDP {
 			t.Errorf("capBps>0 should yield UDP-only, got kind %d", target.kind)
@@ -218,67 +218,6 @@ func TestBuildBwTargetsOrder(t *testing.T) {
 	}
 	if len(gotCap) != 2 {
 		t.Fatalf("capBps>0 targets = %d, want 2 (UDP per lane)", len(gotCap))
-	}
-}
-
-func TestBuildBwTargetsWaitsForTCPReferenceBeforeUncappedUDP(t *testing.T) {
-	lanes := map[laneKey]*laneRuntime{}
-	lane := newLaneRuntime(1, 100)
-	lane.bindUDP(transport.LegRef{Kind: transport.KindUDP, EndpointID: "u"})
-	lanes[laneKey{sessionID: 1, laneID: 1}] = lane
-
-	if got := buildBwTargets(1, lanes, 0, 0); len(got) != 0 {
-		t.Fatalf("uncapped targets without TCP ref = %d, want 0", len(got))
-	}
-
-	if got := buildBwTargets(1, lanes, 0, 120_000_000); len(got) != 1 || got[0].kind != transport.KindUDP {
-		t.Fatalf("explicit-reference targets = %#v, want UDP", got)
-	}
-
-	lane.bindTCP(transport.LegRef{Kind: transport.KindTCP, ConnID: "t"})
-	got := buildBwTargets(1, lanes, 0, 0)
-	if len(got) != 2 || got[0].kind != transport.KindTCP || got[1].kind != transport.KindUDP {
-		t.Fatalf("uncapped targets with TCP ref = %#v, want TCP then UDP", got)
-	}
-}
-
-func TestGateRefreshAddsLateTargetsWhileIdle(t *testing.T) {
-	tcpTarget := bwTarget{
-		laneID: 1,
-		kind:   transport.KindTCP,
-		leg:    transport.LegRef{Kind: transport.KindTCP, ConnID: "t"},
-		key:    LegKey{SessionID: 1, LaneID: 1, Kind: transport.KindTCP, Conn: "t"},
-	}
-	udpTarget := bwTarget{
-		laneID: 1,
-		kind:   transport.KindUDP,
-		leg:    transport.LegRef{Kind: transport.KindUDP, EndpointID: "u"},
-		key:    LegKey{SessionID: 1, LaneID: 1, Kind: transport.KindUDP, Endpoint: "u"},
-	}
-	targets := []bwTarget{tcpTarget}
-	s := newBwScheduler(false, 0, 0,
-		func() []bwTarget { return targets },
-		nil,
-		nil,
-	)
-	s.targets = []bwTarget{tcpTarget}
-	s.idx = 1
-	s.phase = bwPhaseRemote
-	s.started = true
-
-	targets = []bwTarget{tcpTarget, udpTarget}
-	s.refreshTargets()
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.targets) != 2 {
-		t.Fatalf("targets len = %d, want 2", len(s.targets))
-	}
-	if s.targets[1].key != udpTarget.key {
-		t.Fatalf("late target = %#v, want %#v", s.targets[1], udpTarget)
-	}
-	if s.idx != 1 || s.phase != bwPhaseRemote {
-		t.Fatalf("gate after refresh = (%d,%d), want (1,Remote)", s.idx, s.phase)
 	}
 }
 
@@ -468,39 +407,30 @@ func TestGateRemoteTimeoutAdvances(t *testing.T) {
 	// Server starts in Remote phase on target 0. newLoop returns nil (no real
 	// probing); timeout is tiny so the remote fallback fires quickly. After the
 	// fallback advances Remote→Local, runLocal sees a nil loop and self-advances
-	// past the current target, then idles for later targets.
+	// past the last target → done.
 	s := newBwScheduler(false, 0, 0,
 		func() []bwTarget { return targets },
 		func(bwTarget) *bw.BwLoop { return nil },
 		func(bwTarget) time.Duration { return 10 * time.Millisecond },
 	)
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	stopped := make(chan struct{})
+	done := make(chan struct{})
 	go func() {
 		s.Start(ctx)
-		close(stopped)
+		close(done)
 	}()
 
-	deadline := time.After(1500 * time.Millisecond)
-	for {
-		idx, _, _ := s.snapshotState()
-		if idx >= len(targets) {
-			break
-		}
-		select {
-		case <-deadline:
-			t.Fatal("gate did not advance past the remote-wait timeout")
-		case <-time.After(10 * time.Millisecond):
-		}
+	select {
+	case <-done:
+		// Swept to completion via the timeout fallback.
+	case <-time.After(1500 * time.Millisecond):
+		t.Fatal("gate did not advance past the remote-wait timeout")
 	}
 
-	cancel()
-	select {
-	case <-stopped:
-	case <-time.After(time.Second):
-		t.Fatal("scheduler did not stop after context cancellation")
+	if _, _, isDone := s.snapshotState(); !isDone {
+		t.Fatal("scheduler should be done after sweeping the single target")
 	}
 }

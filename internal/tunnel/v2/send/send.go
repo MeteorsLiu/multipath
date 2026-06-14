@@ -312,7 +312,6 @@ func (s *Send) bootstrapSession(ctx context.Context) error {
 			d := newDialer(bl.TCPRemote, s.streamTransport.Dial, func(ref transport.LegRef) {
 				ln.bindTCP(ref)
 				s.openLaneHello(sessionCtx, session, sessionID, ln, ln.id, ref)
-				s.startBwScheduler(sessionCtx, sessionID)
 				debuglog.Printf("send", "tcp_dialed session=%d lane=%d conn=%s", sessionID, ln.id, ref.ConnID)
 			})
 			lane.dialer = d
@@ -1138,9 +1137,7 @@ func (s *Send) startBwScheduler(ctx context.Context, sessionID uint64) {
 	}
 	s.rebootMu.Lock()
 	if s.bwSched != nil {
-		sched := s.bwSched
 		s.rebootMu.Unlock()
-		sched.refreshTargets()
 		return
 	}
 	s.rebootMu.Unlock()
@@ -1148,7 +1145,7 @@ func (s *Send) startBwScheduler(ctx context.Context, sessionID uint64) {
 	snapshot := func() []bwTarget {
 		s.lanesMu.RLock()
 		defer s.lanesMu.RUnlock()
-		return buildBwTargets(sessionID, s.lanes, s.bwCapBps, s.bwReference)
+		return buildBwTargets(sessionID, s.lanes, s.bwCapBps)
 	}
 
 	newLoop := func(t bwTarget) *bw.BwLoop {
