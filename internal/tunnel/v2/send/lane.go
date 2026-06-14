@@ -223,6 +223,9 @@ func (w *txSLCWindow) flush() (txRepairGroup, bool) {
 	if w.sourceCount <= 0 || len(w.pending) == 0 {
 		return txRepairGroup{}, false
 	}
+	if len(w.pending) >= w.sourceCount {
+		return txRepairGroup{}, false
+	}
 	count := contiguousPendingPrefix(w.pending, w.sourceCount)
 	if count == 0 {
 		return txRepairGroup{}, false

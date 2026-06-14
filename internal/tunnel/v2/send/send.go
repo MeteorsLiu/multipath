@@ -30,7 +30,7 @@ const (
 	defaultMTUBytes    = 1500
 	drrBaseQuantum     = 4 * defaultMTUBytes
 	maxFECSourceSpan   = 4
-	defaultFECFlushMin = 2 * time.Millisecond
+	defaultFECFlushMin = 5 * time.Millisecond
 	defaultFECFlushMax = 30 * time.Millisecond
 )
 
