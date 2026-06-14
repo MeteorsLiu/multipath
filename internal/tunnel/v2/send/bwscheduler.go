@@ -54,7 +54,9 @@ type bwScheduler struct {
 	capBps       uint64
 	referenceBps uint64
 
-	// snapshot returns the current ordered probe targets (cold-start once).
+	// snapshot returns the current ordered probe targets. The scheduler merges
+	// later snapshots because TCP/UDP legs can become bound after the session
+	// starts, especially on the passive HELLO_ACK path.
 	snapshot func() []bwTarget
 	// newLoop creates + starts a BwLoop for the target leg and stores it in the
 	// LaneManager (so inbound BW_PROBE_ACK can reach it). Returns nil on failure.
@@ -86,10 +88,11 @@ func newBwScheduler(isClient bool, capBps, referenceBps uint64, snapshot func() 
 	}
 }
 
-// Start runs the cold-start probe sweep once: it walks every target, alternating
-// local/remote phases with the peer, until all targets are measured or ctx ends.
-// Client starts phase=Local (probes first); server starts phase=Remote (waits
-// first). Run as `go sched.Start(ctx)`.
+// Start runs the cold-start probe sweep: it walks every target, alternating
+// local/remote phases with the peer. If the current target set is empty or has
+// been exhausted, the scheduler idles until a later refresh adds a leg or ctx
+// ends. Client starts phase=Local (probes first); server starts phase=Remote
+// (waits first). Run as `go sched.Start(ctx)`.
 func (s *bwScheduler) Start(ctx context.Context) {
 	s.mu.Lock()
 	if s.started {
@@ -97,7 +100,7 @@ func (s *bwScheduler) Start(ctx context.Context) {
 		return
 	}
 	s.started = true
-	s.targets = s.snapshot()
+	s.targets = nil
 	s.idx = 0
 	if s.isClient {
 		s.phase = bwPhaseLocal
@@ -107,6 +110,9 @@ func (s *bwScheduler) Start(ctx context.Context) {
 	s.mu.Unlock()
 
 	s.eval(ctx)
+	s.mu.Lock()
+	s.done = true
+	s.mu.Unlock()
 }
 
 // eval is the gate-driven loop. It launches a local probe when the gate enters a
@@ -114,11 +120,19 @@ func (s *bwScheduler) Start(ctx context.Context) {
 // signaled via wake by advanceAfterLocal/advanceAfterRemote/abort.
 func (s *bwScheduler) eval(ctx context.Context) {
 	for {
+		s.refreshTargetsNoSignal()
+
 		s.mu.Lock()
-		if s.done || s.idx >= len(s.targets) {
-			s.done = true
+		if s.done {
 			s.mu.Unlock()
 			return
+		}
+		if s.idx >= len(s.targets) {
+			s.mu.Unlock()
+			if !s.waitWake(ctx, 0) {
+				return
+			}
+			continue
 		}
 		target := s.targets[s.idx]
 		phase := s.phase
@@ -152,6 +166,49 @@ func (s *bwScheduler) eval(ctx context.Context) {
 			}
 		}
 	}
+}
+
+func (s *bwScheduler) refreshTargets() {
+	s.refreshTargetsWithSignal(true)
+}
+
+func (s *bwScheduler) refreshTargetsNoSignal() {
+	s.refreshTargetsWithSignal(false)
+}
+
+func (s *bwScheduler) refreshTargetsWithSignal(signal bool) {
+	if s.snapshot == nil {
+		return
+	}
+	targets := s.snapshot()
+	s.mu.Lock()
+	wasIdle := s.idx >= len(s.targets)
+	changed := s.mergeTargetsLocked(targets)
+	s.mu.Unlock()
+	if changed && signal && wasIdle {
+		s.signal()
+	}
+}
+
+func (s *bwScheduler) mergeTargetsLocked(targets []bwTarget) bool {
+	if len(targets) == 0 {
+		return false
+	}
+	seen := make(map[LegKey]struct{}, len(s.targets))
+	for _, target := range s.targets {
+		seen[target.key] = struct{}{}
+	}
+	changed := false
+	for _, target := range targets {
+		if _, ok := seen[target.key]; ok {
+			continue
+		}
+		s.targets = append(s.targets, target)
+		seen[target.key] = struct{}{}
+		changed = true
+		debuglog.Printf("send/bw", "gate_target_add lane=%d kind=%d", target.laneID, target.kind)
+	}
+	return changed
 }
 
 // runLocal launches the local probe train for target and records it for abort.
@@ -326,8 +383,10 @@ func (s *bwScheduler) signal() {
 
 // buildBwTargets returns the ordered probe targets for the given lanes: per lane
 // (ascending laneID) TCP then UDP, or UDP only when capBps>0 (spec 7.5). Only
-// legs with a usable ref are included.
-func buildBwTargets(sessionID uint64, lanes map[laneKey]*laneRuntime, capBps uint64) []bwTarget {
+// legs with a usable ref are included. In uncapped mode without an explicit
+// reference, UDP waits until the lane has a TCP ref so the TCP sample can become
+// the scheduler-owned UDP reference.
+func buildBwTargets(sessionID uint64, lanes map[laneKey]*laneRuntime, capBps, referenceBps uint64) []bwTarget {
 	type laneEntry struct {
 		id   uint8
 		lane *laneRuntime
@@ -342,20 +401,34 @@ func buildBwTargets(sessionID uint64, lanes map[laneKey]*laneRuntime, capBps uin
 
 	var targets []bwTarget
 	for _, e := range entries {
-		kinds := []transport.Kind{transport.KindTCP, transport.KindUDP}
 		if capBps > 0 {
-			kinds = []transport.Kind{transport.KindUDP} // capBps>0 跳过 TCP
-		}
-		for _, kind := range kinds {
-			ref := e.lane.leg.refForKind(kind)
-			if ref.Kind == 0 {
-				continue // no usable leg for this kind
+			if ref := e.lane.leg.refForKind(transport.KindUDP); ref.Kind != 0 {
+				targets = append(targets, bwTarget{
+					laneID: e.id,
+					kind:   transport.KindUDP,
+					leg:    ref,
+					key:    KeyForLeg(sessionID, e.id, ref),
+				})
 			}
+			continue
+		}
+
+		tcpRef := e.lane.leg.refForKind(transport.KindTCP)
+		udpRef := e.lane.leg.refForKind(transport.KindUDP)
+		if tcpRef.Kind != 0 {
 			targets = append(targets, bwTarget{
 				laneID: e.id,
-				kind:   kind,
-				leg:    ref,
-				key:    KeyForLeg(sessionID, e.id, ref),
+				kind:   transport.KindTCP,
+				leg:    tcpRef,
+				key:    KeyForLeg(sessionID, e.id, tcpRef),
+			})
+		}
+		if udpRef.Kind != 0 && (referenceBps > 0 || tcpRef.Kind != 0) {
+			targets = append(targets, bwTarget{
+				laneID: e.id,
+				kind:   transport.KindUDP,
+				leg:    udpRef,
+				key:    KeyForLeg(sessionID, e.id, udpRef),
 			})
 		}
 	}
