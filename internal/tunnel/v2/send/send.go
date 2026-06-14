@@ -540,7 +540,7 @@ func (s *Send) Write(ctx context.Context, packet *packetbuf.Packet) error {
 	// Pick lane using scheduler
 	lane, ok := s.pickLane(sessionID, cost)
 	if !ok {
-		return ErrNoRunnableLane
+		return nil
 	}
 
 	// Build DATA frame
@@ -766,7 +766,7 @@ func (s *Send) sendDataFrame(ctx context.Context, lane *laneRuntime, frame proto
 	leg := lane.primaryTransport()
 	if leg.Kind == 0 {
 		packet.Release()
-		return ErrLaneUnavailable
+		return nil
 	}
 	if debuglog.Enabled() {
 		debuglog.Printf("send", "schedule_select session=%d lane=%d leg={%s} frame=type=DATA packet_id=%d payload_len=%d",

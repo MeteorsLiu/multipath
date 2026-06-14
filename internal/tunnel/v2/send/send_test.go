@@ -156,7 +156,7 @@ func TestSendWriteFrameExplicitTransport(t *testing.T) {
 	}
 }
 
-func TestSendNoRunnableLane(t *testing.T) {
+func TestSendWriteDropsWhenNoRunnableLane(t *testing.T) {
 	s := New()
 
 	// Activate session with sendState but don't create any lanes
@@ -170,8 +170,34 @@ func TestSendNoRunnableLane(t *testing.T) {
 
 	ctx := context.Background()
 	err := s.Write(ctx, packet)
-	if err != ErrNoRunnableLane {
-		t.Errorf("expected ErrNoRunnableLane, got %v", err)
+	if err != nil {
+		t.Errorf("expected no error when dropping no-runnable TUN packet, got %v", err)
+	}
+}
+
+func TestSendWriteDropsWhenSelectedLaneHasNoActiveLeg(t *testing.T) {
+	s := New()
+
+	s.activateSession(1)
+	s.sendStatesMu.Lock()
+	s.sendStates[1] = &sendState{}
+	s.sendStatesMu.Unlock()
+
+	lane := newLaneRuntime(1, 100)
+	lane.bindUDP(transport.LegRef{
+		Kind:       transport.KindUDP,
+		EndpointID: "test-ep",
+		RemoteAddr: &testAddr{addr: "127.0.0.1:8080"},
+	})
+	s.lanesMu.Lock()
+	s.lanes[laneKey{sessionID: 1, laneID: 1}] = lane
+	s.lanesMu.Unlock()
+
+	packet := packetbuf.Acquire(100)
+	packet.Payload = []byte("test data")
+
+	if err := s.Write(context.Background(), packet); err != nil {
+		t.Errorf("expected no error when dropping no-active-leg TUN packet, got %v", err)
 	}
 }
 
