@@ -233,6 +233,18 @@ func TestLaneRuntimeReady(t *testing.T) {
 	}
 }
 
+func TestLaneScheduleCostChargesAtLeastMTU(t *testing.T) {
+	if got := laneScheduleCost(40); got != defaultMTUBytes {
+		t.Fatalf("small packet schedule cost = %d, want %d", got, defaultMTUBytes)
+	}
+
+	const jumboPayload = defaultMTUBytes + 200
+	want := uint32(jumboPayload + 14)
+	if got := laneScheduleCost(jumboPayload); got != want {
+		t.Fatalf("jumbo packet schedule cost = %d, want %d", got, want)
+	}
+}
+
 type testAddr struct {
 	addr string
 }

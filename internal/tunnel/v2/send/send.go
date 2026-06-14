@@ -534,8 +534,7 @@ func (s *Send) Write(ctx context.Context, packet *packetbuf.Packet) error {
 	}
 	packetID := state.nextPacketID.Add(1) - 1
 
-	// Estimate cost
-	cost := uint32(len(packet.Payload) + 14) // header + packetID
+	cost := laneScheduleCost(len(packet.Payload))
 
 	// Pick lane using scheduler
 	lane, ok := s.pickLane(sessionID, cost)
@@ -729,6 +728,14 @@ func (s *Send) pickLane(sessionID uint64, cost uint32) (*laneRuntime, bool) {
 		return nil, false
 	}
 	return s.strategy(sessionID).Pick(lanes, cost)
+}
+
+func laneScheduleCost(payloadLen int) uint32 {
+	cost := payloadLen + 14 // DATA frame header + packetID
+	if cost < defaultMTUBytes {
+		return defaultMTUBytes
+	}
+	return uint32(cost)
 }
 
 func (s *Send) runnableLanes(sessionID uint64) []*laneRuntime {
