@@ -18,7 +18,7 @@ import (
 
 const maxStreamFrameLen = 64 * 1024
 
-const defaultTCPUserTimeout = 15 * time.Second
+const defaultTCPUserTimeout = 10 * time.Second
 
 var (
 	ErrUnknownConn   = errors.New("transport: unknown stream conn")
