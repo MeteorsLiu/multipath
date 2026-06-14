@@ -628,7 +628,7 @@ func (s *Send) admitPassiveHelloAck(ctx context.Context, frame protocol.Frame, l
 		s.enableSessionFEC(frame.SessionID)
 	}
 
-	if s.laneManager.LookupPing(KeyForLeg(frame.SessionID, frame.LaneID, legRef)) == nil {
+	if legRef.Kind == transport.KindUDP && s.laneManager.LookupPing(KeyForLeg(frame.SessionID, frame.LaneID, legRef)) == nil {
 		s.startLanePing(sessionCtx, frame.SessionID, lane, legRef)
 	}
 	s.activateSession(frame.SessionID)
@@ -1019,6 +1019,9 @@ func (s *Send) OnLegFailure(ctx context.Context, legRef transport.LegRef, err er
 // each RTT sample into the lane's leg observer for selector quality.
 func (s *Send) startLanePing(ctx context.Context, sessionID uint64, lane *laneRuntime, legRef transport.LegRef) {
 	if s.laneManager == nil {
+		return
+	}
+	if legRef.Kind != transport.KindUDP {
 		return
 	}
 

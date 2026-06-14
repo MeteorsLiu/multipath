@@ -850,6 +850,47 @@ func TestAcceptedHelloAckPassivelyAdmitsServerLane(t *testing.T) {
 	}
 }
 
+func TestAcceptedTCPHelloAckDoesNotStartPing(t *testing.T) {
+	sessions := &sessionpkg.Manager{}
+	s := New(Config{
+		SessionManager: sessions,
+		ProbeInterval:  time.Hour,
+		ProbeTimeout:   time.Hour,
+	})
+
+	const sessionID = uint64(78)
+	const laneID = uint8(5)
+	if _, ok := sessions.GetOrCreate(sessionID); !ok {
+		t.Fatal("failed to create passive session")
+	}
+
+	leg := e2eTCP("tcp-passive")
+	ack := protocol.Frame{
+		Version:   protocol.Version,
+		Type:      protocol.TypeHELLOACK,
+		SessionID: sessionID,
+		LaneID:    laneID,
+		Body: protocol.HelloAckBody{
+			Nonce:    12,
+			Accepted: 1,
+		},
+	}
+	if err := s.WriteFrame(context.Background(), ack, leg); err != nil {
+		t.Fatalf("WriteFrame HELLO_ACK: %v", err)
+	}
+
+	lane := s.getLane(laneKey{sessionID: sessionID, laneID: laneID})
+	if lane == nil {
+		t.Fatal("passive TCP HELLO_ACK did not create lane")
+	}
+	if !lane.leg.isActive(transport.KindTCP) {
+		t.Fatal("passive TCP HELLO_ACK did not mark TCP active")
+	}
+	if p := s.laneManager.LookupPing(KeyForLeg(sessionID, laneID, leg)); p != nil {
+		t.Fatal("passive TCP HELLO_ACK registered a ping loop")
+	}
+}
+
 func TestStartLanePingIsIdempotentForSameLeg(t *testing.T) {
 	sessions := &sessionpkg.Manager{}
 	s := New(Config{
