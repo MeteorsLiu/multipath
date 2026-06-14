@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strings"
 
 	"github.com/MeteorsLiu/multipath/internal/metrics"
 	"github.com/MeteorsLiu/multipath/internal/session"
@@ -91,7 +92,7 @@ func buildServerRuntime(cfg Config, device *tun.Device) (*appRuntime, []io.Close
 		ProbeInterval:        cfg.probeInterval(),
 		ProbeTimeout:         cfg.probeTimeout(),
 		IsClient:             false, // server: gate starts in the Remote phase (spec 7.5)
-		EnableBandwidthProbe: true,
+		EnableBandwidthProbe: bandwidthProbeEnabled(),
 		BWCapBps:             cfg.bandwidthProbeCapForSend(),
 	})
 	if cfg.FEC {
@@ -178,7 +179,7 @@ func buildClientRuntime(cfg Config, device *tun.Device) (*appRuntime, []io.Close
 		ProbeInterval:        cfg.probeInterval(),
 		ProbeTimeout:         cfg.probeTimeout(),
 		IsClient:             true, // client sent HELLO: gate starts in the Local phase (spec 7.5)
-		EnableBandwidthProbe: true,
+		EnableBandwidthProbe: bandwidthProbeEnabled(),
 		BWCapBps:             cfg.bandwidthProbeCapForSend(),
 		BootstrapLanes:       bootstrap,
 	})
@@ -221,6 +222,11 @@ func newMetricsServer(cfg Config) (*metrics.Server, error) {
 		fmt.Fprintf(os.Stderr, "multipath prom listen: %s\n", server.Addr())
 	}
 	return server, nil
+}
+
+func bandwidthProbeEnabled() bool {
+	value := strings.ToLower(strings.TrimSpace(os.Getenv("MULTIPATH_DISABLE_BW_PROBE")))
+	return value == "" || value == "0" || value == "false" || value == "off"
 }
 
 func appendClosers(closers []io.Closer, extra io.Closer) []io.Closer {

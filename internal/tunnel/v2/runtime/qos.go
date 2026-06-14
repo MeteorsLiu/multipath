@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 
+	"github.com/MeteorsLiu/multipath/internal/debuglog"
 	"github.com/MeteorsLiu/multipath/internal/protocol"
 	"github.com/MeteorsLiu/multipath/internal/transport"
 	"github.com/MeteorsLiu/multipath/internal/tunnel/v2/recv"
@@ -51,6 +52,8 @@ func (w *QoSWriter) Write(ctx context.Context, status recv.QoSStatus) error {
 	if !ok {
 		return protocol.ErrInvalidFrame
 	}
+	debuglog.Printf("runtime/qos", "link_status_send session=%d lane=%d kind=%d reason=%d delivered_bps=%d",
+		status.SessionID, status.LaneID, status.Kind, status.Reason, status.DeliveredBps)
 	return w.send.WriteFrame(ctx, protocol.Frame{
 		Version:   protocol.Version,
 		Type:      protocol.TypeLinkStatus,

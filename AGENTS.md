@@ -131,6 +131,14 @@ Important constraints:
   the runtime data/dependencies they directly need.
 - v2 has no public ProbeLoop. Send starts its own HELLO retry loops, active
   ping loops, TCP dialers, and optional bandwidth-probe scheduler.
+- v2 bandwidth-probe reference state belongs inside the private bwScheduler
+  module. TCP reference measurements, cap-derived reference, and UDP probe
+  reference/cap selection must not escape into `Send`, RecvHandler, Session,
+  LaneManager, or exported methods. `Send` may pass static probe config,
+  including an explicit configured reference, into the scheduler and consume
+  final samples for selector quality. `Send` may retain static configured
+  values, but it must not compute, override, or store dynamic/derived bw
+  reference state/maps or become the bandwidth-probe state machine.
 - Runtime RecvHandler is the decoded-control-frame dispatcher. It builds
   control replies through `Send.WriteFrame`, routes PONG/BW_ACK/LINK_STATUS into
   the shared LaneManager, and must not touch lane/leg internals directly.

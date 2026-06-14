@@ -31,10 +31,12 @@ const (
 // gate walks targets in a fixed order: per lane (ascending laneID) TCP then UDP,
 // or UDP only when capBps>0.
 type bwTarget struct {
-	laneID uint8
-	kind   transport.Kind
-	leg    transport.LegRef
-	key    LegKey
+	laneID       uint8
+	kind         transport.Kind
+	leg          transport.LegRef
+	key          LegKey
+	referenceBps uint64
+	capBps       uint64
 }
 
 // bwScheduler serializes bandwidth probing across all lanes (spec 5.8, 7.5).
@@ -48,8 +50,9 @@ type bwTarget struct {
 // onSample feeds the observer's PreferTCP). The scheduler never marks a lane down
 // (bw failure ≠ lane death; lane health is ping's job, spec 5.8).
 type bwScheduler struct {
-	isClient bool
-	capBps   uint64
+	isClient     bool
+	capBps       uint64
+	referenceBps uint64
 
 	// snapshot returns the current ordered probe targets (cold-start once).
 	snapshot func() []bwTarget
@@ -64,19 +67,22 @@ type bwScheduler struct {
 	idx     int
 	phase   bwGatePhase
 	current *bw.BwLoop // active local loop (for abort)
+	tcpRef  map[LaneKey]uint64
 	wake    chan struct{}
 	started bool
 	done    bool
 }
 
-func newBwScheduler(isClient bool, capBps uint64, snapshot func() []bwTarget, newLoop func(bwTarget) *bw.BwLoop, timeout func(bwTarget) time.Duration) *bwScheduler {
+func newBwScheduler(isClient bool, capBps, referenceBps uint64, snapshot func() []bwTarget, newLoop func(bwTarget) *bw.BwLoop, timeout func(bwTarget) time.Duration) *bwScheduler {
 	return &bwScheduler{
-		isClient: isClient,
-		capBps:   capBps,
-		snapshot: snapshot,
-		newLoop:  newLoop,
-		timeout:  timeout,
-		wake:     make(chan struct{}, 1),
+		isClient:     isClient,
+		capBps:       capBps,
+		referenceBps: referenceBps,
+		snapshot:     snapshot,
+		newLoop:      newLoop,
+		timeout:      timeout,
+		tcpRef:       make(map[LaneKey]uint64),
+		wake:         make(chan struct{}, 1),
 	}
 }
 
@@ -150,6 +156,7 @@ func (s *bwScheduler) eval(ctx context.Context) {
 
 // runLocal launches the local probe train for target and records it for abort.
 func (s *bwScheduler) runLocal(ctx context.Context, target bwTarget) {
+	target = s.prepareTarget(target)
 	loop := s.newLoop(target)
 	s.mu.Lock()
 	s.current = loop
@@ -160,6 +167,50 @@ func (s *bwScheduler) runLocal(ctx context.Context, target bwTarget) {
 		debuglog.Printf("send/bw", "gate_local_skip lane=%d kind=%d", target.laneID, target.kind)
 		go s.advanceAfterLocal(target.key)
 	}
+}
+
+func (s *bwScheduler) prepareTarget(target bwTarget) bwTarget {
+	if target.kind != transport.KindUDP {
+		target.referenceBps = 0
+		target.capBps = 0
+		return target
+	}
+	if s.referenceBps > 0 {
+		target.referenceBps = s.referenceBps
+		target.capBps = s.capBps
+		return target
+	}
+	if s.capBps > 0 {
+		target.referenceBps = s.capBps
+		target.capBps = s.capBps
+		return target
+	}
+	s.mu.Lock()
+	ref := s.tcpRef[LaneKey{SessionID: target.key.SessionID, LaneID: target.laneID}]
+	s.mu.Unlock()
+	target.referenceBps = ref
+	target.capBps = ref
+	return target
+}
+
+func (s *bwScheduler) completeLocal(target bwTarget, sample bw.Sample) {
+	s.mu.Lock()
+	if s.done || s.idx >= len(s.targets) || s.phase != bwPhaseLocal || s.targets[s.idx].key != target.key {
+		s.mu.Unlock()
+		return
+	}
+	if target.kind == transport.KindTCP && sample.BandwidthBps > 0 {
+		s.tcpRef[LaneKey{SessionID: target.key.SessionID, LaneID: target.laneID}] = sample.BandwidthBps
+	}
+	s.current = nil
+	if s.isClient {
+		s.phase = bwPhaseRemote
+	} else {
+		s.idx++
+		s.phase = bwPhaseRemote
+	}
+	s.mu.Unlock()
+	s.signal()
 }
 
 // waitWake blocks until a gate advance is signaled, ctx ends, or (when d>0) the

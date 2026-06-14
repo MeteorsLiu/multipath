@@ -30,8 +30,10 @@ type Config struct {
 
 	// Bandwidth probing (spec 5.8). IsClient marks the end that sent HELLO; it
 	// starts the gate in the Local phase (the peer starts in Remote). BWCapBps>0
-	// restricts probing to UDP and caps the rate. BWReferenceBps seeds the UDP
-	// rate adaptation. When EnableBandwidthProbe is false, no bwScheduler runs.
+	// restricts probing to UDP and caps the rate. BWReferenceBps is an explicit
+	// reference override; otherwise the private bwScheduler uses cap as reference
+	// when capped, or the measured TCP reference when uncapped. When
+	// EnableBandwidthProbe is false, no bwScheduler runs.
 	IsClient             bool
 	BWCapBps             uint64
 	BWReferenceBps       uint64

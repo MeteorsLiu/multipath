@@ -183,8 +183,9 @@ and runs protocol-level cases for multipath scheduling, per-lane fallback
 isolation, concurrent multi-lane fallback, legacy `tcp` flag compatibility,
 UDP-to-TCP fallback, fallback dial error (no runnable lane), bandwidth-probe
 QoS leg selection, NAT traversal, FEC weak-net comparison, FEC over TCP
-fallback, multipath plus FEC, FEC loaded latency under iperf3 UDP background
-traffic, weighted scheduling, and near-MTU packet survival. It requires Linux, `go`, root
+fallback, multipath plus FEC, receive-side LINK_STATUS QoS switching, FEC loaded
+latency under iperf3 UDP background traffic, weighted scheduling, and near-MTU
+packet survival. It requires Linux, `go`, root
 privileges, `ip`, `tc`, `ping`, and `iptables`. Run it as a regular user when
 possible; the script builds the binary before escalating for network namespace
 setup. `iperf3` and `timeout` enable an
@@ -199,18 +200,13 @@ The FEC comparison runs the same one-lane scenario with `fec=false` and
 `fec=true` under 20% client-to-server UDP tunnel loss while TCP fallback is
 blocked. The script prints both observed ping packet-loss values and requires the
 FEC case to be lower. See `docs/e2e-evaluation.md` for interpretation and
-limits. By default each FEC sample sends 1000 ping packets at 20ms intervals;
-override `MULTIPATH_REAL_E2E_FEC_PING_COUNT` or
-`MULTIPATH_REAL_E2E_FEC_PING_INTERVAL` for faster local smoke runs. The script
-also repeats the FEC comparison under added UDP tunnel delay; the default is
-`50ms` one-way and can be changed with
-`MULTIPATH_REAL_E2E_FEC_HIGH_RTT_DELAY`.
+limits. Each FEC sample sends 1000 ping packets at 20ms intervals. The script
+also repeats the FEC comparison under 50ms one-way added UDP tunnel delay.
 
 The script starts client and server with `MULTIPATH_DEBUG=1` by default, so each
 case writes verbose protocol, transport, probe, fallback, and FEC traces to
 per-side `${case}.client.log` and `${case}.server.log` files in the work
-directory. Set `MULTIPATH_REAL_E2E_DEBUG=0` to keep those logs quiet for routine
-runs.
+directory.
 
 The same script can be invoked through Go's test runner when explicitly
 enabled:

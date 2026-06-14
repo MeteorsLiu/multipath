@@ -29,7 +29,7 @@ func gateTestTargets(n int) []bwTarget {
 // newGateOnly builds a scheduler with targets pre-installed for direct gate
 // state-machine testing (no Start goroutine, no real loops).
 func newGateOnly(isClient bool, targets []bwTarget) *bwScheduler {
-	s := newBwScheduler(isClient, 0, func() []bwTarget { return targets }, nil, nil)
+	s := newBwScheduler(isClient, 0, 0, func() []bwTarget { return targets }, nil, nil)
 	s.targets = targets
 	s.idx = 0
 	if isClient {
@@ -163,7 +163,7 @@ func TestGateCompletesAfterAllTargets(t *testing.T) {
 	client := newGateOnly(true, targets)
 	key := targets[0].key
 
-	client.advanceAfterLocal(key)  // Local→Remote(0)
+	client.advanceAfterLocal(key) // Local→Remote(0)
 	client.drainWake()
 	client.advanceAfterRemote(key) // Remote→Local, idx=1 (past end)
 	client.drainWake()
@@ -221,6 +221,164 @@ func TestBuildBwTargetsOrder(t *testing.T) {
 	}
 }
 
+func TestGateInjectsCapAsUDPReference(t *testing.T) {
+	const capBps = uint64(200_000_000)
+	target := bwTarget{
+		laneID: 1,
+		kind:   transport.KindUDP,
+		leg:    transport.LegRef{Kind: transport.KindUDP, EndpointID: "u"},
+		key:    LegKey{SessionID: 1, LaneID: 1, Kind: transport.KindUDP, Endpoint: "u"},
+	}
+	var got bwTarget
+	s := newBwScheduler(true, capBps, 0,
+		func() []bwTarget { return []bwTarget{target} },
+		func(t bwTarget) *bw.BwLoop {
+			got = t
+			return nil
+		},
+		nil,
+	)
+
+	s.runLocal(context.Background(), target)
+	if got.referenceBps != capBps || got.capBps != capBps {
+		t.Fatalf("UDP target reference/cap = %d/%d, want %d/%d", got.referenceBps, got.capBps, capBps, capBps)
+	}
+}
+
+func TestGateUsesExplicitReferenceBeforeCapOrTCPReference(t *testing.T) {
+	const explicitReferenceBps = uint64(120_000_000)
+	const capBps = uint64(200_000_000)
+	target := bwTarget{
+		laneID: 1,
+		kind:   transport.KindUDP,
+		leg:    transport.LegRef{Kind: transport.KindUDP, EndpointID: "u"},
+		key:    LegKey{SessionID: 1, LaneID: 1, Kind: transport.KindUDP, Endpoint: "u"},
+	}
+	var got bwTarget
+	s := newBwScheduler(true, capBps, explicitReferenceBps,
+		func() []bwTarget { return []bwTarget{target} },
+		func(t bwTarget) *bw.BwLoop {
+			got = t
+			return nil
+		},
+		nil,
+	)
+	s.completeLocal(bwTarget{
+		laneID: 1,
+		kind:   transport.KindTCP,
+		key:    LegKey{SessionID: 1, LaneID: 1, Kind: transport.KindTCP, Conn: "t"},
+	}, bw.Sample{BandwidthBps: 300_000_000})
+
+	s.runLocal(context.Background(), target)
+	if got.referenceBps != explicitReferenceBps || got.capBps != capBps {
+		t.Fatalf("explicit-ref UDP target reference/cap = %d/%d, want %d/%d", got.referenceBps, got.capBps, explicitReferenceBps, capBps)
+	}
+
+	tcpTarget := bwTarget{
+		laneID: 1,
+		kind:   transport.KindTCP,
+		leg:    transport.LegRef{Kind: transport.KindTCP, ConnID: "t"},
+		key:    LegKey{SessionID: 1, LaneID: 1, Kind: transport.KindTCP, Conn: "t"},
+	}
+	got = bwTarget{}
+	s = newBwScheduler(true, 0, explicitReferenceBps,
+		func() []bwTarget { return []bwTarget{tcpTarget, target} },
+		func(t bwTarget) *bw.BwLoop {
+			got = t
+			return nil
+		},
+		nil,
+	)
+	s.targets = []bwTarget{tcpTarget, target}
+	s.phase = bwPhaseLocal
+	s.started = true
+	s.completeLocal(tcpTarget, bw.Sample{BandwidthBps: 300_000_000})
+	s.drainWake()
+	s.advanceAfterRemote(tcpTarget.key)
+	s.drainWake()
+
+	s.runLocal(context.Background(), target)
+	if got.referenceBps != explicitReferenceBps || got.capBps != 0 {
+		t.Fatalf("explicit-ref UDP target after TCP reference = %d/%d, want %d/0", got.referenceBps, got.capBps, explicitReferenceBps)
+	}
+}
+
+func TestGateInjectsTCPReferenceIntoUncappedUDP(t *testing.T) {
+	const tcpReferenceBps = uint64(300_000_000)
+	tcpTarget := bwTarget{
+		laneID: 1,
+		kind:   transport.KindTCP,
+		leg:    transport.LegRef{Kind: transport.KindTCP, ConnID: "t"},
+		key:    LegKey{SessionID: 1, LaneID: 1, Kind: transport.KindTCP, Conn: "t"},
+	}
+	udpTarget := bwTarget{
+		laneID: 1,
+		kind:   transport.KindUDP,
+		leg:    transport.LegRef{Kind: transport.KindUDP, EndpointID: "u"},
+		key:    LegKey{SessionID: 1, LaneID: 1, Kind: transport.KindUDP, Endpoint: "u"},
+	}
+	var got bwTarget
+	s := newBwScheduler(true, 0, 0,
+		func() []bwTarget { return []bwTarget{tcpTarget, udpTarget} },
+		func(t bwTarget) *bw.BwLoop {
+			got = t
+			return nil
+		},
+		nil,
+	)
+	s.targets = []bwTarget{tcpTarget, udpTarget}
+	s.phase = bwPhaseLocal
+	s.started = true
+
+	s.completeLocal(tcpTarget, bw.Sample{BandwidthBps: tcpReferenceBps})
+	s.drainWake()
+	s.advanceAfterRemote(tcpTarget.key)
+	s.drainWake()
+	s.runLocal(context.Background(), udpTarget)
+
+	if got.referenceBps != tcpReferenceBps || got.capBps != tcpReferenceBps {
+		t.Fatalf("uncapped UDP target reference/cap = %d/%d, want TCP reference %d/%d", got.referenceBps, got.capBps, tcpReferenceBps, tcpReferenceBps)
+	}
+}
+
+func TestGateIgnoresStaleTCPReferenceSample(t *testing.T) {
+	staleTCP := bwTarget{
+		laneID: 1,
+		kind:   transport.KindTCP,
+		key:    LegKey{SessionID: 1, LaneID: 1, Kind: transport.KindTCP, Conn: "stale"},
+	}
+	currentTCP := bwTarget{
+		laneID: 2,
+		kind:   transport.KindTCP,
+		key:    LegKey{SessionID: 1, LaneID: 2, Kind: transport.KindTCP, Conn: "current"},
+	}
+	udpTarget := bwTarget{
+		laneID: 1,
+		kind:   transport.KindUDP,
+		leg:    transport.LegRef{Kind: transport.KindUDP, EndpointID: "u"},
+		key:    LegKey{SessionID: 1, LaneID: 1, Kind: transport.KindUDP, Endpoint: "u"},
+	}
+	var got bwTarget
+	s := newBwScheduler(true, 0, 0,
+		func() []bwTarget { return []bwTarget{currentTCP} },
+		func(t bwTarget) *bw.BwLoop {
+			got = t
+			return nil
+		},
+		nil,
+	)
+	s.targets = []bwTarget{currentTCP}
+	s.phase = bwPhaseLocal
+	s.started = true
+
+	s.completeLocal(staleTCP, bw.Sample{BandwidthBps: 300_000_000})
+	s.runLocal(context.Background(), udpTarget)
+
+	if got.referenceBps != 0 || got.capBps != 0 {
+		t.Fatalf("stale TCP sample leaked into UDP reference/cap = %d/%d, want 0/0", got.referenceBps, got.capBps)
+	}
+}
+
 // TestGateAbortReleasesGate verifies that aborting the active local probe (e.g.
 // the leg died mid-train) releases the gate by advancing past the current phase
 // (spec 7.5: leg 死 → 中止 train + 释放 gate). The scheduler holds no lane
@@ -250,7 +408,7 @@ func TestGateRemoteTimeoutAdvances(t *testing.T) {
 	// probing); timeout is tiny so the remote fallback fires quickly. After the
 	// fallback advances Remote→Local, runLocal sees a nil loop and self-advances
 	// past the last target → done.
-	s := newBwScheduler(false, 0,
+	s := newBwScheduler(false, 0, 0,
 		func() []bwTarget { return targets },
 		func(bwTarget) *bw.BwLoop { return nil },
 		func(bwTarget) time.Duration { return 10 * time.Millisecond },

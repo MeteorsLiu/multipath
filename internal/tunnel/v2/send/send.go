@@ -768,6 +768,10 @@ func (s *Send) sendDataFrame(ctx context.Context, lane *laneRuntime, frame proto
 		packet.Release()
 		return ErrLaneUnavailable
 	}
+	if debuglog.Enabled() {
+		debuglog.Printf("send", "schedule_select session=%d lane=%d leg={%s} frame=type=DATA packet_id=%d payload_len=%d",
+			frame.SessionID, lane.id, debugLeg(leg), packetID, len(payload))
+	}
 
 	// Add to FEC window if enabled
 	if s.sessionFECEnabled(frame.SessionID) {
@@ -1142,8 +1146,8 @@ func (s *Send) startBwScheduler(ctx context.Context, sessionID uint64) {
 		var loopPtr atomic.Pointer[bw.BwLoop]
 		payloadMin, payloadMax, lossStop, rateLimit := bwKindTuning(t.kind)
 		b := bw.New(bw.Config{
-			ReferenceBps:      s.bwReference,
-			CapBps:            s.bwCapBps,
+			ReferenceBps:      t.referenceBps,
+			CapBps:            t.capBps,
 			PayloadMin:        payloadMin,
 			PayloadMax:        payloadMax,
 			LossStopThreshold: lossStop,
@@ -1175,7 +1179,7 @@ func (s *Send) startBwScheduler(ctx context.Context, sessionID uint64) {
 					s.laneManager.DeleteBwLoop(l.TrainID())
 				}
 				if sched := s.getBwScheduler(); sched != nil {
-					sched.advanceAfterLocal(t.key)
+					sched.completeLocal(t, sample)
 				}
 				debuglog.Printf("send/bw", "sample session=%d lane=%d kind=%d bps=%d loss=%.3f",
 					sessionID, t.laneID, t.kind, sample.BandwidthBps, sample.Loss)
@@ -1198,7 +1202,7 @@ func (s *Send) startBwScheduler(ctx context.Context, sessionID uint64) {
 		return lane.leg.srtt(t.kind) * 8
 	}
 
-	sched := newBwScheduler(s.isClient, s.bwCapBps, snapshot, newLoop, timeout)
+	sched := newBwScheduler(s.isClient, s.bwCapBps, s.bwReference, snapshot, newLoop, timeout)
 	s.rebootMu.Lock()
 	if s.bwSched != nil {
 		s.rebootMu.Unlock()

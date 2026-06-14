@@ -509,6 +509,8 @@ func (o *Recv) recoverPacket(sessionID uint64, laneID uint8, state *recvState, r
 		return nil, false
 	}
 	if err := codec.Reconstruct(shards, recoverable.key); err != nil {
+		debuglog.Printf("recv", "recover_err session=%d lane=%d base_packet_id=%d key=%d source_span=%d err=%v",
+			sessionID, laneID, recoverable.basePacketID, recoverable.key, recoverable.sourceSpan, err)
 		metrics.IncCounter(metrics.FECEventsTotal,
 			metrics.L("event", "recover_err"),
 			metrics.L("session", sessionID),
@@ -541,6 +543,8 @@ func (o *Recv) recoverPacket(sessionID uint64, laneID uint8, state *recvState, r
 		metrics.L("session", sessionID),
 		metrics.L("source_span", recoverable.sourceSpan),
 	)
+	debuglog.Printf("recv", "recover_emit session=%d lane=%d packet_id=%d base_packet_id=%d key=%d source_span=%d bytes=%d",
+		sessionID, laneID, packetID, recoverable.basePacketID, recoverable.key, recoverable.sourceSpan, len(payload))
 	pkt := packetbuf.Acquire(len(payload))
 	copy(pkt.Payload, payload)
 	return pkt, true
