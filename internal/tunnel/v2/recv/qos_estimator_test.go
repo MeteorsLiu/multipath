@@ -136,6 +136,37 @@ func TestQoSEstimatorSustainsRandomLossAcrossCleanSmallSamples(t *testing.T) {
 	}
 }
 
+func TestQoSEstimatorEMAClearsAfterSustainedCleanSamples(t *testing.T) {
+	now := time.Unix(0, 0)
+	e := newQoSEstimator(qosConfig{SampleFloor: 4, Sustain: 3 * time.Second, Refresh: time.Second}, nil)
+
+	var loss float64
+	for i := 0; i < 100; i++ {
+		arrived := uint64(1)
+		recovered := uint64(0)
+		if i < 40 && i%5 == 0 {
+			arrived = 0
+			recovered = 84
+		}
+		estimate, ok := e.updateEstimate(qosSample{
+			At:             now.Add(time.Duration(i) * 100 * time.Millisecond),
+			Duration:       100 * time.Millisecond,
+			DataKind:       transport.KindUDP,
+			RepairKind:     transport.KindTCP,
+			DataArrived:    arrived,
+			DataExpected:   1,
+			DataBytes:      arrived * 84,
+			RecoveredBytes: recovered,
+		})
+		if ok {
+			loss = estimate.Loss
+		}
+	}
+	if loss >= qosLossExit {
+		t.Fatalf("EMA loss after clean samples = %.3f, want below exit %.3f", loss, qosLossExit)
+	}
+}
+
 func TestQoSEstimatorComputesActualRateFromRecoveredBytes(t *testing.T) {
 	now := time.Unix(0, 0)
 	var got []qosStatus
@@ -203,26 +234,18 @@ func TestQoSEstimatorDetectsBackloggedDataLegFromLag(t *testing.T) {
 		t.Fatalf("baseline statuses = %+v, want none", got)
 	}
 
-	e.Observe(qosSample{
-		At:           now.Add(2 * time.Second),
-		Duration:     time.Second,
-		DataKind:     transport.KindTCP,
-		RepairKind:   transport.KindUDP,
-		DataArrived:  160,
-		DataExpected: 160,
-		DataBytes:    160 * 1200,
-		Lag:          900 * time.Millisecond,
-	})
-	e.Observe(qosSample{
-		At:           now.Add(4 * time.Second),
-		Duration:     time.Second,
-		DataKind:     transport.KindTCP,
-		RepairKind:   transport.KindUDP,
-		DataArrived:  160,
-		DataExpected: 160,
-		DataBytes:    160 * 1200,
-		Lag:          900 * time.Millisecond,
-	})
+	for i := 0; i < 24 && len(got) == 0; i++ {
+		e.Observe(qosSample{
+			At:           now.Add(2*time.Second + time.Duration(i)*100*time.Millisecond),
+			Duration:     100 * time.Millisecond,
+			DataKind:     transport.KindTCP,
+			RepairKind:   transport.KindUDP,
+			DataArrived:  16,
+			DataExpected: 16,
+			DataBytes:    16 * 1200,
+			Lag:          900 * time.Millisecond,
+		})
+	}
 
 	if len(got) != 1 {
 		t.Fatalf("statuses = %+v, want one", got)

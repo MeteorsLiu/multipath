@@ -80,6 +80,19 @@ func TestRunWriterDropsTransientUDPWriteError(t *testing.T) {
 	}
 }
 
+func TestLegWriterQueueSizesSeparateUDPAndTCP(t *testing.T) {
+	if legWriterQueueSize(KindUDP) >= legWriterQueueSize(KindTCP) {
+		t.Fatalf("UDP queue size = %d, TCP = %d, want UDP smaller than TCP",
+			legWriterQueueSize(KindUDP), legWriterQueueSize(KindTCP))
+	}
+	if legWriterQueueSize(KindUDP) != udpLegWriterQueueSize {
+		t.Fatalf("UDP queue size = %d, want %d", legWriterQueueSize(KindUDP), udpLegWriterQueueSize)
+	}
+	if legWriterQueueSize(KindTCP) != tcpLegWriterQueueSize {
+		t.Fatalf("TCP queue size = %d, want %d", legWriterQueueSize(KindTCP), tcpLegWriterQueueSize)
+	}
+}
+
 func TestRunWriterDoesNotBlockUDPBehindBlockedTCP(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -133,7 +146,7 @@ func TestRunWriterBlocksWhenLegQueueIsFull(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	packets := make(chan Payload, legWriterQueueSize+1)
+	packets := make(chan Payload, tcpLegWriterQueueSize+1)
 	stream := &runWriterStream{
 		block:   make(chan struct{}),
 		started: make(chan struct{}),
@@ -155,7 +168,7 @@ func TestRunWriterBlocksWhenLegQueueIsFull(t *testing.T) {
 		t.Fatal("blocked writer did not receive first packet")
 	}
 
-	for i := 0; i < legWriterQueueSize; i++ {
+	for i := 0; i < tcpLegWriterQueueSize; i++ {
 		packets <- Payload{
 			Leg:    LegRef{Kind: KindTCP, ConnID: "blocked"},
 			Packet: packetbuf.Acquire(16),

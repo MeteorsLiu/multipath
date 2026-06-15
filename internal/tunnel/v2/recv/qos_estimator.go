@@ -15,6 +15,7 @@ const (
 	defaultQoSSampleFloor = 4
 	defaultQoSLagSlack    = 300 * time.Millisecond
 	defaultQoSRefresh     = time.Second
+	defaultQoSAlpha       = 0.10
 
 	qosLossEnter = 0.05
 	qosLossExit  = 0.01
@@ -56,13 +57,28 @@ type qosEstimator struct {
 	backlogSince map[transport.Kind]time.Time
 	lagBaseline  map[transport.Kind]time.Duration
 	lastEmit     map[transport.Kind]map[uint8]time.Time
-	windows      map[transport.Kind]*qosSampleWindow
+	ema          map[transport.Kind]*qosEMAState
 	active       map[transport.Kind]map[uint8]qosActiveEvidence
 }
 
-type qosSampleWindow struct {
-	repairKind transport.Kind
-	samples    []qosSample
+type qosEstimate struct {
+	At           time.Time
+	DataKind     transport.Kind
+	RepairKind   transport.Kind
+	SampleTotal  uint64
+	Loss         float64
+	DeliveredBps uint32
+	Lag          time.Duration
+}
+
+type qosEMAState struct {
+	repairKind         transport.Kind
+	initialized        bool
+	sampleTotal        uint64
+	expectedEMA        float64
+	arrivedEMA         float64
+	deliveredBpsEMA    float64
+	lagMillisecondsEMA float64
 }
 
 type qosActiveEvidence struct {
@@ -90,7 +106,7 @@ func newQoSEstimator(cfg qosConfig, emit func(qosStatus)) *qosEstimator {
 		backlogSince: make(map[transport.Kind]time.Time),
 		lagBaseline:  make(map[transport.Kind]time.Duration),
 		lastEmit:     make(map[transport.Kind]map[uint8]time.Time),
-		windows:      make(map[transport.Kind]*qosSampleWindow),
+		ema:          make(map[transport.Kind]*qosEMAState),
 		active:       make(map[transport.Kind]map[uint8]qosActiveEvidence),
 	}
 }
@@ -99,40 +115,39 @@ func (e *qosEstimator) Observe(sample qosSample) {
 	if !qosKnownKind(sample.DataKind) {
 		return
 	}
-	sample, ok := e.windowSample(sample)
+	estimate, ok := e.updateEstimate(sample)
 	if !ok {
 		return
 	}
-	for _, status := range e.evaluate(sample) {
+	for _, status := range e.evaluate(estimate) {
 		if e.emit != nil {
 			e.emit(status)
 		}
 	}
 }
 
-func (e *qosEstimator) windowSample(sample qosSample) (qosSample, bool) {
+func (e *qosEstimator) updateEstimate(sample qosSample) (qosEstimate, bool) {
 	now := sample.At
 	if now.IsZero() {
 		now = time.Now()
 		sample.At = now
 	}
-	window := e.windows[sample.DataKind]
-	if window == nil || window.repairKind != sample.RepairKind {
-		window = &qosSampleWindow{repairKind: sample.RepairKind}
-		e.windows[sample.DataKind] = window
+	state := e.ema[sample.DataKind]
+	if state == nil || state.repairKind != sample.RepairKind {
+		state = &qosEMAState{repairKind: sample.RepairKind}
+		e.ema[sample.DataKind] = state
 	}
-	window.samples = append(window.samples, sample)
-	window.prune(now.Add(-e.cfg.Sustain))
-	aggregate, ok := window.aggregate()
-	if !ok || aggregate.DataExpected < e.cfg.SampleFloor {
+	state.observe(sample)
+	if state.sampleTotal < e.cfg.SampleFloor {
 		e.recordEvent("below_floor", sample.DataKind, 0)
-		return qosSample{}, false
+		return qosEstimate{}, false
 	}
-	e.recordSampleMetrics(aggregate)
-	return aggregate, true
+	estimate := state.estimate(now, sample.DataKind)
+	e.recordSampleMetrics(estimate)
+	return estimate, true
 }
 
-func (e *qosEstimator) evaluate(sample qosSample) []qosStatus {
+func (e *qosEstimator) evaluate(sample qosEstimate) []qosStatus {
 	var out []qosStatus
 	now := sample.At
 	if now.IsZero() {
@@ -154,23 +169,17 @@ func (e *qosEstimator) evaluate(sample qosSample) []qosStatus {
 	return out
 }
 
-func (e *qosEstimator) evaluateLimited(sample qosSample, now time.Time) (qosStatus, bool) {
-	expected := sample.DataExpected
-	if expected == 0 {
+func (e *qosEstimator) evaluateLimited(sample qosEstimate, now time.Time) (qosStatus, bool) {
+	if sample.SampleTotal == 0 {
 		delete(e.limitedSince, sample.DataKind)
 		return qosStatus{}, false
 	}
-	got := sample.DataArrived
-	loss := float64(expected-got) / float64(expected)
-	if got > expected {
-		loss = 0
-	}
-	if loss < qosLossExit {
+	if sample.Loss < qosLossExit {
 		delete(e.limitedSince, sample.DataKind)
 		e.clearActive(sample.DataKind, protocol.LinkStatusReasonLimited)
 		return qosStatus{}, false
 	}
-	if loss <= qosLossEnter {
+	if sample.Loss <= qosLossEnter {
 		return qosStatus{}, false
 	}
 	ready, first := e.sustained(e.limitedSince, sample.DataKind, now)
@@ -183,13 +192,13 @@ func (e *qosEstimator) evaluateLimited(sample qosSample, now time.Time) (qosStat
 	status := qosStatus{
 		Kind:         sample.DataKind,
 		Reason:       protocol.LinkStatusReasonLimited,
-		DeliveredBps: deliveredBps(sample.DataBytes+sample.RecoveredBytes, sample.Duration),
+		DeliveredBps: sample.DeliveredBps,
 	}
 	e.setActive(status, now)
 	return status, true
 }
 
-func (e *qosEstimator) evaluateBacklogged(sample qosSample, now time.Time) (qosStatus, bool) {
+func (e *qosEstimator) evaluateBacklogged(sample qosEstimate, now time.Time) (qosStatus, bool) {
 	if sample.Lag <= 0 || !qosKnownKind(sample.RepairKind) || sample.RepairKind == sample.DataKind {
 		delete(e.backlogSince, sample.DataKind)
 		e.clearActive(sample.DataKind, protocol.LinkStatusReasonBacklogged)
@@ -215,7 +224,7 @@ func (e *qosEstimator) evaluateBacklogged(sample qosSample, now time.Time) (qosS
 	status := qosStatus{
 		Kind:         sample.DataKind,
 		Reason:       protocol.LinkStatusReasonBacklogged,
-		DeliveredBps: deliveredBps(sample.DataBytes+sample.RecoveredBytes, sample.Duration),
+		DeliveredBps: sample.DeliveredBps,
 	}
 	e.setActive(status, now)
 	return status, true
@@ -306,7 +315,7 @@ func deliveredBps(bytes uint64, duration time.Duration) uint32 {
 func (e *qosEstimator) resetTransientState() {
 	clear(e.limitedSince)
 	clear(e.backlogSince)
-	clear(e.windows)
+	clear(e.ema)
 	clear(e.active)
 }
 
@@ -325,88 +334,70 @@ func otherTransportKind(kind transport.Kind) transport.Kind {
 	return transport.KindUDP
 }
 
-func mergeQoSSamples(a, b qosSample) qosSample {
-	start := qosSampleStart(a)
-	if bStart := qosSampleStart(b); start.IsZero() || (!bStart.IsZero() && bStart.Before(start)) {
-		start = bStart
-	}
-	end := a.At
-	if b.At.After(end) {
-		end = b.At
-	}
-	out := qosSample{
-		At:             end,
-		DataKind:       a.DataKind,
-		DataArrived:    a.DataArrived + b.DataArrived,
-		DataExpected:   a.DataExpected + b.DataExpected,
-		DataBytes:      a.DataBytes + b.DataBytes,
-		RecoveredBytes: a.RecoveredBytes + b.RecoveredBytes,
-		RepairKind:     a.RepairKind,
-		RepairBytes:    a.RepairBytes + b.RepairBytes,
-		Lag:            a.Lag,
-	}
-	if b.Lag > out.Lag {
-		out.Lag = b.Lag
-	}
-	out.Duration = sampleDuration(start, end)
-	return out
-}
-
-func qosSampleStart(sample qosSample) time.Time {
-	if sample.At.IsZero() || sample.Duration <= 0 {
-		return sample.At
-	}
-	return sample.At.Add(-sample.Duration)
-}
-
-func (w *qosSampleWindow) prune(cutoff time.Time) {
-	if w == nil || cutoff.IsZero() {
+func (s *qosEMAState) observe(sample qosSample) {
+	s.sampleTotal += sample.DataExpected
+	expected := float64(sample.DataExpected)
+	arrived := float64(sample.DataArrived)
+	bps := float64(deliveredBps(sample.DataBytes+sample.RecoveredBytes, sample.Duration))
+	lagMS := float64(sample.Lag.Milliseconds())
+	if !s.initialized {
+		s.expectedEMA = expected
+		s.arrivedEMA = arrived
+		s.deliveredBpsEMA = bps
+		s.lagMillisecondsEMA = lagMS
+		s.initialized = true
 		return
 	}
-	keep := 0
-	for keep < len(w.samples) {
-		sample := w.samples[keep]
-		if sample.At.IsZero() || !sample.At.Before(cutoff) {
-			break
-		}
-		keep++
-	}
-	if keep == 0 {
-		return
-	}
-	copy(w.samples, w.samples[keep:])
-	clear(w.samples[len(w.samples)-keep:])
-	w.samples = w.samples[:len(w.samples)-keep]
+	s.expectedEMA = emaUpdate(s.expectedEMA, expected, defaultQoSAlpha)
+	s.arrivedEMA = emaUpdate(s.arrivedEMA, arrived, defaultQoSAlpha)
+	s.deliveredBpsEMA = emaUpdate(s.deliveredBpsEMA, bps, defaultQoSAlpha)
+	s.lagMillisecondsEMA = emaUpdate(s.lagMillisecondsEMA, lagMS, defaultQoSAlpha)
 }
 
-func (w *qosSampleWindow) aggregate() (qosSample, bool) {
-	if w == nil || len(w.samples) == 0 {
-		return qosSample{}, false
+func (s *qosEMAState) estimate(at time.Time, kind transport.Kind) qosEstimate {
+	loss := 0.0
+	if s.expectedEMA > 0 && s.arrivedEMA < s.expectedEMA {
+		loss = (s.expectedEMA - s.arrivedEMA) / s.expectedEMA
 	}
-	out := w.samples[0]
-	for i := 1; i < len(w.samples); i++ {
-		out = mergeQoSSamples(out, w.samples[i])
+	delivered := s.deliveredBpsEMA
+	if delivered < 0 {
+		delivered = 0
 	}
-	return out, true
+	if delivered > math.MaxUint32 {
+		delivered = math.MaxUint32
+	}
+	lagMS := s.lagMillisecondsEMA
+	if lagMS < 0 {
+		lagMS = 0
+	}
+	return qosEstimate{
+		At:           at,
+		DataKind:     kind,
+		RepairKind:   s.repairKind,
+		SampleTotal:  s.sampleTotal,
+		Loss:         loss,
+		DeliveredBps: uint32(delivered),
+		Lag:          time.Duration(lagMS) * time.Millisecond,
+	}
 }
 
-func (e *qosEstimator) recordSampleMetrics(sample qosSample) {
+func emaUpdate(current, sample, alpha float64) float64 {
+	return current + alpha*(sample-current)
+}
+
+func (e *qosEstimator) recordSampleMetrics(sample qosEstimate) {
 	if e == nil || e.cfg.SessionID == 0 {
 		return
 	}
 	leg := kindMetricLabel(sample.DataKind)
-	loss := 0.0
-	if sample.DataExpected > 0 && sample.DataArrived < sample.DataExpected {
-		loss = float64(sample.DataExpected-sample.DataArrived) / float64(sample.DataExpected)
-	}
 	labels := []metrics.Label{
 		metrics.LU64("session", e.cfg.SessionID),
 		metrics.LU8("lane", e.cfg.LaneID),
 		metrics.LStr("leg", leg),
 	}
-	metrics.SetGauge(metrics.QoSLossRatio, loss, labels...)
+	metrics.SetGauge(metrics.QoSLossRatio, sample.Loss, labels...)
 	metrics.SetGauge(metrics.QoSLagMs, float64(sample.Lag.Milliseconds()), labels...)
-	metrics.SetGauge(metrics.QoSDeliveredBps, float64(deliveredBps(sample.DataBytes+sample.RecoveredBytes, sample.Duration)), labels...)
+	metrics.SetGauge(metrics.QoSDeliveredBps, float64(sample.DeliveredBps), labels...)
 }
 
 func (e *qosEstimator) recordEvent(event string, kind transport.Kind, reason uint8) {
