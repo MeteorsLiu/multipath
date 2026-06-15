@@ -97,6 +97,39 @@ func TestLaneQoSOverridesSelector(t *testing.T) {
 	}
 }
 
+func TestLaneQoSSelectionWaitsForBandwidthGate(t *testing.T) {
+	l := newLaneRuntime(1, 100)
+	bindBoth(l)
+
+	l.leg.setPreferTCP(true)
+	laneQoSInput{lane: l}.OnQoS(transport.KindTCP, protocol.LinkStatusReasonLimited, 2_000_000, time.Now())
+
+	if got := l.primaryTransportWithQoS(false); got.Kind != transport.KindTCP {
+		t.Fatalf("primary kind with QoS gated = %v, want TCP from BW PreferTCP", got.Kind)
+	}
+	if got := l.primaryTransportWithQoS(true); got.Kind != transport.KindUDP {
+		t.Fatalf("primary kind with QoS enabled = %v, want UDP from TCP QoS", got.Kind)
+	}
+}
+
+func TestLaneQoSSeenDisablesBandwidthPreferTCP(t *testing.T) {
+	gated := newLaneRuntime(1, 100)
+	bindBoth(gated)
+	gated.leg.setPreferTCP(true)
+	laneQoSInput{lane: gated}.OnQoS(transport.KindUDP, protocol.LinkStatusReasonLimited, 2_000_000, time.Now().Add(-301*time.Second))
+	if got := gated.primaryTransportWithQoS(false); got.Kind != transport.KindTCP {
+		t.Fatalf("primary kind with QoS gated = %v, want TCP from BW PreferTCP", got.Kind)
+	}
+
+	enabled := newLaneRuntime(1, 100)
+	bindBoth(enabled)
+	enabled.leg.setPreferTCP(true)
+	laneQoSInput{lane: enabled}.OnQoS(transport.KindUDP, protocol.LinkStatusReasonLimited, 2_000_000, time.Now().Add(-301*time.Second))
+	if got := enabled.primaryTransportWithQoS(true); got.Kind != transport.KindUDP {
+		t.Fatalf("primary kind after QoS evidence = %v, want UDP with BW PreferTCP suppressed", got.Kind)
+	}
+}
+
 func TestLaneSingleLegDegradeUDPOnly(t *testing.T) {
 	l := newLaneRuntime(1, 100)
 	bindActive(l, udpRef("ep-udp")) // only UDP ready

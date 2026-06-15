@@ -1151,6 +1151,30 @@ func TestStartBwSchedulerIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestQoSSelectionWaitsForBandwidthSchedulerDone(t *testing.T) {
+	if !New().qosSelectionEnabled() {
+		t.Fatal("QoS selection should be enabled when bandwidth probing is disabled")
+	}
+
+	s := New(Config{EnableBandwidthProbe: true})
+	if s.qosSelectionEnabled() {
+		t.Fatal("QoS selection should wait before bandwidth scheduler starts")
+	}
+
+	sched := newBwScheduler(true, 0, 0, nil, nil)
+	s.setBwScheduler(sched)
+	if s.qosSelectionEnabled() {
+		t.Fatal("QoS selection should wait while bandwidth scheduler is running")
+	}
+
+	sched.mu.Lock()
+	sched.done = true
+	sched.mu.Unlock()
+	if !s.qosSelectionEnabled() {
+		t.Fatal("QoS selection should enable after bandwidth scheduler is done")
+	}
+}
+
 func TestPassiveHelloAckWaitsForRemoteBandwidthProbe(t *testing.T) {
 	sessions := &sessionpkg.Manager{}
 	s := New(Config{

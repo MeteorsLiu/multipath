@@ -72,20 +72,32 @@ func (l *laneRuntime) ready() bool {
 // primaryTransport returns the leg ref for DATA frames (spec 7.1). A zero-Kind
 // Ref means no usable transport — the caller drops the packet.
 func (l *laneRuntime) primaryTransport() Ref {
-	return l.leg.selectRef(rolePrimary)
+	return l.primaryTransportWithQoS(true)
+}
+
+func (l *laneRuntime) primaryTransportWithQoS(qosEnabled bool) Ref {
+	return l.leg.selectRefWithQoS(rolePrimary, qosEnabled)
 }
 
 // shadowTransport returns the leg ref for REPAIR frames (spec 7.2). When only
 // one transport is active it returns the same ref as primaryTransport (single-leg
 // degradation; DATA and REPAIR share one link). A zero-Kind Ref means drop.
 func (l *laneRuntime) shadowTransport() Ref {
-	return l.leg.selectRef(roleShadow)
+	return l.shadowTransportWithQoS(true)
+}
+
+func (l *laneRuntime) shadowTransportWithQoS(qosEnabled bool) Ref {
+	return l.leg.selectRefWithQoS(roleShadow, qosEnabled)
 }
 
 // chooseControlTransport selects the transport for lane-policy control frames
 // (WriteFrame with a zero Ref). Control frames follow the primary role.
 func (l *laneRuntime) chooseControlTransport() Ref {
-	return l.leg.selectRef(rolePrimary)
+	return l.chooseControlTransportWithQoS(true)
+}
+
+func (l *laneRuntime) chooseControlTransportWithQoS(qosEnabled bool) Ref {
+	return l.leg.selectRefWithQoS(rolePrimary, qosEnabled)
 }
 
 // bindUDP records the UDP transport ref (config-injected at lane creation).

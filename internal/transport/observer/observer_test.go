@@ -82,11 +82,17 @@ func TestObserverPreferTCP(t *testing.T) {
 func TestObserverQoSExpiresByTTL(t *testing.T) {
 	var o Observer
 	now := time.Unix(0, 0)
+	if q := o.UDPAt(now); q.QoSSeen {
+		t.Fatalf("UDP QoSSeen before status = %+v, want false", q)
+	}
 	o.OnQoS(transport.KindUDP, 1, 2_000_000, now)
 	if q := o.UDPAt(now.Add(299 * time.Second)); !q.QoSActive || q.QoSReason != 1 || q.QoSDeliveredBps != 2_000_000 {
 		t.Fatalf("UDP QoS before TTL = %+v, want active", q)
 	}
-	if q := o.UDPAt(now.Add(301 * time.Second)); q.QoSActive {
-		t.Fatalf("UDP QoS after TTL = %+v, want inactive", q)
+	if q := o.UDPAt(now.Add(301 * time.Second)); q.QoSActive || !q.QoSSeen {
+		t.Fatalf("UDP QoS after TTL = %+v, want inactive but seen", q)
+	}
+	if q := o.TCPAt(now.Add(301 * time.Second)); !q.QoSSeen {
+		t.Fatalf("TCP QoSSeen after UDP status = %+v, want true", q)
 	}
 }

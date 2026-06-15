@@ -195,6 +195,10 @@ func (g *leg) refForKind(k transport.Kind) transport.LegRef {
 //
 // A zero-Kind result means "no usable transport".
 func (g *leg) selectRef(r role) transport.LegRef {
+	return g.selectRefWithQoS(r, true)
+}
+
+func (g *leg) selectRefWithQoS(r role, qosEnabled bool) transport.LegRef {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
@@ -211,7 +215,7 @@ func (g *leg) selectRef(r role) transport.LegRef {
 	}
 
 	// Both active: selector chooses the DATA carrier.
-	useUDP, ok := g.selector.Pick(g.qualityLocked(transport.KindUDP), g.qualityLocked(transport.KindTCP))
+	useUDP, ok := g.selector.Pick(g.qualityLocked(transport.KindUDP, qosEnabled), g.qualityLocked(transport.KindTCP, qosEnabled))
 	if !ok {
 		return transport.LegRef{}
 	}
@@ -231,7 +235,7 @@ func (g *leg) selectRef(r role) transport.LegRef {
 }
 
 // qualityLocked builds the selector Quality snapshot for kind. Caller holds mu.
-func (g *leg) qualityLocked(k transport.Kind) selector.Quality {
+func (g *leg) qualityLocked(k transport.Kind, qosEnabled bool) selector.Quality {
 	var oq observer.Quality
 	switch k {
 	case transport.KindUDP:
@@ -239,13 +243,26 @@ func (g *leg) qualityLocked(k transport.Kind) selector.Quality {
 	case transport.KindTCP:
 		oq = g.observer.TCP()
 	}
-	return selector.Quality{
+	preferTCP := oq.PreferTCP
+	if qosEnabled && oq.QoSSeen {
+		preferTCP = false
+	}
+	q := selector.Quality{
 		Active:       g.activeLocked(k),
 		DeliveryRate: oq.DeliveryRate,
 		SmoothedRTT:  oq.SmoothedRTT,
 		RTTVariance:  oq.RTTVariance,
-		PreferTCP:    oq.PreferTCP,
-
+		PreferTCP:    preferTCP,
+	}
+	if !qosEnabled {
+		return q
+	}
+	return selector.Quality{
+		Active:          q.Active,
+		DeliveryRate:    q.DeliveryRate,
+		SmoothedRTT:     q.SmoothedRTT,
+		RTTVariance:     q.RTTVariance,
+		PreferTCP:       q.PreferTCP,
 		QoSActive:       oq.QoSActive,
 		QoSReason:       oq.QoSReason,
 		QoSDeliveredBps: oq.QoSDeliveredBps,
@@ -255,7 +272,7 @@ func (g *leg) qualityLocked(k transport.Kind) selector.Quality {
 func (g *leg) qualitySnapshot() (selector.Quality, selector.Quality) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return g.qualityLocked(transport.KindUDP), g.qualityLocked(transport.KindTCP)
+	return g.qualityLocked(transport.KindUDP, true), g.qualityLocked(transport.KindTCP, true)
 }
 
 // setPrimary flips the nominal primary orientation. The active DATA/REPAIR role

@@ -26,6 +26,7 @@ type Observer struct {
 	udpRTT      rtt.Estimator
 	tcpRTT      rtt.Estimator
 	preferTCP   bool // set by bw Sample (stage④): probeBW cold-start lock
+	qosSeen     bool
 	udpQoS      qosStatus
 	tcpQoS      qosStatus
 }
@@ -36,6 +37,7 @@ type Quality struct {
 	SmoothedRTT  time.Duration
 	RTTVariance  time.Duration
 	PreferTCP    bool // probeBW cold-start lock (UDP-side only)
+	QoSSeen      bool
 
 	QoSActive       bool
 	QoSReason       uint8
@@ -60,6 +62,7 @@ func (o *Observer) UDPAt(now time.Time) Quality {
 	q := Quality{
 		DeliveryRate: o.udpDelivery.rate(),
 		PreferTCP:    o.preferTCP,
+		QoSSeen:      o.qosSeen,
 	}
 	q.SmoothedRTT = durationOrZero(o.udpRTT.SRTT())
 	q.RTTVariance = durationOrZero(o.udpRTT.RTTVAR())
@@ -86,6 +89,7 @@ func (o *Observer) TCPAt(now time.Time) Quality {
 	defer o.mu.Unlock()
 	q := Quality{
 		DeliveryRate: o.tcpDelivery.rate(),
+		QoSSeen:      o.qosSeen,
 	}
 	q.SmoothedRTT = durationOrZero(o.tcpRTT.SRTT())
 	q.RTTVariance = durationOrZero(o.tcpRTT.RTTVAR())
@@ -117,6 +121,7 @@ func (o *Observer) OnDelivery(kind transport.Kind, onTime bool) {
 func (o *Observer) OnQoS(kind transport.Kind, reason uint8, deliveredBps uint32, now time.Time) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	o.qosSeen = true
 	status := qosStatus{
 		active:       true,
 		reason:       reason,

@@ -208,6 +208,15 @@ func (s *bwScheduler) tcpReferenceBps(sessionID uint64, laneID uint8) uint64 {
 	return s.tcpRef[LaneKey{SessionID: sessionID, LaneID: laneID}]
 }
 
+func (s *bwScheduler) isDone() bool {
+	if s == nil {
+		return true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.done
+}
+
 // waitWake blocks until a gate advance is signaled or ctx ends. Returns false
 // if ctx ended.
 func (s *bwScheduler) waitWake(ctx context.Context) bool {

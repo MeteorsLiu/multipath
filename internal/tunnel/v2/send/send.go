@@ -405,6 +405,14 @@ func (s *Send) setBwScheduler(sched *bwScheduler) {
 	s.rebootMu.Unlock()
 }
 
+func (s *Send) qosSelectionEnabled() bool {
+	if !s.enableBW {
+		return true
+	}
+	sched := s.getBwScheduler()
+	return sched != nil && sched.isDone()
+}
+
 // teardownSession cancels the current session's goroutines (Hello loop, ping,
 // dialer, bwScheduler) and clears all per-session send state (sendStates, lanes,
 // strategies, runnableCache, LaneManager pings/BwLoops, bwScheduler). It bounds
@@ -829,12 +837,13 @@ func (s *Send) sendDataFrame(ctx context.Context, lane *laneRuntime, frame proto
 		return err
 	}
 
-	leg := lane.primaryTransport()
+	qosEnabled := s.qosSelectionEnabled()
+	leg := lane.primaryTransportWithQoS(qosEnabled)
 	if leg.Kind == 0 {
 		packet.Release()
 		return nil
 	}
-	s.recordQoSDataLegSelection(frame.SessionID, lane, leg.Kind)
+	s.recordQoSDataLegSelection(frame.SessionID, lane, leg.Kind, qosEnabled)
 	if debuglog.Enabled() {
 		udpQ, tcpQ := lane.leg.qualitySnapshot()
 		debuglog.Printf("send", "schedule_select session=%d lane=%d leg={%s} frame=type=DATA packet_id=%d payload_len=%d udp_active=%t udp_rate=%.3f udp_qos=%t udp_qos_reason=%d udp_prefer_tcp=%t udp_rttvar_ms=%d tcp_active=%t tcp_rate=%.3f tcp_qos=%t tcp_qos_reason=%d",
@@ -858,8 +867,11 @@ func (s *Send) sendDataFrame(ctx context.Context, lane *laneRuntime, frame proto
 	return s.WriteTo(ctx, leg, packet)
 }
 
-func (s *Send) recordQoSDataLegSelection(sessionID uint64, lane *laneRuntime, kind transport.Kind) {
+func (s *Send) recordQoSDataLegSelection(sessionID uint64, lane *laneRuntime, kind transport.Kind, qosEnabled bool) {
 	if lane == nil || kind == 0 {
+		return
+	}
+	if !qosEnabled {
 		return
 	}
 	udpQ, tcpQ := lane.leg.qualitySnapshot()
@@ -904,7 +916,7 @@ func (s *Send) logBandwidthProbeDecision(target bwTarget, sample bw.Sample, pref
 		udpQ.Active, tcpQ.Active,
 		sample.BandwidthBps, sample.Loss,
 		tcpBps, referenceBps, target.capBps,
-		preferTCP, tcpBetter, preferTCP, selected)
+		udpQ.QoSActive, tcpBetter, preferTCP, selected)
 }
 
 func (s *Send) sendControlFrame(ctx context.Context, lane *laneRuntime, frame protocol.Frame) error {
@@ -913,7 +925,7 @@ func (s *Send) sendControlFrame(ctx context.Context, lane *laneRuntime, frame pr
 		return err
 	}
 
-	leg := lane.chooseControlTransport()
+	leg := lane.chooseControlTransportWithQoS(s.qosSelectionEnabled())
 	if leg.Kind == 0 {
 		packet.Release()
 		return ErrLaneUnavailable
@@ -1035,7 +1047,7 @@ func (s *Send) sendRepair(ctx context.Context, sessionID uint64, lane *laneRunti
 		return
 	}
 
-	leg := lane.shadowTransport()
+	leg := lane.shadowTransportWithQoS(s.qosSelectionEnabled())
 	if leg.Kind == 0 {
 		packet.Release()
 		return
