@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/MeteorsLiu/multipath/internal/debuglog"
+	"github.com/MeteorsLiu/multipath/internal/eventlog"
 	"github.com/MeteorsLiu/multipath/internal/transport"
 	"github.com/MeteorsLiu/multipath/internal/tunnel/v2/probe/bw"
 )
@@ -148,6 +149,8 @@ func (s *bwScheduler) eval(ctx context.Context) {
 			s.mu.Unlock()
 			if stillRemoteSameTarget {
 				debuglog.Printf("send/bw", "gate_remote_timeout lane=%d kind=%d", target.laneID, target.kind)
+				eventlog.Printf("bw", "action=remote_timeout session=%d lane=%d leg=%s timeout=%s",
+					target.key.SessionID, target.laneID, kindEventLabel(target.kind), d)
 				s.advanceAfterRemote(target.key)
 			}
 		}
@@ -165,6 +168,8 @@ func (s *bwScheduler) runLocal(ctx context.Context, target bwTarget) {
 		// Could not start (e.g. leg not active): skip this local phase by
 		// self-advancing as if the local probe completed.
 		debuglog.Printf("send/bw", "gate_local_skip lane=%d kind=%d", target.laneID, target.kind)
+		eventlog.Printf("bw", "action=local_skip session=%d lane=%d leg=%s reference_bps=%d cap_bps=%d",
+			target.key.SessionID, target.laneID, kindEventLabel(target.kind), target.referenceBps, target.capBps)
 		go s.advanceAfterLocal(target.key)
 	}
 }
@@ -308,6 +313,7 @@ func (s *bwScheduler) abort(key LegKey) {
 		loop.Stop()
 	}
 	debuglog.Printf("send/bw", "gate_abort lane=%d kind=%d", key.LaneID, key.Kind)
+	eventlog.Printf("bw", "action=gate_abort session=%d lane=%d leg=%s", key.SessionID, key.LaneID, kindEventLabel(key.Kind))
 
 	// Release the gate by advancing past the current phase.
 	if phase == bwPhaseLocal {

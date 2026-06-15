@@ -275,6 +275,7 @@ func (h *RecvHandler) OnClose(ctx context.Context, leg transport.LegRef, frame p
 	}
 
 	if body.Reason == protocol.CloseReasonUnknownSession {
+		eventlog.Printf("reconnect", "action=unknown_session_close session=%d leg=%s", frame.SessionID, linkStatusKindLabel(leg.Kind))
 		// The peer forgot our session (it restarted). Rebuild a fresh one. Only
 		// the client (with bootstrap lanes) acts; the server side is a no-op and
 		// just awaits the peer's new HELLO. Rebootstrap tears down the old session

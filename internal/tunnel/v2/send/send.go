@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/MeteorsLiu/multipath/internal/debuglog"
+	"github.com/MeteorsLiu/multipath/internal/eventlog"
 	"github.com/MeteorsLiu/multipath/internal/fec"
 	"github.com/MeteorsLiu/multipath/internal/packetbuf"
 	"github.com/MeteorsLiu/multipath/internal/protocol"
@@ -361,7 +362,13 @@ func (s *Send) Rebootstrap() error {
 	oldSessionID, _ := s.activeSession()
 	closedTCP := s.teardownSession(oldSessionID)
 	debuglog.Printf("send", "rebootstrap old_session=%d", oldSessionID)
+	eventlog.Printf("reconnect", "action=rebootstrap_start old_session=%d", oldSessionID)
 	err := s.bootstrapSession(baseCtx)
+	if err != nil {
+		eventlog.Printf("reconnect", "action=rebootstrap_error old_session=%d err=%v", oldSessionID, err)
+	} else if newSessionID, ok := s.activeSession(); ok {
+		eventlog.Printf("reconnect", "action=rebootstrap_done old_session=%d new_session=%d", oldSessionID, newSessionID)
+	}
 	s.rebootstrapMu.Unlock()
 	s.closeTCPRefs(closedTCP)
 	return err
@@ -1046,20 +1053,26 @@ func (s *Send) OnLegFailure(ctx context.Context, legRef transport.LegRef, err er
 
 	// Find the lane holding this TCP connID and mark TCP down.
 	s.lanesMu.RLock()
-	var affected []*laneRuntime
-	for _, lane := range s.lanes {
+	type affectedLane struct {
+		sessionID uint64
+		lane      *laneRuntime
+	}
+	var affected []affectedLane
+	for key, lane := range s.lanes {
 		if ref := lane.leg.refForKind(transport.KindTCP); ref.ConnID == legRef.ConnID {
-			affected = append(affected, lane)
+			affected = append(affected, affectedLane{sessionID: key.sessionID, lane: lane})
 		}
 	}
 	s.lanesMu.RUnlock()
 
-	for _, lane := range affected {
-		lane.markDown(transport.KindTCP)
-		if lane.dialer != nil {
-			lane.dialer.redial()
+	for _, affected := range affected {
+		affected.lane.markDown(transport.KindTCP)
+		if affected.lane.dialer != nil {
+			affected.lane.dialer.redial()
 		}
 		debuglog.Printf("send", "tcp_leg_failure conn=%s err=%v", legRef.ConnID, err)
+		eventlog.Printf("reconnect", "action=tcp_leg_failure session=%d lane=%d conn=%s err=%v",
+			affected.sessionID, affected.lane.id, legRef.ConnID, err)
 	}
 }
 
@@ -1247,6 +1260,9 @@ func (s *Send) startBwScheduler(ctx context.Context, sessionID uint64) {
 				}
 				debuglog.Printf("send/bw", "sample session=%d lane=%d kind=%d bps=%d loss=%.3f",
 					sessionID, t.laneID, t.kind, sample.BandwidthBps, sample.Loss)
+				eventlog.Printf("bw", "action=sample session=%d lane=%d leg=%s bps=%d loss=%.3f reference_bps=%d cap_bps=%d prefer_tcp=%t",
+					sessionID, t.laneID, kindEventLabel(t.kind), sample.BandwidthBps, sample.Loss,
+					t.referenceBps, t.capBps, t.kind == transport.KindUDP && bwPreferTCP(sample))
 			},
 		})
 		loop, err := b.Start(ctx)
@@ -1273,6 +1289,8 @@ func (s *Send) startBwScheduler(ctx context.Context, sessionID uint64) {
 		return
 	}
 	s.bwSched = sched
+	eventlog.Printf("bw", "action=scheduler_start session=%d is_client=%t cap_bps=%d reference_bps=%d",
+		sessionID, s.isClient, s.bwCapBps, s.bwReference)
 	s.laneManager.SetRemoteComplete(func(key LegKey) {
 		if sched := s.getBwScheduler(); sched != nil {
 			sched.advanceAfterRemote(key)
@@ -1308,4 +1326,15 @@ func (s *Send) currentSessionContext(sessionID uint64) (context.Context, bool) {
 		return nil, false
 	}
 	return s.sessionCtx, true
+}
+
+func kindEventLabel(kind transport.Kind) string {
+	switch kind {
+	case transport.KindUDP:
+		return "udp"
+	case transport.KindTCP:
+		return "tcp"
+	default:
+		return "unknown"
+	}
 }

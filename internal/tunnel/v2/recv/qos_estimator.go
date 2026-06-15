@@ -175,8 +175,12 @@ func (e *qosEstimator) evaluateLimited(sample qosEstimate, now time.Time) (qosSt
 		return qosStatus{}, false
 	}
 	if sample.Loss < qosLossExit {
+		_, pending := e.limitedSince[sample.DataKind]
 		delete(e.limitedSince, sample.DataKind)
-		e.clearActive(sample.DataKind, protocol.LinkStatusReasonLimited)
+		cleared := e.clearActive(sample.DataKind, protocol.LinkStatusReasonLimited)
+		if pending || cleared {
+			e.recordEvent("limited_clear", sample.DataKind, protocol.LinkStatusReasonLimited)
+		}
 		return qosStatus{}, false
 	}
 	if sample.Loss <= qosLossEnter {
@@ -200,8 +204,12 @@ func (e *qosEstimator) evaluateLimited(sample qosEstimate, now time.Time) (qosSt
 
 func (e *qosEstimator) evaluateBacklogged(sample qosEstimate, now time.Time) (qosStatus, bool) {
 	if sample.Lag <= 0 || !qosKnownKind(sample.RepairKind) || sample.RepairKind == sample.DataKind {
+		_, pending := e.backlogSince[sample.DataKind]
 		delete(e.backlogSince, sample.DataKind)
-		e.clearActive(sample.DataKind, protocol.LinkStatusReasonBacklogged)
+		cleared := e.clearActive(sample.DataKind, protocol.LinkStatusReasonBacklogged)
+		if pending || cleared {
+			e.recordEvent("backlogged_clear", sample.DataKind, protocol.LinkStatusReasonBacklogged)
+		}
 		return qosStatus{}, false
 	}
 	base, hasBase := e.lagBaseline[sample.DataKind]
@@ -210,8 +218,12 @@ func (e *qosEstimator) evaluateBacklogged(sample qosEstimate, now time.Time) (qo
 		base = sample.Lag
 	}
 	if sample.Lag <= base+e.cfg.LagSlack {
+		_, pending := e.backlogSince[sample.DataKind]
 		delete(e.backlogSince, sample.DataKind)
-		e.clearActive(sample.DataKind, protocol.LinkStatusReasonBacklogged)
+		cleared := e.clearActive(sample.DataKind, protocol.LinkStatusReasonBacklogged)
+		if pending || cleared {
+			e.recordEvent("backlogged_clear", sample.DataKind, protocol.LinkStatusReasonBacklogged)
+		}
 		return qosStatus{}, false
 	}
 	ready, first := e.sustained(e.backlogSince, sample.DataKind, now)
@@ -239,15 +251,17 @@ func (e *qosEstimator) setActive(status qosStatus, now time.Time) {
 	byReason[status.Reason] = qosActiveEvidence{lastEvidence: now, status: status}
 }
 
-func (e *qosEstimator) clearActive(kind transport.Kind, reason uint8) {
+func (e *qosEstimator) clearActive(kind transport.Kind, reason uint8) bool {
 	byReason := e.active[kind]
 	if byReason == nil {
-		return
+		return false
 	}
+	_, existed := byReason[reason]
 	delete(byReason, reason)
 	if len(byReason) == 0 {
 		delete(e.active, kind)
 	}
+	return existed
 }
 
 func (e *qosEstimator) refreshActive(now time.Time) []qosStatus {
@@ -412,7 +426,7 @@ func (e *qosEstimator) recordEvent(event string, kind transport.Kind, reason uin
 		metrics.LU8("reason", reason),
 	)
 	switch event {
-	case "limited_pending", "limited_active", "backlogged_pending", "backlogged_active":
+	case "limited_pending", "limited_active", "limited_clear", "backlogged_pending", "backlogged_active", "backlogged_clear":
 		eventlog.Printf("qos_state", "event=%s session=%d lane=%d leg=%s reason=%d",
 			event, e.cfg.SessionID, e.cfg.LaneID, kindMetricLabel(kind), reason)
 	}
