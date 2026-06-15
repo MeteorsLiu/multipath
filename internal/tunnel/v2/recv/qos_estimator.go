@@ -13,7 +13,6 @@ import (
 const (
 	defaultQoSSustain     = 3 * time.Second
 	defaultQoSSampleFloor = 4
-	defaultQoSLagSlack    = 300 * time.Millisecond
 	defaultQoSRefresh     = time.Second
 	defaultQoSAlpha       = 0.10
 
@@ -24,7 +23,6 @@ const (
 type qosConfig struct {
 	Sustain     time.Duration
 	SampleFloor uint64
-	LagSlack    time.Duration
 	Refresh     time.Duration
 	SessionID   uint64
 	LaneID      uint8
@@ -46,7 +44,6 @@ type qosSample struct {
 	RecoveredBytes uint64
 	RepairKind     transport.Kind
 	RepairBytes    uint64
-	Lag            time.Duration
 }
 
 type qosEstimator struct {
@@ -54,8 +51,6 @@ type qosEstimator struct {
 	emit func(qosStatus)
 
 	limitedSince map[transport.Kind]time.Time
-	backlogSince map[transport.Kind]time.Time
-	lagBaseline  map[transport.Kind]time.Duration
 	lastEmit     map[transport.Kind]map[uint8]time.Time
 	ema          map[transport.Kind]*qosEMAState
 	active       map[transport.Kind]map[uint8]qosActiveEvidence
@@ -68,17 +63,15 @@ type qosEstimate struct {
 	SampleTotal  uint64
 	Loss         float64
 	DeliveredBps uint32
-	Lag          time.Duration
 }
 
 type qosEMAState struct {
-	repairKind         transport.Kind
-	initialized        bool
-	sampleTotal        uint64
-	expectedEMA        float64
-	arrivedEMA         float64
-	deliveredBpsEMA    float64
-	lagMillisecondsEMA float64
+	repairKind      transport.Kind
+	initialized     bool
+	sampleTotal     uint64
+	expectedEMA     float64
+	arrivedEMA      float64
+	deliveredBpsEMA float64
 }
 
 type qosActiveEvidence struct {
@@ -93,9 +86,6 @@ func newQoSEstimator(cfg qosConfig, emit func(qosStatus)) *qosEstimator {
 	if cfg.SampleFloor == 0 {
 		cfg.SampleFloor = defaultQoSSampleFloor
 	}
-	if cfg.LagSlack <= 0 {
-		cfg.LagSlack = defaultQoSLagSlack
-	}
 	if cfg.Refresh <= 0 {
 		cfg.Refresh = defaultQoSRefresh
 	}
@@ -103,8 +93,6 @@ func newQoSEstimator(cfg qosConfig, emit func(qosStatus)) *qosEstimator {
 		cfg:          cfg,
 		emit:         emit,
 		limitedSince: make(map[transport.Kind]time.Time),
-		backlogSince: make(map[transport.Kind]time.Time),
-		lagBaseline:  make(map[transport.Kind]time.Duration),
 		lastEmit:     make(map[transport.Kind]map[uint8]time.Time),
 		ema:          make(map[transport.Kind]*qosEMAState),
 		active:       make(map[transport.Kind]map[uint8]qosActiveEvidence),
@@ -159,12 +147,6 @@ func (e *qosEstimator) evaluate(sample qosEstimate) []qosStatus {
 			out = append(out, status)
 		}
 	}
-	if status, ok := e.evaluateBacklogged(sample, now); ok {
-		if e.shouldEmit(status.Kind, status.Reason, now) {
-			e.recordEvent("backlogged_active", status.Kind, status.Reason)
-			out = append(out, status)
-		}
-	}
 	out = append(out, e.refreshActive(now)...)
 	return out
 }
@@ -196,46 +178,6 @@ func (e *qosEstimator) evaluateLimited(sample qosEstimate, now time.Time) (qosSt
 	status := qosStatus{
 		Kind:         sample.DataKind,
 		Reason:       protocol.LinkStatusReasonLimited,
-		DeliveredBps: sample.DeliveredBps,
-	}
-	e.setActive(status, now)
-	return status, true
-}
-
-func (e *qosEstimator) evaluateBacklogged(sample qosEstimate, now time.Time) (qosStatus, bool) {
-	if sample.Lag <= 0 || !qosKnownKind(sample.RepairKind) || sample.RepairKind == sample.DataKind {
-		_, pending := e.backlogSince[sample.DataKind]
-		delete(e.backlogSince, sample.DataKind)
-		cleared := e.clearActive(sample.DataKind, protocol.LinkStatusReasonBacklogged)
-		if pending || cleared {
-			e.recordEvent("backlogged_clear", sample.DataKind, protocol.LinkStatusReasonBacklogged)
-		}
-		return qosStatus{}, false
-	}
-	base, hasBase := e.lagBaseline[sample.DataKind]
-	if !hasBase || sample.Lag < base {
-		e.lagBaseline[sample.DataKind] = sample.Lag
-		base = sample.Lag
-	}
-	if sample.Lag <= base+e.cfg.LagSlack {
-		_, pending := e.backlogSince[sample.DataKind]
-		delete(e.backlogSince, sample.DataKind)
-		cleared := e.clearActive(sample.DataKind, protocol.LinkStatusReasonBacklogged)
-		if pending || cleared {
-			e.recordEvent("backlogged_clear", sample.DataKind, protocol.LinkStatusReasonBacklogged)
-		}
-		return qosStatus{}, false
-	}
-	ready, first := e.sustained(e.backlogSince, sample.DataKind, now)
-	if !ready {
-		if first {
-			e.recordEvent("backlogged_pending", sample.DataKind, protocol.LinkStatusReasonBacklogged)
-		}
-		return qosStatus{}, false
-	}
-	status := qosStatus{
-		Kind:         sample.DataKind,
-		Reason:       protocol.LinkStatusReasonBacklogged,
 		DeliveredBps: sample.DeliveredBps,
 	}
 	e.setActive(status, now)
@@ -286,9 +228,6 @@ func (e *qosEstimator) refreshActive(now time.Time) []qosStatus {
 }
 
 func activeEventName(reason uint8) string {
-	if reason == protocol.LinkStatusReasonBacklogged {
-		return "backlogged_active"
-	}
 	return "limited_active"
 }
 
@@ -328,13 +267,12 @@ func deliveredBps(bytes uint64, duration time.Duration) uint32 {
 
 func (e *qosEstimator) resetTransientState() {
 	clear(e.limitedSince)
-	clear(e.backlogSince)
 	clear(e.ema)
 	clear(e.active)
 }
 
 func (e *qosEstimator) hasPendingState() bool {
-	return len(e.limitedSince) > 0 || len(e.backlogSince) > 0
+	return len(e.limitedSince) > 0
 }
 
 func qosKnownKind(kind transport.Kind) bool {
@@ -353,19 +291,16 @@ func (s *qosEMAState) observe(sample qosSample) {
 	expected := float64(sample.DataExpected)
 	arrived := float64(sample.DataArrived)
 	bps := float64(deliveredBps(sample.DataBytes+sample.RecoveredBytes, sample.Duration))
-	lagMS := float64(sample.Lag.Milliseconds())
 	if !s.initialized {
 		s.expectedEMA = expected
 		s.arrivedEMA = arrived
 		s.deliveredBpsEMA = bps
-		s.lagMillisecondsEMA = lagMS
 		s.initialized = true
 		return
 	}
 	s.expectedEMA = emaUpdate(s.expectedEMA, expected, defaultQoSAlpha)
 	s.arrivedEMA = emaUpdate(s.arrivedEMA, arrived, defaultQoSAlpha)
 	s.deliveredBpsEMA = emaUpdate(s.deliveredBpsEMA, bps, defaultQoSAlpha)
-	s.lagMillisecondsEMA = emaUpdate(s.lagMillisecondsEMA, lagMS, defaultQoSAlpha)
 }
 
 func (s *qosEMAState) estimate(at time.Time, kind transport.Kind) qosEstimate {
@@ -380,10 +315,6 @@ func (s *qosEMAState) estimate(at time.Time, kind transport.Kind) qosEstimate {
 	if delivered > math.MaxUint32 {
 		delivered = math.MaxUint32
 	}
-	lagMS := s.lagMillisecondsEMA
-	if lagMS < 0 {
-		lagMS = 0
-	}
 	return qosEstimate{
 		At:           at,
 		DataKind:     kind,
@@ -391,7 +322,6 @@ func (s *qosEMAState) estimate(at time.Time, kind transport.Kind) qosEstimate {
 		SampleTotal:  s.sampleTotal,
 		Loss:         loss,
 		DeliveredBps: uint32(delivered),
-		Lag:          time.Duration(lagMS) * time.Millisecond,
 	}
 }
 
@@ -410,7 +340,6 @@ func (e *qosEstimator) recordSampleMetrics(sample qosEstimate) {
 		metrics.LStr("leg", leg),
 	}
 	metrics.SetGauge(metrics.QoSLossRatio, sample.Loss, labels...)
-	metrics.SetGauge(metrics.QoSLagMs, float64(sample.Lag.Milliseconds()), labels...)
 	metrics.SetGauge(metrics.QoSDeliveredBps, float64(sample.DeliveredBps), labels...)
 }
 
@@ -426,7 +355,7 @@ func (e *qosEstimator) recordEvent(event string, kind transport.Kind, reason uin
 		metrics.LU8("reason", reason),
 	)
 	switch event {
-	case "limited_pending", "limited_active", "limited_clear", "backlogged_pending", "backlogged_active", "backlogged_clear":
+	case "limited_active", "limited_clear":
 		eventlog.Printf("qos_state", "event=%s session=%d lane=%d leg=%s reason=%d",
 			event, e.cfg.SessionID, e.cfg.LaneID, kindMetricLabel(kind), reason)
 	}

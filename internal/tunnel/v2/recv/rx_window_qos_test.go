@@ -131,7 +131,7 @@ func TestRxWindowDefersTCPRecoverySampleUntilLateData(t *testing.T) {
 
 	late := w.observeLateData(transport.KindTCP, 300, make([]byte, 100), now.Add(900*time.Millisecond))
 	if !late.hasSample {
-		t.Fatal("late TCP DATA should produce a QoS lag sample")
+		t.Fatal("late TCP DATA should produce a QoS sample")
 	}
 	if late.sample.DataKind != transport.KindTCP || late.sample.RepairKind != transport.KindUDP {
 		t.Fatalf("sample kinds = data %d repair %d, want TCP/UDP", late.sample.DataKind, late.sample.RepairKind)
@@ -142,10 +142,6 @@ func TestRxWindowDefersTCPRecoverySampleUntilLateData(t *testing.T) {
 	if late.sample.DataBytes != 100 {
 		t.Fatalf("DataBytes = %d, want late DATA bytes 100", late.sample.DataBytes)
 	}
-	if late.sample.Lag != 900*time.Millisecond {
-		t.Fatalf("Lag = %s, want 900ms", late.sample.Lag)
-	}
-
 	again := w.observeLateData(transport.KindTCP, 300, make([]byte, 100), now.Add(time.Second))
 	if again.hasSample || again.hasRecoverable {
 		t.Fatalf("second duplicate result = %+v, want no repeated sample", again)

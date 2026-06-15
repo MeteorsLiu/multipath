@@ -32,8 +32,7 @@ const (
 	minTCPDelivery = 0.90
 	minUDPJitter   = 10 * time.Millisecond
 
-	QoSReasonLimited    uint8 = 1
-	QoSReasonBacklogged uint8 = 2
+	QoSReasonLimited uint8 = 1
 
 	qosHold       = 10 * time.Second
 	qosPreferWait = 10 * time.Second

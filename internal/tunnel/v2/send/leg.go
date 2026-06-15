@@ -270,6 +270,23 @@ func (g *leg) setPrimary(k transport.Kind) {
 	g.mu.Unlock()
 }
 
+func (g *leg) noteQoSSelectedPrimary(k transport.Kind, qosActive bool) (transport.Kind, bool) {
+	if k != transport.KindUDP && k != transport.KindTCP {
+		return 0, false
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	previous := g.primaryKind
+	if !qosActive && !(previous == transport.KindTCP && k == transport.KindUDP) {
+		return previous, false
+	}
+	if previous == k {
+		return previous, false
+	}
+	g.primaryKind = k
+	return previous, true
+}
+
 func otherKind(k transport.Kind) transport.Kind {
 	if k == transport.KindUDP {
 		return transport.KindTCP

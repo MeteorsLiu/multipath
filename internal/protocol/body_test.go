@@ -180,7 +180,7 @@ func TestLinkStatusRejectsInvalidBody(t *testing.T) {
 		{LegKind: 0, Reason: LinkStatusReasonLimited, DeliveredBps: 1},
 		{LegKind: LinkStatusLegUDP, Reason: 0, DeliveredBps: 1},
 		{LegKind: LinkStatusLegTCP + 1, Reason: LinkStatusReasonLimited, DeliveredBps: 1},
-		{LegKind: LinkStatusLegUDP, Reason: LinkStatusReasonBacklogged + 1, DeliveredBps: 1},
+		{LegKind: LinkStatusLegUDP, Reason: LinkStatusReasonLimited + 1, DeliveredBps: 1},
 	}
 	for _, body := range tests {
 		_, err := Encode(Frame{Type: TypeLinkStatus, SessionID: 1, LaneID: 1, Body: body}, nil)

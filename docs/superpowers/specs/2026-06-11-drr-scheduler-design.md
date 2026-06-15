@@ -236,7 +236,7 @@ DRR does not implement QoS detection or switching.
 DRR does not know:
 
 ```text
-limited/backlogged state
+limited state
 LINK_STATUS
 primary/shadow transport role
 UDP/TCP transport quality

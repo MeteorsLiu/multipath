@@ -57,8 +57,6 @@ func (w *QoSWriter) Write(ctx context.Context, status recv.QoSStatus) error {
 	}
 	debuglog.Printf("runtime/qos", "link_status_send session=%d lane=%d kind=%d reason=%d delivered_bps=%d",
 		status.SessionID, status.LaneID, status.Kind, status.Reason, status.DeliveredBps)
-	eventlog.Printf("link_status", "action=send session=%d lane=%d leg=%s reason=%d delivered_bps=%d",
-		status.SessionID, status.LaneID, linkStatusKindLabel(status.Kind), status.Reason, status.DeliveredBps)
 	err := w.send.WriteFrame(ctx, protocol.Frame{
 		Version:   protocol.Version,
 		Type:      protocol.TypeLinkStatus,

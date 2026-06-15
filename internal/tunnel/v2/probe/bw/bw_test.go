@@ -60,6 +60,133 @@ func TestBWStartActiveSendsProbes(t *testing.T) {
 	}
 }
 
+func TestBwLoopUsesTrainBudgetForRemaining(t *testing.T) {
+	const referenceBps = uint64(200_000_000)
+
+	var sentProbes []Probe
+	var sentMu sync.Mutex
+	sampleDone := make(chan struct{})
+
+	b := New(Config{
+		ReferenceBps:      referenceBps,
+		MinRateBps:        16_000_000,
+		StepWindow:        5 * time.Millisecond,
+		AckGrace:          5 * time.Millisecond,
+		PayloadMin:        1200,
+		PayloadMax:        1200,
+		LossStopThreshold: 0.01,
+		SendProbe: func(p Probe) error {
+			sentMu.Lock()
+			sentProbes = append(sentProbes, p)
+			sentMu.Unlock()
+			return nil
+		},
+		OnSample: func(Sample) {
+			close(sampleDone)
+		},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := b.Start(ctx); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	select {
+	case <-sampleDone:
+	case <-time.After(time.Second):
+		t.Fatal("train did not complete")
+	}
+
+	sentMu.Lock()
+	defer sentMu.Unlock()
+	if len(sentProbes) < 2 {
+		t.Fatalf("expected data probes plus completion marker, got %d", len(sentProbes))
+	}
+
+	trainTotal := trainBudgetBytes(referenceBps)
+	first := sentProbes[0]
+	if first.Total != trainTotal {
+		t.Fatalf("first probe total = %d, want train budget %d", first.Total, trainTotal)
+	}
+	if first.Remaining != trainTotal-uint64(first.Bytes) {
+		t.Fatalf("first probe remaining = %d, want %d", first.Remaining, trainTotal-uint64(first.Bytes))
+	}
+
+	last := sentProbes[len(sentProbes)-1]
+	if last.Remaining != 0 || last.Bytes != 0 || last.Count != 1 {
+		t.Fatalf("completion marker = %+v, want Remaining=0 Bytes=0 Count=1", last)
+	}
+	for i, p := range sentProbes[:len(sentProbes)-1] {
+		if p.Bytes == 0 {
+			t.Fatalf("probe %d before completion has zero bytes: %+v", i, p)
+		}
+		if p.Total != trainTotal {
+			t.Fatalf("probe %d total = %d, want %d", i, p.Total, trainTotal)
+		}
+		if p.Remaining == 0 {
+			t.Fatalf("probe %d reported train complete before completion marker", i)
+		}
+	}
+}
+
+func TestBwLoopRemainingDecreasesAcrossSteps(t *testing.T) {
+	var sentProbes []Probe
+	var sentMu sync.Mutex
+	sampleDone := make(chan struct{})
+
+	b := New(Config{
+		ReferenceBps: 200_000_000,
+		CapBps:       32_000_000,
+		MinRateBps:   16_000_000,
+		StepWindow:   5 * time.Millisecond,
+		AckGrace:     5 * time.Millisecond,
+		PayloadMin:   1200,
+		PayloadMax:   1200,
+		SendProbe: func(p Probe) error {
+			sentMu.Lock()
+			sentProbes = append(sentProbes, p)
+			sentMu.Unlock()
+			return nil
+		},
+		OnSample: func(Sample) {
+			close(sampleDone)
+		},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := b.Start(ctx); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	select {
+	case <-sampleDone:
+	case <-time.After(time.Second):
+		t.Fatal("train did not complete")
+	}
+
+	sentMu.Lock()
+	defer sentMu.Unlock()
+	var dataProbes []Probe
+	for _, p := range sentProbes {
+		if p.Bytes > 0 {
+			dataProbes = append(dataProbes, p)
+		}
+	}
+	if len(dataProbes) < 4 {
+		t.Fatalf("expected multiple step probes, got %d data probes from %+v", len(dataProbes), sentProbes)
+	}
+	for i := 1; i < len(dataProbes); i++ {
+		if dataProbes[i].Remaining >= dataProbes[i-1].Remaining {
+			t.Fatalf("remaining did not decrease at probe %d: prev=%d cur=%d", i, dataProbes[i-1].Remaining, dataProbes[i].Remaining)
+		}
+		if dataProbes[i].Total != dataProbes[0].Total {
+			t.Fatalf("total changed at probe %d: first=%d cur=%d", i, dataProbes[0].Total, dataProbes[i].Total)
+		}
+	}
+}
+
 // TestBwLoopAckYieldsSample verifies that fully acking each step yields a
 // non-zero bandwidth sample with zero loss.
 func TestBwLoopAckYieldsSample(t *testing.T) {
@@ -289,6 +416,7 @@ func TestNextRateAndPlateau(t *testing.T) {
 		t.Error("plateau should be false for a growing series")
 	}
 }
+
 // TestPayloadSizeRandomizesWithinBounds verifies the per-probe payload size is
 // fixed when min==max and varies deterministically within [min,max] otherwise
 // (spec: UDP randomizes 1200-1400, TCP fixes 32KB). Pure function.
@@ -401,7 +529,7 @@ func TestLossStopEndsTrainEarly(t *testing.T) {
 			LossStopThreshold: lossStop,
 			OnSample:          func(Sample) {},
 			SendProbe: func(p Probe) error {
-				if p.Seq == 0 {
+				if p.Bytes > 0 && p.Seq == 0 {
 					stepsMu.Lock()
 					steps++ // one per step (first frame)
 					stepsMu.Unlock()

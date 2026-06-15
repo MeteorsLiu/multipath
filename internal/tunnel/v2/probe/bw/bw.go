@@ -78,16 +78,16 @@ type Config struct {
 // Rate adaptation defaults (mirrors the old bandwidth_probe.go constants,
 // trimmed to what the zero-identity loop needs).
 const (
-	defaultMinRateBps     = uint64(16_000_000)
-	defaultStepWindow     = 200 * time.Millisecond
-	defaultAckGrace       = 100 * time.Millisecond
-	additiveStepBps       = uint64(10_000_000)
-	plateauGrowth         = 1.05
-	plateauSteps          = 2
-	minProbeSize          = 1200
-	maxProbeFrames        = 64
-	minProbeFrames        = 2
-	trainWindow           = 10 * time.Second // total budget window
+	defaultMinRateBps = uint64(16_000_000)
+	defaultStepWindow = 200 * time.Millisecond
+	defaultAckGrace   = 100 * time.Millisecond
+	additiveStepBps   = uint64(10_000_000)
+	plateauGrowth     = 1.05
+	plateauSteps      = 2
+	minProbeSize      = 1200
+	maxProbeFrames    = 64
+	minProbeFrames    = 2
+	trainWindow       = 10 * time.Second // total budget window
 )
 
 // nextRate returns the next probing rate given the current rate, an optional
@@ -174,6 +174,16 @@ func trainBudgetBytes(rateBps uint64) uint64 {
 		rateBps = defaultMinRateBps
 	}
 	return rateBps * uint64(trainWindow) / uint64(time.Second) / 8
+}
+
+func trainBudgetRate(referenceBps, capBps, minRateBps uint64) uint64 {
+	if referenceBps > 0 {
+		return referenceBps
+	}
+	if capBps > 0 {
+		return capBps
+	}
+	return minRateBps
 }
 
 // stepFrameCount derives how many probe frames a step sends at rateBps over the
@@ -351,15 +361,15 @@ type BwLoop struct {
 
 // stepState tracks one step's send/ack accounting.
 type stepState struct {
-	rateBps    uint64
-	count      uint16
-	sent       uint16
-	received   uint64
-	firstRXMS  uint64
-	lastRXMS   uint64
-	bytesEach  int
-	ackCh      chan struct{}
-	ackClosed  bool
+	rateBps   uint64
+	count     uint16
+	sent      uint16
+	received  uint64
+	firstRXMS uint64
+	lastRXMS  uint64
+	bytesEach int
+	ackCh     chan struct{}
+	ackClosed bool
 }
 
 // TrainID returns the probe train ID (used as the LaneManager key).
@@ -380,10 +390,11 @@ func (l *BwLoop) run(ctx context.Context) {
 	defer l.cleanup()
 
 	curRate := startRate(l.capBps, l.minRateBps)
-	budget := trainBudgetBytes(effectiveRate(curRate, l.capBps, l.minRateBps))
+	trainTotal := trainBudgetBytes(trainBudgetRate(l.referenceBps, l.capBps, l.minRateBps))
+	remaining := trainTotal
 	deadline := time.Now().Add(trainWindow)
 
-	for budget > 0 && time.Now().Before(deadline) {
+	for remaining > 0 && time.Now().Before(deadline) {
 		if ctx.Err() != nil {
 			return
 		}
@@ -391,12 +402,7 @@ func (l *BwLoop) run(ctx context.Context) {
 		count := stepFrameCount(effRate, l.stepWindow, l.bytesPerProbe)
 
 		step := l.beginStep(effRate, count)
-		sentBytes := l.sendStep(ctx, step, budget)
-		if sentBytes >= budget {
-			budget = 0
-		} else {
-			budget -= sentBytes
-		}
+		l.sendStep(ctx, step, trainTotal, &remaining)
 
 		// Wait for this step's acks (or grace timeout) before scoring it.
 		l.waitStep(ctx, step)
@@ -421,7 +427,31 @@ func (l *BwLoop) run(ctx context.Context) {
 		curRate = nextRate(effRate, l.capBps, stalled)
 	}
 
+	if remaining > 0 {
+		l.sendComplete(ctx, trainTotal)
+	}
 	l.emitSample()
+}
+
+func (l *BwLoop) sendComplete(ctx context.Context, trainTotal uint64) {
+	if ctx.Err() != nil || l.isDone() || l.bw == nil || l.bw.sendProbe == nil {
+		return
+	}
+	_ = l.bw.sendProbe(Probe{
+		ID:        l.trainID,
+		Seq:       0,
+		Count:     1,
+		SendMS:    uint64(time.Now().UnixMilli()),
+		Total:     trainTotal,
+		Remaining: 0,
+		Bytes:     0,
+	})
+}
+
+func (l *BwLoop) isDone() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.done
 }
 
 // stepLoss returns the loss ratio of a step from its sent vs acked frame counts.
@@ -452,14 +482,26 @@ func (l *BwLoop) beginStep(rateBps uint64, count uint16) *stepState {
 // the peer can detect train end (Remaining==0 on the final frame). Per-probe
 // payload sizes are randomized in [payloadMin,payloadMax] (spec: UDP 1200-1400);
 // when a limiter is set, sends are token-bucket paced to the step rate.
-func (l *BwLoop) sendStep(ctx context.Context, step *stepState, budget uint64) uint64 {
-	// Pre-size each probe so the step's byte total is known up front (needed for
-	// the decreasing Remaining the peer uses to detect train end).
-	sizes := make([]int, step.count)
-	total := uint64(0)
-	for seq := uint16(0); seq < step.count; seq++ {
-		sizes[seq] = payloadSize(l.payloadMin, l.payloadMax, l.trainID, seq)
-		total += uint64(sizes[seq])
+func (l *BwLoop) sendStep(ctx context.Context, step *stepState, trainTotal uint64, remaining *uint64) uint64 {
+	if remaining == nil || *remaining == 0 {
+		return 0
+	}
+	sizes := make([]int, 0, step.count)
+	stepRemaining := *remaining
+	for seq := uint16(0); seq < step.count && stepRemaining > 0; seq++ {
+		bytes := payloadSize(l.payloadMin, l.payloadMax, l.trainID, seq)
+		if uint64(bytes) > stepRemaining {
+			bytes = int(stepRemaining)
+		}
+		sizes = append(sizes, bytes)
+		stepRemaining -= uint64(bytes)
+	}
+	l.mu.Lock()
+	step.count = uint16(len(sizes))
+	l.count = step.count
+	l.mu.Unlock()
+	if step.count == 0 {
+		return 0
 	}
 
 	// Pace the step rate via the limiter (re-sized to this step's rate) or, when
@@ -479,13 +521,11 @@ func (l *BwLoop) sendStep(ctx context.Context, step *stepState, budget uint64) u
 		defer ticker.Stop()
 	}
 
-	remaining := total
 	var sentBytes uint64
 
-	for seq := uint16(0); seq < step.count; seq++ {
-		bytes := sizes[seq]
-		if uint64(bytes) > remaining {
-			bytes = int(remaining)
+	for seq, bytes := range sizes {
+		if *remaining == 0 {
+			return sentBytes
 		}
 
 		// Pace with the limiter when enabled (token-bucket on bytes).
@@ -496,14 +536,14 @@ func (l *BwLoop) sendStep(ctx context.Context, step *stepState, budget uint64) u
 		}
 
 		nowMS := uint64(time.Now().UnixMilli())
-		remaining -= uint64(bytes)
+		*remaining -= uint64(bytes)
 		probe := Probe{
 			ID:        l.trainID,
-			Seq:       seq,
+			Seq:       uint16(seq),
 			Count:     step.count,
 			SendMS:    nowMS,
-			Total:     total,
-			Remaining: remaining,
+			Total:     trainTotal,
+			Remaining: *remaining,
 			Bytes:     bytes,
 		}
 

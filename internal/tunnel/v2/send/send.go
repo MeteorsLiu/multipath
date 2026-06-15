@@ -511,6 +511,7 @@ func (s *Send) openLaneHello(ctx context.Context, session *sessionpkg.Session, s
 	onExpire := func() {
 		debuglog.Printf("send", "hello_expired session=%d lane=%d", sessionID, laneID)
 		lane.markDown(legRef.Kind)
+		s.abortBwTarget(sessionID, laneID, legRef)
 		if legRef.Kind == transport.KindTCP && lane.dialer != nil {
 			lane.dialer.redial()
 		}
@@ -833,6 +834,7 @@ func (s *Send) sendDataFrame(ctx context.Context, lane *laneRuntime, frame proto
 		packet.Release()
 		return nil
 	}
+	s.recordQoSDataLegSelection(frame.SessionID, lane, leg.Kind)
 	if debuglog.Enabled() {
 		udpQ, tcpQ := lane.leg.qualitySnapshot()
 		debuglog.Printf("send", "schedule_select session=%d lane=%d leg={%s} frame=type=DATA packet_id=%d payload_len=%d udp_active=%t udp_rate=%.3f udp_qos=%t udp_qos_reason=%d udp_prefer_tcp=%t udp_rttvar_ms=%d tcp_active=%t tcp_rate=%.3f tcp_qos=%t tcp_qos_reason=%d",
@@ -854,6 +856,55 @@ func (s *Send) sendDataFrame(ctx context.Context, lane *laneRuntime, frame proto
 	}
 
 	return s.WriteTo(ctx, leg, packet)
+}
+
+func (s *Send) recordQoSDataLegSelection(sessionID uint64, lane *laneRuntime, kind transport.Kind) {
+	if lane == nil || kind == 0 {
+		return
+	}
+	udpQ, tcpQ := lane.leg.qualitySnapshot()
+	qosActive := udpQ.QoSActive || tcpQ.QoSActive
+	previousKind, changed := lane.leg.noteQoSSelectedPrimary(kind, qosActive)
+	if !changed {
+		return
+	}
+	eventlog.Printf("selector", "action=qos_data_leg session=%d lane=%d from=%s to=%s udp_active=%t udp_delivery=%.3f udp_qos=%t udp_qos_bps=%d udp_prefer_tcp=%t tcp_active=%t tcp_delivery=%.3f tcp_qos=%t tcp_qos_bps=%d",
+		sessionID, lane.id, kindEventLabel(previousKind), kindEventLabel(kind),
+		udpQ.Active, udpQ.DeliveryRate, udpQ.QoSActive, udpQ.QoSDeliveredBps, udpQ.PreferTCP,
+		tcpQ.Active, tcpQ.DeliveryRate, tcpQ.QoSActive, tcpQ.QoSDeliveredBps)
+}
+
+func (s *Send) logBandwidthProbeDecision(target bwTarget, sample bw.Sample, preferTCP bool) {
+	if target.kind != transport.KindUDP {
+		return
+	}
+	referenceBps := target.referenceBps
+	tcpBps := uint64(0)
+	if sched := s.getBwScheduler(); sched != nil {
+		tcpBps = sched.tcpReferenceBps(target.key.SessionID, target.laneID)
+	}
+	if referenceBps == 0 {
+		referenceBps = tcpBps
+	}
+	if referenceBps == 0 {
+		return
+	}
+	lane := s.getLane(laneKey{sessionID: target.key.SessionID, laneID: target.laneID})
+	if lane == nil {
+		return
+	}
+	udpQ, tcpQ := lane.leg.qualitySnapshot()
+	selected := "udp"
+	if preferTCP && tcpQ.Active {
+		selected = "tcp"
+	}
+	tcpBetter := referenceBps > sample.BandwidthBps
+	eventlog.Printf("bandwidth_probe_decision", "session=%d lane=%d udp_active=%t tcp_active=%t udp_bps=%d udp_loss=%.3f tcp_bps=%d reference_bps=%d cap_bps=%d udp_qos_limited=%t tcp_better=%t prefer_tcp=%t selected_leg=%s",
+		target.key.SessionID, target.laneID,
+		udpQ.Active, tcpQ.Active,
+		sample.BandwidthBps, sample.Loss,
+		tcpBps, referenceBps, target.capBps,
+		preferTCP, tcpBetter, preferTCP, selected)
 }
 
 func (s *Send) sendControlFrame(ctx context.Context, lane *laneRuntime, frame protocol.Frame) error {
@@ -1067,6 +1118,7 @@ func (s *Send) OnLegFailure(ctx context.Context, legRef transport.LegRef, err er
 
 	for _, affected := range affected {
 		affected.lane.markDown(transport.KindTCP)
+		s.abortBwTarget(affected.sessionID, affected.lane.id, legRef)
 		if affected.lane.dialer != nil {
 			affected.lane.dialer.redial()
 		}
@@ -1127,6 +1179,7 @@ func (s *Send) startLanePing(ctx context.Context, sessionID uint64, lane *laneRu
 		},
 		OnDown: func() {
 			lane.markDown(kind)
+			s.abortBwTarget(sessionID, laneID, legRef)
 			debuglog.Printf("send", "ping_down session=%d lane=%d kind=%d", sessionID, laneID, kind)
 		},
 		Observer: func(q ping.Quality) {
@@ -1147,6 +1200,15 @@ func (s *Send) startLanePing(ctx context.Context, sessionID uint64, lane *laneRu
 			debuglog.Printf("send", "ping_stop session=%d lane=%d kind=%d err=%v", sessionID, laneID, kind, err)
 		}
 	}()
+}
+
+func (s *Send) abortBwTarget(sessionID uint64, laneID uint8, legRef transport.LegRef) {
+	if legRef.Kind == 0 {
+		return
+	}
+	if sched := s.getBwScheduler(); sched != nil {
+		sched.abort(KeyForLeg(sessionID, laneID, legRef))
+	}
 }
 
 // bwPreferTCPThresholds: a UDP probe sample locks PreferTCP when loss is high or
@@ -1193,7 +1255,6 @@ func bwKindTuning(kind transport.Kind) (payloadMin, payloadMax int, lossStop flo
 //   - newLoop creates a bw.BW for the target leg (SendProbe → WriteFrame BW_PROBE;
 //     OnSample → setPreferTCP + DeleteBwLoop + advanceAfterLocal), starts a
 //     BwLoop, and stores it in the LaneManager so inbound BW_ACK can reach it.
-//   - timeout reads the leg SRTT to bound the remote-wait gate fallback.
 //   - remoteComplete (registered on the LaneManager) advances the gate when the
 //     recv glue reports the peer's train done (BW_PROBE remaining==0).
 //
@@ -1249,8 +1310,9 @@ func (s *Send) startBwScheduler(ctx context.Context, sessionID uint64) {
 				return s.WriteFrame(ctx, frame, t.leg)
 			},
 			OnSample: func(sample bw.Sample) {
+				preferTCP := t.kind == transport.KindUDP && bwPreferTCP(sample)
 				if t.kind == transport.KindUDP {
-					lane.leg.setPreferTCP(bwPreferTCP(sample))
+					lane.leg.setPreferTCP(preferTCP)
 				}
 				if l := loopPtr.Load(); l != nil {
 					s.laneManager.DeleteBwLoop(l.TrainID())
@@ -1262,7 +1324,8 @@ func (s *Send) startBwScheduler(ctx context.Context, sessionID uint64) {
 					sessionID, t.laneID, t.kind, sample.BandwidthBps, sample.Loss)
 				eventlog.Printf("bw", "action=sample session=%d lane=%d leg=%s bps=%d loss=%.3f reference_bps=%d cap_bps=%d prefer_tcp=%t",
 					sessionID, t.laneID, kindEventLabel(t.kind), sample.BandwidthBps, sample.Loss,
-					t.referenceBps, t.capBps, t.kind == transport.KindUDP && bwPreferTCP(sample))
+					t.referenceBps, t.capBps, preferTCP)
+				s.logBandwidthProbeDecision(t, sample, preferTCP)
 			},
 		})
 		loop, err := b.Start(ctx)
@@ -1274,15 +1337,7 @@ func (s *Send) startBwScheduler(ctx context.Context, sessionID uint64) {
 		return loop
 	}
 
-	timeout := func(t bwTarget) time.Duration {
-		lane := s.getLane(laneKey{sessionID: sessionID, laneID: t.laneID})
-		if lane == nil {
-			return 0
-		}
-		return lane.leg.srtt(t.kind) * 8
-	}
-
-	sched := newBwScheduler(s.isClient, s.bwCapBps, s.bwReference, snapshot, newLoop, timeout)
+	sched := newBwScheduler(s.isClient, s.bwCapBps, s.bwReference, snapshot, newLoop)
 	s.rebootMu.Lock()
 	if s.bwSched != nil {
 		s.rebootMu.Unlock()

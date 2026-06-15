@@ -73,7 +73,6 @@ PORT_UNKNOWN_SESSION_REBOOTSTRAP=5020
 PORT_TCP_ESTABLISHED_REDIAL=5021
 PORT_FEC_DISABLED_NEGOTIATION=5022
 PORT_LINK_STATUS_QOS_REVERSE=5023
-PORT_LINK_STATUS_QOS_BACKLOGGED=5024
 PORT_MULTILANE_REBOOTSTRAP=5025
 PORT_NAT_TCP_FALLBACK=5026
 PORT_MTU_FEC=5027
@@ -1092,12 +1091,18 @@ run_bandwidth_probe_convergence_case() {
   echo "[${name}] rate-limit UDP tunnel before startup; bandwidth probe should classify UDP relative to TCP"
   apply_udp_tunnel_rate_path 1 "${PORT_BW_PROBE_CONVERGENCE}" 80mbit
   local client_start_line
+  local server_start_line
   local client_log_file="${WORKDIR}/${name}.client.log"
+  local server_log_file="${WORKDIR}/${name}.server.log"
   client_start_line="$(current_log_file_line_count "${client_log_file}")"
+  server_start_line="$(current_log_file_line_count "${server_log_file}")"
   start_multipath "${name}"
 
   wait_ping_ok "${name} baseline-under-rate-limit" 12
+  wait_bandwidth_probe_train_budget "${name}" "${CURRENT_CLIENT_LOG}" "${client_start_line}" 25 "client TCP BW_PROBE used train-level budget" 20000000 32768 32768
   wait_client_tcp_reference_probe "${name}" "${client_start_line}"
+  assert_no_bandwidth_probe_remote_timeout_since "${name}" "${CURRENT_CLIENT_LOG}" "${client_start_line}" "client BW gate did not rely on remote timeout"
+  assert_no_bandwidth_probe_remote_timeout_since "${name}" "${CURRENT_SERVER_LOG}" "${server_start_line}" "server BW gate did not rely on remote timeout"
   wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "send/bw: sample session=[0-9]+ lane=1 kind=1" 35 "client measured UDP bandwidth after TCP reference" "${client_start_line}"
   wait_ping_ok "${name} post-convergence" 12
 
@@ -1114,11 +1119,17 @@ run_bandwidth_probe_tcp_reference_case() {
   echo "[${name}] apply 200mbit UDP tunnel bottleneck; bandwidth probe should classify UDP relative to TCP reference"
   apply_udp_tunnel_rate_path 1 "${PORT_BW_PROBE_GUARD}" 200mbit
   local client_start_line
+  local server_start_line
   local client_log_file="${WORKDIR}/${name}.client.log"
+  local server_log_file="${WORKDIR}/${name}.server.log"
   client_start_line="$(current_log_file_line_count "${client_log_file}")"
+  server_start_line="$(current_log_file_line_count "${server_log_file}")"
   start_multipath "${name}"
   wait_ping_ok "${name} baseline" 12
+  wait_bandwidth_probe_train_budget "${name}" "${CURRENT_CLIENT_LOG}" "${client_start_line}" 25 "client TCP BW_PROBE used train-level budget" 20000000 32768 32768
   wait_client_tcp_reference_probe "${name}" "${client_start_line}"
+  assert_no_bandwidth_probe_remote_timeout_since "${name}" "${CURRENT_CLIENT_LOG}" "${client_start_line}" "client BW gate did not rely on remote timeout"
+  assert_no_bandwidth_probe_remote_timeout_since "${name}" "${CURRENT_SERVER_LOG}" "${server_start_line}" "server BW gate did not rely on remote timeout"
   wait_bandwidth_probe_udp_rate_window "${name}" "${CURRENT_CLIENT_LOG}" "${client_start_line}" 40 "client UDP probe measured veth throughput" 60000000 140000000 200000000
   wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "send/bw: sample session=[0-9]+ lane=1 kind=1" 35 "client measured UDP bandwidth after TCP reference" "${client_start_line}"
 
@@ -1135,12 +1146,18 @@ run_bandwidth_probe_default_cap_case() {
   echo "[${name}] apply 50% large-packet UDP loss before startup; default 200mbit cap should classify UDP without TCP reference probe"
   apply_udp_large_packet_partial_loss 1 "${PORT_BW_PROBE_DEFAULT_CAP}" 50%
   local client_start_line
+  local server_start_line
   local client_log_file="${WORKDIR}/${name}.client.log"
+  local server_log_file="${WORKDIR}/${name}.server.log"
   client_start_line="$(current_log_file_line_count "${client_log_file}")"
+  server_start_line="$(current_log_file_line_count "${server_log_file}")"
   start_multipath "${name}"
 
   wait_log_pattern "${name}" "send: hello_ack_active session=[0-9]+ lane=1 kind=2" 20 "warm TCP fallback leg reached HELLO_ACK"
+  wait_bandwidth_probe_train_budget "${name}" "${CURRENT_CLIENT_LOG}" "${client_start_line}" 20 "client UDP BW_PROBE used default-cap train-level budget" 20000000 1200 1400
   wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "send/bw: sample session=[0-9]+ lane=1 kind=1" 20 "client started default-capped UDP bandwidth probe" "${client_start_line}"
+  assert_no_bandwidth_probe_remote_timeout_since "${name}" "${CURRENT_CLIENT_LOG}" "${client_start_line}" "client BW gate did not rely on remote timeout"
+  assert_no_bandwidth_probe_remote_timeout_since "${name}" "${CURRENT_SERVER_LOG}" "${server_start_line}" "server BW gate did not rely on remote timeout"
   wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "send/bw: sample session=[0-9]+ lane=1 kind=1" 35 "client measured UDP bandwidth against default cap without TCP probe sample" "${client_start_line}"
   local client_select_start_line
   client_select_start_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
@@ -1353,6 +1370,110 @@ wait_bandwidth_probe_udp_rate_window() {
   done
   fail "${label}" "${message}: UDP sample not observed within ${timeout}s"
   return 1
+}
+
+wait_bandwidth_probe_train_budget() {
+  local label="$1"
+  local log_file="$2"
+  local start_line="$3"
+  local timeout="${4:-25}"
+  local message="$5"
+  local min_total="$6"
+  local min_payload="$7"
+  local max_payload="$8"
+  local deadline=$((SECONDS + timeout))
+  local output status
+
+  while (( SECONDS < deadline )); do
+    set +e
+    output="$(awk \
+      -v start="${start_line}" \
+      -v min_total="${min_total}" \
+      -v min_payload="${min_payload}" \
+      -v max_payload="${max_payload}" '
+        NR <= start { next }
+        /protocol: encode type=BW_PROBE/ {
+          train_total = -1
+          train_remaining = -1
+          payload_len = -1
+          for (i = 1; i <= NF; i++) {
+            if ($i ~ /^train_total=/) {
+              split($i, parts, "=")
+              train_total = parts[2] + 0
+            } else if ($i ~ /^train_remaining=/) {
+              split($i, parts, "=")
+              train_remaining = parts[2] + 0
+            } else if ($i ~ /^payload_len=/) {
+              split($i, parts, "=")
+              payload_len = parts[2] + 0
+            }
+          }
+          if (payload_len < min_payload || payload_len > max_payload) {
+            next
+          }
+          if (train_total < min_total) {
+            message = sprintf("bad-train-budget train_total=%d train_remaining=%d payload_len=%d min_total=%d", train_total, train_remaining, payload_len, min_total)
+            status = 1
+            done = 1
+            exit
+          }
+          if (train_remaining <= 0 || train_remaining >= train_total) {
+            message = sprintf("bad-train-remaining train_total=%d train_remaining=%d payload_len=%d", train_total, train_remaining, payload_len)
+            status = 1
+            done = 1
+            exit
+          }
+          message = sprintf("ok train_total=%d train_remaining=%d payload_len=%d", train_total, train_remaining, payload_len)
+          status = 0
+          done = 1
+          exit
+        }
+        END {
+          if (!done) {
+            message = "need matching BW_PROBE encode"
+            status = 2
+          }
+          print message
+          exit status
+        }
+      ' "${log_file}" 2>/dev/null)"
+    status=$?
+    set -e
+    case "${status}" in
+    0)
+      pass "${label}" "${message}: ${output#ok }"
+      return 0
+      ;;
+    1)
+      fail "${label}" "${message}: ${output}"
+      return 1
+      ;;
+    esac
+    if ! check_multipath_alive "${label}"; then
+      return 1
+    fi
+    ping_once_from "${NS_C}" "${TUN_C_REMOTE}" || true
+    sleep 0.2
+  done
+  fail "${label}" "${message}: matching BW_PROBE encode not observed within ${timeout}s"
+  return 1
+}
+
+assert_no_bandwidth_probe_remote_timeout_since() {
+  local label="$1"
+  local log_file="$2"
+  local start_line="$3"
+  local message="$4"
+  local pattern="bw action=remote_timeout|gate_remote_timeout"
+  if [[ -z "${log_file}" || ! -f "${log_file}" ]]; then
+    fail "${label}" "${message}: log file missing"
+    return 1
+  fi
+  if tail -n "+$((start_line + 1))" "${log_file}" | grep -E "${pattern}" >/dev/null; then
+    fail "${label}" "${message}: unexpected BW remote timeout found"
+    return 1
+  fi
+  pass "${label}" "${message}"
 }
 
 assert_log_not_contains() {
@@ -1898,50 +2019,6 @@ run_link_status_qos_reverse_case() {
   echo "==== ${name} e2e end ===="
 }
 
-run_link_status_qos_backlogged_case() {
-  local name="link-status-qos-backlogged"
-  echo "==== ${name} e2e start ===="
-  clear_loss
-  write_one_lane_config "${name}" "${PORT_LINK_STATUS_QOS_BACKLOGGED}" false true 200 3000
-
-  echo "[${name}] apply large-packet UDP loss before startup; bandwidth probe should make client DATA prefer TCP while small tunnel DATA stays usable"
-  apply_udp_large_packet_partial_loss 1 "${PORT_LINK_STATUS_QOS_BACKLOGGED}" 50%
-  local client_start_line
-  local server_status_line
-  local client_apply_line
-  local client_select_line
-  local client_log_file="${WORKDIR}/${name}.client.log"
-  client_start_line="$(current_log_file_line_count "${client_log_file}")"
-  start_multipath "${name}"
-
-  wait_ping_ok "${name} baseline" 12
-  wait_log_pattern "${name}" "send: hello_ack_active session=[0-9]+ lane=1 kind=2" 20 "TCP shadow leg reached HELLO_ACK"
-  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "send/bw: sample session=[0-9]+ lane=1 kind=1" 35 "client measured UDP bandwidth under large-packet loss" "${client_start_line}"
-  client_select_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
-  wait_log_file_pattern_while_ping_from "${name}" "${CURRENT_CLIENT_LOG}" "schedule_select.*lane=1 .*leg=\\{tcp .*frame=type=DATA" 20 "client selector sent DATA over TCP before backlogged probe" "${client_select_line}" "${NS_C}" "${TUN_C_REMOTE}"
-
-  echo "[${name}] clear UDP impairment and add mild TCP delay to establish the FEC lag baseline"
-  clear_loss
-  apply_tcp_tunnel_delay_path 1 "${PORT_LINK_STATUS_QOS_BACKLOGGED}" 50ms
-  run_short_ping_load "${name}-tcp-primary-baseline" 260 0.02
-
-  server_status_line="$(current_log_file_line_count "${CURRENT_SERVER_LOG}")"
-  client_apply_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
-  echo "[${name}] add TCP tunnel delay while UDP shadow stays clean; receive-side QoS should flag TCP backlogged"
-  apply_tcp_tunnel_delay_path 1 "${PORT_LINK_STATUS_QOS_BACKLOGGED}" 900ms
-  run_ping_sample "${name}-backlogged"
-
-  wait_log_file_pattern_while_ping "${name}" "${CURRENT_SERVER_LOG}" "runtime/qos: link_status_send session=[0-9]+ lane=1 kind=2 reason=2" 8 "server emitted TCP backlogged LINK_STATUS from FEC lag" "${server_status_line}"
-  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "runtime: link_status_apply session=[0-9]+ lane=1 kind=2 reason=2" 8 "client applied TCP backlogged LINK_STATUS to lane selector" "${client_apply_line}"
-
-  client_select_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
-  wait_log_file_pattern_while_ping_from "${name}" "${CURRENT_CLIENT_LOG}" "schedule_select.*lane=1 .*leg=\\{udp .*frame=type=DATA" 20 "client selector returned DATA to UDP after TCP backlogged feedback" "${client_select_line}" "${NS_C}" "${TUN_C_REMOTE}"
-
-  stop_multipath
-  clear_loss
-  echo "==== ${name} e2e end ===="
-}
-
 run_fec_loaded_latency_case() {
   local name="fec-loaded-latency"
   local iperf_rate="10M"
@@ -2248,7 +2325,6 @@ run_fec_tcp_fallback_case
 run_multipath_fec_case
 run_link_status_qos_case
 run_link_status_qos_reverse_case
-run_link_status_qos_backlogged_case
 run_fec_loaded_latency_case
 run_weighted_scheduling_case
 run_mtu_case

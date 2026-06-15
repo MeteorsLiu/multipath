@@ -403,7 +403,5 @@ func (h *RecvHandler) OnQoS(ctx context.Context, leg transport.LegRef, frame pro
 	debuglog.Printf("runtime", "link_status_apply session=%d lane=%d kind=%d reason=%d delivered_bps=%d",
 		frame.SessionID, frame.LaneID, kind, body.Reason, body.DeliveredBps)
 	recordLinkStatusEvent("apply", frame.SessionID, frame.LaneID, kind, body.Reason)
-	eventlog.Printf("link_status", "action=apply session=%d lane=%d leg=%s reason=%d delivered_bps=%d",
-		frame.SessionID, frame.LaneID, linkStatusKindLabel(kind), body.Reason, body.DeliveredBps)
 	return nil
 }

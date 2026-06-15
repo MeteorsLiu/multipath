@@ -264,7 +264,8 @@ Unknown-session DATA or REPAIR is dropped.
 Recv owns per-lane receive-side FEC windows and a session-scoped emit dedupe.
 Recv keeps a per-lane QoS arrival ledger beside the receive FEC window. The
 ledger estimates DATA delivery, FEC-derived expected bytes, repair lower-bound
-capacity, and lag; abnormal status is reported through Recv's QoS callback.
+capacity, and delivered rate; abnormal status is reported through Recv's QoS
+callback.
 Recv must not import or call concrete Send.
 ```
 

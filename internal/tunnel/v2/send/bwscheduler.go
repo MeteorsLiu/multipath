@@ -4,7 +4,6 @@ import (
 	"context"
 	"sort"
 	"sync"
-	"time"
 
 	"github.com/MeteorsLiu/multipath/internal/debuglog"
 	"github.com/MeteorsLiu/multipath/internal/eventlog"
@@ -21,12 +20,7 @@ const (
 	bwPhaseRemote
 )
 
-// bwGateTimeoutMin/Max bound the remote-wait fallback (spec 7.5: clamp(8*SRTT,
-// 500ms, 10s)). When the peer never probes a target, the gate advances anyway.
-const (
-	bwGateTimeoutMin = 500 * time.Millisecond
-	bwGateTimeoutMax = 10 * time.Second
-)
+const defaultBandwidthReferenceBps = uint64(200_000_000)
 
 // bwTarget is one (lane, transport-kind) cell the gate visits (spec 7.5). The
 // gate walks targets in a fixed order: per lane (ascending laneID) TCP then UDP,
@@ -47,9 +41,9 @@ type bwTarget struct {
 //
 // It is coarse and self-contained (plan 5.8): it owns all gate logic. Send stays
 // thin — it only hands the scheduler isClient, a lanes view, and the closures
-// (newLoop creates a BwLoop and stores it in the LaneManager; timeout reads SRTT;
-// onSample feeds the observer's PreferTCP). The scheduler never marks a lane down
-// (bw failure ≠ lane death; lane health is ping's job, spec 5.8).
+// (newLoop creates a BwLoop and stores it in the LaneManager; onSample feeds the
+// observer's PreferTCP). The scheduler never marks a lane down (bw failure ≠
+// lane death; lane health is ping's job, spec 5.8).
 type bwScheduler struct {
 	isClient     bool
 	capBps       uint64
@@ -60,9 +54,6 @@ type bwScheduler struct {
 	// newLoop creates + starts a BwLoop for the target leg and stores it in the
 	// LaneManager (so inbound BW_PROBE_ACK can reach it). Returns nil on failure.
 	newLoop func(t bwTarget) *bw.BwLoop
-	// timeout returns the remote-wait fallback for a target (SRTT-based clamp).
-	timeout func(t bwTarget) time.Duration
-
 	mu      sync.Mutex
 	targets []bwTarget
 	idx     int
@@ -74,14 +65,13 @@ type bwScheduler struct {
 	done    bool
 }
 
-func newBwScheduler(isClient bool, capBps, referenceBps uint64, snapshot func() []bwTarget, newLoop func(bwTarget) *bw.BwLoop, timeout func(bwTarget) time.Duration) *bwScheduler {
+func newBwScheduler(isClient bool, capBps, referenceBps uint64, snapshot func() []bwTarget, newLoop func(bwTarget) *bw.BwLoop) *bwScheduler {
 	return &bwScheduler{
 		isClient:     isClient,
 		capBps:       capBps,
 		referenceBps: referenceBps,
 		snapshot:     snapshot,
 		newLoop:      newLoop,
-		timeout:      timeout,
 		tcpRef:       make(map[LaneKey]uint64),
 		wake:         make(chan struct{}, 1),
 	}
@@ -111,8 +101,8 @@ func (s *bwScheduler) Start(ctx context.Context) {
 }
 
 // eval is the gate-driven loop. It launches a local probe when the gate enters a
-// Local phase, and waits (with an SRTT fallback) when it is Remote. Advances are
-// signaled via wake by advanceAfterLocal/advanceAfterRemote/abort.
+// Local phase, and waits when it is Remote. Advances are signaled via wake by
+// advanceAfterLocal/advanceAfterRemote/abort.
 func (s *bwScheduler) eval(ctx context.Context) {
 	for {
 		s.mu.Lock()
@@ -131,27 +121,15 @@ func (s *bwScheduler) eval(ctx context.Context) {
 			// runLocal blocks until the local train finishes (onSample →
 			// advanceAfterLocal) or ctx/ abort. The gate has advanced by the time
 			// we loop; just re-evaluate.
-			if !s.waitWake(ctx, 0) {
+			if !s.waitWake(ctx) {
 				return
 			}
 		case bwPhaseRemote:
-			// Wait for the peer to finish probing this target. Fallback advances
-			// the gate if the peer never shows (gear-mesh self-heal).
-			d := s.remoteTimeout(target)
-			if !s.waitWake(ctx, d) {
+			// Wait for the peer to finish probing this target. Transport or ping
+			// failures abort the scheduler path explicitly; the remote phase does
+			// not self-advance on a short timer.
+			if !s.waitWake(ctx) {
 				return
-			}
-			// On timeout (no external advance), force a remote advance so the
-			// sweep does not stall.
-			s.mu.Lock()
-			stillRemoteSameTarget := !s.done && s.idx < len(s.targets) &&
-				s.phase == bwPhaseRemote && s.targets[s.idx].key == target.key
-			s.mu.Unlock()
-			if stillRemoteSameTarget {
-				debuglog.Printf("send/bw", "gate_remote_timeout lane=%d kind=%d", target.laneID, target.kind)
-				eventlog.Printf("bw", "action=remote_timeout session=%d lane=%d leg=%s timeout=%s",
-					target.key.SessionID, target.laneID, kindEventLabel(target.kind), d)
-				s.advanceAfterRemote(target.key)
 			}
 		}
 	}
@@ -176,7 +154,10 @@ func (s *bwScheduler) runLocal(ctx context.Context, target bwTarget) {
 
 func (s *bwScheduler) prepareTarget(target bwTarget) bwTarget {
 	if target.kind != transport.KindUDP {
-		target.referenceBps = 0
+		target.referenceBps = s.referenceBps
+		if target.referenceBps == 0 {
+			target.referenceBps = defaultBandwidthReferenceBps
+		}
 		target.capBps = 0
 		return target
 	}
@@ -218,41 +199,24 @@ func (s *bwScheduler) completeLocal(target bwTarget, sample bw.Sample) {
 	s.signal()
 }
 
-// waitWake blocks until a gate advance is signaled, ctx ends, or (when d>0) the
-// timeout elapses. Returns false if ctx ended.
-func (s *bwScheduler) waitWake(ctx context.Context, d time.Duration) bool {
-	if d <= 0 {
-		select {
-		case <-ctx.Done():
-			return false
-		case <-s.wake:
-			return true
-		}
+func (s *bwScheduler) tcpReferenceBps(sessionID uint64, laneID uint8) uint64 {
+	if s == nil {
+		return 0
 	}
-	timer := time.NewTimer(d)
-	defer timer.Stop()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.tcpRef[LaneKey{SessionID: sessionID, LaneID: laneID}]
+}
+
+// waitWake blocks until a gate advance is signaled or ctx ends. Returns false
+// if ctx ended.
+func (s *bwScheduler) waitWake(ctx context.Context) bool {
 	select {
 	case <-ctx.Done():
 		return false
 	case <-s.wake:
 		return true
-	case <-timer.C:
-		return true
 	}
-}
-
-func (s *bwScheduler) remoteTimeout(target bwTarget) time.Duration {
-	if s.timeout == nil {
-		return bwGateTimeoutMax
-	}
-	d := s.timeout(target)
-	if d < bwGateTimeoutMin {
-		d = bwGateTimeoutMin
-	}
-	if d > bwGateTimeoutMax {
-		d = bwGateTimeoutMax
-	}
-	return d
 }
 
 // advanceAfterLocal moves the gate after this end finishes probing a target

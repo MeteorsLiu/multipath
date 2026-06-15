@@ -20,7 +20,6 @@
 
 - **该收多少 DATA**：PacketID 水位线。双保险——数据腿丢成筛子也无妨，shadow 上的 repair 携带 basePacketID+span，照样暴露发送端进度；
 - **该收多少 repair**：组数（每 4 个 ID 一组），数据与 repair 互相证明对方存在；全组覆灭由水位线兜出；
-- **何时到**：同组 repair 与数据末包的到达时差（lag），repair 从健康腿先到，给同组数据当秒表。
 
 三个差分量覆盖三种劣化形态：
 
@@ -59,14 +58,12 @@
 - `dataExpected`：水位线差（取数据腿 ID 与 repair basePacketID+span 的较大者；小幅重排宽限）；
 - `dataGot`/`repairGot` 与对应字节数：按**到达腿 × 帧类别**，**去重前**计数（链路送达语义）；
 - `repairExpected`：窗口内组数；span 以 repair 头部为准，flush 小组天然兼容；
-- `lag`：每组 t(数据末 shard) − t(repair)，窗口中位数，带符号；开放组上限（~2s/256 组），超限按"≥上限"记；
 - 切换瞬间跨腿组的归因噪声至多一组/次，接受。
 
 **判定**（沿用阈值，迁移至接收端）：
 
 ```
 limited(leg)    = 丢包率 > 5%，持续 sustain(3s)        // 进入；低于 1% 解除（迟滞）
-backlogged(leg) = lag > 基线 + 300ms，持续 sustain      // 基线 = 长窗滚动最小 lag
 实测带宽(leg)   = 该腿窗口实收字节 ÷ W                  // 随状态一并上报
 样本门槛        = 窗口 dataExpected < 100 → 不判定（静默，发端 ping 兜底接管）
 ```
@@ -76,7 +73,7 @@ backlogged(leg) = lag > 基线 + 300ms，持续 sustain      // 基线 = 长窗�
 周期性上报不存在。反馈只在异常时发生：
 
 ```
-LINK_STATUS 帧（~8B）：{legKind u8, reason u8 (limited|backlogged), deliveredBps u32}
+LINK_STATUS 帧（~8B）：{legKind u8, reason u8 (limited), deliveredBps u32}
 ```
 
 - **电平触发**：异常持续期间每 ~1s 重发，两条腿都发。单发一次是边沿触发，恰好诞生在链路出事的时刻，丢了就永远丢了——必须刷新；
@@ -89,7 +86,7 @@ LINK_STATUS 帧（~8B）：{legKind u8, reason u8 (limited|backlogged), delivere
 检测在接收端，决策留在发送端（它持有 hold/退避上下文，也是执行者）：
 
 ```
-两腿均无 limited/backlogged 状态 → 偏好 UDP
+两腿均无 limited 状态 → 偏好 UDP
 仅一腿异常                      → 走另一条（切换原子：primaryKind 取反，repair 随动）
 两腿均异常                      → 比较状态包携带的实测 bps，走数字大的那条
 切换后 hold(10s) 内禁再切
@@ -109,7 +106,6 @@ LINK_STATUS 帧（~8B）：{legKind u8, reason u8 (limited|backlogged), delivere
 |---|---|---|---|
 | W | 3s | 接收端 | 滑动窗口 |
 | lossEnter / lossExit | 5% / 1% | 接收端 | limited 进入/解除（迟滞） |
-| lagSlack | 300ms | 接收端 | 时延差分容差（基线之上） |
 | sustain | 3s | 接收端 | 判定持续确认 |
 | refresh / TTL | 1s / 3s | 收/发 | LINK_STATUS 刷新与过期 |
 | hold | 10s | 发送端 | 切换后最短驻留 |
@@ -123,7 +119,6 @@ LINK_STATUS 帧（~8B）：{legKind u8, reason u8 (limited|backlogged), delivere
 | UDP(primary) 被限到 2 Mbps | UDP 该到 7.5MB/3s 实到 0.75MB → 实测 2 Mbps、丢包 70%；TCP repair 全到 → ≥5 Mbps | 接收端刷 UDP limited(2Mbps) → 发送端切 TCP（检测+通知 ≈ 6s，<10s） |
 | QoS 解除 | UDP repair 转干净 → 刷新停止 | TTL 过期 + preferWait 后切回 UDP |
 | 温和限速（UDP 实际 3 Mbps，>下界） | 切回后数秒 UDP limited(3Mbps) 再现 | 切回 TCP，preferWait 翻倍；3 Mbps 实测值入账 |
-| TCP(primary) 被限到 8 Mbps | 不丢包；UDP repair 进度到 16000、TCP 送达 10000 → 积压，lag 秒级 | 接收端刷 TCP backlogged(8Mbps) → 切 UDP |
 | 两腿同时受限 | 双状态各带实测 bps | 择优走大的 |
 | 接近空闲 | 无组可判，接收端静默 | ping 兜底 |
 | FEC=Off | 无 repair 流，差分关闭 | ping 兜底——测量与 FEC 同生死，明示接受 |
@@ -146,16 +141,15 @@ LINK_STATUS 帧（~8B）：{legKind u8, reason u8 (limited|backlogged), delivere
 | 组账本 + 判定 | recv（rx window 旁） | §5 记账、迟滞判定、LINK_STATUS 发出与刷新 |
 | 协议 | `internal/protocol` | `CapLinkStatus` + LINK_STATUS 帧编解码 |
 | 选腿 | send/leg | §7 规则替换现有质量规则；ping 规则保留为兜底与未协商回退 |
-| metrics | metrics 包 | 每腿实测 bps/丢包/lag、角色、切换与回偏好事件、退避档位 |
+| metrics | metrics 包 | 每腿实测 bps/丢包、角色、切换与回偏好事件、退避档位 |
 
 ## 12. 测试策略
 
-**单元**：账本（水位线双保险、重排宽限、全组覆灭、变 span、lag 符号与开放组上限）；判定迟滞（5%↔1%、4.9↔5.1 不抖）；LINK_STATUS 编解码与 caps 矩阵；发送端 TTL 过期、择优、hold、preferWait 退避与复位、样本门槛。
+**单元**：账本（水位线双保险、重排宽限、全组覆灭、变 span）；判定迟滞（5%↔1%、4.9↔5.1 不抖）；LINK_STATUS 编解码与 caps 矩阵；发送端 TTL 过期、择优、hold、preferWait 退避与复位、样本门槛。
 
 **集成（e2e）**：
 
 - UDP 单向限速/丢 30% → <10s 切 TCP，业务不中断；
-- TCP=primary 限速（限速率而非注入丢包）→ backlogged 触发切回 UDP——本场景在丢包率类设计下不可构造，本版可构造；
 - QoS 解除 → TTL+preferWait 后回 UDP；温和限速 → 回切失败、退避翻倍；
 - LINK_STATUS 丢包注入 → 刷新机制下行为不变；
 - 两腿同限 → 择优；近空闲腿死亡 → ping 兜底切换；
@@ -166,7 +160,6 @@ LINK_STATUS 帧（~8B）：{legKind u8, reason u8 (limited|backlogged), delivere
 ## 13. 边界、诚实声明与开放项
 
 - **下界语义**：shadow 健康只证明 ≥ 实测 repair 速率（最坏 0.25R），是必要条件非充分条件。误切由可逆性自愈（数秒次优，FEC 兜底），反复误切由 preferWait 退避压制，且每次失败试探都产出一个实测带宽值。
-- **lag 基线**为估计值（长窗滚动最小值 + 300ms 容差），实现期可调，参数集中一处。
 - **阈值住在接收端**：两端同代码，调参需两端同步升级。开放替代：HELLO 下发阈值（本版不做）。
 - **遥测**：事件化后发送端平时无连续带宽数据；如观测需要，可加纯 metrics 低频统计包（~10s，决策无关），可选。
 - bonding（权重分流聚合带宽）明确不在范围。

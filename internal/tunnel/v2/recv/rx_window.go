@@ -237,7 +237,7 @@ func (w *rxSLCWindow) observeLateData(kind transport.Kind, packetID uint32, pack
 		return rxWindowResult{}
 	}
 	if debuglog.Enabled() {
-		debuglog.Printf("recv/fec_window", "rx_late_data_sample packet_id=%d kind=%d lag_ms=%d", packetID, kind, sample.Lag.Milliseconds())
+		debuglog.Printf("recv/fec_window", "rx_late_data_sample packet_id=%d kind=%d", packetID, kind)
 	}
 	return rxWindowResult{sample: sample, hasSample: true}
 }
@@ -333,10 +333,9 @@ func (w *rxSLCWindow) completeGroupSample(repair rxRepair, at time.Time) (qosSam
 		return qosSample{}, false
 	}
 	var (
-		dataKind   transport.Kind
-		firstAt    time.Time
-		lastDataAt time.Time
-		dataBytes  uint64
+		dataKind  transport.Kind
+		firstAt   time.Time
+		dataBytes uint64
 	)
 	for i := 0; i < repair.sourceSpan; i++ {
 		packetID := repair.basePacketID + uint32(i)
@@ -350,16 +349,9 @@ func (w *rxSLCWindow) completeGroupSample(repair rxRepair, at time.Time) (qosSam
 			return qosSample{}, false
 		}
 		firstAt = earliest(firstAt, data.at)
-		if data.at.After(lastDataAt) {
-			lastDataAt = data.at
-		}
 		dataBytes += uint64(len(data.packet.Payload))
 	}
 	firstAt = earliest(firstAt, repair.at)
-	lag := lastDataAt.Sub(repair.at)
-	if lag < 0 {
-		lag = 0
-	}
 	return qosSample{
 		At:           at,
 		Duration:     sampleDuration(firstAt, at),
@@ -369,7 +361,6 @@ func (w *rxSLCWindow) completeGroupSample(repair rxRepair, at time.Time) (qosSam
 		DataBytes:    dataBytes,
 		RepairKind:   repair.kind,
 		RepairBytes:  uint64(len(repair.symbol.Payload)),
-		Lag:          lag,
 	}, true
 }
 
@@ -384,7 +375,6 @@ func (w *rxSLCWindow) recoveredGroupSample(r rxRecoverable, recoveredBytes uint6
 	var (
 		dataKind    transport.Kind
 		firstAt     = repair.at
-		lastDataAt  time.Time
 		dataBytes   uint64
 		dataArrived uint64
 	)
@@ -403,9 +393,6 @@ func (w *rxSLCWindow) recoveredGroupSample(r rxRecoverable, recoveredBytes uint6
 			return qosSample{}, false
 		}
 		firstAt = earliest(firstAt, data.at)
-		if data.at.After(lastDataAt) {
-			lastDataAt = data.at
-		}
 		dataBytes += uint64(len(data.packet.Payload))
 		dataArrived++
 	}
@@ -414,10 +401,6 @@ func (w *rxSLCWindow) recoveredGroupSample(r rxRecoverable, recoveredBytes uint6
 	}
 	if dataKind == transport.KindTCP && repair.kind == transport.KindUDP && dataArrived < uint64(r.sourceSpan) {
 		return qosSample{}, false
-	}
-	lag := lastDataAt.Sub(repair.at)
-	if lag < 0 {
-		lag = 0
 	}
 	return qosSample{
 		At:             at,
@@ -429,7 +412,6 @@ func (w *rxSLCWindow) recoveredGroupSample(r rxRecoverable, recoveredBytes uint6
 		RecoveredBytes: recoveredBytes,
 		RepairKind:     repair.kind,
 		RepairBytes:    uint64(len(repair.symbol.Payload)),
-		Lag:            lag,
 	}, true
 }
 
@@ -459,10 +441,9 @@ func (w *rxSLCWindow) closedCompleteGroupSample(basePacketID uint32, sourceSpan 
 		return qosSample{}, false
 	}
 	var (
-		dataKind   transport.Kind
-		firstAt    = closed.repairAt
-		lastDataAt time.Time
-		dataBytes  uint64
+		dataKind  transport.Kind
+		firstAt   = closed.repairAt
+		dataBytes uint64
 	)
 	for i := 0; i < sourceSpan; i++ {
 		packetID := basePacketID + uint32(i)
@@ -476,14 +457,7 @@ func (w *rxSLCWindow) closedCompleteGroupSample(basePacketID uint32, sourceSpan 
 			return qosSample{}, false
 		}
 		firstAt = earliest(firstAt, data.at)
-		if data.at.After(lastDataAt) {
-			lastDataAt = data.at
-		}
 		dataBytes += uint64(len(data.packet.Payload))
-	}
-	lag := lastDataAt.Sub(closed.repairAt)
-	if lag < 0 {
-		lag = 0
 	}
 	return qosSample{
 		At:           at,
@@ -494,7 +468,6 @@ func (w *rxSLCWindow) closedCompleteGroupSample(basePacketID uint32, sourceSpan 
 		DataBytes:    dataBytes,
 		RepairKind:   closed.repairKind,
 		RepairBytes:  closed.repairBytes,
-		Lag:          lag,
 	}, true
 }
 

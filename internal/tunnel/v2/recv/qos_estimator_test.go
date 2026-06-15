@@ -203,58 +203,6 @@ func TestQoSEstimatorComputesActualRateFromRecoveredBytes(t *testing.T) {
 	}
 }
 
-func TestQoSEstimatorDetectsBackloggedDataLegFromLag(t *testing.T) {
-	now := time.Unix(0, 0)
-	var got []qosStatus
-	e := newQoSEstimator(qosConfig{SampleFloor: 100, Sustain: time.Second, LagSlack: 300 * time.Millisecond}, func(status qosStatus) {
-		got = append(got, status)
-	})
-
-	e.Observe(qosSample{
-		At:           now,
-		Duration:     time.Second,
-		DataKind:     transport.KindTCP,
-		RepairKind:   transport.KindUDP,
-		DataArrived:  160,
-		DataExpected: 160,
-		DataBytes:    160 * 1200,
-		Lag:          50 * time.Millisecond,
-	})
-	e.Observe(qosSample{
-		At:           now.Add(1500 * time.Millisecond),
-		Duration:     time.Second,
-		DataKind:     transport.KindTCP,
-		RepairKind:   transport.KindUDP,
-		DataArrived:  160,
-		DataExpected: 160,
-		DataBytes:    160 * 1200,
-		Lag:          50 * time.Millisecond,
-	})
-	if len(got) != 0 {
-		t.Fatalf("baseline statuses = %+v, want none", got)
-	}
-
-	for i := 0; i < 24 && len(got) == 0; i++ {
-		e.Observe(qosSample{
-			At:           now.Add(2*time.Second + time.Duration(i)*100*time.Millisecond),
-			Duration:     100 * time.Millisecond,
-			DataKind:     transport.KindTCP,
-			RepairKind:   transport.KindUDP,
-			DataArrived:  16,
-			DataExpected: 16,
-			DataBytes:    16 * 1200,
-			Lag:          900 * time.Millisecond,
-		})
-	}
-
-	if len(got) != 1 {
-		t.Fatalf("statuses = %+v, want one", got)
-	}
-	if got[0].Kind != transport.KindTCP || got[0].Reason != protocol.LinkStatusReasonBacklogged {
-		t.Fatalf("status = %+v, want TCP backlogged", got[0])
-	}
-}
-
 func TestQoSEstimatorRefreshesSustainedStatus(t *testing.T) {
 	now := time.Unix(0, 0)
 	var got []qosStatus

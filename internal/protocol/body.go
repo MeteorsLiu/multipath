@@ -27,8 +27,7 @@ const (
 	LinkStatusLegUDP uint8 = 1
 	LinkStatusLegTCP uint8 = 2
 
-	LinkStatusReasonLimited    uint8 = 1
-	LinkStatusReasonBacklogged uint8 = 2
+	LinkStatusReasonLimited uint8 = 1
 )
 
 type Body interface {
@@ -352,5 +351,5 @@ func validLinkStatusLeg(legKind uint8) bool {
 }
 
 func validLinkStatusReason(reason uint8) bool {
-	return reason == LinkStatusReasonLimited || reason == LinkStatusReasonBacklogged
+	return reason == LinkStatusReasonLimited
 }

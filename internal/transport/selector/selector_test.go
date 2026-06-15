@@ -123,7 +123,7 @@ func TestQualitySelectorQoSChoosesHigherBpsWhenBothBad(t *testing.T) {
 	now := time.Unix(0, 0)
 	sel := NewQualitySelectorForTest(func() time.Time { return now })
 	udp := Quality{Active: true, DeliveryRate: 1.0, QoSActive: true, QoSReason: QoSReasonLimited, QoSDeliveredBps: 2_000_000}
-	tcp := Quality{Active: true, DeliveryRate: 1.0, QoSActive: true, QoSReason: QoSReasonBacklogged, QoSDeliveredBps: 8_000_000}
+	tcp := Quality{Active: true, DeliveryRate: 1.0, QoSActive: true, QoSReason: QoSReasonLimited, QoSDeliveredBps: 8_000_000}
 
 	useUDP, ok := sel.Pick(udp, tcp)
 	if !ok || useUDP {

@@ -29,7 +29,7 @@ func gateTestTargets(n int) []bwTarget {
 // newGateOnly builds a scheduler with targets pre-installed for direct gate
 // state-machine testing (no Start goroutine, no real loops).
 func newGateOnly(isClient bool, targets []bwTarget) *bwScheduler {
-	s := newBwScheduler(isClient, 0, 0, func() []bwTarget { return targets }, nil, nil)
+	s := newBwScheduler(isClient, 0, 0, func() []bwTarget { return targets }, nil)
 	s.targets = targets
 	s.idx = 0
 	if isClient {
@@ -236,12 +236,33 @@ func TestGateInjectsCapAsUDPReference(t *testing.T) {
 			got = t
 			return nil
 		},
-		nil,
 	)
 
 	s.runLocal(context.Background(), target)
 	if got.referenceBps != capBps || got.capBps != capBps {
 		t.Fatalf("UDP target reference/cap = %d/%d, want %d/%d", got.referenceBps, got.capBps, capBps, capBps)
+	}
+}
+
+func TestGateInjectsDefaultTCPReference(t *testing.T) {
+	target := bwTarget{
+		laneID: 1,
+		kind:   transport.KindTCP,
+		leg:    transport.LegRef{Kind: transport.KindTCP, ConnID: "t"},
+		key:    LegKey{SessionID: 1, LaneID: 1, Kind: transport.KindTCP, Conn: "t"},
+	}
+	var got bwTarget
+	s := newBwScheduler(true, 0, 0,
+		func() []bwTarget { return []bwTarget{target} },
+		func(t bwTarget) *bw.BwLoop {
+			got = t
+			return nil
+		},
+	)
+
+	s.runLocal(context.Background(), target)
+	if got.referenceBps != defaultBandwidthReferenceBps || got.capBps != 0 {
+		t.Fatalf("TCP target reference/cap = %d/%d, want %d/0", got.referenceBps, got.capBps, defaultBandwidthReferenceBps)
 	}
 }
 
@@ -261,7 +282,6 @@ func TestGateUsesExplicitReferenceBeforeCapOrTCPReference(t *testing.T) {
 			got = t
 			return nil
 		},
-		nil,
 	)
 	s.completeLocal(bwTarget{
 		laneID: 1,
@@ -287,7 +307,6 @@ func TestGateUsesExplicitReferenceBeforeCapOrTCPReference(t *testing.T) {
 			got = t
 			return nil
 		},
-		nil,
 	)
 	s.targets = []bwTarget{tcpTarget, target}
 	s.phase = bwPhaseLocal
@@ -324,7 +343,6 @@ func TestGateInjectsTCPReferenceIntoUncappedUDP(t *testing.T) {
 			got = t
 			return nil
 		},
-		nil,
 	)
 	s.targets = []bwTarget{tcpTarget, udpTarget}
 	s.phase = bwPhaseLocal
@@ -365,7 +383,6 @@ func TestGateIgnoresStaleTCPReferenceSample(t *testing.T) {
 			got = t
 			return nil
 		},
-		nil,
 	)
 	s.targets = []bwTarget{currentTCP}
 	s.phase = bwPhaseLocal
@@ -398,24 +415,18 @@ func TestGateAbortReleasesGate(t *testing.T) {
 	}
 }
 
-// TestGateRemoteTimeoutAdvances verifies the SRTT fallback: when this end waits
-// in the Remote phase and the peer never probes, the gate self-advances after
-// the timeout so the sweep does not stall (spec 7.5: 超时兜底 + 齿轮咬合 self-heal).
-func TestGateRemoteTimeoutAdvances(t *testing.T) {
+// TestGateRemoteWaitDoesNotSelfAdvance verifies that the Remote phase waits for
+// explicit RemoteComplete/abort/ctx cancellation. A short timer must not advance
+// the gate while the peer may still be probing.
+func TestGateRemoteWaitDoesNotSelfAdvance(t *testing.T) {
 	targets := gateTestTargets(1)
 
-	// Server starts in Remote phase on target 0. newLoop returns nil (no real
-	// probing); timeout is tiny so the remote fallback fires quickly. After the
-	// fallback advances Remote→Local, runLocal sees a nil loop and self-advances
-	// past the last target → done.
 	s := newBwScheduler(false, 0, 0,
 		func() []bwTarget { return targets },
 		func(bwTarget) *bw.BwLoop { return nil },
-		func(bwTarget) time.Duration { return 10 * time.Millisecond },
 	)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
+	ctx, cancel := context.WithCancel(context.Background())
 
 	done := make(chan struct{})
 	go func() {
@@ -425,12 +436,19 @@ func TestGateRemoteTimeoutAdvances(t *testing.T) {
 
 	select {
 	case <-done:
-		// Swept to completion via the timeout fallback.
-	case <-time.After(1500 * time.Millisecond):
-		t.Fatal("gate did not advance past the remote-wait timeout")
+		t.Fatal("scheduler exited without RemoteComplete or cancellation")
+	case <-time.After(50 * time.Millisecond):
 	}
 
-	if _, _, isDone := s.snapshotState(); !isDone {
-		t.Fatal("scheduler should be done after sweeping the single target")
+	idx, phase, isDone := s.snapshotState()
+	if idx != 0 || phase != bwPhaseRemote || isDone {
+		t.Fatalf("remote wait state = (%d,%d,%t), want (0,Remote,false)", idx, phase, isDone)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("scheduler did not exit after cancellation")
 	}
 }
