@@ -102,6 +102,40 @@ func TestQoSEstimatorAggregatesSmallFECSamples(t *testing.T) {
 	}
 }
 
+func TestQoSEstimatorSustainsRandomLossAcrossCleanSmallSamples(t *testing.T) {
+	now := time.Unix(0, 0)
+	var got []qosStatus
+	e := newQoSEstimator(qosConfig{SampleFloor: 4, Sustain: 3 * time.Second, Refresh: time.Second}, func(status qosStatus) {
+		got = append(got, status)
+	})
+
+	for i := 0; i < 80; i++ {
+		arrived := uint64(1)
+		recovered := uint64(0)
+		if i%5 == 0 {
+			arrived = 0
+			recovered = 84
+		}
+		e.Observe(qosSample{
+			At:             now.Add(time.Duration(i) * 100 * time.Millisecond),
+			Duration:       100 * time.Millisecond,
+			DataKind:       transport.KindUDP,
+			RepairKind:     transport.KindTCP,
+			DataArrived:    arrived,
+			DataExpected:   1,
+			DataBytes:      arrived * 84,
+			RecoveredBytes: recovered,
+		})
+	}
+
+	if len(got) == 0 {
+		t.Fatal("statuses = none, want UDP limited despite clean samples inside sustained 20% loss")
+	}
+	if got[0].Kind != transport.KindUDP || got[0].Reason != protocol.LinkStatusReasonLimited {
+		t.Fatalf("status = %+v, want UDP limited", got[0])
+	}
+}
+
 func TestQoSEstimatorComputesActualRateFromRecoveredBytes(t *testing.T) {
 	now := time.Unix(0, 0)
 	var got []qosStatus
@@ -249,5 +283,64 @@ func TestQoSEstimatorRefreshesSustainedStatus(t *testing.T) {
 	})
 	if len(got) != 2 {
 		t.Fatalf("refresh statuses = %+v, want refreshed status", got)
+	}
+}
+
+func TestQoSEstimatorRefreshesActiveStatusFromOtherLegSamples(t *testing.T) {
+	now := time.Unix(0, 0)
+	var got []qosStatus
+	e := newQoSEstimator(qosConfig{SampleFloor: 4, Sustain: 3 * time.Second, Refresh: time.Second}, func(status qosStatus) {
+		got = append(got, status)
+	})
+
+	e.Observe(qosSample{
+		At:           now,
+		Duration:     time.Second,
+		DataKind:     transport.KindUDP,
+		RepairKind:   transport.KindTCP,
+		DataArrived:  1,
+		DataExpected: 4,
+		DataBytes:    1200,
+	})
+	e.Observe(qosSample{
+		At:           now.Add(3 * time.Second),
+		Duration:     time.Second,
+		DataKind:     transport.KindUDP,
+		RepairKind:   transport.KindTCP,
+		DataArrived:  1,
+		DataExpected: 4,
+		DataBytes:    1200,
+	})
+	if len(got) != 1 {
+		t.Fatalf("active statuses = %+v, want one", got)
+	}
+
+	e.Observe(qosSample{
+		At:           now.Add(4 * time.Second),
+		Duration:     time.Second,
+		DataKind:     transport.KindTCP,
+		RepairKind:   transport.KindUDP,
+		DataArrived:  4,
+		DataExpected: 4,
+		DataBytes:    4800,
+	})
+	if len(got) != 2 {
+		t.Fatalf("refresh from other leg statuses = %+v, want two", got)
+	}
+	if got[1].Kind != transport.KindUDP || got[1].Reason != protocol.LinkStatusReasonLimited {
+		t.Fatalf("refresh status = %+v, want UDP limited", got[1])
+	}
+
+	e.Observe(qosSample{
+		At:           now.Add(7*time.Second + time.Millisecond),
+		Duration:     time.Second,
+		DataKind:     transport.KindTCP,
+		RepairKind:   transport.KindUDP,
+		DataArrived:  4,
+		DataExpected: 4,
+		DataBytes:    4800,
+	})
+	if len(got) != 2 {
+		t.Fatalf("stale active status refreshed = %+v, want no third status", got)
 	}
 }

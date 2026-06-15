@@ -127,6 +127,9 @@ func (s *QualitySelector) pickQoS(udp, tcp Quality, now time.Time) (bool, bool) 
 		s.preferWait = qosPreferWait
 	}
 	if s.hasCurrent && now.Before(s.holdUntil) {
+		if s.currentUDP && localPrefersTCP(udp, tcp) {
+			return false, false
+		}
 		return s.currentUDP, true
 	}
 
@@ -163,6 +166,20 @@ func (s *QualitySelector) pickQoS(udp, tcp Quality, now time.Time) (bool, bool) 
 		}
 	}
 	return false, false
+}
+
+func localPrefersTCP(udp, tcp Quality) bool {
+	if udp.DeliveryRate < minUDPDelivery && tcp.DeliveryRate >= minTCPDelivery {
+		return true
+	}
+	if udp.RTTVariance >= minUDPJitter && udp.RTTVariance >= udp.SmoothedRTT &&
+		tcp.DeliveryRate >= minTCPDelivery {
+		return true
+	}
+	if udp.PreferTCP {
+		return true
+	}
+	return false
 }
 
 func qosPreferredStateless(udp, tcp Quality) (bool, bool) {

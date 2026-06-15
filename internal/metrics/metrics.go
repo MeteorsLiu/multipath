@@ -27,6 +27,11 @@ const (
 	BandwidthProbeEventsTotal = "multipath_bandwidth_probe_events_total"
 	FECEventsTotal            = "multipath_fec_events_total"
 	FECFlushTotal             = "multipath_fec_flush_total"
+	QoSEventsTotal            = "multipath_qos_events_total"
+	QoSLossRatio              = "multipath_qos_loss_ratio"
+	QoSLagMs                  = "multipath_qos_lag_ms"
+	QoSDeliveredBps           = "multipath_qos_delivered_bps"
+	LinkStatusEventsTotal     = "multipath_link_status_events_total"
 	ProbeEventsTotal          = "multipath_probe_events_total"
 	RuntimeInfo               = "multipath_runtime_info"
 )
@@ -147,6 +152,31 @@ var specs = map[string]metricSpec{
 		kind:   metricCounter,
 		help:   "Total FEC flush-triggered repair emissions.",
 		labels: []string{"session", "source_span"},
+	},
+	QoSEventsTotal: {
+		kind:   metricCounter,
+		help:   "Total receive-side QoS estimator events.",
+		labels: []string{"event", "session", "lane", "leg", "reason"},
+	},
+	QoSLossRatio: {
+		kind:   metricGauge,
+		help:   "Receive-side QoS DATA loss ratio by lane and transport leg.",
+		labels: []string{"session", "lane", "leg"},
+	},
+	QoSLagMs: {
+		kind:   metricGauge,
+		help:   "Receive-side QoS DATA lag in milliseconds by lane and transport leg.",
+		labels: []string{"session", "lane", "leg"},
+	},
+	QoSDeliveredBps: {
+		kind:   metricGauge,
+		help:   "Receive-side QoS delivered bits per second by lane and transport leg.",
+		labels: []string{"session", "lane", "leg"},
+	},
+	LinkStatusEventsTotal: {
+		kind:   metricCounter,
+		help:   "Total LINK_STATUS send/apply/drop events.",
+		labels: []string{"event", "session", "lane", "leg", "reason"},
 	},
 	ProbeEventsTotal: {
 		kind:   metricCounter,

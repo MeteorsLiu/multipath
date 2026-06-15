@@ -31,7 +31,7 @@ type rxSLCWindow struct {
 	sourceCount int
 	data        map[uint32]rxData
 	repairs     map[uint32]rxRepair
-	closed      map[rxGroupKey]struct{}
+	closed      map[rxGroupKey]rxClosedGroup
 	dataOrder   []uint32
 	repairOrder []uint32
 	closedOrder []rxGroupKey
@@ -61,6 +61,13 @@ type rxGroupKey struct {
 	sourceSpan   int
 }
 
+type rxClosedGroup struct {
+	repairKind   transport.Kind
+	repairAt     time.Time
+	repairBytes  uint64
+	missingIndex int
+}
+
 type rxWindowResult struct {
 	recoverable    rxRecoverable
 	hasRecoverable bool
@@ -83,7 +90,7 @@ func newRxSLCWindow(sourceCount int) *rxSLCWindow {
 		sourceCount: sourceCount,
 		data:        make(map[uint32]rxData),
 		repairs:     make(map[uint32]rxRepair),
-		closed:      make(map[rxGroupKey]struct{}),
+		closed:      make(map[rxGroupKey]rxClosedGroup),
 		maxData:     defaultRxSLCWindowDataLimit,
 		maxRepairs:  defaultRxSLCWindowRepairLimit,
 		maxClosed:   defaultRxSLCWindowClosedLimit,
@@ -130,7 +137,7 @@ func (w *rxSLCWindow) addData(kind transport.Kind, packetID uint32, packet []byt
 			continue
 		}
 		if sample, ok := w.completeGroupSample(repair, at); ok {
-			w.closeGroup(repair)
+			w.closeGroup(repair, -1)
 			w.dropRepair(base)
 			if !out.hasSample {
 				out.sample = sample
@@ -184,7 +191,7 @@ func (w *rxSLCWindow) addRepair(kind transport.Kind, basePacketID uint32, key ui
 	}
 	if sample, ok := w.completeGroupSample(repair, at); ok {
 		repair.symbol.Release()
-		w.closeGroup(repair)
+		w.closeGroup(repair, -1)
 		w.prune()
 		if debuglog.Enabled() {
 			debuglog.Printf("recv/fec_window", "rx_repair_complete base_packet_id=%d key=%d source_span=%d symbol_len=%d", basePacketID, key, sourceSpan, len(symbol))
@@ -215,16 +222,34 @@ func (w *rxSLCWindow) addRepair(kind transport.Kind, basePacketID uint32, key ui
 	return rxWindowResult{}
 }
 
+func (w *rxSLCWindow) observeLateData(kind transport.Kind, packetID uint32, packet []byte, at time.Time) rxWindowResult {
+	if w.sourceCount <= 0 || !qosKnownKind(kind) {
+		return rxWindowResult{}
+	}
+	existing, ok := w.data[packetID]
+	if !ok || existing.packet == nil || existing.wire {
+		return rxWindowResult{}
+	}
+	w.storeData(packetID, packet, kind, at, true)
+	sample, ok := w.lateClosedGroupSample(packetID, at)
+	w.prune()
+	if !ok {
+		return rxWindowResult{}
+	}
+	if debuglog.Enabled() {
+		debuglog.Printf("recv/fec_window", "rx_late_data_sample packet_id=%d kind=%d lag_ms=%d", packetID, kind, sample.Lag.Milliseconds())
+	}
+	return rxWindowResult{sample: sample, hasSample: true}
+}
+
 func (w *rxSLCWindow) finishRecovery(r rxRecoverable, recovered []byte, at time.Time) (qosSample, bool) {
 	packetID := r.basePacketID + uint32(r.missingIndex)
 	sample, ok := w.recoveredGroupSample(r, uint64(len(recovered)), at)
 	w.storeData(packetID, recovered, 0, at, false)
-	if ok {
-		if repair, exists := w.repairs[r.basePacketID]; exists {
-			w.closeGroup(repair)
-		}
-		w.dropRepair(r.basePacketID)
+	if repair, exists := w.repairs[r.basePacketID]; exists {
+		w.closeGroup(repair, r.missingIndex)
 	}
+	w.dropRepair(r.basePacketID)
 	w.prune()
 	return sample, ok
 }
@@ -387,6 +412,9 @@ func (w *rxSLCWindow) recoveredGroupSample(r rxRecoverable, recoveredBytes uint6
 	if dataKind == 0 {
 		dataKind = otherTransportKind(repair.kind)
 	}
+	if dataKind == transport.KindTCP && repair.kind == transport.KindUDP && dataArrived < uint64(r.sourceSpan) {
+		return qosSample{}, false
+	}
 	lag := lastDataAt.Sub(repair.at)
 	if lag < 0 {
 		lag = 0
@@ -402,6 +430,71 @@ func (w *rxSLCWindow) recoveredGroupSample(r rxRecoverable, recoveredBytes uint6
 		RepairKind:     repair.kind,
 		RepairBytes:    uint64(len(repair.symbol.Payload)),
 		Lag:            lag,
+	}, true
+}
+
+func (w *rxSLCWindow) lateClosedGroupSample(packetID uint32, at time.Time) (qosSample, bool) {
+	for offset := 0; offset < w.sourceCount; offset++ {
+		if packetID < uint32(offset) {
+			break
+		}
+		base := packetID - uint32(offset)
+		for sourceSpan := offset + 1; sourceSpan <= w.sourceCount; sourceSpan++ {
+			key := rxGroupKey{basePacketID: base, sourceSpan: sourceSpan}
+			closed, ok := w.closed[key]
+			if !ok || closed.missingIndex != offset || !qosKnownKind(closed.repairKind) {
+				continue
+			}
+			sample, ok := w.closedCompleteGroupSample(base, sourceSpan, closed, at)
+			if ok {
+				return sample, true
+			}
+		}
+	}
+	return qosSample{}, false
+}
+
+func (w *rxSLCWindow) closedCompleteGroupSample(basePacketID uint32, sourceSpan int, closed rxClosedGroup, at time.Time) (qosSample, bool) {
+	if sourceSpan <= 0 || sourceSpan > w.sourceCount {
+		return qosSample{}, false
+	}
+	var (
+		dataKind   transport.Kind
+		firstAt    = closed.repairAt
+		lastDataAt time.Time
+		dataBytes  uint64
+	)
+	for i := 0; i < sourceSpan; i++ {
+		packetID := basePacketID + uint32(i)
+		data, ok := w.data[packetID]
+		if !ok || data.packet == nil || !data.wire || !qosKnownKind(data.kind) {
+			return qosSample{}, false
+		}
+		if dataKind == 0 {
+			dataKind = data.kind
+		} else if dataKind != data.kind {
+			return qosSample{}, false
+		}
+		firstAt = earliest(firstAt, data.at)
+		if data.at.After(lastDataAt) {
+			lastDataAt = data.at
+		}
+		dataBytes += uint64(len(data.packet.Payload))
+	}
+	lag := lastDataAt.Sub(closed.repairAt)
+	if lag < 0 {
+		lag = 0
+	}
+	return qosSample{
+		At:           at,
+		Duration:     sampleDuration(firstAt, at),
+		DataKind:     dataKind,
+		DataArrived:  uint64(sourceSpan),
+		DataExpected: uint64(sourceSpan),
+		DataBytes:    dataBytes,
+		RepairKind:   closed.repairKind,
+		RepairBytes:  closed.repairBytes,
+		Lag:          lag,
 	}, true
 }
 
@@ -441,12 +534,17 @@ func (w *rxSLCWindow) isClosed(repair rxRepair) bool {
 	return ok
 }
 
-func (w *rxSLCWindow) closeGroup(repair rxRepair) {
+func (w *rxSLCWindow) closeGroup(repair rxRepair, missingIndex int) {
 	key := w.groupKey(repair)
 	if _, ok := w.closed[key]; ok {
 		return
 	}
-	w.closed[key] = struct{}{}
+	w.closed[key] = rxClosedGroup{
+		repairKind:   repair.kind,
+		repairAt:     repair.at,
+		repairBytes:  uint64(len(repair.symbol.Payload)),
+		missingIndex: missingIndex,
+	}
 	w.closedOrder = append(w.closedOrder, key)
 }
 

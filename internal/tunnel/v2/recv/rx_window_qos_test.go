@@ -112,6 +112,46 @@ func TestRxWindowRecoveredGroupSampleUsesRecoveredPayloadLength(t *testing.T) {
 	}
 }
 
+func TestRxWindowDefersTCPRecoverySampleUntilLateData(t *testing.T) {
+	now := time.Unix(0, 0)
+	w := newRxSLCWindow(1)
+
+	result := w.addRepair(transport.KindUDP, 300, 9, 1, make([]byte, 64), now)
+	if !result.hasRecoverable {
+		t.Fatal("UDP repair with one missing TCP DATA should be recoverable")
+	}
+
+	sample, ok := w.finishRecovery(result.recoverable, make([]byte, 80), now.Add(10*time.Millisecond))
+	if ok {
+		t.Fatalf("recovery sample = %+v, want no TCP limited evidence before late DATA", sample)
+	}
+	if len(w.repairs) != 0 {
+		t.Fatalf("repairs retained after recovery = %d, want 0", len(w.repairs))
+	}
+
+	late := w.observeLateData(transport.KindTCP, 300, make([]byte, 100), now.Add(900*time.Millisecond))
+	if !late.hasSample {
+		t.Fatal("late TCP DATA should produce a QoS lag sample")
+	}
+	if late.sample.DataKind != transport.KindTCP || late.sample.RepairKind != transport.KindUDP {
+		t.Fatalf("sample kinds = data %d repair %d, want TCP/UDP", late.sample.DataKind, late.sample.RepairKind)
+	}
+	if late.sample.DataExpected != 1 || late.sample.DataArrived != 1 {
+		t.Fatalf("sample counts = expected %d arrived %d, want 1/1", late.sample.DataExpected, late.sample.DataArrived)
+	}
+	if late.sample.DataBytes != 100 {
+		t.Fatalf("DataBytes = %d, want late DATA bytes 100", late.sample.DataBytes)
+	}
+	if late.sample.Lag != 900*time.Millisecond {
+		t.Fatalf("Lag = %s, want 900ms", late.sample.Lag)
+	}
+
+	again := w.observeLateData(transport.KindTCP, 300, make([]byte, 100), now.Add(time.Second))
+	if again.hasSample || again.hasRecoverable {
+		t.Fatalf("second duplicate result = %+v, want no repeated sample", again)
+	}
+}
+
 func TestRxWindowDoesNotEstimateWithoutFECProof(t *testing.T) {
 	now := time.Unix(0, 0)
 	w := newRxSLCWindow(4)

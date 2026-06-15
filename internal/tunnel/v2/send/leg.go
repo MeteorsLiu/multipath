@@ -252,6 +252,12 @@ func (g *leg) qualityLocked(k transport.Kind) selector.Quality {
 	}
 }
 
+func (g *leg) qualitySnapshot() (selector.Quality, selector.Quality) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.qualityLocked(transport.KindUDP), g.qualityLocked(transport.KindTCP)
+}
+
 // setPrimary flips the nominal primary orientation. The active DATA/REPAIR role
 // is selected by the selector from observer quality, including received QoS
 // status.

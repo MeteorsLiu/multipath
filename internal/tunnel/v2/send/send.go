@@ -827,8 +827,11 @@ func (s *Send) sendDataFrame(ctx context.Context, lane *laneRuntime, frame proto
 		return nil
 	}
 	if debuglog.Enabled() {
-		debuglog.Printf("send", "schedule_select session=%d lane=%d leg={%s} frame=type=DATA packet_id=%d payload_len=%d",
-			frame.SessionID, lane.id, debugLeg(leg), packetID, len(payload))
+		udpQ, tcpQ := lane.leg.qualitySnapshot()
+		debuglog.Printf("send", "schedule_select session=%d lane=%d leg={%s} frame=type=DATA packet_id=%d payload_len=%d udp_active=%t udp_rate=%.3f udp_qos=%t udp_qos_reason=%d udp_prefer_tcp=%t udp_rttvar_ms=%d tcp_active=%t tcp_rate=%.3f tcp_qos=%t tcp_qos_reason=%d",
+			frame.SessionID, lane.id, debugLeg(leg), packetID, len(payload),
+			udpQ.Active, udpQ.DeliveryRate, udpQ.QoSActive, udpQ.QoSReason, udpQ.PreferTCP, udpQ.RTTVariance.Milliseconds(),
+			tcpQ.Active, tcpQ.DeliveryRate, tcpQ.QoSActive, tcpQ.QoSReason)
 	}
 
 	// Add to FEC window if enabled

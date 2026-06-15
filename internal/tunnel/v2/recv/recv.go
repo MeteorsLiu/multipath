@@ -78,6 +78,7 @@ type Recv struct {
 
 type recvState struct {
 	mu         sync.Mutex
+	sessionID  uint64
 	closed     bool
 	pendingQoS []qosStatus
 
@@ -114,7 +115,7 @@ func (s *recvState) windowFor(laneID uint8) *rxSLCWindow {
 func (s *recvState) qosFor(laneID uint8, emit func(qosStatus)) *qosEstimator {
 	q := s.qos[laneID]
 	if q == nil {
-		q = newQoSEstimator(qosConfig{}, emit)
+		q = newQoSEstimator(qosConfig{SessionID: s.sessionID, LaneID: laneID}, emit)
 		s.qos[laneID] = q
 	}
 	return q
@@ -311,6 +312,8 @@ func (o *Recv) handleDATA(ctx context.Context, leg Ref, frame protocol.Frame, pa
 		return false, nil
 	}
 	if !state.dedupe.mark(body.PacketID) {
+		result := state.windowFor(frame.LaneID).observeLateData(leg.Kind, body.PacketID, body.Packet, time.Now())
+		state.observeQoSResult(frame.LaneID, result)
 		statuses := state.takeQoSStatuses()
 		state.mu.Unlock()
 		if debuglog.Enabled() {
@@ -539,6 +542,7 @@ func (o *Recv) recvState(sessionID uint64) *recvState {
 		return state
 	}
 	state = &recvState{
+		sessionID: sessionID,
 		rxWindows: make(map[uint8]*rxSLCWindow),
 		dedupe:    newEmitDedupe(0),
 		qos:       make(map[uint8]*qosEstimator),
