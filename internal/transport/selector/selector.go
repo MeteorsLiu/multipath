@@ -47,7 +47,7 @@ const (
 //  1. both dead            → ok=false
 //  2. only one active      → that one
 //  3. active QoS status    → avoid bad leg, or choose higher delivered bps
-//  4. UDP loss high & TCP good → TCP   (ping fallback)
+//  4. UDP delivery poor & TCP good → TCP (ping fallback)
 //  5. UDP jitter high & TCP good → TCP (ping fallback)
 //  6. PreferTCP            → TCP        (probeBW cold-start lock)
 //  7. default             → UDP
@@ -87,7 +87,7 @@ func (s *QualitySelector) Pick(udp, tcp Quality) (useUDP bool, ok bool) {
 		return useUDP, true
 	}
 
-	// 3. UDP delivery poor & TCP healthy → TCP.
+	// UDP delivery poor & TCP healthy → TCP.
 	if udp.DeliveryRate < minUDPDelivery && tcp.DeliveryRate >= minTCPDelivery {
 		s.recordPick(false, now)
 		return false, true

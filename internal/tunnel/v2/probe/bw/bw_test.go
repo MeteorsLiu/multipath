@@ -8,6 +8,15 @@ import (
 	"time"
 )
 
+func withTrainWindow(t *testing.T, window time.Duration) {
+	t.Helper()
+	old := trainWindow
+	trainWindow = window
+	t.Cleanup(func() {
+		trainWindow = old
+	})
+}
+
 // TestBWStartActiveSendsProbes verifies an active train emits probe frames with
 // a well-formed structure through the SendProbe callback.
 func TestBWStartActiveSendsProbes(t *testing.T) {
@@ -62,6 +71,7 @@ func TestBWStartActiveSendsProbes(t *testing.T) {
 
 func TestBwLoopUsesTrainBudgetForRemaining(t *testing.T) {
 	const referenceBps = uint64(200_000_000)
+	withTrainWindow(t, 50*time.Millisecond)
 
 	var sentProbes []Probe
 	var sentMu sync.Mutex
@@ -131,6 +141,8 @@ func TestBwLoopUsesTrainBudgetForRemaining(t *testing.T) {
 }
 
 func TestBwLoopRemainingDecreasesAcrossSteps(t *testing.T) {
+	withTrainWindow(t, 50*time.Millisecond)
+
 	var sentProbes []Probe
 	var sentMu sync.Mutex
 	sampleDone := make(chan struct{})
@@ -417,6 +429,19 @@ func TestNextRateAndPlateau(t *testing.T) {
 	}
 }
 
+func TestCapReachedThreshold(t *testing.T) {
+	const capBps = uint64(200_000_000)
+	if capReached(198_999_999, capBps) {
+		t.Fatal("cap reached below 99.5% threshold")
+	}
+	if !capReached(199_000_000, capBps) {
+		t.Fatal("cap not reached at 99.5% threshold")
+	}
+	if capReached(1, 0) {
+		t.Fatal("zero cap should never be reached")
+	}
+}
+
 // TestPayloadSizeRandomizesWithinBounds verifies the per-probe payload size is
 // fixed when min==max and varies deterministically within [min,max] otherwise
 // (spec: UDP randomizes 1200-1400, TCP fixes 32KB). Pure function.
@@ -505,22 +530,22 @@ func TestRateLimiterPacesSends(t *testing.T) {
 	}
 }
 
-// TestLossStopEndsTrainEarly verifies a UDP-style train with a loss-stop
-// threshold ends sooner under high loss than a TCP-style train (lossStop=0) that
-// only stops when it climbs to the cap. Both are capped so neither waits out the
-// full 10s budget window; the loss-stop just cuts the UDP-style train short.
-func TestLossStopEndsTrainEarly(t *testing.T) {
-	// runWithLossStop runs one train (capped so it always terminates) acking only
-	// ~25% of each step, and returns how many steps it took. The SendProbe closure
-	// acks via the loop captured from Start's return; a tiny settle loop ensures
-	// the loop pointer is set before the first probes arrive.
+// TestLossStopDoesNotEndTrainEarly verifies loss no longer ends a train early:
+// if measured bandwidth never reaches cap, the train runs until TrainWindow.
+func TestLossStopDoesNotEndTrainEarly(t *testing.T) {
+	withTrainWindow(t, 220*time.Millisecond)
+
+	// runWithLossStop runs one train acking only ~25% of each step, and returns
+	// how many steps it took. The SendProbe closure acks via the loop captured
+	// from Start's return; a tiny settle loop ensures the loop pointer is set
+	// before the first probes arrive.
 	runWithLossStop := func(lossStop float64) int {
 		var steps int
 		var stepsMu sync.Mutex
 		var loop atomic.Pointer[BwLoop]
 		b := New(Config{
-			ReferenceBps:      1_000_000,
-			CapBps:            500_000_000, // large cap → many steps without a loss stop
+			ReferenceBps:      500_000_000,
+			CapBps:            500_000_000, // measured bps below cap → run until TrainWindow
 			MinRateBps:        16_000_000,
 			StepWindow:        5 * time.Millisecond,
 			AckGrace:          15 * time.Millisecond,
@@ -541,13 +566,13 @@ func TestLossStopEndsTrainEarly(t *testing.T) {
 						received |= 1 << i
 					}
 					now := uint64(time.Now().UnixMilli())
-					l.Ack(Ack{ID: p.ID, Count: p.Count, Received: received, FirstRXMS: now - 1, LastRXMS: now})
+					l.Ack(Ack{ID: p.ID, Count: p.Count, Received: received, FirstRXMS: now - 1000, LastRXMS: now})
 				}
 				return nil
 			},
 		})
 
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
 		l, err := b.Start(ctx)
 		if err != nil {
@@ -555,7 +580,7 @@ func TestLossStopEndsTrainEarly(t *testing.T) {
 		}
 		loop.Store(l)
 
-		deadline := time.Now().Add(5 * time.Second)
+		deadline := time.Now().Add(time.Second)
 		for time.Now().Before(deadline) {
 			b.mu.Lock()
 			_, active := b.activeLoops[l.TrainID()]
@@ -572,11 +597,14 @@ func TestLossStopEndsTrainEarly(t *testing.T) {
 		return 0
 	}
 
-	udpSteps := runWithLossStop(bwTestLossStop) // loss-stop on → stops early
-	tcpSteps := runWithLossStop(0)              // loss-stop off → climbs to cap
+	udpSteps := runWithLossStop(bwTestLossStop)
+	tcpSteps := runWithLossStop(0)
 
-	if udpSteps >= tcpSteps {
-		t.Fatalf("loss-stop did not shorten the train: udp steps=%d, tcp steps=%d", udpSteps, tcpSteps)
+	if udpSteps < 2 || tcpSteps < 2 {
+		t.Fatalf("train ended too early: udp steps=%d, tcp steps=%d", udpSteps, tcpSteps)
+	}
+	if udpSteps != tcpSteps {
+		t.Fatalf("loss-stop changed train length: udp steps=%d, tcp steps=%d", udpSteps, tcpSteps)
 	}
 }
 

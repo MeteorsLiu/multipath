@@ -2,6 +2,7 @@ package recv
 
 import (
 	"math"
+	"sort"
 	"time"
 
 	"github.com/MeteorsLiu/multipath/internal/eventlog"
@@ -16,8 +17,12 @@ const (
 	defaultQoSRefresh     = time.Second
 	defaultQoSAlpha       = 0.10
 
-	qosLossEnter = 0.05
-	qosLossExit  = 0.01
+	qosRateGapEnter = 0.10
+	qosRateGapExit  = 0.03
+
+	qosShadowQuantile       = 0.25
+	qosShadowAdvantageEnter = 1.10
+	qosShadowAdvantageExit  = 1.05
 )
 
 type qosConfig struct {
@@ -61,17 +66,21 @@ type qosEstimate struct {
 	DataKind     transport.Kind
 	RepairKind   transport.Kind
 	SampleTotal  uint64
-	Loss         float64
+	RateGapRatio float64
+	ActualBps    uint32
+	ExpectedBps  uint32
+	ShadowBps    uint32
 	DeliveredBps uint32
 }
 
 type qosEMAState struct {
-	repairKind      transport.Kind
-	initialized     bool
-	sampleTotal     uint64
-	expectedEMA     float64
-	arrivedEMA      float64
-	deliveredBpsEMA float64
+	repairKind     transport.Kind
+	initialized    bool
+	sampleTotal    uint64
+	actualBpsEMA   float64
+	expectedBpsEMA float64
+	repairBpsEMA   float64
+	betaQ25        qosQuantile
 }
 
 type qosActiveEvidence struct {
@@ -156,7 +165,7 @@ func (e *qosEstimator) evaluateLimited(sample qosEstimate, now time.Time) (qosSt
 		delete(e.limitedSince, sample.DataKind)
 		return qosStatus{}, false
 	}
-	if sample.Loss < qosLossExit {
+	if sample.RateGapRatio < qosRateGapExit || !sample.hasShadowAdvantage(qosShadowAdvantageExit) {
 		_, pending := e.limitedSince[sample.DataKind]
 		delete(e.limitedSince, sample.DataKind)
 		cleared := e.clearActive(sample.DataKind, protocol.LinkStatusReasonLimited)
@@ -165,7 +174,12 @@ func (e *qosEstimator) evaluateLimited(sample qosEstimate, now time.Time) (qosSt
 		}
 		return qosStatus{}, false
 	}
-	if sample.Loss <= qosLossEnter {
+	if sample.RateGapRatio <= qosRateGapEnter {
+		delete(e.limitedSince, sample.DataKind)
+		return qosStatus{}, false
+	}
+	if !sample.hasShadowAdvantage(qosShadowAdvantageEnter) {
+		delete(e.limitedSince, sample.DataKind)
 		return qosStatus{}, false
 	}
 	ready, first := e.sustained(e.limitedSince, sample.DataKind, now)
@@ -288,45 +302,179 @@ func otherTransportKind(kind transport.Kind) transport.Kind {
 
 func (s *qosEMAState) observe(sample qosSample) {
 	s.sampleTotal += sample.DataExpected
-	expected := float64(sample.DataExpected)
-	arrived := float64(sample.DataArrived)
-	bps := float64(deliveredBps(sample.DataBytes+sample.RecoveredBytes, sample.Duration))
+	actualBps := float64(deliveredBps(sample.DataBytes, sample.Duration))
+	expectedBps := float64(deliveredBps(sample.DataBytes+sample.RecoveredBytes, sample.Duration))
+	repairBps := float64(deliveredBps(sample.RepairBytes, sample.Duration))
+	if factor, ok := shadowBetaFactor(sample); ok {
+		s.betaQ25.observe(factor)
+	}
 	if !s.initialized {
-		s.expectedEMA = expected
-		s.arrivedEMA = arrived
-		s.deliveredBpsEMA = bps
+		s.actualBpsEMA = actualBps
+		s.expectedBpsEMA = expectedBps
+		s.repairBpsEMA = repairBps
 		s.initialized = true
 		return
 	}
-	s.expectedEMA = emaUpdate(s.expectedEMA, expected, defaultQoSAlpha)
-	s.arrivedEMA = emaUpdate(s.arrivedEMA, arrived, defaultQoSAlpha)
-	s.deliveredBpsEMA = emaUpdate(s.deliveredBpsEMA, bps, defaultQoSAlpha)
+	s.actualBpsEMA = emaUpdate(s.actualBpsEMA, actualBps, defaultQoSAlpha)
+	s.expectedBpsEMA = emaUpdate(s.expectedBpsEMA, expectedBps, defaultQoSAlpha)
+	s.repairBpsEMA = emaUpdate(s.repairBpsEMA, repairBps, defaultQoSAlpha)
 }
 
 func (s *qosEMAState) estimate(at time.Time, kind transport.Kind) qosEstimate {
-	loss := 0.0
-	if s.expectedEMA > 0 && s.arrivedEMA < s.expectedEMA {
-		loss = (s.expectedEMA - s.arrivedEMA) / s.expectedEMA
-	}
-	delivered := s.deliveredBpsEMA
-	if delivered < 0 {
-		delivered = 0
-	}
-	if delivered > math.MaxUint32 {
-		delivered = math.MaxUint32
+	actual := clampUint32Float(s.actualBpsEMA)
+	expected := clampUint32Float(s.expectedBpsEMA)
+	shadow := clampUint32Float(s.repairBpsEMA * s.betaQ25.value())
+	delivered := actual
+	rateGapRatio := 0.0
+	if s.expectedBpsEMA > 0 && s.actualBpsEMA < s.expectedBpsEMA {
+		rateGapRatio = (s.expectedBpsEMA - s.actualBpsEMA) / s.expectedBpsEMA
 	}
 	return qosEstimate{
 		At:           at,
 		DataKind:     kind,
 		RepairKind:   s.repairKind,
 		SampleTotal:  s.sampleTotal,
-		Loss:         loss,
-		DeliveredBps: uint32(delivered),
+		RateGapRatio: rateGapRatio,
+		ActualBps:    actual,
+		ExpectedBps:  expected,
+		ShadowBps:    shadow,
+		DeliveredBps: delivered,
 	}
+}
+
+func (s qosEstimate) hasShadowAdvantage(ratio float64) bool {
+	if s.ShadowBps == 0 {
+		return false
+	}
+	if s.ActualBps == 0 {
+		return true
+	}
+	return float64(s.ShadowBps) > float64(s.ActualBps)*ratio
+}
+
+func shadowBetaFactor(sample qosSample) (float64, bool) {
+	groupBytes := sample.DataBytes + sample.RecoveredBytes
+	if groupBytes == 0 || sample.RepairBytes == 0 {
+		return 0, false
+	}
+	factor := float64(groupBytes) / float64(sample.RepairBytes)
+	if factor < 1 {
+		factor = 1
+	}
+	maxFactor := float64(sample.DataExpected)
+	if maxFactor < 1 {
+		maxFactor = 1
+	}
+	if factor > maxFactor {
+		factor = maxFactor
+	}
+	return factor, true
+}
+
+type qosQuantile struct {
+	initialized bool
+	initial     []float64
+	q           [5]float64
+	n           [5]int
+	np          [5]float64
+	dn          [5]float64
+}
+
+func (q *qosQuantile) observe(v float64) {
+	if v <= 0 || math.IsNaN(v) || math.IsInf(v, 0) {
+		return
+	}
+	if !q.initialized {
+		q.initial = append(q.initial, v)
+		if len(q.initial) < 5 {
+			return
+		}
+		sort.Float64s(q.initial)
+		copy(q.q[:], q.initial)
+		q.n = [5]int{1, 2, 3, 4, 5}
+		q.np = [5]float64{1, 1 + 2*qosShadowQuantile, 1 + 4*qosShadowQuantile, 3 + 2*qosShadowQuantile, 5}
+		q.dn = [5]float64{0, qosShadowQuantile / 2, qosShadowQuantile, (1 + qosShadowQuantile) / 2, 1}
+		q.initialized = true
+		return
+	}
+
+	k := 0
+	switch {
+	case v < q.q[0]:
+		q.q[0] = v
+	case v < q.q[1]:
+		k = 0
+	case v < q.q[2]:
+		k = 1
+	case v < q.q[3]:
+		k = 2
+	case v <= q.q[4]:
+		k = 3
+	default:
+		q.q[4] = v
+		k = 3
+	}
+	for i := k + 1; i < 5; i++ {
+		q.n[i]++
+	}
+	for i := range q.np {
+		q.np[i] += q.dn[i]
+	}
+	for i := 1; i < 4; i++ {
+		d := q.np[i] - float64(q.n[i])
+		if (d >= 1 && q.n[i+1]-q.n[i] > 1) || (d <= -1 && q.n[i-1]-q.n[i] < -1) {
+			step := 1
+			if d < 0 {
+				step = -1
+			}
+			next := q.parabolic(i, step)
+			if next <= q.q[i-1] || next >= q.q[i+1] {
+				next = q.linear(i, step)
+			}
+			q.q[i] = next
+			q.n[i] += step
+		}
+	}
+}
+
+func (q *qosQuantile) value() float64 {
+	if !q.initialized {
+		if len(q.initial) == 0 {
+			return 0
+		}
+		values := append([]float64(nil), q.initial...)
+		sort.Float64s(values)
+		idx := int(math.Floor(qosShadowQuantile * float64(len(values)-1)))
+		return values[idx]
+	}
+	return q.q[2]
+}
+
+func (q *qosQuantile) parabolic(i, step int) float64 {
+	n := q.n
+	v := q.q
+	return v[i] + float64(step)/float64(n[i+1]-n[i-1])*
+		((float64(n[i]-n[i-1]+step)*(v[i+1]-v[i])/float64(n[i+1]-n[i]))+
+			(float64(n[i+1]-n[i]-step)*(v[i]-v[i-1])/float64(n[i]-n[i-1])))
+}
+
+func (q *qosQuantile) linear(i, step int) float64 {
+	j := i + step
+	return q.q[i] + float64(step)*(q.q[j]-q.q[i])/float64(q.n[j]-q.n[i])
 }
 
 func emaUpdate(current, sample, alpha float64) float64 {
 	return current + alpha*(sample-current)
+}
+
+func clampUint32Float(v float64) uint32 {
+	if v < 0 {
+		return 0
+	}
+	if v > math.MaxUint32 {
+		return math.MaxUint32
+	}
+	return uint32(v)
 }
 
 func (e *qosEstimator) recordSampleMetrics(sample qosEstimate) {
@@ -339,7 +487,6 @@ func (e *qosEstimator) recordSampleMetrics(sample qosEstimate) {
 		metrics.LU8("lane", e.cfg.LaneID),
 		metrics.LStr("leg", leg),
 	}
-	metrics.SetGauge(metrics.QoSLossRatio, sample.Loss, labels...)
 	metrics.SetGauge(metrics.QoSDeliveredBps, float64(sample.DeliveredBps), labels...)
 }
 

@@ -20,7 +20,7 @@ func TestQualitySelectorPrefersUDPWhenBothHealthy(t *testing.T) {
 	}
 }
 
-// Rule 3 (loss-form QoS): UDP delivery poor & TCP good → TCP.
+// Ping fallback: UDP delivery poor & TCP good → TCP.
 func TestQualitySelectorFallsBackToTCPWhenUDPDegraded(t *testing.T) {
 	sel := QualitySelector{}
 	udp := Quality{Active: true, DeliveryRate: 0.50, SmoothedRTT: 200 * time.Millisecond}

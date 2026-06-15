@@ -251,20 +251,24 @@ func TestRecvReportsQoSStatusThroughCallback(t *testing.T) {
 	}
 	state.mu.Lock()
 	state.qos[1].Observe(qosSample{
-		At:           time.Now(),
-		Duration:     time.Second,
-		DataKind:     transport.KindUDP,
-		RepairKind:   transport.KindTCP,
-		DataArrived:  0,
-		DataExpected: 16,
+		At:             time.Now(),
+		Duration:       time.Second,
+		DataKind:       transport.KindUDP,
+		RepairKind:     transport.KindTCP,
+		DataArrived:    0,
+		DataExpected:   16,
+		RecoveredBytes: 16 * 1200,
+		RepairBytes:    4 * 1200,
 	})
 	state.qos[1].Observe(qosSample{
-		At:           time.Now().Add(2 * time.Second),
-		Duration:     time.Second,
-		DataKind:     transport.KindUDP,
-		RepairKind:   transport.KindTCP,
-		DataArrived:  0,
-		DataExpected: 16,
+		At:             time.Now().Add(2 * time.Second),
+		Duration:       time.Second,
+		DataKind:       transport.KindUDP,
+		RepairKind:     transport.KindTCP,
+		DataArrived:    0,
+		DataExpected:   16,
+		RecoveredBytes: 16 * 1200,
+		RepairBytes:    4 * 1200,
 	})
 	state.mu.Unlock()
 

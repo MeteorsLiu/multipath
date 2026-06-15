@@ -28,7 +28,6 @@ const (
 	FECEventsTotal            = "multipath_fec_events_total"
 	FECFlushTotal             = "multipath_fec_flush_total"
 	QoSEventsTotal            = "multipath_qos_events_total"
-	QoSLossRatio              = "multipath_qos_loss_ratio"
 	QoSDeliveredBps           = "multipath_qos_delivered_bps"
 	LinkStatusEventsTotal     = "multipath_link_status_events_total"
 	ProbeEventsTotal          = "multipath_probe_events_total"
@@ -156,11 +155,6 @@ var specs = map[string]metricSpec{
 		kind:   metricCounter,
 		help:   "Total receive-side QoS estimator events.",
 		labels: []string{"event", "session", "lane", "leg", "reason"},
-	},
-	QoSLossRatio: {
-		kind:   metricGauge,
-		help:   "Receive-side QoS DATA loss ratio by lane and transport leg.",
-		labels: []string{"session", "lane", "leg"},
 	},
 	QoSDeliveredBps: {
 		kind:   metricGauge,

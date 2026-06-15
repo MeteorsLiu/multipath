@@ -14,7 +14,7 @@ import (
 const (
 	deliveryWindowSize = 32
 	deliveryMinSamples = 8
-	qosTTL             = 3 * time.Second
+	qosTTL             = 300 * time.Second
 )
 
 // Observer tracks delivery rate and RTT for UDP and TCP (spec 5.4). It exposes

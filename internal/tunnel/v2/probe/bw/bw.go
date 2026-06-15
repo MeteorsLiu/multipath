@@ -65,9 +65,8 @@ type Config struct {
 	PayloadMin int
 	PayloadMax int
 
-	// LossStopThreshold ends the train early when a step's loss meets/exceeds it
-	// (spec: UDP stops at ~0.01 loss; TCP passes 0 to never stop on loss and rely
-	// on plateau instead). Zero disables early loss stop.
+	// LossStopThreshold is retained for old callers but no longer stops a train;
+	// trains either measure near cap or run until TrainWindow.
 	LossStopThreshold float64
 
 	// RateLimit enables a token-bucket limiter that paces probe sends to the
@@ -87,8 +86,11 @@ const (
 	minProbeSize      = 1200
 	maxProbeFrames    = 64
 	minProbeFrames    = 2
-	trainWindow       = 10 * time.Second // total budget window
+	capReachedNum     = uint64(995)
+	capReachedDen     = uint64(1000)
 )
+
+var trainWindow = 2 * time.Second
 
 // nextRate returns the next probing rate given the current rate, an optional
 // hard cap, and whether growth has stalled (plateau). Pure function (spec 5.8:
@@ -170,10 +172,17 @@ func effectiveRate(rateBps, capBps, minRateBps uint64) uint64 {
 // trainBudgetBytes returns the total byte budget for a probe train at the given
 // rate over trainWindow. Pure function.
 func trainBudgetBytes(rateBps uint64) uint64 {
+	return trainBudgetBytesFor(rateBps, trainWindow)
+}
+
+func trainBudgetBytesFor(rateBps uint64, window time.Duration) uint64 {
 	if rateBps == 0 {
 		rateBps = defaultMinRateBps
 	}
-	return rateBps * uint64(trainWindow) / uint64(time.Second) / 8
+	if window <= 0 {
+		window = trainWindow
+	}
+	return rateBps * uint64(window) / uint64(time.Second) / 8
 }
 
 func trainBudgetRate(referenceBps, capBps, minRateBps uint64) uint64 {
@@ -226,7 +235,6 @@ type BW struct {
 	ackGrace     time.Duration
 	payloadMin   int
 	payloadMax   int
-	lossStop     float64
 	rateLimit    bool
 	sendProbe    func(Probe) error
 	onSample     func(Sample)
@@ -266,7 +274,6 @@ func New(cfg Config) *BW {
 		ackGrace:     ackGrace,
 		payloadMin:   payloadMin,
 		payloadMax:   payloadMax,
-		lossStop:     cfg.LossStopThreshold,
 		rateLimit:    cfg.RateLimit,
 		sendProbe:    cfg.SendProbe,
 		onSample:     cfg.OnSample,
@@ -315,7 +322,6 @@ func (b *BW) Start(ctx context.Context) (*BwLoop, error) {
 		ackGrace:      b.ackGrace,
 		payloadMin:    b.payloadMin,
 		payloadMax:    b.payloadMax,
-		lossStop:      b.lossStop,
 		bytesPerProbe: (b.payloadMin + b.payloadMax) / 2, // average, for frame-count sizing
 	}
 	if b.rateLimit {
@@ -345,7 +351,6 @@ type BwLoop struct {
 	ackGrace     time.Duration
 	payloadMin   int
 	payloadMax   int
-	lossStop     float64
 	limiter      *rate.Limiter // nil when rate limiting is off
 
 	bytesPerProbe int
@@ -390,9 +395,11 @@ func (l *BwLoop) run(ctx context.Context) {
 	defer l.cleanup()
 
 	curRate := startRate(l.capBps, l.minRateBps)
-	trainTotal := trainBudgetBytes(trainBudgetRate(l.referenceBps, l.capBps, l.minRateBps))
+	window := trainWindow
+	trainTotal := trainBudgetBytesFor(trainBudgetRate(l.referenceBps, l.capBps, l.minRateBps), window)
 	remaining := trainTotal
-	deadline := time.Now().Add(trainWindow)
+	deadline := time.Now().Add(window)
+	bestBps := uint64(0)
 
 	for remaining > 0 && time.Now().Before(deadline) {
 		if ctx.Err() != nil {
@@ -407,21 +414,15 @@ func (l *BwLoop) run(ctx context.Context) {
 		// Wait for this step's acks (or grace timeout) before scoring it.
 		l.waitStep(ctx, step)
 		stepBps := l.scoreStep(step)
-		stepLoss := l.stepLoss(step)
 		l.mu.Lock()
 		l.stepBps = append(l.stepBps, stepBps)
 		stalled := plateau(l.stepBps)
 		l.mu.Unlock()
+		if stepBps > bestBps {
+			bestBps = stepBps
+		}
 
-		// Early loss stop (spec: UDP stops at high loss; TCP sets lossStop=0 to
-		// never stop here and rely on the plateau check instead).
-		if l.lossStop > 0 && stepLoss >= l.lossStop {
-			break
-		}
-		if l.capBps > 0 && effRate >= l.capBps {
-			break
-		}
-		if stalled {
+		if capReached(bestBps, l.capBps) {
 			break
 		}
 		curRate = nextRate(effRate, l.capBps, stalled)
@@ -431,6 +432,13 @@ func (l *BwLoop) run(ctx context.Context) {
 		l.sendComplete(ctx, trainTotal)
 	}
 	l.emitSample()
+}
+
+func capReached(measuredBps, capBps uint64) bool {
+	if capBps == 0 || measuredBps == 0 {
+		return false
+	}
+	return measuredBps >= capBps*capReachedNum/capReachedDen
 }
 
 func (l *BwLoop) sendComplete(ctx context.Context, trainTotal uint64) {
