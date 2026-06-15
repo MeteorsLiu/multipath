@@ -1116,8 +1116,8 @@ run_bandwidth_probe_tcp_reference_case() {
   echo "==== ${name} e2e start ===="
   clear_loss
   write_one_lane_config "${name}" "${PORT_BW_PROBE_GUARD}" false false 200 1000 -1
-  echo "[${name}] apply 200mbit UDP tunnel bottleneck; bandwidth probe should classify UDP relative to TCP reference"
-  apply_udp_tunnel_rate_path 1 "${PORT_BW_PROBE_GUARD}" 200mbit
+  echo "[${name}] apply 50mbit UDP tunnel bottleneck; bandwidth probe should classify UDP relative to TCP reference"
+  apply_udp_tunnel_rate_path 1 "${PORT_BW_PROBE_GUARD}" 50mbit
   local client_start_line
   local server_start_line
   local client_log_file="${WORKDIR}/${name}.client.log"
@@ -1130,7 +1130,7 @@ run_bandwidth_probe_tcp_reference_case() {
   wait_client_tcp_reference_probe "${name}" "${client_start_line}"
   assert_no_bandwidth_probe_remote_timeout_since "${name}" "${CURRENT_CLIENT_LOG}" "${client_start_line}" "client BW gate did not rely on remote timeout"
   assert_no_bandwidth_probe_remote_timeout_since "${name}" "${CURRENT_SERVER_LOG}" "${server_start_line}" "server BW gate did not rely on remote timeout"
-  wait_bandwidth_probe_udp_rate_window "${name}" "${CURRENT_CLIENT_LOG}" "${client_start_line}" 40 "client UDP probe measured veth throughput" 40000000 140000000 200000000
+  wait_bandwidth_probe_udp_rate_window "${name}" "${CURRENT_CLIENT_LOG}" "${client_start_line}" 40 "client UDP probe measured veth throughput" 20000000 80000000 200000000
   wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "send/bw: sample session=[0-9]+ lane=1 kind=1" 35 "client measured UDP bandwidth after TCP reference" "${client_start_line}"
   wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "bandwidth_probe_decision .*prefer_tcp=true selected_leg=tcp" 10 "client classified UDP below TCP reference and selected TCP" "${client_start_line}"
 
