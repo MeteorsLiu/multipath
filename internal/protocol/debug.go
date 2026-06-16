@@ -53,6 +53,8 @@ func debugFrame(frame Frame) string {
 		return fmt.Sprintf("%s train_id=%d probe_id=%d seq=%d count=%d send_ms=%d train_total=%d train_remaining=%d payload_len=%d", base, body.TrainID, body.ProbeID, body.Seq, body.Count, body.SendMS, body.TrainBytesTotal, body.TrainBytesRemaining, len(body.Payload))
 	case BandwidthProbeAckBody:
 		return fmt.Sprintf("%s probe_id=%d base_seq=%d count=%d received=%#x first_rx_ms=%d last_rx_ms=%d", base, body.ProbeID, body.BaseSeq, body.Count, body.Received, body.FirstRXMS, body.LastRXMS)
+	case LinkStatusBody:
+		return fmt.Sprintf("%s leg_kind=%d reason=%d delivered_bps=%d", base, body.LegKind, body.Reason, body.DeliveredBps)
 	default:
 		return base
 	}
@@ -78,6 +80,8 @@ func frameTypeName(frameType FrameType) string {
 		return "BW_PROBE"
 	case TypeBandwidthProbeAck:
 		return "BW_PROBE_ACK"
+	case TypeLinkStatus:
+		return "LINK_STATUS"
 	default:
 		return fmt.Sprintf("UNKNOWN(%d)", frameType)
 	}

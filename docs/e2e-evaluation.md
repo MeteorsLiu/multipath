@@ -12,16 +12,27 @@ and how to interpret its results.
 | Concurrent multi-lane fallback | two UDP-first lanes over two veth paths | UDP tunnel traffic is dropped on path1 and path2 simultaneously | both lanes fall back to TCP independently, ping survives, and both lanes return to UDP after the block clears |
 | Legacy TCP flag | two UDP-first lanes with legacy `tcp: true` config | client TCP dials to the server port are dropped, then path2 is dropped | old configs still parse, but `tcp: true` no longer forces TCP-only bootstrap |
 | Fallback | one UDP-first lane over one veth path | UDP tunnel traffic is dropped while TCP is clean, then TCP traffic is dropped after UDP is restored | a lane falls back to TCP when UDP fails and recovers back to UDP |
-| Fallback dial error | one UDP-first lane over one veth path | UDP tunnel traffic is dropped and the server REJECTs incoming TCP with TCP RST | the client emits `fallback_result_err` for the lane and ping fails closed because no transport leg is runnable |
-| Leg selector | one UDP-first lane with warm TCP fallback over one veth path | 30% UDP tunnel loss degrades the initial bandwidth-probe ramp while TCP stays clean | bandwidth probe samples mark UDP as QoS-limited, and both client and server leg selectors send DATA frames over TCP even though UDP remains active |
+| Unknown-session rebootstrap | one UDP-first lane over one veth path | the server process is restarted while the client keeps probing the stale session | the restarted server replies `CLOSE{unknown_session}`, the client rebuilds a fresh session, and ping recovers |
+| Multi-lane rebootstrap | two UDP-first lanes over two veth paths | the server process is restarted while the client keeps probing the stale session | the restarted server rejects the stale session, the client rebuilds once, and both configured lanes accept fresh UDP HELLO_ACKs |
+| Fallback dial error | one UDP-first lane over one veth path | UDP tunnel traffic is dropped and the server REJECTs incoming TCP with TCP RST | the client emits `send/dialer: dial err` for the lane and ping fails closed because no transport leg is runnable |
+| TCP established redial | one UDP-first lane over one veth path | UDP is blocked, TCP fallback is established, then the server process is killed and restarted | the client observes an established TCP leg failure, redials TCP, accepts a new TCP HELLO_ACK, and ping recovers while UDP remains blocked |
+| Leg selector | one UDP-first lane with warm TCP fallback over one veth path | 50% large-packet UDP loss degrades the initial bandwidth-probe ramp while TCP stays clean | bandwidth probe samples are recorded and both client and server leg selectors send DATA frames over TCP even though UDP remains active |
+| Bandwidth probe TCP reference | one UDP-first lane with warm TCP fallback over one veth path | UDP tunnel traffic is rate-limited while TCP stays clean | the client records a TCP reference sample before its UDP sample and the UDP sample falls in the expected rate window |
+| Bandwidth probe default cap | one UDP-first lane with warm TCP fallback over one veth path | 50% large-packet UDP loss while the default cap is used as reference | the client records a capped UDP sample and then sends DATA frames over TCP |
+| Bandwidth probe disabled | one UDP-first lane over one veth path | `MULTIPATH_DISABLE_BW_PROBE=1` | ping traffic works while neither side emits `send/bw` logs |
 | NAT | client namespace behind a router namespace doing SNAT to the server namespace | TCP fallback is blocked | UDP HELLO/ACK, DATA, and probes work through NAT/conntrack using observed source addresses |
+| NAT + TCP fallback | client namespace behind a router namespace doing SNAT to the server namespace | UDP tunnel traffic is dropped through NAT while TCP stays clean | the same lane establishes TCP fallback through SNAT and ping recovers |
 | FEC weak-net comparison | one UDP-first lane over one veth path | 20% client-to-server UDP tunnel loss with TCP fallback blocked | `fec=true` reduces observed tunnel packet loss versus `fec=false` |
 | FEC high-RTT weak-net comparison | one UDP-first lane over one veth path | 20% client-to-server UDP tunnel loss, added UDP tunnel delay in both directions, TCP fallback blocked | FEC loss reduction still holds while ping RTT shows recovery-delay impact |
+| FEC disabled negotiation | one UDP-first lane with `fec=false` | clean network with short DATA load | HELLO/HELLO_ACK do not negotiate FEC or LINK_STATUS, and neither REPAIR nor LINK_STATUS is emitted |
 | FEC over TCP fallback | one UDP-first lane with `fec=true` | UDP tunnel traffic is dropped while TCP is clean | the lane falls back to TCP and the TCP HELLO_ACK preserves the FEC capability and `fec_profile` |
 | Multipath + FEC | two UDP-first lanes with `fec=true` | path1 has 20% UDP tunnel loss and TCP fallback blocked; path2 stays clean | observed ping packet loss stays under 10%, validating combined multipath spreading and FEC recovery |
+| LINK_STATUS QoS | one UDP-first lane with `fec=true` and warm TCP shadow | REPAIR is observed on TCP shadow, then 20% client-to-server UDP tunnel loss is applied and later cleared while bandwidth probe is disabled | server receive-side FEC differential QoS emits and refreshes `LINK_STATUS`, client applies it, client DATA switches to TCP, then returns to UDP after status expiry and prefer-wait |
+| LINK_STATUS reverse QoS | one UDP-first lane with `fec=true` and warm TCP shadow | server-to-client DATA sees 20% UDP tunnel loss and later clears while bandwidth probe is disabled | client receive-side FEC differential QoS emits and refreshes `LINK_STATUS`, server applies it, server DATA switches to TCP, then returns to UDP |
 | FEC loaded latency | one UDP-first lane with `fec=true` | 20% client-to-server UDP tunnel loss, TCP fallback blocked, iperf3 UDP background load fills the FEC group quickly | sparse ping reports the realistic loaded-latency RTT distribution (line `rtt min/avg/max/mdev = ...`) so that FEC recovery delay can be evaluated under traffic instead of under sparse ping |
-| Weighted scheduling | two UDP-first lanes with `weight: 4` and `weight: 1` | clean network | observed client-side `tun_done` lane=1 fraction tracks `4/(4+1)` within ±0.15, validating per-lane weight handling |
+| Weighted scheduling | two UDP-first lanes with `weight: 4` and `weight: 1` | clean network | observed client-side DATA `schedule_select` lane=1 fraction tracks `4/(4+1)` within ±0.15, validating per-lane weight handling |
 | MTU | one UDP-first lane over one veth path | clean network, then UDP tunnel traffic dropped to force TCP fallback | near-MTU pings (`ping -s 1412 -M do`) survive both UDP transport and TCP fallback, validating tunnel header overhead math |
+| MTU + FEC | one UDP-first lane with `fec=true` | near-MTU pings on UDP and then TCP fallback | near-MTU DATA and REPAIR frames are accepted without FEC recovery errors |
 
 The FEC comparison intentionally uses one lane. Multipath failover would hide
 some losses and make it harder to isolate the FEC signal. TCP fallback is also
@@ -71,24 +82,21 @@ arrives. The return path is left clean so the measured ping loss mainly reflects
 whether client-to-server tunnel packets survive. TCP dials to the same server
 port are dropped during this sample so fallback cannot hide UDP loss.
 
-The script records Linux `ping` packet loss for both cases. The default sample
-is 1000 packets at 20ms intervals to reduce random `tc netem` variance. The
-count and interval can be overridden with
-`MULTIPATH_REAL_E2E_FEC_PING_COUNT` and
-`MULTIPATH_REAL_E2E_FEC_PING_INTERVAL`. The pass condition requires:
+The script records Linux `ping` packet loss for both cases. Each sample sends
+1000 packets at 20ms intervals to reduce random `tc netem` variance. The pass
+condition requires:
 
 ```text
 fec_on_loss < fec_off_loss
 ```
 
 After the normal FEC comparison, the script repeats the same `fec=false` and
-`fec=true` cases with added UDP tunnel delay in both directions. The default is
-`50ms` one-way delay, controlled by
-`MULTIPATH_REAL_E2E_FEC_HIGH_RTT_DELAY`. The high-RTT case is intended to expose
-how FEC recovery changes ping RTT and max latency, not just packet-loss rate.
-Because the `fec=false` and `fec=true` high-RTT samples use independent random
-loss streams, the high-RTT case prints the packet-loss comparison but gates on
-FEC actually emitting recovered packets without recovery errors.
+`fec=true` cases with 50ms added UDP tunnel delay in both directions. The
+high-RTT case is intended to expose how FEC recovery changes ping RTT and max
+latency, not just packet-loss rate. Because the `fec=false` and `fec=true`
+high-RTT samples use independent random loss streams, the high-RTT case prints
+the packet-loss comparison but gates on FEC actually emitting recovered packets
+without recovery errors.
 
 ## FEC Loaded Latency Method
 
@@ -108,20 +116,12 @@ With adaptive flushing, replace `fecFlushFixedMs` with:
 clamp(max_session_srtt * fecFlushAlpha, fecFlushMinMs, fecFlushMaxMs)
 ```
 
-The loaded-latency case loads the tunnel with an iperf3 UDP background flow at a
-configurable rate, then runs a separate sparse ping concurrently to measure the
-RTT distribution that an interactive flow would observe. The sparse ping is the
-measurement; the iperf3 stream verifies the loaded path while the flush timer
-keeps partial FEC groups from stalling under sparse traffic.
-
-Tunable env vars:
-
-```text
-MULTIPATH_REAL_E2E_FEC_LOAD_RATE             default 10M
-MULTIPATH_REAL_E2E_FEC_LOAD_DURATION         default 25 (seconds)
-MULTIPATH_REAL_E2E_FEC_LOAD_PING_COUNT       default 400
-MULTIPATH_REAL_E2E_FEC_LOAD_PING_INTERVAL    default 0.05 (seconds)
-```
+The loaded-latency case loads the tunnel with a 10Mbit/s iperf3 UDP background
+flow for 25 seconds, then runs 400 sparse ping probes at 50ms intervals
+concurrently to measure the RTT distribution that an interactive flow would
+observe. The sparse ping is the measurement; the iperf3 stream verifies the
+loaded path while the flush timer keeps partial FEC groups from stalling under
+sparse traffic.
 
 The ping output is recorded under `${case}.ping.log` and the iperf3 logs under
 `${case}.iperf-client.log` and `${case}.iperf-server.log`. The pass condition is

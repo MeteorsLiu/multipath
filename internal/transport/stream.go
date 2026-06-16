@@ -9,6 +9,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/MeteorsLiu/multipath/internal/debuglog"
 	"github.com/MeteorsLiu/multipath/internal/metrics"
@@ -16,6 +17,8 @@ import (
 )
 
 const maxStreamFrameLen = 64 * 1024
+
+const defaultTCPUserTimeout = 10 * time.Second
 
 var (
 	ErrUnknownConn   = errors.New("transport: unknown stream conn")
@@ -81,6 +84,15 @@ func (s *Stream) Dial(ctx context.Context, remote string) (LegRef, error) {
 		metrics.IncCounter(metrics.TransportErrorsTotal,
 			metrics.L("transport", "tcp"),
 			metrics.L("operation", "dial"),
+		)
+		return LegRef{}, err
+	}
+	if err := configureTCPConn(conn, defaultTCPUserTimeout); err != nil {
+		_ = conn.Close()
+		debuglog.Printf("transport/tcp", "dial remote=%s configure err=%v", remote, err)
+		metrics.IncCounter(metrics.TransportErrorsTotal,
+			metrics.L("transport", "tcp"),
+			metrics.L("operation", "configure"),
 		)
 		return LegRef{}, err
 	}
@@ -197,6 +209,15 @@ func (s *Stream) acceptLoop(ctx context.Context, writer PacketWriter) error {
 			metrics.IncCounter(metrics.TransportErrorsTotal,
 				metrics.L("transport", "tcp"),
 				metrics.L("operation", "accept"),
+			)
+			return err
+		}
+		if err := configureTCPConn(conn, defaultTCPUserTimeout); err != nil {
+			_ = conn.Close()
+			debuglog.Printf("transport/tcp", "accept configure err=%v", err)
+			metrics.IncCounter(metrics.TransportErrorsTotal,
+				metrics.L("transport", "tcp"),
+				metrics.L("operation", "configure"),
 			)
 			return err
 		}

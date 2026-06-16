@@ -92,6 +92,18 @@ func TestParseConfigNegativeBandwidthProbeCapDisablesCap(t *testing.T) {
 	}
 }
 
+func TestBandwidthProbeEnvToggle(t *testing.T) {
+	t.Setenv("MULTIPATH_DISABLE_BW_PROBE", "1")
+	if bandwidthProbeEnabled() {
+		t.Fatal("bandwidthProbeEnabled = true with MULTIPATH_DISABLE_BW_PROBE=1")
+	}
+
+	t.Setenv("MULTIPATH_DISABLE_BW_PROBE", "0")
+	if !bandwidthProbeEnabled() {
+		t.Fatal("bandwidthProbeEnabled = false with MULTIPATH_DISABLE_BW_PROBE=0")
+	}
+}
+
 func TestParseOldConfigShape(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	if err := os.WriteFile(path, []byte(`{

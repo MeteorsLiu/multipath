@@ -19,6 +19,14 @@ This project is a TUN-based multipath tunnel. It carries complete IP packets
 between TUN interfaces across multiple independently scheduled lanes. It is not
 an end-to-end reliable transport protocol.
 
+FEC exists to reduce loss recovery latency for upper-layer reliable protocols
+carried inside the layer-3 tunnel. Those protocols can eventually recover with
+their own ARQ, but the tunnel sees that recovery only after a larger end-to-end
+delay. FEC should opportunistically repair recoverable packet loss before that
+upper-layer ARQ delay is paid; it must not turn the tunnel into a fully reliable
+transport, add tunnel-level retransmission semantics, or chase unrecoverable loss
+with reliability machinery.
+
 Do not reduce this project to a single-path transport with a global UDP/TCP
 fallback. Multiple lanes may be active at the same time, and the scheduler
 distributes TUN packets across runnable lanes.
@@ -59,12 +67,13 @@ Public architecture boundaries:
 ```text
 Send
 Recv
-ProbeLoop
+Runtime RecvHandler
 Session
 Schedule Strategy
 Transport
 Protocol
 FEC
+Probe packages
 ```
 
 Do not introduce public `Path` or `Lane` modules unless the design docs are
@@ -79,10 +88,10 @@ Important constraints:
 - Session exposes only `Manager`, `Session`, `Hello`, and `View` with the
   interface in `docs/architecture.md`.
 - Manager only owns session lifetime and creation admission:
-  `Get`, `Create`, `GetOrCreate`, and `Delete`.
+  `Get`, `Create`, `GetOrCreate`, `GetOrDelete`, and `Delete`.
 - Session only owns session id, nonce, and HELLO open/ack/retry state:
   `Open`, `Ack`, and `Do`.
-- Hello only exposes `Do` and `Retry`.
+- Hello only exposes `Do` and `Ack`.
 - View has no exported fields and only exposes `SessionID()` and `Nonce()`.
 - Session must not know lanes, transport legs, protocol frames, FEC, schedule
   strategy, caps, fallback, or packet output.
@@ -104,28 +113,48 @@ Important constraints:
   waits for cancellation or errors.
 - The TUN read loop belongs in `internal/tun`. Send must not own a
   `TUNReader` or application lifecycle loop.
-- Send has one TUN input method: `Write`, one direct transport-bound output
-  method: `WriteTo`, and one transport output channel: `Packets`. Send must not
-  expose control-plane maintenance methods; the ProbeLoop adapter lives in the
-  send package and uses Send's unexported control hooks.
+- Send has one TUN input method: `Write`, one caller-constructed frame output
+  method: `WriteFrame`, one direct transport-bound output method: `WriteTo`,
+  and one transport output channel: `Packets`.
+- Send owns v2 bootstrap, rebootstrap, active ping, TCP redial, optional
+  bandwidth probe scheduling, and FEC capability state. Narrow exported seams
+  for those runtime facts are allowed when required by transport/runtime glue:
+  `Bootstrap`, `Rebootstrap`, `CloseSession`, `LaneManager`, `FECEnabled`,
+  `EnableFEC`, and `OnLegFailure`.
 - Do not expose semantic
   control methods such as `AcceptHello`, `AcceptHelloAck`, `ObserveLane`,
   `ReceivePing`, `ReceivePong`, or `Close` on Send.
 - HELLO and HELLO_ACK state transitions must go through Session. Protocol frame
   construction stays in the caller's callback; Session must not encode frames or
   write transport packets.
-- Send must not participate in HELLO_ACK admission/decision logic. The caller
-  updates Send-owned lane readiness, negotiated caps, FEC profile, and probe
-  state only after `Session.Ack` accepts the nonce and accepted flag.
+- Send must not participate in HELLO_ACK admission/decision logic. `Session.Ack`
+  is the nonce/accepted gate; Send-owned lane readiness is updated only by
+  Send-registered callbacks after that gate accepts.
 - Transport loops call `Recv.WriteTo`. The TUN write loop consumes
   `Recv.Packets()`. Recv must not write TUN directly.
 - Recv must not own transport writers. Control replies use caller-owned protocol
   frame construction and the runtime transport-bound output path.
 - Do not reintroduce a tunnel loop object inside `internal/tunnel`. `Send`,
-  `Recv`, and ProbeLoop are separate runtime roles and should own only
+  `Recv`, and runtime RecvHandler are separate runtime roles and should own only
   the runtime data/dependencies they directly need.
-- ProbeLoop drives probe, HELLO retry, and fallback flow. It must not become a
-  raw decoded-control-frame forwarder.
+- v2 has no public ProbeLoop. Send starts its own HELLO retry loops, active
+  ping loops, TCP dialers, and optional bandwidth-probe scheduler.
+- v2 bandwidth-probe reference state belongs inside the private bwScheduler
+  module. TCP reference measurements, cap-derived reference, and UDP probe
+  reference/cap selection must not escape into `Send`, RecvHandler, Session,
+  LaneManager, or exported methods. `Send` may pass static probe config,
+  including an explicit configured reference, into the scheduler and consume
+  final samples for selector quality. `Send` may retain static configured
+  values, but it must not compute, override, or store dynamic/derived bw
+  reference state/maps or become the bandwidth-probe state machine.
+- Runtime RecvHandler is the decoded-control-frame dispatcher. It builds
+  control replies through `Send.WriteFrame`, routes PONG/BW_ACK/LINK_STATUS into
+  the shared LaneManager, and must not touch lane/leg internals directly.
+- Runtime RecvHandler handles inbound control frames only. Local receive-side
+  QoS feedback uses a separate runtime QoS writer callback injected into Recv;
+  do not add outbound feedback methods to RecvHandler.
+- v2 negotiates `CapLinkStatus` only with FEC. `LINK_STATUS` carries receive-side
+  QoS status; it must not reintroduce global TCP fallback semantics.
 - Recv packets may reuse transport read buffers; the TUN write loop must
   release each packet after writing. Transport
   `Write`/`WriteTo` implementations must finish using the provided payload
@@ -145,6 +174,59 @@ Test:
 ```bash
 go test ./...
 ```
+
+Remote Live E2E:
+
+Use a real remote Linux deployment for behavior that depends on real tunnel
+traffic, carrier QoS, systemd service state, TCP behavior, live TUN devices,
+bandwidth probing, LINK_STATUS, or UDP/TCP selector decisions. This is different
+from local unit tests and from synthetic namespace tests: it validates the
+program running as the deployed service against real TUN traffic and real
+network shaping.
+
+Do not write remote credentials, passwords, private host details, or temporary
+access tokens into this repository or into `AGENTS.md`. Use user-provided
+credentials only for the current session.
+
+Typical workflow:
+
+1. Push or otherwise publish the local branch that contains the change.
+2. SSH to the user-provided remote Linux host with a login shell so `go`,
+   service tooling, and the user's environment are loaded.
+3. In the remote checkout, fetch the target branch, reset or pull to the exact
+   commit being tested, and build the real binary there.
+4. Restart the deployed service on the remote host. The current live setup has
+   used a systemd unit named `mp`; verify the unit name on the host before
+   restarting it.
+5. Drive traffic through the real tunnel, not through localhost shortcuts.
+   For reverse-direction QoS, use reverse iperf over the TUN address, for
+   example `iperf3 -c <peer-tun-ip> -R`.
+6. Observe the service logs with `journalctl` while traffic and shaping are
+   active. Do not rely only on a single command's exit status.
+
+Useful remote log signals:
+
+- `bw action=scheduler_start`
+- `bw action=sample`
+- `bandwidth_probe_decision`
+- `runtime/qos: link_status_send`
+- `runtime: link_status_apply`
+- `selector action=qos_data_leg`
+- `schedule_select`
+- `qos_state`
+
+For LINK_STATUS QoS validation, verify both directions explicitly: the receiving
+side should emit `runtime/qos: link_status_send ... kind=1 reason=1`, the peer
+should apply `runtime: link_status_apply ... kind=1 reason=1`, and DATA
+selection should move to TCP with `schedule_select ... leg={tcp ... frame=type=DATA`.
+For reverse tests, also confirm the iperf command is actually reverse mode and
+that the limited direction matches the side expected to send LINK_STATUS.
+
+When reporting remote live E2E results, include the tested commit, branch,
+remote service state, traffic command, shaping or QoS condition, relevant log
+snippets, affected lanes, and DATA leg counts where possible. If behavior differs
+from local tests, treat the remote live result as the stronger signal and debug
+from the live logs.
 
 ## Engineering Rules
 

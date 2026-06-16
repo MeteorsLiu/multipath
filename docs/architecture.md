@@ -1,7 +1,7 @@
 # Multipath Tunnel Architecture
 
-This document describes the runtime module boundaries for the multipath tunnel
-refactor. The wire format is described in [protocol.md](protocol.md).
+This document describes the current v2 runtime module boundaries for the
+multipath tunnel. The wire format is described in [protocol.md](protocol.md).
 
 ## Module Boundaries
 
@@ -10,72 +10,82 @@ Public runtime modules:
 ```text
 Send
 Recv
-ProbeLoop
+Runtime RecvHandler
 Session
 Schedule Strategy
 Transport
 Protocol
 FEC
 TUN I/O adapter
+Probe packages
 ```
 
-There is no public Tunnel module, tunnel facade, or shared runtime-data module.
-Send and Recv are separate modules. Runtime glue constructs modules explicitly,
-starts loops, and waits for cancellation or errors.
+There is no public Tunnel module, tunnel facade, public Lane module, public Path
+module, or shared runtime-data module between Send and Recv. Lane and transport
+leg runtime state are internal to Send. Runtime glue constructs modules
+explicitly, starts loops, and waits for cancellation or errors.
 
-Not public module boundaries:
+Current tunnel runtime implementation packages live under `internal/tunnel/v2`:
 
 ```text
-Lane
-Path
-runtime state
+internal/tunnel/v2/send
+internal/tunnel/v2/recv
+internal/tunnel/v2/runtime
+internal/tunnel/v2/probe/ping
+internal/tunnel/v2/probe/bw
 ```
 
-Lane data is internal runtime data. Session lifecycle and HELLO state are owned
-by the Session module. TUN is an I/O adapter. Runtime glue does not decode
-frames, choose lanes, or mutate lane data.
+The former non-v2 `internal/tunnel/send`, `internal/tunnel/recv`,
+`internal/tunnel/runtime`, and `internal/tunnel/probe` packages have been
+removed. Do not import or recreate them for compatibility.
 
 ## Construction
 
-The application wires modules explicitly:
+The application wires the v2 runtime explicitly:
 
 ```go
-probeEvents := make(chan core.Event, 128)
 sessions := &session.Manager{}
 
 sender := send.New(send.Config{
-    StreamTransport: streamTransport,
-    SessionManager:   sessions,
-    ProbeInterval:   probeInterval,
-    ProbeTimeout:    probeTimeout,
-    ProbeEvents:     probeEvents,
-    BootstrapLanes:  bootstrap,
+    StreamTransport:      streamTransport,
+    SessionManager:       sessions,
+    ProbeInterval:        probeInterval,
+    ProbeTimeout:         probeTimeout,
+    IsClient:             isClient,
+    EnableBandwidthProbe: true,
+    BWCapBps:             bwCapBps,
+    BWReferenceBps:       bwReferenceBps,
+    BootstrapLanes:       bootstrap,
 })
+if enableFEC {
+    sender.EnableFEC()
+}
 
-probeLoop := send.NewProbeLoop(sender, send.ProbeLoopConfig{
-    Events:   probeEvents,
-    Interval: probeInterval,
-    Timeout:  probeTimeout,
+qosWriter := runtime.NewQoSWriter(sender)
+handler := runtime.NewRecvHandler(sender, sessions, runtime.Config{
+    QoSWriter: qosWriter,
 })
-
 receiver := recv.New(recv.Config{
-    Control:        send.NewRecvState(sender),
+    Handler:        handler,
     SessionManager: sessions,
+    OnQoSStatus:    qosWriter.Write,
 })
 ```
 
 The runtime glue then starts:
 
 ```text
-probeLoop.Bootstrap(ctx)
 tun.Run(ctx, tunReader, sender)
 transport.RunWriter(ctx, sender.Packets(), packetTransport, streamTransport)
 packetTransport.Run(ctx, receiver)
 streamTransport.Run(ctx, receiver)
 tun.RunWriter(ctx, receiver.Packets(), tunWriter)
-probeLoop.Run(ctx)
 metricsServer.Run(ctx)
 ```
+
+Send starts its own bootstrap HELLO retry loops, active ping loops, TCP dialers,
+and optional bandwidth-probe scheduler from `Send.Bootstrap(ctx)`. There is no
+separate public ProbeLoop in v2.
 
 ## Data Flow
 
@@ -85,9 +95,10 @@ TUN packet to transport:
 TUN
  -> tun.Run
  -> Send.Write(packet)
- -> DATA frame
- -> optional REPAIR frame
- -> Schedule Strategy Pick()
+ -> active session id
+ -> DRR Schedule Strategy Pick()
+ -> DATA frame on selected lane primary transport
+ -> optional lane-local REPAIR on selected lane shadow transport
  -> Send.Packets()
  -> transport.RunWriter
  -> UDP/TCP Transport
@@ -97,8 +108,9 @@ Transport payload to TUN:
 
 ```text
 UDP/TCP Transport
- -> Recv.WriteTo(leg, packet)
+ -> Recv.WriteTo(observed leg, packet)
  -> Protocol.Decode
+ -> DATA/REPAIR handled inside Recv
  -> Recv.Packets()
  -> tun.RunWriter
  -> TUN
@@ -108,69 +120,44 @@ Transport control payload:
 
 ```text
 UDP/TCP Transport
- -> Recv.WriteTo(leg, packet)
+ -> Recv.WriteTo(observed leg, packet)
  -> Protocol.Decode
- -> control-plane glue
- -> Session Manager / Session / Hello
- -> caller-owned protocol frame construction
- -> optional Send.Packets()
+ -> RecvHandler method
+ -> Session / probe package / Send.WriteFrame
+ -> Send.Packets()
  -> transport.RunWriter
  -> UDP/TCP Transport
 ```
 
 Recv handles control-frame classification and must not expose a control-frame
-channel. DATA/REPAIR are not gated by control accept results. HELLO and
-HELLO_ACK state transitions go through Session; protocol frame construction
-stays in the caller and does not move into Session.
-
-Probe loop:
-
-```text
-probe timer / HELLO retry / fallback dial result
- -> ProbeLoop.Run
- -> Send internal lane/session state
- -> optional Send.Packets()
- -> transport.RunWriter
- -> UDP/TCP Transport
-```
-
-Metrics:
-
-```text
-runtime
- -> metrics server
- -> /metrics
-
-TUN / Transport / Send / Recv / ProbeLoop
- -> internal metrics counters and gauges
-```
-
-Metrics are observational only. The metrics package does not own session, lane,
-protocol, FEC, schedule strategy, TUN, or transport state, and instrumentation
-must not change scheduling, recovery, fallback, or packet ownership behavior.
+channel. DATA and REPAIR never go to `recv.Handler`. HELLO and HELLO_ACK state
+transitions go through Session; protocol frame construction stays in Send or
+runtime callbacks and does not move into Session.
 
 ## Send
 
 Role:
 
 ```text
-TUN packet ingress, send-side lane scheduling, and transport-bound packet queue
+TUN packet ingress, send-side lane scheduling, transport-leg lifecycle, active
+probe drivers, and transport-bound packet queue
 ```
 
 Owns:
 
 ```text
 active outbound session id
-send-side session data
 lane runtime data
-per-session Schedule Strategy
-global FEC profile and codec
-HELLO bootstrap and retry data
-per-route HELLO timeout policy
-per-leg RTT estimator sampled from PONG
-per-lane leg controller for TCP warm fallback decisions
-RTT-driven FEC flush timer for variable-span SLC
+per-session DRR Schedule Strategy
+outbound packet id allocator
+DATA frame construction
+per-lane FEC transmit windows
 transport-bound output queue
+bootstrap HELLO send/retry callbacks
+active ping instances registered in LaneManager
+optional TCP dialers and TCP leg failure handling
+optional bandwidth-probe scheduler
+local FEC capability and per-session FEC enabled state
 ```
 
 Interface sketch:
@@ -179,18 +166,16 @@ Interface sketch:
 package send
 
 type Config struct {
-    StreamTransport transport.StreamTransport
-    SessionManager   *session.Manager
-    ProbeInterval   time.Duration
-    ProbeTimeout    time.Duration
-    ProbeEvents     chan core.Event
-    EnableFEC       bool
-    FECFlushAlpha       uint32
-    FECFlushMinMs       uint32
-    FECFlushMaxMs       uint32
-    FECFlushColdStartMs uint32
-    FECFlushFixedMs     uint32
-    BootstrapLanes  []BootstrapLane
+    SessionManager       *session.Manager
+    LaneManager          *LaneManager
+    StreamTransport      transport.StreamTransport
+    ProbeInterval        time.Duration
+    ProbeTimeout         time.Duration
+    IsClient             bool
+    BWCapBps             uint64
+    BWReferenceBps       uint64
+    EnableBandwidthProbe bool
+    BootstrapLanes       []BootstrapLane
 }
 
 type BootstrapLane struct {
@@ -201,9 +186,17 @@ type BootstrapLane struct {
 }
 
 func New(configs ...Config) *Send
+func (s *Send) Bootstrap(ctx context.Context) error
+func (s *Send) Rebootstrap() error
+func (s *Send) CloseSession(sessionID uint64)
+func (s *Send) LaneManager() *LaneManager
+func (s *Send) FECEnabled() bool
+func (s *Send) EnableFEC()
 func (s *Send) Write(ctx context.Context, packet *packetbuf.Packet) error
+func (s *Send) WriteFrame(ctx context.Context, frame protocol.Frame, to transport.LegRef) error
 func (s *Send) WriteTo(ctx context.Context, leg transport.LegRef, packet *packetbuf.Packet) error
 func (s *Send) Packets() <-chan transport.Payload
+func (s *Send) OnLegFailure(ctx context.Context, leg transport.LegRef, err error)
 ```
 
 Rules:
@@ -211,51 +204,38 @@ Rules:
 ```text
 Send does not read TUN.
 Send does not read transport sockets.
-Send owns DATA and REPAIR scheduling through a per-session Schedule Strategy.
-Send owns DATA and REPAIR creation.
-Send is the only module that schedules TUN packets across lanes.
+Send is the only module that schedules TUN DATA packets across lanes.
 Send.Write takes ownership of the TUN packet and releases it before returning.
+Send.WriteFrame sends a caller-constructed protocol frame on an explicit
+transport ref, or with zero ref via the target lane's control transport policy.
+WriteFrame does not run schedule strategy lane selection.
 Send.WriteTo takes ownership of an already encoded transport payload and emits
 it through Send.Packets().
 Send.Packets returns transport-bound packets. The consumer releases each packet
 after the transport write returns.
-Send does not expose control-plane maintenance methods on `Send` itself. The
-RecvState adapter lives in the send package so it can implement
-`recv.ControlState` using Send-owned lane/session/probe state without making
-those hooks methods on `Send`.
-Send does not expose semantic control methods such as AcceptHello,
-AcceptHelloAck, ObserveLane, ReceivePing, ReceivePong, or Close.
-Send may keep a per-lane TCP fallback leg warm after UDP HELLO_ACK when TCP
-fallback is negotiated and a TCP remote is configured. A warm TCP leg is a
-candidate for probing and later leg selection; it does not make DATA use TCP by
-default.
-PING/PONG liveness is not treated as a UDP bandwidth or QoS signal. UDP QoS
-detection belongs in send-side leg quality policy and must use data-plane
-bandwidth samples when implemented. Bandwidth probing is an initial lane
-classification and is not a continuous QoS monitor. For lanes with TCP
-fallback and an actual TCP reference path, Send establishes a TCP bandwidth
-reference first, then probes UDP only long enough to decide whether UDP can
-approach that reference without material loss or under-delivery. Negotiated
-fallback capability by itself must not make Send wait for a TCP reference when
-the lane has no TCP leg and no dialable TCP remote. Send must not keep
-increasing UDP probe traffic merely to discover UDP's absolute ceiling after
-the relative TCP-vs-UDP decision is clear. Probe results recorded into leg
-quality state come from the completed paced step that produced the reference or
-decision, not from averaging the whole warmup ramp.
-Bandwidth probe results are exposed through `multipath_lane_bandwidth_bps`,
-`multipath_lane_probe_loss_ratio`, `multipath_bandwidth_probe_events_total`,
-and the `bandwidth_probe_decision` event log.
-Send arms the FEC flush timer only when the negotiated FEC profile supports
-variable-span REPAIR frames. The timer emits transport-bound REPAIR frames
-through the same scheduling and packet queue path as fill-triggered REPAIR.
+Send must not expose broad semantic control wrappers such as AcceptHello,
+AcceptHelloAck, ReceivePing, ReceivePong, or ReceiveBandwidthProbe.
+Send may expose narrow runtime seams needed by transport failure handling,
+rebootstrap, FEC capability, and the shared probe-state LaneManager.
 ```
+
+Lane runtime is internal to Send. Each lane owns UDP/TCP leg refs and liveness,
+primary/shadow transport selection, and a lane-local FEC transmit window. DATA
+uses the lane primary transport. REPAIR uses the lane shadow transport. If only
+one transport is active, both DATA and REPAIR use that transport as the
+single-leg degradation case.
+
+FEC is enabled in two steps: `EnableFEC()` marks local capability and initializes
+codecs; data-plane REPAIR is emitted only for sessions whose HELLO/HELLO_ACK
+negotiation accepted FEC.
 
 ## Recv
 
 Role:
 
 ```text
-transport payload ingress and receive-side protocol handling
+transport payload ingress, protocol decode, local DATA/REPAIR handling, and
+control dispatch
 ```
 
 Interface sketch:
@@ -263,7 +243,7 @@ Interface sketch:
 ```go
 package recv
 
-type ControlState interface {
+type Handler interface {
     OnHello(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error
     OnHelloAck(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error
     OnPing(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error
@@ -271,11 +251,23 @@ type ControlState interface {
     OnClose(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error
     OnBandwidthProbe(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error
     OnBandwidthProbeAck(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error
+    OnQoS(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error
 }
 
+type QoSStatus struct {
+    SessionID    uint64
+    LaneID       uint8
+    Kind         transport.Kind
+    Reason       uint8
+    DeliveredBps uint32
+}
+
+type QoSCallback func(ctx context.Context, status QoSStatus) error
+
 type Config struct {
-    Control        ControlState
+    Handler        Handler
     SessionManager *session.Manager
+    OnQoSStatus    QoSCallback
 }
 
 func New(configs ...Config) *Recv
@@ -290,25 +282,57 @@ Rules:
 Recv does not read transport sockets.
 Recv does not read TUN.
 Recv does not write TUN.
-Recv does not write transport sockets.
-Recv.Write is a convenience for packet input when no transport leg is known.
-Recv.WriteTo decodes protocol frames from transport payloads with their leg.
+Recv does not own transport writers.
+Recv.WriteTo decodes protocol frames from transport payloads with their observed leg.
 Recv emits received or recovered IP packets through Packets().
-Recv passes decoded HELLO, HELLO_ACK, PING, PONG, CLOSE, BW_PROBE, and
-BW_PROBE_ACK frames to the configured ControlState.
-Recv does not pass DATA or REPAIR to ControlState.
-Recv does not emit BW_PROBE payloads to TUN.
-Recv only accepts DATA or REPAIR for sessions admitted by the shared Session
-Manager. Unknown-session DATA or REPAIR is dropped.
-Recv owns receive-side FEC windows.
-Recv does not own or call a control-plane writer.
-Recv must not call ProbeLoop or Send directly.
-Recv must not expose Result, Respond, or accept-gating plumbing.
-Recv uses profile-aware FEC codecs and keeps per-session receive windows because
-packet_id and base_packet_id are session-scoped. REPAIR `source_span` is
-interpreted in Recv according to the negotiated FEC profile; Session does not
-own that state.
-Those FEC windows stay in Recv; Session does not own FEC state.
+Recv passes HELLO, HELLO_ACK, PING, PONG, CLOSE, BW_PROBE, BW_PROBE_ACK, and LINK_STATUS to Handler.
+Recv does not pass DATA or REPAIR to Handler.
+Recv only accepts DATA or REPAIR for sessions admitted by the shared Session Manager.
+Unknown-session DATA or REPAIR is dropped.
+Recv owns per-lane receive-side FEC windows and a session-scoped emit dedupe.
+Recv keeps a per-lane QoS estimator beside the receive FEC window. The
+estimator consumes complete or recovered DATA/REPAIR group samples, compares
+DATA-leg delivery with FEC-derived expected delivery, estimates shadow-leg
+equivalent rate from REPAIR bytes, and reports abnormal status through Recv's
+QoS callback.
+Recv must not import or call concrete Send.
+```
+
+## Runtime RecvHandler
+
+Role:
+
+```text
+control-frame glue between Recv, Session, Send.WriteFrame, and probe packages
+```
+
+Interface sketch:
+
+```go
+package runtime
+
+type Config struct {
+    BWReferenceBps uint64
+    BWCapBps       uint64
+    QoSWriter      *QoSWriter
+}
+
+func NewRecvHandler(s *send.Send, sessions *session.Manager, configs ...Config) *RecvHandler
+```
+
+Rules:
+
+```text
+RecvHandler implements recv.Handler.
+RecvHandler constructs HELLO_ACK, PONG, BW_PROBE_ACK, and CLOSE replies and writes them through Send.WriteFrame.
+RecvHandler validates HELLO_ACK by calling Session.Ack before any send-side readiness callback can run.
+RecvHandler routes inbound PONG to the send-registered ping instance through LaneManager.
+RecvHandler routes inbound BW_PROBE_ACK to the send-registered BwLoop through LaneManager.
+RecvHandler routes inbound LINK_STATUS into the lane QoS input registered in LaneManager.
+Runtime QoSWriter converts Recv QoS callbacks into outbound LINK_STATUS frames
+after LINK_STATUS has been negotiated for that session and lane.
+RecvHandler does not touch lane/leg internals directly.
+RecvHandler does not handle DATA or REPAIR.
 ```
 
 ## Session
@@ -316,7 +340,7 @@ Those FEC windows stay in Recv; Session does not own FEC state.
 Role:
 
 ```text
-session lifecycle admission and HELLO open/ack/retry state
+session id, nonce, and HELLO open/ack/retry state
 ```
 
 Interface sketch:
@@ -332,18 +356,28 @@ func (m *Manager) Get(id uint64) (*Session, bool)
 func (m *Manager) Add(s *Session) bool
 func (m *Manager) Create(id uint64) (*Session, bool)
 func (m *Manager) GetOrCreate(id uint64) (*Session, bool)
+func (m *Manager) GetOrDelete(id uint64) (*Session, bool)
 func (m *Manager) Delete(id uint64)
+
+type HelloConfig struct {
+    RetryInterval time.Duration
+    MaxRetries    int
+    TimeoutMS     uint64
+    OnAck         func()
+}
+
+type FrameSender func(ctx context.Context, v View) error
 
 type Session struct{}
 
-func (s *Session) Open(nowMS uint64) *Hello
+func (s *Session) Open(ctx context.Context, cfg HelloConfig, sender FrameSender, onExpire func()) *Hello
 func (s *Session) Ack(nonce uint64, accepted bool) bool
 func (s *Session) Do(fn func(View) error) error
 
 type Hello struct{}
 
 func (h *Hello) Do(fn func(View) error) error
-func (h *Hello) Retry(nowMS uint64, fn func(View) error) (sent bool, expired bool, err error)
+func (h *Hello) Ack()
 
 type View struct{}
 
@@ -356,110 +390,32 @@ Rules:
 ```text
 New creates a local outbound Session with a fresh opaque random session id.
 Manager only owns session lifetime and creation admission.
-Manager does not know protocol frames, lanes, legs, transport, FEC, schedule
-strategy, caps, or fallback.
 Session only owns session id, nonce, and HELLO open/ack/retry state.
-Session does not know lanes, transport legs, protocol frames, FEC, schedule
-strategy, caps, or fallback.
-Hello is the retry-capable HELLO send handle returned by Session.Open.
-View has no exported fields. Callers may only read SessionID and Nonce through
-methods while inside Do/Retry callbacks.
-Session methods do not encode protocol frames and do not write transport
-packets. Callers construct HELLO/HELLO_ACK frames inside Do/Retry callbacks and
-write them through the runtime's transport-bound output path.
+Hello drives its retry loop through the caller-provided FrameSender.
+Session does not know lanes, transport legs, protocol frames, FEC, schedule strategy, caps, fallback, or packet output.
+Session methods do not encode protocol frames and do not write transport packets.
+Callers construct HELLO/HELLO_ACK frames outside Session and send them through Send.WriteFrame.
 Do not add OpenLane, RunnableLanes, ReceiveHello, ReceiveHelloAck, AcceptHello,
 or other lane/protocol-specific methods to Session.
 ```
 
-Passive HELLO handling:
-
-```go
-sess, ok := sessions.GetOrCreate(frame.SessionID)
-if !ok {
-    // creation denied; caller may write accepted=0 or drop according to policy
-}
-
-err := sess.Do(func(v session.View) error {
-    return out.WriteFrame(ctx, leg, protocol.Frame{
-        Type:      protocol.TypeHELLOACK,
-        SessionID: v.SessionID(),
-        LaneID:    frame.LaneID,
-        Body: protocol.HelloAckBody{
-            Nonce:      hello.Nonce,
-            Accepted:   boolByte(accepted),
-            Caps:       negotiatedCaps,
-            FECProfile: negotiatedFEC,
-        },
-    })
-})
-```
-
-Active HELLO handling:
-
-```go
-hello := sess.Open(nowMS)
-
-err := hello.Do(func(v session.View) error {
-    return out.WriteFrame(ctx, leg, protocol.Frame{
-        Type:      protocol.TypeHELLO,
-        SessionID: v.SessionID(),
-        LaneID:    laneID,
-        Body: protocol.HelloBody{
-            Nonce:      v.Nonce(),
-            Caps:       caps,
-            FECProfile: fecProfile,
-        },
-    })
-})
-```
-
-HELLO_ACK handling:
-
-```go
-if !sess.Ack(body.Nonce, body.Accepted == 1) {
-    return nil
-}
-
-// Caller updates lane readiness, negotiated caps, global FEC profile, and probe state.
-```
-
-## ProbeLoop
+## Probe Packages
 
 Role:
 
 ```text
-probe-loop adapter for Send
-```
-
-Interface sketch:
-
-```go
-package send
-
-type ProbeLoopConfig struct {
-    Events   <-chan core.Event
-    Interval time.Duration
-    Timeout  time.Duration
-}
-
-func NewProbeLoop(s *Send, configs ...ProbeLoopConfig) *ProbeLoop
-func (l *ProbeLoop) Bootstrap(ctx context.Context) error
-func (l *ProbeLoop) Run(ctx context.Context) error
+semantic ping and bandwidth-probe state machines
 ```
 
 Rules:
 
 ```text
-Runtime bootstrap calls ProbeLoop.Bootstrap.
-ProbeLoop.Run drives probe, HELLO retry, and fallback/warm-leg flow.
-ProbeLoop does not read TUN or transport sockets.
-ProbeLoop does not schedule DATA directly.
-ProbeLoop is implemented in the send package because it adapts generic
-probe/core events and retry ticks to Send-owned lane state. The probe/core
-package remains independent and owns only the generic probe state machine.
-ProbeLoop must not own UDP QoS bandwidth estimation. Bandwidth probing feeds
-send-side leg quality state; ProbeLoop may trigger maintenance ticks but must
-not choose TCP-vs-UDP probe policy and must not become a data-plane scheduler.
+probe/ping owns active PING timing, pending PING bookkeeping, PONG validation, RTT estimation, and liveness thresholds for one concrete lane transport path.
+probe/bw owns bandwidth probe send state, received sequence bookkeeping, ACK accounting, and sample calculation.
+Probe packages do not import Send or Protocol.
+Probe packages do not encode frames and do not write transport packets.
+Send creates active ping and bandwidth probe instances with callbacks that adapt semantic values to protocol frames via Send.WriteFrame.
+Runtime RecvHandler feeds inbound PONG and BW_PROBE_ACK back into the registered instances through LaneManager.
 ```
 
 ## Schedule Strategy
@@ -489,13 +445,10 @@ Rules:
 
 ```text
 Schedule Strategy is not a runtime loop or packet queue owner.
-Schedule Strategy does not own packet queues, lane lifecycle, fallback state,
-transport output, protocol frames, or FEC state.
+Schedule Strategy does not own packet queues, lane lifecycle, fallback state, transport output, protocol frames, or FEC state.
 Send provides the current runnable lane candidates and packet cost.
-Schedule Strategy picks one candidate lane and updates its own fairness
-bookkeeping as part of Pick.
-The Lane interface is a local schedule package abstraction for lane weight only;
-it is not a public runtime Lane module.
+The default v2 strategy is DRR.
+The Lane interface is a local schedule package abstraction for lane weight only; it is not a public runtime Lane module.
 ```
 
 ## Transport
@@ -541,21 +494,12 @@ Rules:
 
 ```text
 Transport does not know sessions, Schedule Strategy, FEC, Protocol, or Frame.
-Transport reads complete UDP payloads or TCP length-prefixed payloads and calls
-PacketWriter.WriteTo with the observed transport leg.
-Transport reports concrete transport-leg failures through LegFailureHandler
-when one is registered. The failure event carries only LegRef and error; Send
-maps the leg to lane state through its existing probe target bindings.
-PacketWriter.WriteTo takes ownership of packet. It must release packet before
-returning or transfer ownership to its own output channel before returning.
-After WriteTo returns, Transport must not read or release packet.
-Transport RunWriter consumes Payload values and releases Payload.Packet after
-the transport write returns.
-Transport RunWriter must not allow a blocked write on one transport leg to
-prevent writes on another leg. It preserves write order within each concrete
-leg, but different legs may be written independently.
-Transport Write/WriteTo must not retain payload after returning unless it
-copies bytes itself.
+Transport reads complete UDP payloads or TCP length-prefixed payloads and calls PacketWriter.WriteTo with the observed transport leg.
+UDP replies for a lane must use the same UDP socket that received the packet and reply to the observed remote address.
+Transport reports concrete TCP leg failures through LegFailureHandler when registered.
+PacketWriter.WriteTo takes ownership of packet.
+Transport RunWriter consumes Payload values and releases Payload.Packet after the transport write returns.
+Transport Write/WriteTo must not retain payload after returning unless it copies bytes itself.
 ```
 
 ## TUN I/O Adapter
@@ -615,6 +559,10 @@ Protocol does not know runtime modules.
 Protocol does not know lane health.
 Protocol does not know Schedule Strategy.
 Protocol behavior is only Encode and Decode.
+Frame carries one concrete Body, and Frame.Type selects which body type is valid.
+Do not add public per-type body helper functions.
+Current v2 negotiates CapLinkStatus with FEC. LINK_STATUS is a control frame for
+receive-side QoS status; protocol only encodes and decodes it.
 ```
 
 ## FEC
@@ -637,6 +585,7 @@ Rules:
 
 ```text
 FEC does not know packet ids, session ids, lane ids, frames, TUN, Transport, or Schedule Strategy.
+FEC core erasure coding uses a maintained library; local code adapts project shard/window semantics.
 ```
 
 ## Dependency Rules
@@ -644,12 +593,11 @@ FEC does not know packet ids, session ids, lane ids, frames, TUN, Transport, or 
 Allowed:
 
 ```text
-runtime glue -> Send / Recv / Transport / TUN
-runtime glue -> ProbeLoop
-Send -> Protocol / FEC / Schedule Strategy / Session / Transport leg types / Probe core event type
+runtime glue -> Send / Recv / Session / Protocol / Transport leg types / probe packages
+Send -> Protocol / FEC / Schedule Strategy / Session / Transport leg types / probe packages
 Recv -> Protocol / FEC / Session / Transport leg types
-ProbeLoop -> Send maintenance entry points / Protocol / Transport leg types / Probe core runner
 Transport -> packetbuf / net primitives
+TUN read loop -> Send.Write
 TUN write loop -> Recv packet channel / TUN device
 ```
 
@@ -659,10 +607,9 @@ Forbidden:
 public Tunnel module
 shared runtime-data module
 public Path/Lane module interface
-Session -> Protocol / Transport / FEC / Schedule Strategy / lane data
-Schedule Strategy -> Protocol / Transport / session data
+Session -> Protocol / Transport / FEC / Schedule Strategy / lane data / caps
+Schedule Strategy -> Protocol / Transport / session data / lane runtime data
 Transport -> Protocol / Schedule Strategy / FEC / session data
-Recv -> TUN writer / Transport writers
-Recv -> concrete Send package
+Recv -> TUN writer / Transport writers / concrete Send package
 Send -> Recv
 ```

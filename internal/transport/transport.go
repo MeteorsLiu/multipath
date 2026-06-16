@@ -34,7 +34,10 @@ type Payload struct {
 	Packet *packetbuf.Packet
 }
 
-const legWriterQueueSize = 128
+const (
+	tcpLegWriterQueueSize = 64*1024*1024/1500 + 1
+	udpLegWriterQueueSize = 1024
+)
 
 type PacketWriter interface {
 	WriteTo(ctx context.Context, leg LegRef, packet *packetbuf.Packet) error
@@ -118,10 +121,16 @@ func (d *legWriterDispatcher) dispatch(payload Payload) error {
 	d.mu.Lock()
 	ch := d.writers[key]
 	if ch == nil {
-		ch = make(chan Payload, legWriterQueueSize)
+		ch = make(chan Payload, legWriterQueueSize(key.kind))
 		d.writers[key] = ch
-		d.wg.Add(1)
-		go d.runLegWriter(key, ch)
+		switch key.kind {
+		case KindUDP:
+			d.wg.Add(1)
+			go d.runUDPWriter(key, ch)
+		case KindTCP:
+			d.wg.Add(1)
+			go d.runTCPWriter(key, ch)
+		}
 	}
 	d.mu.Unlock()
 
@@ -131,18 +140,21 @@ func (d *legWriterDispatcher) dispatch(payload Payload) error {
 	case <-d.ctx.Done():
 		payload.Packet.Release()
 		return d.ctx.Err()
-	default:
-		debuglog.Printf("transport", "writer drop queue_full %s bytes=%d", debugLeg(payload.Leg), len(payload.Packet.Payload))
-		metrics.IncCounter(metrics.TransportErrorsTotal,
-			metrics.L("transport", kindLabel(payload.Leg.Kind)),
-			metrics.L("operation", "write_queue_full"),
-		)
-		payload.Packet.Release()
-		return nil
 	}
 }
 
-func (d *legWriterDispatcher) runLegWriter(key writerKey, ch <-chan Payload) {
+func legWriterQueueSize(kind Kind) int {
+	switch kind {
+	case KindUDP:
+		return udpLegWriterQueueSize
+	case KindTCP:
+		return tcpLegWriterQueueSize
+	default:
+		return 1
+	}
+}
+
+func (d *legWriterDispatcher) runUDPWriter(key writerKey, ch <-chan Payload) {
 	defer d.wg.Done()
 	for {
 		select {
@@ -156,23 +168,51 @@ func (d *legWriterDispatcher) runLegWriter(key writerKey, ch <-chan Payload) {
 			if debuglog.Enabled() {
 				debuglog.Printf("transport", "writer dispatch %s bytes=%d", debugLeg(payload.Leg), len(payload.Packet.Payload))
 			}
-			err := writePayload(d.ctx, payload, d.packet, d.stream)
+			err := writeUDPPayload(d.ctx, payload, d.packet)
 			payload.Packet.Release()
 			if err != nil {
-				debuglog.Printf("transport", "writer error %s err=%v", debugLeg(payload.Leg), err)
-				metrics.IncCounter(metrics.TransportErrorsTotal,
-					metrics.L("transport", kindLabel(payload.Leg.Kind)),
-					metrics.L("operation", "write_dispatch"),
-				)
-				d.releaseQueued(ch)
-				select {
-				case d.errs <- err:
-				case <-d.ctx.Done():
-				default:
-				}
+				d.reportWriterError(ch, payload.Leg, err)
 				return
 			}
 		}
+	}
+}
+
+func (d *legWriterDispatcher) runTCPWriter(key writerKey, ch <-chan Payload) {
+	defer d.wg.Done()
+	for {
+		select {
+		case <-d.ctx.Done():
+			d.releaseQueued(ch)
+			return
+		case payload, ok := <-ch:
+			if !ok {
+				return
+			}
+			if debuglog.Enabled() {
+				debuglog.Printf("transport", "writer dispatch %s bytes=%d", debugLeg(payload.Leg), len(payload.Packet.Payload))
+			}
+			err := writeTCPPayload(d.ctx, payload, d.stream)
+			payload.Packet.Release()
+			if err != nil {
+				d.reportWriterError(ch, payload.Leg, err)
+				return
+			}
+		}
+	}
+}
+
+func (d *legWriterDispatcher) reportWriterError(ch <-chan Payload, leg LegRef, err error) {
+	debuglog.Printf("transport", "writer error %s err=%v", debugLeg(leg), err)
+	metrics.IncCounter(metrics.TransportErrorsTotal,
+		metrics.L("transport", kindLabel(leg.Kind)),
+		metrics.L("operation", "write_dispatch"),
+	)
+	d.releaseQueued(ch)
+	select {
+	case d.errs <- err:
+	case <-d.ctx.Done():
+	default:
 	}
 }
 
@@ -245,33 +285,30 @@ func kindLabel(kind Kind) string {
 	}
 }
 
-func writePayload(ctx context.Context, payload Payload, packet PacketTransport, stream StreamTransport) error {
-	switch payload.Leg.Kind {
-	case KindUDP:
-		if packet == nil || payload.Leg.EndpointID == "" || payload.Leg.RemoteAddr == nil {
-			return ErrInvalidLeg
-		}
-		_, err := packet.WriteTo(ctx, payload.Leg.EndpointID, payload.Leg.RemoteAddr, payload.Packet.Payload)
-		if err != nil && !errors.Is(err, context.Canceled) {
-			if debuglog.Enabled() {
-				debuglog.Printf("transport", "drop failed udp payload endpoint=%s remote=%v bytes=%d err=%v", payload.Leg.EndpointID, payload.Leg.RemoteAddr, len(payload.Packet.Payload), err)
-			}
-			return nil
-		}
-		return err
-	case KindTCP:
-		if stream == nil || payload.Leg.ConnID == "" {
-			return ErrInvalidLeg
-		}
-		_, err := stream.Write(ctx, payload.Leg.ConnID, payload.Packet.Payload)
-		if err != nil && !errors.Is(err, context.Canceled) {
-			if debuglog.Enabled() {
-				debuglog.Printf("transport", "drop stale tcp payload conn=%s bytes=%d err=%v", payload.Leg.ConnID, len(payload.Packet.Payload), err)
-			}
-			return nil
-		}
-		return err
-	default:
+func writeUDPPayload(ctx context.Context, payload Payload, packet PacketTransport) error {
+	if packet == nil || payload.Leg.EndpointID == "" || payload.Leg.RemoteAddr == nil {
 		return ErrInvalidLeg
 	}
+	_, err := packet.WriteTo(ctx, payload.Leg.EndpointID, payload.Leg.RemoteAddr, payload.Packet.Payload)
+	if err != nil && !errors.Is(err, context.Canceled) {
+		if debuglog.Enabled() {
+			debuglog.Printf("transport", "drop failed udp payload endpoint=%s remote=%v bytes=%d err=%v", payload.Leg.EndpointID, payload.Leg.RemoteAddr, len(payload.Packet.Payload), err)
+		}
+		return nil
+	}
+	return err
+}
+
+func writeTCPPayload(ctx context.Context, payload Payload, stream StreamTransport) error {
+	if stream == nil || payload.Leg.ConnID == "" {
+		return ErrInvalidLeg
+	}
+	_, err := stream.Write(ctx, payload.Leg.ConnID, payload.Packet.Payload)
+	if err != nil && !errors.Is(err, context.Canceled) {
+		if debuglog.Enabled() {
+			debuglog.Printf("transport", "drop stale tcp payload conn=%s bytes=%d err=%v", payload.Leg.ConnID, len(payload.Packet.Payload), err)
+		}
+		return nil
+	}
+	return err
 }

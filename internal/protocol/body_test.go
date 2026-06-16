@@ -153,6 +153,52 @@ func TestBandwidthProbeDecodeRejectsInvalidTrainBudget(t *testing.T) {
 	}
 }
 
+func TestLinkStatusRoundTrip(t *testing.T) {
+	frame := Frame{
+		Type:      TypeLinkStatus,
+		SessionID: 11,
+		LaneID:    1,
+		Body: LinkStatusBody{
+			LegKind:      LinkStatusLegUDP,
+			Reason:       LinkStatusReasonLimited,
+			DeliveredBps: 2_000_000,
+		},
+	}
+	encoded, err := Encode(frame, nil)
+	if err != nil {
+		t.Fatalf("Encode LINK_STATUS failed: %v", err)
+	}
+	got, err := Decode(encoded)
+	if err != nil {
+		t.Fatalf("Decode LINK_STATUS failed: %v", err)
+	}
+	assertFrameEqual(t, got, frame)
+}
+
+func TestLinkStatusRejectsInvalidBody(t *testing.T) {
+	tests := []LinkStatusBody{
+		{LegKind: 0, Reason: LinkStatusReasonLimited, DeliveredBps: 1},
+		{LegKind: LinkStatusLegUDP, Reason: 0, DeliveredBps: 1},
+		{LegKind: LinkStatusLegTCP + 1, Reason: LinkStatusReasonLimited, DeliveredBps: 1},
+		{LegKind: LinkStatusLegUDP, Reason: LinkStatusReasonLimited + 1, DeliveredBps: 1},
+	}
+	for _, body := range tests {
+		_, err := Encode(Frame{Type: TypeLinkStatus, SessionID: 1, LaneID: 1, Body: body}, nil)
+		if !errors.Is(err, ErrInvalidFrame) {
+			t.Fatalf("Encode(%+v) err = %v, want ErrInvalidFrame", body, err)
+		}
+	}
+}
+
+func TestCapLinkStatusIsSupportedWithFEC(t *testing.T) {
+	if CapLinkStatus == 0 || CapLinkStatus == CapFEC || CapLinkStatus == CapTCPFallback {
+		t.Fatalf("CapLinkStatus = %#x overlaps existing caps", CapLinkStatus)
+	}
+	if SupportedCaps&(CapFEC|CapLinkStatus) != (CapFEC | CapLinkStatus) {
+		t.Fatalf("SupportedCaps = %#x, want FEC and LinkStatus", SupportedCaps)
+	}
+}
+
 func assertFrameEqual(t *testing.T, got Frame, want Frame) {
 	t.Helper()
 	if got.Type != want.Type || got.SessionID != want.SessionID || got.LaneID != want.LaneID {

@@ -80,13 +80,27 @@ func TestRunWriterDropsTransientUDPWriteError(t *testing.T) {
 	}
 }
 
+func TestLegWriterQueueSizesSeparateUDPAndTCP(t *testing.T) {
+	if legWriterQueueSize(KindUDP) >= legWriterQueueSize(KindTCP) {
+		t.Fatalf("UDP queue size = %d, TCP = %d, want UDP smaller than TCP",
+			legWriterQueueSize(KindUDP), legWriterQueueSize(KindTCP))
+	}
+	if legWriterQueueSize(KindUDP) != udpLegWriterQueueSize {
+		t.Fatalf("UDP queue size = %d, want %d", legWriterQueueSize(KindUDP), udpLegWriterQueueSize)
+	}
+	if legWriterQueueSize(KindTCP) != tcpLegWriterQueueSize {
+		t.Fatalf("TCP queue size = %d, want %d", legWriterQueueSize(KindTCP), tcpLegWriterQueueSize)
+	}
+}
+
 func TestRunWriterDoesNotBlockUDPBehindBlockedTCP(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	packets := make(chan Payload, 2)
 	stream := &runWriterStream{
-		block: make(chan struct{}),
+		block:   make(chan struct{}),
+		started: make(chan struct{}),
 	}
 	packet := &runWriterPacket{wrote: make(chan struct{})}
 
@@ -128,10 +142,85 @@ func TestRunWriterDoesNotBlockUDPBehindBlockedTCP(t *testing.T) {
 	}
 }
 
+func TestRunWriterBlocksWhenLegQueueIsFull(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	packets := make(chan Payload, tcpLegWriterQueueSize+1)
+	stream := &runWriterStream{
+		block:   make(chan struct{}),
+		started: make(chan struct{}),
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- RunWriter(ctx, packets, nil, stream)
+	}()
+
+	packets <- Payload{
+		Leg:    LegRef{Kind: KindTCP, ConnID: "blocked"},
+		Packet: packetbuf.Acquire(16),
+	}
+
+	select {
+	case <-stream.started:
+	case <-time.After(time.Second):
+		t.Fatal("blocked writer did not receive first packet")
+	}
+
+	for i := 0; i < tcpLegWriterQueueSize; i++ {
+		packets <- Payload{
+			Leg:    LegRef{Kind: KindTCP, ConnID: "blocked"},
+			Packet: packetbuf.Acquire(16),
+		}
+	}
+
+	deadline := time.After(time.Second)
+	for len(packets) > 0 {
+		select {
+		case <-deadline:
+			t.Fatalf("RunWriter did not drain initial packets, remaining=%d", len(packets))
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	blockedPacket := packetbuf.Acquire(16)
+	packets <- Payload{
+		Leg:    LegRef{Kind: KindTCP, ConnID: "blocked"},
+		Packet: blockedPacket,
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("RunWriter exited while dispatch was blocked: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	if blockedPacket.Payload == nil {
+		t.Fatal("packet was released while dispatch should be blocked on full leg queue")
+	}
+
+	cancel()
+	close(stream.block)
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("RunWriter err = %v, want context canceled", err)
+		}
+		if blockedPacket.Payload != nil {
+			t.Fatal("packet was not released after blocked dispatch was canceled")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("RunWriter did not stop after context cancellation")
+	}
+}
+
 type runWriterStream struct {
-	err    error
-	block  chan struct{}
-	writes int
+	err     error
+	block   chan struct{}
+	started chan struct{}
+	once    sync.Once
+	writes  int
 }
 
 func (s *runWriterStream) Run(ctx context.Context, writer PacketWriter) error {
@@ -145,6 +234,11 @@ func (s *runWriterStream) Dial(ctx context.Context, remote string) (LegRef, erro
 
 func (s *runWriterStream) Write(ctx context.Context, connID string, payload []byte) (int, error) {
 	s.writes++
+	s.once.Do(func() {
+		if s.started != nil {
+			close(s.started)
+		}
+	})
 	if s.block != nil {
 		select {
 		case <-s.block:

@@ -10,18 +10,24 @@ var ErrBodyTooShort = errors.New("protocol: frame body too short")
 const (
 	CapTCPFallback uint16 = 1 << 0
 	CapFEC         uint16 = 1 << 1
+	CapLinkStatus  uint16 = 1 << 2
 
 	FECProfileOff              uint8 = 0
 	FECProfileSLC4Plus1        uint8 = 1
 	FECProfileSLCVariablePlus1 uint8 = 2
 
-	SupportedCaps        = CapTCPFallback | CapFEC
+	SupportedCaps        = CapFEC | CapLinkStatus
 	SessionControlLaneID = 0xff
 
 	CloseScopeLane    uint8 = 1
 	CloseScopeSession uint8 = 2
 
 	CloseReasonUnknownSession uint8 = 1
+
+	LinkStatusLegUDP uint8 = 1
+	LinkStatusLegTCP uint8 = 2
+
+	LinkStatusReasonLimited uint8 = 1
 )
 
 type Body interface {
@@ -99,6 +105,14 @@ type BandwidthProbeAckBody struct {
 
 func (BandwidthProbeAckBody) protocolBody() {}
 
+type LinkStatusBody struct {
+	LegKind      uint8
+	Reason       uint8
+	DeliveredBps uint32
+}
+
+func (LinkStatusBody) protocolBody() {}
+
 func encodedBodySize(frame Frame) (int, error) {
 	switch frame.Type {
 	case TypeHELLO:
@@ -141,6 +155,12 @@ func encodedBodySize(frame Frame) (int, error) {
 			return 0, ErrInvalidFrame
 		}
 		return 36, nil
+	case TypeLinkStatus:
+		body, ok := frame.Body.(LinkStatusBody)
+		if !ok || !validLinkStatusLeg(body.LegKind) || !validLinkStatusReason(body.Reason) {
+			return 0, ErrInvalidFrame
+		}
+		return 6, nil
 	default:
 		return 0, ErrInvalidFrame
 	}
@@ -202,6 +222,11 @@ func encodeBodyInto(frame Frame, out []byte) error {
 		binary.BigEndian.PutUint64(out[12:20], body.Received)
 		binary.BigEndian.PutUint64(out[20:28], body.FirstRXMS)
 		binary.BigEndian.PutUint64(out[28:36], body.LastRXMS)
+	case TypeLinkStatus:
+		body := frame.Body.(LinkStatusBody)
+		out[0] = body.LegKind
+		out[1] = body.Reason
+		binary.BigEndian.PutUint32(out[2:6], body.DeliveredBps)
 	default:
 		return ErrInvalidFrame
 	}
@@ -301,8 +326,30 @@ func decodeBody(frame *Frame, body []byte) error {
 			FirstRXMS: binary.BigEndian.Uint64(body[20:28]),
 			LastRXMS:  binary.BigEndian.Uint64(body[28:36]),
 		}
+	case TypeLinkStatus:
+		if len(body) != 6 {
+			return ErrBodyTooShort
+		}
+		legKind := body[0]
+		reason := body[1]
+		if !validLinkStatusLeg(legKind) || !validLinkStatusReason(reason) {
+			return ErrInvalidFrame
+		}
+		frame.Body = LinkStatusBody{
+			LegKind:      legKind,
+			Reason:       reason,
+			DeliveredBps: binary.BigEndian.Uint32(body[2:6]),
+		}
 	default:
 		return ErrInvalidFrame
 	}
 	return nil
+}
+
+func validLinkStatusLeg(legKind uint8) bool {
+	return legKind == LinkStatusLegUDP || legKind == LinkStatusLegTCP
+}
+
+func validLinkStatusReason(reason uint8) bool {
+	return reason == LinkStatusReasonLimited
 }

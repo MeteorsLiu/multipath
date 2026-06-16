@@ -9,15 +9,14 @@ import (
 	"github.com/MeteorsLiu/multipath/internal/metrics"
 	"github.com/MeteorsLiu/multipath/internal/transport"
 	"github.com/MeteorsLiu/multipath/internal/tun"
-	"github.com/MeteorsLiu/multipath/internal/tunnel/recv"
-	"github.com/MeteorsLiu/multipath/internal/tunnel/send"
+	"github.com/MeteorsLiu/multipath/internal/tunnel/v2/recv"
+	"github.com/MeteorsLiu/multipath/internal/tunnel/v2/send"
 )
 
 type appRuntime struct {
 	tunReader       tun.PacketReader
 	tunWriter       *tun.Device
 	send            *send.Send
-	probeLoop       *send.ProbeLoop
 	recv            *recv.Recv
 	packetTransport transport.PacketTransport
 	streamTransport transport.StreamTransport
@@ -36,9 +35,13 @@ func (r *appRuntime) Run(ctx context.Context) error {
 		}
 	}
 
-	if r.probeLoop != nil {
+	// v2 Send.Bootstrap stands up the active session + lanes and starts the
+	// self-driving HELLO retry, per-lane ping, TCP dialer, and bandwidth probe
+	// scheduler. It replaces the old ProbeLoop (whose responsibilities are now
+	// split across session/ping/dialer/bwScheduler).
+	if r.send != nil {
 		debuglog.Printf("runtime", "bootstrap")
-		if err := r.probeLoop.Bootstrap(runCtx); err != nil {
+		if err := r.send.Bootstrap(runCtx); err != nil {
 			debuglog.Printf("runtime", "bootstrap err=%v", err)
 			return err
 		}
@@ -64,10 +67,6 @@ func (r *appRuntime) Run(ctx context.Context) error {
 	}
 
 	started := false
-	if r.probeLoop != nil {
-		started = true
-		start("probe", func() error { return r.probeLoop.Run(runCtx) })
-	}
 	if r.metricsServer != nil {
 		started = true
 		start("prom", func() error { return r.metricsServer.Run(runCtx) })

@@ -10,10 +10,10 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKDIR="${MULTIPATH_REAL_E2E_WORKDIR:-$(mktemp -d)}"
 BIN="${MULTIPATH_REAL_E2E_BIN:-${WORKDIR}/multipath}"
 PREBUILT_BIN="${MULTIPATH_REAL_E2E_PREBUILT_BIN:-0}"
-REAL_E2E_DEBUG="${MULTIPATH_REAL_E2E_DEBUG:-1}"
-FEC_PING_COUNT="${MULTIPATH_REAL_E2E_FEC_PING_COUNT:-1000}"
-FEC_PING_INTERVAL="${MULTIPATH_REAL_E2E_FEC_PING_INTERVAL:-0.02}"
-FEC_HIGH_RTT_DELAY="${MULTIPATH_REAL_E2E_FEC_HIGH_RTT_DELAY:-50ms}"
+E2E_DEBUG=1
+FEC_PING_COUNT=1000
+FEC_PING_INTERVAL=0.02
+FEC_HIGH_RTT_DELAY=50ms
 
 require_command() {
   local cmd="$1"
@@ -31,10 +31,6 @@ if [[ ${EUID:-0} -ne 0 ]]; then
     MULTIPATH_REAL_E2E_WORKDIR="${WORKDIR}" \
     MULTIPATH_REAL_E2E_BIN="${BIN}" \
     MULTIPATH_REAL_E2E_PREBUILT_BIN=1 \
-    MULTIPATH_REAL_E2E_DEBUG="${REAL_E2E_DEBUG}" \
-    MULTIPATH_REAL_E2E_FEC_PING_COUNT="${FEC_PING_COUNT}" \
-    MULTIPATH_REAL_E2E_FEC_PING_INTERVAL="${FEC_PING_INTERVAL}" \
-    MULTIPATH_REAL_E2E_FEC_HIGH_RTT_DELAY="${FEC_HIGH_RTT_DELAY}" \
     bash "$0" "$@"
 fi
 
@@ -72,6 +68,15 @@ PORT_SERVER_RESTART=5015
 PORT_BW_PROBE_CONVERGENCE=5016
 PORT_BW_PROBE_GUARD=5017
 PORT_BW_PROBE_DEFAULT_CAP=5018
+PORT_LINK_STATUS_QOS=5019
+PORT_UNKNOWN_SESSION_REBOOTSTRAP=5020
+PORT_TCP_ESTABLISHED_REDIAL=5021
+PORT_FEC_DISABLED_NEGOTIATION=5022
+PORT_LINK_STATUS_QOS_REVERSE=5023
+PORT_MULTILANE_REBOOTSTRAP=5025
+PORT_NAT_TCP_FALLBACK=5026
+PORT_MTU_FEC=5027
+PORT_BW_PROBE_DISABLED=5028
 
 PATH1_C="10.201.1.1/24"
 PATH1_S="10.201.1.2/24"
@@ -437,6 +442,7 @@ expect_ping_fail_for() {
 
 run_iperf_if_available() {
   local label="$1"
+  local min_bps="${2:-1000000}"
   if ! command -v iperf3 >/dev/null 2>&1; then
     echo "[${label}] iperf3 not found, skip throughput smoke"
     return 0
@@ -446,13 +452,62 @@ run_iperf_if_available() {
     return 0
   fi
 
-  ip netns exec "${NS_S}" iperf3 -s -1 -B "${TUN_S_LOCAL}" >/dev/null 2>&1 &
+  local server_log="${WORKDIR}/${label}.iperf-server.log"
+  local client_log="${WORKDIR}/${label}.iperf-client.log"
+  ip netns exec "${NS_S}" iperf3 -s -1 -B "${TUN_S_LOCAL}" >"${server_log}" 2>&1 &
   local iperf_server=$!
   sleep 1
   echo "[${label}] iperf3 over TUN"
-  timeout 8s ip netns exec "${NS_C}" iperf3 -c "${TUN_C_REMOTE}" -t 3 -i 1 || true
+  timeout 8s ip netns exec "${NS_C}" iperf3 -c "${TUN_C_REMOTE}" -t 3 -i 1 >"${client_log}" 2>&1 || true
   kill "${iperf_server}" >/dev/null 2>&1 || true
   wait "${iperf_server}" >/dev/null 2>&1 || true
+  echo "[${label}] iperf3 client log: ${client_log}"
+  echo "[${label}] iperf3 server log: ${server_log}"
+  tail -n 6 "${client_log}" || true
+
+  local bps
+  bps="$(parse_iperf_receiver_bps "${client_log}")"
+  if [[ -z "${bps}" ]]; then
+    fail "${label}" "iperf3 receiver bitrate was not parsed"
+    return 0
+  fi
+  echo "[${label}] iperf3 receiver_bps=${bps}"
+  if awk -v got="${bps}" -v min="${min_bps}" 'BEGIN { exit !(got >= min) }'; then
+    pass "${label}" "iperf3 receiver bitrate ${bps} bps >= ${min_bps} bps"
+  else
+    fail "${label}" "iperf3 receiver bitrate ${bps} bps < ${min_bps} bps"
+  fi
+}
+
+parse_iperf_receiver_bps() {
+  local log_file="$1"
+  if [[ ! -f "${log_file}" ]]; then
+    return 0
+  fi
+  awk '
+    /receiver/ && /bits\/sec/ {
+      value = "";
+      unit = "";
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^[0-9]+([.][0-9]+)?$/ && (i + 1) <= NF && $(i + 1) ~ /^[KMG]?bits\/sec$/) {
+          value = $i + 0;
+          unit = $(i + 1);
+        }
+      }
+      if (value != "") {
+        scale = 1;
+        if (unit == "Kbits/sec") scale = 1000;
+        if (unit == "Mbits/sec") scale = 1000000;
+        if (unit == "Gbits/sec") scale = 1000000000;
+        bps = value * scale;
+      }
+    }
+    END {
+      if (bps != "") {
+        printf "%.0f\n", bps;
+      }
+    }
+  ' "${log_file}"
 }
 
 start_multipath() {
@@ -466,11 +521,11 @@ start_multipath() {
   CURRENT_CLIENT_LOG="${client_log}"
   CURRENT_SERVER_LOG="${server_log}"
   start_server_process "${name}"
-  ip netns exec "${NS_C}" env MULTIPATH_DEBUG="${REAL_E2E_DEBUG}" "${CURRENT_EXTRA_ENV[@]}" "${BIN}" -config "${client_config}" >>"${client_log}" 2>&1 &
+  ip netns exec "${NS_C}" env MULTIPATH_DEBUG="${E2E_DEBUG}" "${CURRENT_EXTRA_ENV[@]}" "${BIN}" -config "${client_config}" >>"${client_log}" 2>&1 &
   CLIENT_PID=$!
 
   echo "[${name}] client log: ${client_log}"
-  echo "[${name}] server log: ${server_log} (MULTIPATH_DEBUG=${REAL_E2E_DEBUG})"
+  echo "[${name}] server log: ${server_log} (MULTIPATH_DEBUG=${E2E_DEBUG})"
 }
 
 start_server_process() {
@@ -479,7 +534,7 @@ start_server_process() {
   local server_log="${WORKDIR}/${name}.server.log"
 
   CURRENT_SERVER_LOG="${server_log}"
-  ip netns exec "${NS_S}" env MULTIPATH_DEBUG="${REAL_E2E_DEBUG}" "${CURRENT_EXTRA_ENV[@]}" "${BIN}" -config "${server_config}" >>"${server_log}" 2>&1 &
+  ip netns exec "${NS_S}" env MULTIPATH_DEBUG="${E2E_DEBUG}" "${CURRENT_EXTRA_ENV[@]}" "${BIN}" -config "${server_config}" >>"${server_log}" 2>&1 &
   SERVER_PID=$!
 }
 
@@ -752,11 +807,39 @@ apply_udp_tunnel_rate_path() {
   add_port_filter "${NS_S}" "${server_dev}" 1 udp sport "${port}" 3
 }
 
+apply_tcp_tunnel_delay_path() {
+  local path="$1"
+  local port="$2"
+  local delay="$3"
+  local client_dev server_dev
+  client_dev="$(path_client_dev "${path}")"
+  server_dev="$(path_server_dev "${path}")"
+
+  setup_prio_qdisc "${NS_C}" "${client_dev}"
+  add_delay_band "${NS_C}" "${client_dev}" 3 30 "${delay}"
+  add_port_filter "${NS_C}" "${client_dev}" 1 tcp dport "${port}" 3
+
+  setup_prio_qdisc "${NS_S}" "${server_dev}"
+  add_delay_band "${NS_S}" "${server_dev}" 3 30 "${delay}"
+  add_port_filter "${NS_S}" "${server_dev}" 1 tcp sport "${port}" 3
+}
+
 apply_nat_tcp_block() {
   local port="$1"
   setup_prio_qdisc "${NS_C}" "${VETHCN}"
   add_loss_band "${NS_C}" "${VETHCN}" 3 30 100%
   add_port_filter "${NS_C}" "${VETHCN}" 1 tcp dport "${port}" 3
+}
+
+apply_nat_udp_tunnel_block() {
+  local port="$1"
+  setup_prio_qdisc "${NS_C}" "${VETHCN}"
+  add_loss_band "${NS_C}" "${VETHCN}" 3 30 100%
+  add_port_filter "${NS_C}" "${VETHCN}" 1 udp dport "${port}" 3
+
+  setup_prio_qdisc "${NS_S}" "${VETHSN}"
+  add_loss_band "${NS_S}" "${VETHSN}" 3 30 100%
+  add_port_filter "${NS_S}" "${VETHSN}" 1 udp sport "${port}" 3
 }
 
 apply_tcp_server_reject() {
@@ -898,13 +981,72 @@ run_server_restart_reconnect_case() {
     SERVER_PID=""
   fi
   sleep 2
-  wait_log_file_pattern "${name}" "${CURRENT_CLIENT_LOG}" "fallback_result_err .*lane=1" 20 "client observed TCP fallback dial failure while server was down"
+  wait_log_file_pattern "${name}" "${CURRENT_CLIENT_LOG}" "send/dialer: dial err remote=" 20 "client observed TCP fallback dial failure while server was down"
 
   echo "[${name}] restart server with UDP still blocked; client must retry TCP fallback and reconnect"
   start_server_process "${name}"
-  wait_log_file_pattern "${name}" "${CURRENT_CLIENT_LOG}" "fallback_result_start_lane session=[0-9]+ lane=1 leg=\\{tcp conn=" 20 "client retried TCP fallback after server restart"
-  wait_log_file_pattern "${name}" "${CURRENT_CLIENT_LOG}" "accept_hello_ack session=[0-9]+ lane=1 .*tcp conn=" 20 "client accepted TCP HELLO_ACK after server restart"
+  wait_log_file_pattern "${name}" "${CURRENT_CLIENT_LOG}" "send: tcp_dialed session=[0-9]+ lane=1 conn=" 20 "client retried TCP fallback after server restart"
+  wait_log_file_pattern "${name}" "${CURRENT_CLIENT_LOG}" "send: hello_ack_active session=[0-9]+ lane=1 kind=2" 20 "client accepted TCP HELLO_ACK after server restart"
   wait_ping_ok "${name} post-restart-tcp" 20
+
+  stop_multipath
+  clear_loss
+  echo "==== ${name} e2e end ===="
+}
+
+run_unknown_session_rebootstrap_case() {
+  local name="unknown-session-rebootstrap"
+  echo "==== ${name} e2e start ===="
+  clear_loss
+  write_one_lane_config "${name}" "${PORT_UNKNOWN_SESSION_REBOOTSTRAP}" false false 100 300
+  CURRENT_EXTRA_ENV=(MULTIPATH_DISABLE_BW_PROBE=1)
+  start_multipath "${name}"
+
+  wait_ping_ok "${name} baseline" 12
+
+  local server_close_line
+  local client_rebootstrap_line
+  server_close_line="$(current_log_file_line_count "${CURRENT_SERVER_LOG}")"
+  client_rebootstrap_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
+
+  echo "[${name}] restart server only; stale client PING must get CLOSE{UnknownSession} and rebuild a fresh session"
+  restart_server_process "${name}"
+
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_SERVER_LOG}" "runtime: close_unknown_session session=[0-9]+ kind=1" 20 "server rejected stale session with CLOSE unknown_session" "${server_close_line}"
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "send: rebootstrap old_session=[0-9]+" 20 "client rebuilt after unknown-session CLOSE" "${client_rebootstrap_line}"
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "send: hello_ack_active session=[0-9]+ lane=1 kind=1" 20 "client accepted HELLO_ACK for fresh session" "${client_rebootstrap_line}"
+  wait_ping_ok "${name} post-rebootstrap" 12
+
+  stop_multipath
+  clear_loss
+  echo "==== ${name} e2e end ===="
+}
+
+run_multilane_rebootstrap_case() {
+  local name="multilane-rebootstrap"
+  echo "==== ${name} e2e start ===="
+  clear_loss
+  write_two_lane_config "${name}" "${PORT_MULTILANE_REBOOTSTRAP}" false false 100 300
+  CURRENT_EXTRA_ENV=(MULTIPATH_DISABLE_BW_PROBE=1)
+  start_multipath "${name}"
+
+  wait_ping_ok "${name} baseline" 12
+  wait_log_pattern "${name}" "send: hello_ack_active session=[0-9]+ lane=1 kind=1" 12 "lane=1 UDP active before restart"
+  wait_log_pattern "${name}" "send: hello_ack_active session=[0-9]+ lane=2 kind=1" 12 "lane=2 UDP active before restart"
+
+  local server_close_line
+  local client_rebootstrap_line
+  server_close_line="$(current_log_file_line_count "${CURRENT_SERVER_LOG}")"
+  client_rebootstrap_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
+
+  echo "[${name}] restart server only; all bootstrap lanes must rebuild under a fresh session"
+  restart_server_process "${name}"
+
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_SERVER_LOG}" "runtime: close_unknown_session session=[0-9]+ kind=1" 20 "server rejected stale multi-lane session with CLOSE unknown_session" "${server_close_line}"
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "send: rebootstrap old_session=[0-9]+" 20 "client rebuilt multi-lane session after unknown-session CLOSE" "${client_rebootstrap_line}"
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "send: hello_ack_active session=[0-9]+ lane=1 kind=1" 20 "lane=1 accepted HELLO_ACK for fresh session" "${client_rebootstrap_line}"
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "send: hello_ack_active session=[0-9]+ lane=2 kind=1" 20 "lane=2 accepted HELLO_ACK for fresh session" "${client_rebootstrap_line}"
+  wait_ping_ok "${name} post-rebootstrap" 12
 
   stop_multipath
   clear_loss
@@ -925,13 +1067,13 @@ run_leg_selector_case() {
   client_qos_start_line="$(current_log_file_line_count "${client_log_file}")"
   server_qos_start_line="$(current_log_file_line_count "${server_log_file}")"
   start_multipath "${name}"
-  wait_log_pattern "${name}" "accept_hello_ack session=[0-9]+ lane=1 .*tcp conn=" 20 "warm TCP fallback leg reached HELLO_ACK"
-  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "bandwidth_probe_decision .*lane=1 .*udp_qos_limited=true .*tcp_better=true selected_leg=tcp" 45 "client produced bandwidth-probe QoS decision" "${client_qos_start_line}"
+  wait_log_pattern "${name}" "send: hello_ack_active session=[0-9]+ lane=1 kind=2" 20 "warm TCP fallback leg reached HELLO_ACK"
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "send/bw: sample session=[0-9]+ lane=1 kind=1" 45 "client produced UDP bandwidth sample" "${client_qos_start_line}"
   local client_select_start_line
   client_select_start_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
   wait_log_file_pattern_while_ping_from "${name}" "${CURRENT_CLIENT_LOG}" "schedule_select.*leg=\\{tcp .*frame=type=DATA" 20 "client leg selector chose TCP for DATA after UDP QoS detection" "${client_select_start_line}" "${NS_C}" "${TUN_C_REMOTE}"
 
-  wait_log_file_pattern_while_ping "${name}" "${CURRENT_SERVER_LOG}" "bandwidth_probe_decision .*lane=1 .*udp_qos_limited=true .*tcp_better=true selected_leg=tcp" 45 "server produced bandwidth-probe QoS decision" "${server_qos_start_line}"
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_SERVER_LOG}" "send/bw: sample session=[0-9]+ lane=1 kind=1" 45 "server produced UDP bandwidth sample" "${server_qos_start_line}"
   local server_select_start_line
   server_select_start_line="$(current_log_file_line_count "${CURRENT_SERVER_LOG}")"
   wait_log_file_pattern_while_ping_from "${name}" "${CURRENT_SERVER_LOG}" "schedule_select.*leg=\\{tcp .*frame=type=DATA" 20 "server leg selector chose TCP for DATA after UDP QoS detection" "${server_select_start_line}" "${NS_S}" "${TUN_S_REMOTE}"
@@ -949,13 +1091,19 @@ run_bandwidth_probe_convergence_case() {
   echo "[${name}] rate-limit UDP tunnel before startup; bandwidth probe should classify UDP relative to TCP"
   apply_udp_tunnel_rate_path 1 "${PORT_BW_PROBE_CONVERGENCE}" 80mbit
   local client_start_line
+  local server_start_line
   local client_log_file="${WORKDIR}/${name}.client.log"
+  local server_log_file="${WORKDIR}/${name}.server.log"
   client_start_line="$(current_log_file_line_count "${client_log_file}")"
+  server_start_line="$(current_log_file_line_count "${server_log_file}")"
   start_multipath "${name}"
 
   wait_ping_ok "${name} baseline-under-rate-limit" 12
+  wait_bandwidth_probe_train_budget "${name}" "${CURRENT_CLIENT_LOG}" "${client_start_line}" 25 "client TCP BW_PROBE used train-level budget" 20000000 32768 32768
   wait_client_tcp_reference_probe "${name}" "${client_start_line}"
-  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "bandwidth_probe_decision .*lane=1 .*udp_qos_limited=true .*tcp_better=true selected_leg=tcp" 35 "client bandwidth probe classified UDP relative to TCP" "${client_start_line}"
+  assert_no_bandwidth_probe_remote_timeout_since "${name}" "${CURRENT_CLIENT_LOG}" "${client_start_line}" "client BW gate did not rely on remote timeout"
+  assert_no_bandwidth_probe_remote_timeout_since "${name}" "${CURRENT_SERVER_LOG}" "${server_start_line}" "server BW gate did not rely on remote timeout"
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "send/bw: sample session=[0-9]+ lane=1 kind=1" 35 "client measured UDP bandwidth after TCP reference" "${client_start_line}"
   wait_ping_ok "${name} post-convergence" 12
 
   stop_multipath
@@ -968,16 +1116,23 @@ run_bandwidth_probe_tcp_reference_case() {
   echo "==== ${name} e2e start ===="
   clear_loss
   write_one_lane_config "${name}" "${PORT_BW_PROBE_GUARD}" false false 200 1000 -1
-  echo "[${name}] apply 200mbit UDP tunnel bottleneck; bandwidth probe should classify UDP relative to TCP reference"
-  apply_udp_tunnel_rate_path 1 "${PORT_BW_PROBE_GUARD}" 200mbit
+  echo "[${name}] apply 50mbit UDP tunnel bottleneck; bandwidth probe should classify UDP relative to TCP reference"
+  apply_udp_tunnel_rate_path 1 "${PORT_BW_PROBE_GUARD}" 50mbit
   local client_start_line
+  local server_start_line
   local client_log_file="${WORKDIR}/${name}.client.log"
+  local server_log_file="${WORKDIR}/${name}.server.log"
   client_start_line="$(current_log_file_line_count "${client_log_file}")"
+  server_start_line="$(current_log_file_line_count "${server_log_file}")"
   start_multipath "${name}"
   wait_ping_ok "${name} baseline" 12
+  wait_bandwidth_probe_train_budget "${name}" "${CURRENT_CLIENT_LOG}" "${client_start_line}" 25 "client TCP BW_PROBE used train-level budget" 20000000 32768 32768
   wait_client_tcp_reference_probe "${name}" "${client_start_line}"
-  wait_bandwidth_probe_udp_rate_window "${name}" "${CURRENT_CLIENT_LOG}" "${client_start_line}" 40 "client UDP probe measured veth throughput" 60000000 140000000 200000000
-  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "bandwidth_probe_decision .*lane=1 .*udp_qos_limited=true .*tcp_better=true selected_leg=tcp" 35 "client classified UDP relative to TCP reference" "${client_start_line}"
+  assert_no_bandwidth_probe_remote_timeout_since "${name}" "${CURRENT_CLIENT_LOG}" "${client_start_line}" "client BW gate did not rely on remote timeout"
+  assert_no_bandwidth_probe_remote_timeout_since "${name}" "${CURRENT_SERVER_LOG}" "${server_start_line}" "server BW gate did not rely on remote timeout"
+  wait_bandwidth_probe_udp_rate_window "${name}" "${CURRENT_CLIENT_LOG}" "${client_start_line}" 40 "client UDP probe measured veth throughput" 20000000 80000000 200000000
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "send/bw: sample session=[0-9]+ lane=1 kind=1" 35 "client measured UDP bandwidth after TCP reference" "${client_start_line}"
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "bandwidth_probe_decision .*prefer_tcp=true selected_leg=tcp" 10 "client classified UDP below TCP reference and selected TCP" "${client_start_line}"
 
   stop_multipath
   clear_loss
@@ -992,16 +1147,42 @@ run_bandwidth_probe_default_cap_case() {
   echo "[${name}] apply 50% large-packet UDP loss before startup; default 200mbit cap should classify UDP without TCP reference probe"
   apply_udp_large_packet_partial_loss 1 "${PORT_BW_PROBE_DEFAULT_CAP}" 50%
   local client_start_line
+  local server_start_line
   local client_log_file="${WORKDIR}/${name}.client.log"
+  local server_log_file="${WORKDIR}/${name}.server.log"
   client_start_line="$(current_log_file_line_count "${client_log_file}")"
+  server_start_line="$(current_log_file_line_count "${server_log_file}")"
   start_multipath "${name}"
 
-  wait_log_pattern "${name}" "accept_hello_ack session=[0-9]+ lane=1 .*tcp conn=" 20 "warm TCP fallback leg reached HELLO_ACK"
-  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "send/bw_probe: train_start .*leg=\\{udp .*cap_bps=200000000" 20 "client started default-capped UDP bandwidth probe" "${client_start_line}"
-  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "bandwidth_probe_decision .*lane=1 .*udp_samples=1 .*tcp_samples=0 .*reference_bps=200000000 .*udp_qos_limited=true .*tcp_better=true selected_leg=tcp" 35 "client classified UDP against default bandwidth cap without TCP probe sample" "${client_start_line}"
+  wait_log_pattern "${name}" "send: hello_ack_active session=[0-9]+ lane=1 kind=2" 20 "warm TCP fallback leg reached HELLO_ACK"
+  wait_bandwidth_probe_train_budget "${name}" "${CURRENT_CLIENT_LOG}" "${client_start_line}" 20 "client UDP BW_PROBE used default-cap train-level budget" 20000000 1200 1400
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "send/bw: sample session=[0-9]+ lane=1 kind=1" 20 "client started default-capped UDP bandwidth probe" "${client_start_line}"
+  assert_no_bandwidth_probe_remote_timeout_since "${name}" "${CURRENT_CLIENT_LOG}" "${client_start_line}" "client BW gate did not rely on remote timeout"
+  assert_no_bandwidth_probe_remote_timeout_since "${name}" "${CURRENT_SERVER_LOG}" "${server_start_line}" "server BW gate did not rely on remote timeout"
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "send/bw: sample session=[0-9]+ lane=1 kind=1" 35 "client measured UDP bandwidth against default cap without TCP probe sample" "${client_start_line}"
   local client_select_start_line
   client_select_start_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
   wait_log_file_pattern_while_ping_from "${name}" "${CURRENT_CLIENT_LOG}" "schedule_select.*leg=\\{tcp .*frame=type=DATA" 20 "client leg selector chose TCP after default-cap QoS detection" "${client_select_start_line}" "${NS_C}" "${TUN_C_REMOTE}"
+
+  stop_multipath
+  clear_loss
+  echo "==== ${name} e2e end ===="
+}
+
+run_bandwidth_probe_disabled_case() {
+  local name="bandwidth-probe-disabled"
+  echo "==== ${name} e2e start ===="
+  clear_loss
+  write_one_lane_config "${name}" "${PORT_BW_PROBE_DISABLED}" false false 100 300 -1
+  CURRENT_EXTRA_ENV=(MULTIPATH_DISABLE_BW_PROBE=1)
+  start_multipath "${name}"
+
+  wait_ping_ok "${name} baseline" 12
+  run_short_ping_load "${name}-load" 180 0.02
+
+  assert_log_file_not_contains "${name}" "${CURRENT_CLIENT_LOG}" "send/bw:" "client did not run bandwidth probe when disabled"
+  assert_log_file_not_contains "${name}" "${CURRENT_SERVER_LOG}" "send/bw:" "server did not run bandwidth probe when disabled"
+  wait_ping_ok "${name} post-load" 12
 
   stop_multipath
   clear_loss
@@ -1024,13 +1205,41 @@ run_nat_case() {
   echo "==== ${name} e2e end ===="
 }
 
+run_nat_tcp_fallback_case() {
+  local name="nat-tcp-fallback"
+  echo "==== ${name} e2e start ===="
+  clear_loss
+  write_nat_config "${name}" "${PORT_NAT_TCP_FALLBACK}" 200 600
+  CURRENT_EXTRA_ENV=(MULTIPATH_DISABLE_BW_PROBE=1)
+  start_multipath "${name}"
+  wait_ping_ok "${name} udp-through-snat" 15
+  wait_log_pattern "${name}" "send: hello_ack_active session=[0-9]+ lane=1 kind=2" 20 "TCP shadow leg reached HELLO_ACK through NAT"
+
+  local client_fallback_line
+  client_fallback_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
+  echo "[${name}] block UDP tunnel through NAT; TCP fallback must reconnect over the same SNAT path"
+  apply_nat_udp_tunnel_block "${PORT_NAT_TCP_FALLBACK}"
+  wait_ping_ok "${name} tcp-fallback-through-snat" 25
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "schedule_select.*lane=1 .*leg=\\{tcp .*frame=type=DATA" 25 "client sent DATA over TCP fallback through NAT" "${client_fallback_line}"
+
+  stop_multipath
+  clear_loss
+  echo "==== ${name} e2e end ===="
+}
+
 run_ping_sample() {
+  run_ping_sample_from "$1" "${NS_C}" "${TUN_C_REMOTE}"
+}
+
+run_ping_sample_from() {
   local label="$1"
+  local ns="$2"
+  local remote="$3"
   local count="${FEC_PING_COUNT}"
   local interval="${FEC_PING_INTERVAL}"
   local output
-  echo "[${label}] ping sample: count=${count} interval=${interval}s"
-  output="$(ip netns exec "${NS_C}" ping -c "${count}" -i "${interval}" -W 1 "${TUN_C_REMOTE}" 2>&1 || true)"
+  echo "[${label}] ping sample: ns=${ns} remote=${remote} count=${count} interval=${interval}s"
+  output="$(ip netns exec "${ns}" ping -c "${count}" -i "${interval}" -W 1 "${remote}" 2>&1 || true)"
   echo "${output}" >"${WORKDIR}/${label}.ping.log"
   echo "[${label}] ping log: ${WORKDIR}/${label}.ping.log"
   printf '%s\n' "${output}" | tail -n 2
@@ -1044,6 +1253,20 @@ run_ping_sample() {
   PING_SAMPLE_LOSS="${loss}"
 }
 
+run_short_ping_load() {
+  run_short_ping_load_from "$1" "${NS_C}" "${TUN_C_REMOTE}" "${2:-180}" "${3:-0.02}"
+}
+
+run_short_ping_load_from() {
+  local label="$1"
+  local ns="$2"
+  local remote="$3"
+  local count="${4:-180}"
+  local interval="${5:-0.02}"
+  echo "[${label}] short ping load: ns=${ns} remote=${remote} count=${count} interval=${interval}s"
+  ip netns exec "${ns}" ping -c "${count}" -i "${interval}" -W 1 "${remote}" >/dev/null 2>&1 || true
+}
+
 count_log_pattern() {
   local pattern="$1"
   local log_file="$2"
@@ -1052,6 +1275,34 @@ count_log_pattern() {
     return 0
   fi
   grep -c "${pattern}" "${log_file}" || true
+}
+
+count_log_file_pattern_since() {
+  local log_file="$1"
+  local start_line="$2"
+  local pattern="$3"
+  if [[ ! -f "${log_file}" ]]; then
+    printf '0\n'
+    return 0
+  fi
+  tail -n "+$((start_line + 1))" "${log_file}" | grep -E -c "${pattern}" || true
+}
+
+assert_log_file_pattern_count_since_ge() {
+  local label="$1"
+  local log_file="$2"
+  local start_line="$3"
+  local pattern="$4"
+  local min_count="$5"
+  local message="$6"
+  local count
+  count="$(count_log_file_pattern_since "${log_file}" "${start_line}" "${pattern}")"
+  count="${count:-0}"
+  if (( count >= min_count )); then
+    pass "${label}" "${message}: count=${count}"
+  else
+    fail "${label}" "${message}: count=${count}, want >=${min_count}; pattern=${pattern}"
+  fi
 }
 
 wait_bandwidth_probe_udp_rate_window() {
@@ -1074,22 +1325,9 @@ wait_bandwidth_probe_udp_rate_window() {
       -v max_window="${max_window_bps}" \
       -v max_target="${max_target_bps}" '
         NR <= start { next }
-        /send\/bw_probe: round_start/ && /leg=\{udp/ {
-          rate = 0
+        /send\/bw: sample/ && /kind=1/ {
           for (i = 1; i <= NF; i++) {
-            if ($i ~ /^rate_bps=/) {
-              split($i, parts, "=")
-              rate = parts[2] + 0
-              break
-            }
-          }
-          if (rate > max_rate) {
-            max_rate = rate
-          }
-        }
-        /send\/bw_probe: train_finish/ && /leg=\{udp/ {
-          for (i = 1; i <= NF; i++) {
-            if ($i ~ /^window_bps=/) {
+            if ($i ~ /^bps=/) {
               split($i, parts, "=")
               window_bps = parts[2] + 0
               finish = 1
@@ -1098,18 +1336,18 @@ wait_bandwidth_probe_udp_rate_window() {
         }
         END {
           if (!finish) {
-            print "need udp train_finish"
+            print "need udp sample"
             exit 2
           }
           if (window_bps < min_window || window_bps > max_window) {
-            printf("bad-window window_bps=%d max_rate_bps=%d\n", window_bps, max_rate)
+            printf("bad-window window_bps=%d\n", window_bps)
             exit 1
           }
-          if (max_rate > max_target) {
-            printf("bad-target window_bps=%d max_rate_bps=%d\n", window_bps, max_rate)
+          if (window_bps > max_target) {
+            printf("bad-target window_bps=%d max_target_bps=%d\n", window_bps, max_target)
             exit 1
           }
-          printf("ok window_bps=%d max_rate_bps=%d\n", window_bps, max_rate)
+          printf("ok window_bps=%d\n", window_bps)
           exit 0
         }
       ' "${log_file}" 2>/dev/null)"
@@ -1131,8 +1369,112 @@ wait_bandwidth_probe_udp_rate_window() {
     ping_once_from "${NS_C}" "${TUN_C_REMOTE}" || true
     sleep 0.2
   done
-  fail "${label}" "${message}: UDP train_finish not observed within ${timeout}s"
+  fail "${label}" "${message}: UDP sample not observed within ${timeout}s"
   return 1
+}
+
+wait_bandwidth_probe_train_budget() {
+  local label="$1"
+  local log_file="$2"
+  local start_line="$3"
+  local timeout="${4:-25}"
+  local message="$5"
+  local min_total="$6"
+  local min_payload="$7"
+  local max_payload="$8"
+  local deadline=$((SECONDS + timeout))
+  local output status
+
+  while (( SECONDS < deadline )); do
+    set +e
+    output="$(awk \
+      -v start="${start_line}" \
+      -v min_total="${min_total}" \
+      -v min_payload="${min_payload}" \
+      -v max_payload="${max_payload}" '
+        NR <= start { next }
+        /protocol: encode type=BW_PROBE/ {
+          train_total = -1
+          train_remaining = -1
+          payload_len = -1
+          for (i = 1; i <= NF; i++) {
+            if ($i ~ /^train_total=/) {
+              split($i, parts, "=")
+              train_total = parts[2] + 0
+            } else if ($i ~ /^train_remaining=/) {
+              split($i, parts, "=")
+              train_remaining = parts[2] + 0
+            } else if ($i ~ /^payload_len=/) {
+              split($i, parts, "=")
+              payload_len = parts[2] + 0
+            }
+          }
+          if (payload_len < min_payload || payload_len > max_payload) {
+            next
+          }
+          if (train_total < min_total) {
+            message = sprintf("bad-train-budget train_total=%d train_remaining=%d payload_len=%d min_total=%d", train_total, train_remaining, payload_len, min_total)
+            status = 1
+            done = 1
+            exit
+          }
+          if (train_remaining <= 0 || train_remaining >= train_total) {
+            message = sprintf("bad-train-remaining train_total=%d train_remaining=%d payload_len=%d", train_total, train_remaining, payload_len)
+            status = 1
+            done = 1
+            exit
+          }
+          message = sprintf("ok train_total=%d train_remaining=%d payload_len=%d", train_total, train_remaining, payload_len)
+          status = 0
+          done = 1
+          exit
+        }
+        END {
+          if (!done) {
+            message = "need matching BW_PROBE encode"
+            status = 2
+          }
+          print message
+          exit status
+        }
+      ' "${log_file}" 2>/dev/null)"
+    status=$?
+    set -e
+    case "${status}" in
+    0)
+      pass "${label}" "${message}: ${output#ok }"
+      return 0
+      ;;
+    1)
+      fail "${label}" "${message}: ${output}"
+      return 1
+      ;;
+    esac
+    if ! check_multipath_alive "${label}"; then
+      return 1
+    fi
+    ping_once_from "${NS_C}" "${TUN_C_REMOTE}" || true
+    sleep 0.2
+  done
+  fail "${label}" "${message}: matching BW_PROBE encode not observed within ${timeout}s"
+  return 1
+}
+
+assert_no_bandwidth_probe_remote_timeout_since() {
+  local label="$1"
+  local log_file="$2"
+  local start_line="$3"
+  local message="$4"
+  local pattern="bw action=remote_timeout|gate_remote_timeout"
+  if [[ -z "${log_file}" || ! -f "${log_file}" ]]; then
+    fail "${label}" "${message}: log file missing"
+    return 1
+  fi
+  if tail -n "+$((start_line + 1))" "${log_file}" | grep -E "${pattern}" >/dev/null; then
+    fail "${label}" "${message}: unexpected BW remote timeout found"
+    return 1
+  fi
+  pass "${label}" "${message}"
 }
 
 assert_log_not_contains() {
@@ -1144,6 +1486,22 @@ assert_log_not_contains() {
     return
   fi
   if grep -E -q "${pattern}" "${CURRENT_LOG_FILE}"; then
+    fail "${label}" "${message}: unexpected pattern found: ${pattern}"
+  else
+    pass "${label}" "${message}"
+  fi
+}
+
+assert_log_file_not_contains() {
+  local label="$1"
+  local log_file="$2"
+  local pattern="$3"
+  local message="$4"
+  if [[ -z "${log_file}" || ! -f "${log_file}" ]]; then
+    fail "${label}" "${message}: log file missing"
+    return
+  fi
+  if grep -E -q "${pattern}" "${log_file}"; then
     fail "${label}" "${message}: unexpected pattern found: ${pattern}"
   else
     pass "${label}" "${message}"
@@ -1197,9 +1555,8 @@ wait_client_tcp_reference_probe() {
   local name="$1"
   local start_line="$2"
 
-  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "accept_hello_ack session=[0-9]+ lane=1 .*tcp conn=" 25 "client warmed TCP reference leg" "${start_line}"
-  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "send/bw_probe: train_start .*leg=\\{tcp " 10 "client started TCP reference probe" "${start_line}"
-  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "send/bw_probe: train_finish .*leg=\\{tcp .*window_bps=[0-9]+" 25 "client finished TCP reference probe" "${start_line}"
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "send: hello_ack_active session=[0-9]+ lane=1 kind=2" 25 "client warmed TCP reference leg" "${start_line}"
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "send/bw: sample session=[0-9]+ lane=1 kind=2" 25 "client finished TCP reference probe" "${start_line}"
   assert_client_tcp_reference_before_udp_probe "${name}" "${start_line}"
 }
 
@@ -1211,21 +1568,21 @@ assert_client_tcp_reference_before_udp_probe() {
   set +e
   output="$(awk -v start="${start_line}" '
     NR <= start { next }
-    /send\/bw_probe: train_start/ && /leg=\{udp/ {
-      message = "udp train_start before tcp train_finish: " $0
+    /send\/bw: sample/ && /kind=1/ {
+      message = "udp sample before tcp sample: " $0
       status = 1
       done = 1
       exit
     }
-    /send\/bw_probe: train_finish/ && /leg=\{tcp/ {
-      message = "tcp train_finish before udp train_start"
+    /send\/bw: sample/ && /kind=2/ {
+      message = "tcp sample before udp sample"
       status = 0
       done = 1
       exit
     }
     END {
       if (!done) {
-        message = "need tcp train_finish"
+        message = "need tcp sample"
         status = 2
       }
       print message
@@ -1240,7 +1597,7 @@ assert_client_tcp_reference_before_udp_probe() {
     pass "${label}" "client TCP reference completed before UDP probe"
     ;;
   1)
-    fail "${label}" "client UDP bandwidth probe started before TCP reference completed: ${output}"
+    fail "${label}" "client UDP bandwidth probe completed before TCP reference completed: ${output}"
     return 1
     ;;
   *)
@@ -1310,7 +1667,7 @@ log_file_has_any_pattern_since() {
   fi
   local pattern
   for pattern in "$@"; do
-    if tail -n "+$((start_line + 1))" "${log_file}" | grep -E -q "${pattern}"; then
+    if tail -n "+$((start_line + 1))" "${log_file}" | grep -E "${pattern}" >/dev/null; then
       return 0
     fi
   done
@@ -1336,7 +1693,7 @@ wait_log_file_pattern_while_ping_from() {
   if [[ -z "${start_line}" || "${start_line}" == "0" ]]; then
     grep_cmd() { grep -E -q "${pattern}" "${log_file}"; }
   else
-    grep_cmd() { tail -n "+$((start_line + 1))" "${log_file}" | grep -E -q "${pattern}"; }
+    grep_cmd() { tail -n "+$((start_line + 1))" "${log_file}" | grep -E "${pattern}" >/dev/null; }
   fi
   while (( SECONDS < deadline )); do
     if [[ -f "${log_file}" ]] && grep_cmd; then
@@ -1482,7 +1839,7 @@ run_per_lane_fallback_case() {
   echo "[${name}] restore UDP; lane=2 must come back to UDP"
   clear_loss
   wait_ping_ok "${name} post-recovery" 15
-  wait_log_pattern "${name}" "target_recovered .*lane=2" 15 "lane=2 probe target recovered after UDP restore"
+  wait_log_pattern "${name}" "send: ping_up session=[0-9]+ lane=2 kind=1" 15 "lane=2 probe target recovered after UDP restore"
 
   stop_multipath
   clear_loss
@@ -1498,12 +1855,16 @@ run_fec_tcp_fallback_case() {
   start_multipath "${name}"
 
   wait_ping_ok "${name} baseline" 12
+  wait_log_pattern "${name}" "type=HELLO_ACK .*accepted=1 caps=0x6 fec_profile=1" 20 "TCP shadow HELLO_ACK preserved FEC and LINK_STATUS negotiation"
+  wait_log_pattern "${name}" "send: hello_ack_active session=[0-9]+ lane=1 kind=2" 20 "TCP shadow leg reached HELLO_ACK"
 
   echo "[${name}] block UDP on path1; lane must fall back to TCP while preserving FEC capability"
+  local client_fallback_line
+  client_fallback_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
   apply_udp_tunnel_block_path 1 "${PORT_FEC_TCP_FALLBACK}"
 
   wait_ping_ok "${name} tcp-fallback" 20
-  wait_log_pattern "${name}" "accept_hello_ack session=[0-9]+ lane=1 .*tcp conn=.*negotiated_caps=0x3 negotiated_fec_profile=2" 20 "TCP HELLO_ACK preserved FEC capability and variable FEC profile after fallback"
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "schedule_select.*lane=1 .*leg=\\{tcp .*frame=type=DATA" 20 "client sent DATA over TCP fallback with negotiated FEC" "${client_fallback_line}"
 
   stop_multipath
   clear_loss
@@ -1547,12 +1908,124 @@ run_multipath_fec_case() {
   echo "==== ${name} e2e end ===="
 }
 
+run_fec_disabled_negotiation_case() {
+  local name="fec-disabled-negotiation"
+  echo "==== ${name} e2e start ===="
+  clear_loss
+  write_one_lane_config "${name}" "${PORT_FEC_DISABLED_NEGOTIATION}" false false 200 600
+  CURRENT_EXTRA_ENV=(MULTIPATH_DISABLE_BW_PROBE=1)
+  start_multipath "${name}"
+
+  wait_ping_ok "${name} baseline" 12
+  run_short_ping_load "${name}-load" 180 0.02
+
+  assert_log_file_not_contains "${name}" "${CURRENT_CLIENT_LOG}" "type=HELLO .*caps=0x[1-9a-f]" "client HELLO did not advertise FEC/LinkStatus when fec=false"
+  assert_log_file_not_contains "${name}" "${CURRENT_SERVER_LOG}" "type=HELLO_ACK .*caps=0x[1-9a-f]" "server HELLO_ACK did not negotiate FEC/LinkStatus when fec=false"
+  assert_log_file_not_contains "${name}" "${CURRENT_CLIENT_LOG}" "type=REPAIR|runtime/qos: link_status_send|runtime: link_status_apply" "client emitted no FEC repair or LINK_STATUS when fec=false"
+  assert_log_file_not_contains "${name}" "${CURRENT_SERVER_LOG}" "type=REPAIR|runtime/qos: link_status_send|runtime: link_status_apply" "server emitted no FEC repair or LINK_STATUS when fec=false"
+
+  stop_multipath
+  clear_loss
+  echo "==== ${name} e2e end ===="
+}
+
+run_link_status_qos_case() {
+  local name="link-status-qos"
+  echo "==== ${name} e2e start ===="
+  clear_loss
+  write_one_lane_config "${name}" "${PORT_LINK_STATUS_QOS}" false true 200 3000
+  CURRENT_EXTRA_ENV=(MULTIPATH_DISABLE_BW_PROBE=1)
+  start_multipath "${name}"
+
+  wait_ping_ok "${name} baseline" 12
+  wait_log_pattern "${name}" "send: hello_ack_active session=[0-9]+ lane=1 kind=2" 20 "TCP shadow leg reached HELLO_ACK"
+
+  local server_repair_line
+  server_repair_line="$(current_log_file_line_count "${CURRENT_SERVER_LOG}")"
+  run_short_ping_load "${name}-repair-shadow" 120 0.02
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_SERVER_LOG}" "recv: frame_in type=REPAIR .*leg=\\{tcp" 10 "server received FEC REPAIR on TCP shadow" "${server_repair_line}"
+
+  local server_status_line
+  local client_apply_line
+  local client_select_line
+  server_status_line="$(current_log_file_line_count "${CURRENT_SERVER_LOG}")"
+  client_apply_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
+
+  echo "[${name}] apply 20% UDP data loss while TCP shadow stays clean; recv-side FEC differential QoS should notify the sender"
+  apply_udp_partial_loss 1 "${PORT_LINK_STATUS_QOS}" 20%
+
+  run_ping_sample "${name}-qos"
+
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_SERVER_LOG}" "runtime/qos: link_status_send session=[0-9]+ lane=1 kind=1 reason=1" 5 "server emitted UDP limited LINK_STATUS from receive-side QoS" "${server_status_line}"
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "runtime: link_status_apply session=[0-9]+ lane=1 kind=1 reason=1" 5 "client applied server LINK_STATUS to lane selector" "${client_apply_line}"
+  assert_log_file_pattern_count_since_ge "${name}" "${CURRENT_SERVER_LOG}" "${server_status_line}" "runtime/qos: link_status_send session=[0-9]+ lane=1 kind=1 reason=1" 2 "server refreshed sustained UDP limited LINK_STATUS"
+
+  client_select_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
+  wait_log_file_pattern_while_ping_from "${name}" "${CURRENT_CLIENT_LOG}" "schedule_select.*lane=1 .*leg=\\{tcp .*frame=type=DATA" 20 "client selector sent DATA over TCP after receive-side QoS feedback" "${client_select_line}" "${NS_C}" "${TUN_C_REMOTE}"
+
+  echo "[${name}] clear UDP loss; LINK_STATUS should expire and selector should return DATA to UDP"
+  clear_loss
+  local client_return_line
+  client_return_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
+  wait_log_file_pattern_while_ping_from "${name}" "${CURRENT_CLIENT_LOG}" "schedule_select.*lane=1 .*leg=\\{udp .*frame=type=DATA" 35 "client selector returned DATA to UDP after QoS TTL and preferWait" "${client_return_line}" "${NS_C}" "${TUN_C_REMOTE}"
+  wait_ping_ok "${name} post-qos-clear" 12
+
+  stop_multipath
+  clear_loss
+  echo "==== ${name} e2e end ===="
+}
+
+run_link_status_qos_reverse_case() {
+  local name="link-status-qos-reverse"
+  echo "==== ${name} e2e start ===="
+  clear_loss
+  write_one_lane_config "${name}" "${PORT_LINK_STATUS_QOS_REVERSE}" false true 200 3000
+  CURRENT_EXTRA_ENV=(MULTIPATH_DISABLE_BW_PROBE=1)
+  start_multipath "${name}"
+
+  wait_ping_ok "${name} baseline" 12
+  wait_log_pattern "${name}" "send: hello_ack_active session=[0-9]+ lane=1 kind=2" 20 "TCP shadow leg reached HELLO_ACK"
+
+  local client_repair_line
+  client_repair_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
+  run_short_ping_load_from "${name}-repair-shadow" "${NS_S}" "${TUN_S_REMOTE}" 120 0.02
+  wait_log_file_pattern_while_ping_from "${name}" "${CURRENT_CLIENT_LOG}" "recv: frame_in type=REPAIR .*leg=\\{tcp" 10 "client received FEC REPAIR on TCP shadow" "${client_repair_line}" "${NS_S}" "${TUN_S_REMOTE}"
+
+  local client_status_line
+  local server_apply_line
+  client_status_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
+  server_apply_line="$(current_log_file_line_count "${CURRENT_SERVER_LOG}")"
+
+  echo "[${name}] apply 20% UDP data loss and generate server-to-client DATA; client receive-side QoS should notify the server"
+  apply_udp_partial_loss 1 "${PORT_LINK_STATUS_QOS_REVERSE}" 20%
+
+  run_ping_sample_from "${name}-qos" "${NS_S}" "${TUN_S_REMOTE}"
+
+  wait_log_file_pattern_while_ping_from "${name}" "${CURRENT_CLIENT_LOG}" "runtime/qos: link_status_send session=[0-9]+ lane=1 kind=1 reason=1" 5 "client emitted UDP limited LINK_STATUS from receive-side QoS" "${client_status_line}" "${NS_S}" "${TUN_S_REMOTE}"
+  wait_log_file_pattern_while_ping_from "${name}" "${CURRENT_SERVER_LOG}" "runtime: link_status_apply session=[0-9]+ lane=1 kind=1 reason=1" 5 "server applied client LINK_STATUS to lane selector" "${server_apply_line}" "${NS_S}" "${TUN_S_REMOTE}"
+
+  local server_select_line
+  server_select_line="$(current_log_file_line_count "${CURRENT_SERVER_LOG}")"
+  wait_log_file_pattern_while_ping_from "${name}" "${CURRENT_SERVER_LOG}" "schedule_select.*lane=1 .*leg=\\{tcp .*frame=type=DATA" 20 "server selector sent DATA over TCP after receive-side QoS feedback" "${server_select_line}" "${NS_S}" "${TUN_S_REMOTE}"
+
+  echo "[${name}] clear UDP loss; server selector should return DATA to UDP"
+  clear_loss
+  local server_return_line
+  server_return_line="$(current_log_file_line_count "${CURRENT_SERVER_LOG}")"
+  wait_log_file_pattern_while_ping_from "${name}" "${CURRENT_SERVER_LOG}" "schedule_select.*lane=1 .*leg=\\{udp .*frame=type=DATA" 35 "server selector returned DATA to UDP after QoS TTL and preferWait" "${server_return_line}" "${NS_S}" "${TUN_S_REMOTE}"
+  wait_ping_ok "${name} post-qos-clear" 12
+
+  stop_multipath
+  clear_loss
+  echo "==== ${name} e2e end ===="
+}
+
 run_fec_loaded_latency_case() {
   local name="fec-loaded-latency"
-  local iperf_rate="${MULTIPATH_REAL_E2E_FEC_LOAD_RATE:-10M}"
-  local iperf_duration="${MULTIPATH_REAL_E2E_FEC_LOAD_DURATION:-25}"
-  local ping_count="${MULTIPATH_REAL_E2E_FEC_LOAD_PING_COUNT:-400}"
-  local ping_interval="${MULTIPATH_REAL_E2E_FEC_LOAD_PING_INTERVAL:-0.05}"
+  local iperf_rate="10M"
+  local iperf_duration="25"
+  local ping_count="400"
+  local ping_interval="0.05"
 
   echo "==== ${name} e2e start ===="
   if ! command -v iperf3 >/dev/null 2>&1; then
@@ -1622,14 +2095,14 @@ run_concurrent_fallback_case() {
   apply_udp_tunnel_block_path 2 "${PORT_CONCURRENT_FALLBACK}"
 
   wait_ping_ok "${name} dual-tcp-fallback" 25
-  wait_log_pattern "${name}" "accept_hello_ack session=[0-9]+ lane=1 .*tcp conn=" 25 "lane=1 reached TCP HELLO_ACK with both UDP paths blocked"
-  wait_log_pattern "${name}" "accept_hello_ack session=[0-9]+ lane=2 .*tcp conn=" 25 "lane=2 reached TCP HELLO_ACK with both UDP paths blocked"
+  wait_log_pattern "${name}" "send: hello_ack_active session=[0-9]+ lane=1 kind=2" 25 "lane=1 reached TCP HELLO_ACK with both UDP paths blocked"
+  wait_log_pattern "${name}" "send: hello_ack_active session=[0-9]+ lane=2 kind=2" 25 "lane=2 reached TCP HELLO_ACK with both UDP paths blocked"
 
   echo "[${name}] restore UDP; both lanes must come back to UDP"
   clear_loss
   wait_ping_ok "${name} post-recovery" 15
-  wait_log_pattern "${name}" "target_recovered .*lane=1" 15 "lane=1 probe target recovered after UDP restore"
-  wait_log_pattern "${name}" "target_recovered .*lane=2" 15 "lane=2 probe target recovered after UDP restore"
+  wait_log_pattern "${name}" "send: ping_up session=[0-9]+ lane=1 kind=1" 15 "lane=1 probe target recovered after UDP restore"
+  wait_log_pattern "${name}" "send: ping_up session=[0-9]+ lane=2 kind=1" 15 "lane=2 probe target recovered after UDP restore"
 
   stop_multipath
   clear_loss
@@ -1649,12 +2122,51 @@ run_fallback_dial_error_case() {
   apply_udp_tunnel_block_path 1 "${PORT_FALLBACK_DIAL_ERROR}"
   apply_tcp_server_reject "${PORT_FALLBACK_DIAL_ERROR}"
 
-  wait_log_pattern "${name}" "fallback_result_err .*lane=1" 15 "client observed fallback_dial_error on lane=1"
+  wait_log_pattern "${name}" "send/dialer: dial err remote=" 15 "client observed fallback_dial_error on lane=1"
   expect_ping_fail_for "${name} no-runnable" 3
 
   echo "[${name}] restore UDP and TCP; lane must come back online"
   clear_loss
   wait_ping_ok "${name} post-recovery" 15
+
+  stop_multipath
+  clear_loss
+  echo "==== ${name} e2e end ===="
+}
+
+run_tcp_established_redial_case() {
+  local name="tcp-established-redial"
+  echo "==== ${name} e2e start ===="
+  clear_loss
+  write_one_lane_config "${name}" "${PORT_TCP_ESTABLISHED_REDIAL}" false false 200 600
+  CURRENT_EXTRA_ENV=(MULTIPATH_DISABLE_BW_PROBE=1)
+  start_multipath "${name}"
+
+  wait_ping_ok "${name} baseline" 12
+
+  echo "[${name}] block UDP; establish TCP fallback first"
+  apply_udp_tunnel_block_path 1 "${PORT_TCP_ESTABLISHED_REDIAL}"
+  wait_ping_ok "${name} tcp-fallback" 20
+  wait_log_pattern "${name}" "send: hello_ack_active session=[0-9]+ lane=1 kind=2" 20 "client established TCP fallback before failure"
+
+  local client_failure_line
+  client_failure_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
+  echo "[${name}] kill server with TCP fallback established; client must mark TCP failed and redial"
+  if [[ -n "${SERVER_PID}" ]]; then
+    kill "${SERVER_PID}" >/dev/null 2>&1 || true
+    wait "${SERVER_PID}" >/dev/null 2>&1 || true
+    SERVER_PID=""
+  fi
+
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "send: tcp_leg_failure conn=" 20 "client observed established TCP leg failure" "${client_failure_line}"
+
+  local client_redial_line
+  client_redial_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
+  echo "[${name}] restart server with UDP still blocked; TCP redial must restore the lane"
+  start_server_process "${name}"
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "send: tcp_dialed session=[0-9]+ lane=1 conn=" 20 "client redialed TCP after established failure" "${client_redial_line}"
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "send: hello_ack_active session=[0-9]+ lane=1 kind=2" 20 "client accepted TCP HELLO_ACK after redial" "${client_redial_line}"
+  wait_ping_ok "${name} post-redial" 20
 
   stop_multipath
   clear_loss
@@ -1682,15 +2194,15 @@ run_weighted_scheduling_case() {
   local lane1_count
   local lane2_count
   local total
-  lane1_count="$(grep -E -c "tun_done session=[0-9]+ packet_id=[0-9]+ lane=1 " "${client_log}" 2>/dev/null || true)"
-  lane2_count="$(grep -E -c "tun_done session=[0-9]+ packet_id=[0-9]+ lane=2 " "${client_log}" 2>/dev/null || true)"
+  lane1_count="$(grep -E -c "schedule_select session=[0-9]+ lane=1 .*frame=type=DATA" "${client_log}" 2>/dev/null || true)"
+  lane2_count="$(grep -E -c "schedule_select session=[0-9]+ lane=2 .*frame=type=DATA" "${client_log}" 2>/dev/null || true)"
   lane1_count="${lane1_count:-0}"
   lane2_count="${lane2_count:-0}"
   total=$((lane1_count + lane2_count))
   echo "[${name}] lane1_count=${lane1_count} lane2_count=${lane2_count} total=${total}"
 
   if (( total < 50 )); then
-    fail "${name}" "client emitted only ${total} tun_done lines; expected >=50 (MULTIPATH_DEBUG must be enabled)"
+    fail "${name}" "client emitted only ${total} DATA schedule_select lines; expected >=50 (MULTIPATH_DEBUG must be enabled)"
   elif awk -v l1="${lane1_count}" -v l2="${lane2_count}" -v w1="${path1_weight}" -v w2="${path2_weight}" 'BEGIN {
         total = l1 + l2;
         if (total == 0) { exit 1 }
@@ -1742,6 +2254,52 @@ run_mtu_case() {
   echo "==== ${name} e2e end ===="
 }
 
+run_mtu_fec_case() {
+  local name="mtu-fec"
+  local payload=1412
+  echo "==== ${name} e2e start ===="
+  clear_loss
+  write_one_lane_config "${name}" "${PORT_MTU_FEC}" false true 200 600
+  CURRENT_EXTRA_ENV=(MULTIPATH_DISABLE_BW_PROBE=1)
+  start_multipath "${name}"
+
+  wait_ping_ok "${name} baseline" 12
+  wait_log_pattern "${name}" "send: hello_ack_active session=[0-9]+ lane=1 kind=2" 20 "TCP shadow leg reached HELLO_ACK"
+
+  local server_repair_line
+  server_repair_line="$(current_log_file_line_count "${CURRENT_SERVER_LOG}")"
+  echo "[${name}] send near-MTU ping (-s ${payload} -M do) over UDP with FEC enabled"
+  if ip netns exec "${NS_C}" ping -c 12 -i 0.05 -W 2 -s "${payload}" -M do "${TUN_C_REMOTE}" >/dev/null 2>&1; then
+    pass "${name}" "near-MTU ping survived UDP transport with FEC"
+  else
+    fail "${name}" "near-MTU ping failed over UDP transport with FEC"
+  fi
+  wait_log_file_any_pattern_while_ping "${name}" "${CURRENT_SERVER_LOG}" 10 "server received near-MTU FEC REPAIR on TCP shadow" "${server_repair_line}" \
+    "recv: frame_in type=REPAIR .*symbol_len=[1-9][0-9]{3} .*leg=\\{tcp" \
+    "recv: frame_in type=REPAIR .*leg=\\{tcp .*symbol_len=[1-9][0-9]{3}"
+
+  echo "[${name}] block UDP and force TCP fallback with FEC still enabled"
+  local client_fallback_line
+  client_fallback_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
+  apply_udp_tunnel_block_path 1 "${PORT_MTU_FEC}"
+  wait_ping_ok "${name} tcp-fallback" 20
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "schedule_select.*lane=1 .*leg=\\{tcp .*frame=type=DATA" 20 "client sent DATA over TCP fallback for FEC MTU path" "${client_fallback_line}"
+
+  echo "[${name}] send near-MTU ping (-s ${payload} -M do) over TCP fallback with FEC enabled"
+  if ip netns exec "${NS_C}" ping -c 8 -i 0.05 -W 2 -s "${payload}" -M do "${TUN_C_REMOTE}" >/dev/null 2>&1; then
+    pass "${name}" "near-MTU ping survived TCP fallback with FEC"
+  else
+    fail "${name}" "near-MTU ping failed over TCP fallback with FEC"
+  fi
+
+  assert_log_file_not_contains "${name}" "${CURRENT_CLIENT_LOG}" "recv: recover_err" "client observed no FEC recovery errors during MTU case"
+  assert_log_file_not_contains "${name}" "${CURRENT_SERVER_LOG}" "recv: recover_err" "server observed no FEC recovery errors during MTU case"
+
+  stop_multipath
+  clear_loss
+  echo "==== ${name} e2e end ===="
+}
+
 build_bin
 setup_netns
 
@@ -1751,18 +2309,27 @@ run_concurrent_fallback_case
 run_legacy_tcp_flag_case
 run_fallback_case
 run_server_restart_reconnect_case
+run_unknown_session_rebootstrap_case
+run_multilane_rebootstrap_case
 run_fallback_dial_error_case
+run_tcp_established_redial_case
 run_leg_selector_case
 run_bandwidth_probe_convergence_case
 run_bandwidth_probe_tcp_reference_case
 run_bandwidth_probe_default_cap_case
+run_bandwidth_probe_disabled_case
 run_nat_case
+run_nat_tcp_fallback_case
 run_fec_comparison
+run_fec_disabled_negotiation_case
 run_fec_tcp_fallback_case
 run_multipath_fec_case
+run_link_status_qos_case
+run_link_status_qos_reverse_case
 run_fec_loaded_latency_case
 run_weighted_scheduling_case
 run_mtu_case
+run_mtu_fec_case
 
 if [[ "${FAIL_COUNT}" -gt 0 ]]; then
   echo "real e2e failed (${FAIL_COUNT} failures)"

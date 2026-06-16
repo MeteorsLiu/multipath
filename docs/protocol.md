@@ -1,7 +1,6 @@
-# Multipath Tunnel Protocol Draft
+# Multipath Tunnel Protocol
 
-This document describes the proposed v2 wire protocol for the multipath
-tunnel refactor.
+This document describes the current v2 wire protocol for the multipath tunnel.
 
 ## Scope
 
@@ -192,6 +191,7 @@ Frame types:
 0x7 CLOSE
 0x8 BW_PROBE
 0x9 BW_PROBE_ACK
+0xa LINK_STATUS
 ```
 
 `session_id` identifies the tunnel. `lane_id` identifies the lane that carries
@@ -209,6 +209,7 @@ should close the transport leg.
 ```text
 bit 0 = TCP fallback supported
 bit 1 = FEC supported
+bit 2 = LINK_STATUS supported
 ```
 
 `fec_profile` is a `uint8`:
@@ -221,7 +222,8 @@ bit 1 = FEC supported
 
 Both peers use the capability intersection returned in HELLO_ACK. If both peers
 support FEC, the negotiated `fec_profile` is the highest profile supported by
-both peers.
+both peers. LINK_STATUS is meaningful only with FEC enabled because its QoS
+evidence comes from DATA/REPAIR group observations.
 
 ## Type 0x1: HELLO
 
@@ -636,11 +638,15 @@ Receiver behavior:
 4. Maintain a per-leg cumulative receive bitmap for the current probe round.
 5. Reply with BW_PROBE_ACK on the same transport leg.
 6. When `train_bytes_remaining = 0`, release the bandwidth-probe gate for the
-   next local train phase.
-7. If the final train frame is lost, release only the bandwidth-probe gate
-   after an idle timeout of `clamp(8*SRTT, 500ms, 10s)`, falling back to the
-   configured probe timeout when SRTT is unavailable. This timeout does not
-   mark the lane or leg down.
+   next local train phase. In the normal case this value is carried by an
+   ordinary payload-bearing BW_PROBE frame as the train byte budget naturally
+   reaches zero. If a train stops before naturally consuming its byte budget,
+   the sender may send a zero-payload BW_PROBE with `train_bytes_remaining = 0`
+   only as a gate-release signal.
+7. If the BW_PROBE frame carrying `train_bytes_remaining = 0` is lost, release
+   only the bandwidth-probe gate after an idle timeout of
+   `clamp(8*SRTT, 500ms, 10s)`, falling back to the configured probe timeout
+   when SRTT is unavailable. This timeout does not mark the lane or leg down.
 
 ## Type 0x9: BW_PROBE_ACK
 
@@ -663,7 +669,9 @@ Sender behavior:
 1. Match `probe_id` to an outstanding bandwidth probe round.
 2. Merge `received` into the round's cumulative ACK bitmap.
 3. Finish the round early when the ACK bitmap covers all expected probe frames;
-   otherwise finish it after the round timeout.
+   otherwise finish it after the ACK timeout. Once ACK-delay SRTT exists, the
+   ACK timeout is `min(4*SRTT, 1s)`. Before any ACK-delay sample exists, use an
+   initial 500ms timeout.
 4. Compute received count and loss for the round.
 5. Feed the sample into per-leg bandwidth EWMA and leg selection policy.
 6. When the lane has enough TCP-vs-UDP evidence to classify the leg quality,
@@ -675,6 +683,38 @@ Receiver behavior:
 1. Validate session and lane.
 2. Drop ACKs that do not match an outstanding local probe round.
 3. Do not emit anything to TUN.
+
+## Type 0xa: LINK_STATUS
+
+LINK_STATUS carries receive-side QoS evidence for one lane transport leg. It is
+not a liveness frame and does not mark a leg up or down.
+
+Body:
+
+```text
+leg_kind      uint8  // 1 = UDP, 2 = TCP
+reason        uint8  // 1 = limited
+delivered_bps uint32
+```
+
+Sender behavior:
+
+1. Send LINK_STATUS only after both peers negotiated FEC and LINK_STATUS.
+2. Send LINK_STATUS only from receive-side QoS evidence derived from DATA and
+   REPAIR observations. Do not synthesize it from local ping timeout, TCP write
+   error, or bandwidth-probe state alone.
+3. Set `leg_kind` to the leg that the receiver judges limited. This can be the
+   DATA leg or the REPAIR shadow leg.
+4. Set `delivered_bps` to the receive-side estimate for the limited leg.
+
+Receiver behavior:
+
+1. Validate session, lane, `leg_kind`, and `reason`.
+2. Apply the status to the matching lane transport leg's selector quality.
+3. Treat the status as time-limited evidence. If no fresh LINK_STATUS arrives,
+   selector quality eventually expires the active QoS status and may probe a
+   return to UDP according to local selector policy.
+4. Do not emit anything to TUN.
 
 ## Lane State Machine
 
@@ -760,6 +800,67 @@ UDP PING continues at low rate so UDP recovery remains observable
 
 When UDP is selected again, DATA and REPAIR return to UDP. The TCP warm leg may
 remain open for low-rate probing or be closed after a drain/cooldown policy.
+
+## Receive-Side QoS Feedback
+
+Receive-side QoS feedback requires FEC because the receiver needs paired DATA
+and REPAIR observations to compare the selected DATA leg with the shadow leg.
+When DATA and REPAIR arrive on the same transport kind, the sample is not
+cross-leg evidence and must not produce a QoS decision.
+
+For each recovered or complete FEC group, the receiver records:
+
+```text
+DATA leg kind
+REPAIR leg kind
+actual DATA bytes delivered by the DATA leg
+FEC-derived expected DATA bytes for the group
+REPAIR bytes delivered by the shadow leg
+group observation duration
+```
+
+The receiver turns those group facts into rate estimates:
+
+```text
+actualRate         = DATA bytes actually delivered / duration
+expectedRate       = DATA bytes expected for the group / duration
+shadowEquivalentRate = REPAIR bytes / duration scaled by the observed group ratio
+```
+
+There are two limited-leg evidence paths:
+
+1. DATA-leg limited: when `actualRate` is materially below `expectedRate` and
+   the shadow leg estimate is materially better than the DATA leg, emit
+   `LINK_STATUS` for the DATA leg.
+2. Shadow-leg limited: when the DATA leg is clean, but
+   `shadowEquivalentRate` is materially below the DATA leg's `actualRate`, emit
+   `LINK_STATUS` for the REPAIR shadow leg.
+
+This makes the feedback stable across a fallback transition:
+
+```text
+Initial:
+  DATA = UDP
+  REPAIR = TCP
+  UDP DATA under-delivers
+  -> receiver sends LINK_STATUS(UDP, limited)
+
+After selector switches DATA to TCP:
+  DATA = TCP
+  REPAIR = UDP
+  TCP DATA is clean
+  UDP shadow remains weak
+  -> receiver continues sending LINK_STATUS(UDP, limited)
+```
+
+Without the shadow-leg path, the UDP limited state would lose fresh evidence as
+soon as DATA moves to TCP, even though UDP is still observable as the REPAIR
+shadow leg.
+
+If the receiver later sees the limited leg perform normally in the DATA role,
+or stops seeing fresh limited evidence, the sender-side selector's QoS status
+expires according to its local time-based policy. LINK_STATUS does not carry an
+explicit clear frame.
 
 ## UDP QoS Bandwidth Probe Design
 
