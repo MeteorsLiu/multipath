@@ -1,6 +1,5 @@
-// Package rtt provides an RFC 6298 SRTT/RTTVAR estimator used by the transport
-// observer (spec 5.4). It is a relocation of the original tunnel/send/rtt with
-// no behavior change.
+// Package rtt provides an RFC 6298 SRTT/RTTVAR estimator used by transport
+// observers.
 package rtt
 
 // Estimator tracks smoothed RTT using the RFC 6298 SRTT/RTTVAR update rule.

@@ -1,168 +1,162 @@
-# V2 Send / Probe / Runtime / Recv Refactor
+# V2 Tunnel Runtime
 
-Spec: `docs/superpowers/specs/2026-06-11-send-lane-recvhandler-refactor-design.md`
-Plan: `docs/superpowers/plans/2026-06-11-send-lane-recvhandler-rewrite-plan.md`
+This directory is the current tunnel runtime implementation. The architecture
+source of truth is `docs/architecture.md`; the wire format source of truth is
+`docs/protocol.md`.
 
-A clean-room implementation of the send/receive refactor in `internal/tunnel/v2/`,
-built strictly to the spec module boundaries rather than ported from the old
-`internal/tunnel/{send,recv}`.
+The former non-v2 `internal/tunnel/send`, `internal/tunnel/recv`,
+`internal/tunnel/runtime`, and `internal/tunnel/probe` packages have been
+removed. New runtime work should stay in the v2 packages below instead of
+reintroducing the old package layout.
 
-`transport.Ref` is the spec 5.2 design name for a concrete transport reference;
-v2 packages alias it locally (`type Ref = transport.LegRef`) so the global
-`internal/transport` package is untouched. There is no public `leg` module — the
-leg concept lives inside lane runtime as primary/shadow transport policy
-(spec 10).
+## Packages
 
-## Module boundaries
-
-```
-session (existing)   HELLO authority: session_id, nonce, open/ack/retry
-        ▲
-        │
-runtime/RecvHandler   the glue (spec 5.6). Owns per-path probe/ping and
-        │             probe/bw instances. Converts protocol <-> semantic and
-        │             drives all output through Send.WriteFrame.
-        ├──────────────► probe/ping   pure ping/pong timing + RTT (no send/protocol)
-        ├──────────────► probe/bw     pure bandwidth probe logic (no send/protocol)
-        ├──────────────► send         thin: encode, schedule, lane send, FEC tx
-        └──────────────► recv         decode, per-lane FEC rx, dedupe, dispatch
+```text
+internal/tunnel/v2/
+├── send/          TUN ingress, lane scheduling, leg lifecycle, FEC tx
+├── recv/          transport ingress, DATA/REPAIR, FEC rx, dedupe, QoS
+├── runtime/       control-frame glue and LINK_STATUS writer
+└── probe/
+    ├── ping/      semantic ping/pong timing and RTT state
+    └── bw/        semantic bandwidth-probe train, ACK, and sample logic
 ```
 
-### send (thin)
+## Module Roles
 
-Per spec 5.2, Send owns only the outbound data path and exposes exactly:
+Send owns the outbound data path. It accepts packets from TUN, selects a
+runnable lane through the schedule strategy, writes DATA on the lane's selected
+primary leg, writes optional FEC REPAIR on the shadow leg, owns TCP dialing and
+redial, starts active ping loops, and starts the private bandwidth-probe
+scheduler.
 
-```go
-func (s *Send) Write(ctx, *packetbuf.Packet) error   // TUN DATA, runs scheduler
-func (s *Send) WriteFrame(ctx, protocol.Frame, Ref)  // any frame, no scheduler
-func (s *Send) WriteTo(ctx, Ref, *packetbuf.Packet)
-func (s *Send) Packets() <-chan transport.Payload
+Recv owns the inbound data path. It decodes transport payloads, handles DATA and
+REPAIR locally, keeps per-lane receive FEC windows, deduplicates emitted packet
+ids per session, emits received or recovered IP packets to TUN, and forwards
+control frames to `runtime.RecvHandler`.
+
+Runtime owns decoded control-frame glue. `RecvHandler` builds HELLO_ACK, PONG,
+BW_PROBE_ACK, and CLOSE replies through `Send.WriteFrame`; routes inbound PONG
+and BW_PROBE_ACK into instances registered in `send.LaneManager`; routes inbound
+LINK_STATUS into the lane QoS input; and owns the passive bandwidth-probe
+receive side. `QoSWriter` converts Recv QoS callbacks into outbound LINK_STATUS
+frames after FEC and LINK_STATUS are negotiated.
+
+Probe packages are semantic state machines. `probe/ping` and `probe/bw` do not
+import Send, Recv, Runtime, Protocol, or Transport. They emit and consume plain
+semantic values through callbacks supplied by their owner.
+
+## Data Flows
+
+TUN packet to transport:
+
+```text
+TUN
+ -> tun.Run
+ -> send.Send.Write
+ -> schedule.Strategy.Pick
+ -> DATA on selected lane primary leg
+ -> optional REPAIR on selected lane shadow leg
+ -> send.Send.Packets
+ -> transport.RunWriter
 ```
 
-Send does **not** import probe/ping or probe/bw and holds no ping/bw state.
-Its internals: lane runtime (unexported), DRR scheduler, packet-id allocator,
-DATA construction, per-lane FEC transmit window, transport output queue.
+Transport DATA/REPAIR to TUN:
 
-**Lane primary/shadow roles.** Each lane carries a `primaryKind` (the carrier
-kind currently acting as primary; initial = UDP). `primaryTransport()` returns
-the DATA leg, `shadowTransport()` the REPAIR leg (the other kind). When only one
-leg is ready both return the *same* leg — DATA and REPAIR share one link, the
-correct single-transport degradation, which the receiver detects on its own (no
-notification). `setPrimary(kind)` is a reserved reversal entry point: it flips
-the role so REPAIR routing reverses with it, but no QoS switching policy,
-LINK_STATUS, or TTL machinery exists this round.
-
-### probe/ping, probe/bw
-
-Pure logic packages. They import neither `send` nor `protocol`, deal only in
-semantic values (`ping.Message`/`ping.Quality`, `bw.Probe`/`bw.Ack`/`bw.Sample`),
-and never encode frames or touch transports. Instances are created with their
-send callbacks already bound.
-
-Verified:
-
-```
-probe/ping multipath imports: NONE
-probe/bw   multipath imports: NONE
-send imports v2/probe:        NONE
+```text
+transport.Run
+ -> recv.Recv.WriteTo(observed leg)
+ -> protocol.Decode
+ -> per-session dedupe and per-lane rx window
+ -> optional FEC recovery
+ -> recv.Recv.Packets
+ -> tun.RunWriter
 ```
 
-### runtime/RecvHandler (the glue)
+Transport control frame:
 
-Implements `recv.Handler`. This is the only component that knows both protocol
-frames and the semantic probe packages. It owns a `map[probeKey]*ping.Ping` and
-`map[probeKey]*bw.BW` keyed by `{session, lane, transport}`, plus the active
-`map[trainID]*bw.BwLoop`. Every probe callback is an adapter that builds a
-protocol frame and calls `Send.WriteFrame`.
+```text
+transport.Run
+ -> recv.Recv.WriteTo(observed leg)
+ -> protocol.Decode
+ -> runtime.RecvHandler
+ -> Session / LaneManager / QoSWriter / Send.WriteFrame
+```
 
-### recv (per-lane receive)
+DATA and REPAIR never reach `recv.Handler`. RecvHandler does not handle DATA or
+REPAIR and does not touch lane or leg internals directly.
 
-`Recv` decodes transport-bound frames, handles DATA and REPAIR locally, and
-dispatches the seven control frame types to a `recv.Handler` (which
-`runtime.RecvHandler` structurally satisfies — verified by
-`var _ recv.Handler = (*RecvHandler)(nil)`). DATA and REPAIR never reach a
-Handler.
+## FEC And QoS
 
-Per session it keeps **per-lane** `rxSLCWindow`s (FEC reconstruction never
-crosses lanes, spec 9.2) and one **session-scoped** emit dedupe over
-`bits-and-blooms/bitset` (spec 8.2); a duplicate DATA is dropped before the
-window and before TUN. The FEC window and dedupe algorithms are reused from the
-old recv, unexported.
+FEC is negotiated through HELLO/HELLO_ACK. Local `Send.EnableFEC()` only exposes
+capability; REPAIR frames are emitted only for sessions whose negotiation
+accepted FEC.
 
-Beside each lane's window sits a reserved **per-lane QoS arrival ledger**
-(`laneArrivalStats`, spec 8.3/8.4): it counts wire arrivals by `{carrier kind ×
-DATA|REPAIR}`. Its intended consumer compares the kind carrying DATA against the
-kind carrying REPAIR — equal means single-transport, so differential detection
-is skipped. This round only writes the ledger; nothing reads it for a decision,
-and it is not exported. recv imports neither send nor the probe packages.
+Each send lane has a lane-local FEC transmit window. DATA selected for lane X
+enters lane X's window, and the resulting REPAIR keeps the same lane id. On the
+receive side, each lane has a separate FEC receive window; reconstruction never
+crosses lanes.
 
-## Data flows (spec 7)
+LINK_STATUS is negotiated only with FEC. Recv's QoS estimator consumes grouped
+DATA/REPAIR observations from the receive FEC window. Same-leg DATA/REPAIR
+samples are ignored because they have no cross-leg evidence. Cross-leg samples
+estimate:
 
-| Flow | Path |
-|------|------|
-| DATA (7.1) | `Send.Write` → reserve id → DRR pick → DATA on lane primary transport → lane FEC txWindow |
-| REPAIR (7.2) | lane txWindow full/flush → FEC encode → REPAIR on owning lane shadow transport (no scheduler) |
-| HELLO (7.3) | `Session.Open` → frame → `Send.WriteFrame`; inbound → `RecvHandler.OnHello` → `sessions.GetOrCreate` → HELLO_ACK via `Send.WriteFrame` |
-| HELLO_ACK (7.3) | inbound → `RecvHandler.OnHelloAck` → `sess.Ack` validates nonce |
-| out PING (7.4) | `RecvHandler.StartPing` → `ping.Ping.Start` → adapter → `Send.WriteFrame(PING)` |
-| in PING (7.4) | `RecvHandler.OnPing` → builds PONG → `Send.WriteFrame(PONG)` |
-| in PONG (7.4) | `RecvHandler.OnPong` → `ping.Message` → lane-path `Ping.Pong` → `ping.Quality` |
-| out BW (7.5) | `RecvHandler.StartBandwidthProbe` → `bw.BW.Start(nil)` → adapter → `Send.WriteFrame(BW_PROBE)`; returns tracked `BwLoop` |
-| in BW (7.5) | `RecvHandler.OnBandwidthProbe` → `bw.Probe` → lane-path `BW.Start(&probe)` → ACK via bound callback → `Send.WriteFrame(BW_PROBE_ACK)` |
-| in BW_ACK (7.5) | `RecvHandler.OnBandwidthProbeAck` → `bw.Ack` → tracked `BwLoop.Ack` → `bw.Sample` |
-| in DATA (8.3) | `Recv.WriteTo` → session dedupe `mark` (dup→drop) → first: account + per-lane `rxWindow.addData` → emit to TUN → recover if a group completes |
-| in REPAIR (8.4) | `Recv.WriteTo` → account + per-lane `rxWindow.addRepair` → if exactly one DATA recoverable: reconstruct → session dedupe → emit (or drop late dup) |
+- actual DATA delivery rate
+- FEC-derived expected DATA rate
+- REPAIR shadow equivalent rate
 
-## FEC (spec 9)
+The estimator can report either the DATA leg as limited or the REPAIR shadow leg
+as limited. Runtime `QoSWriter` sends LINK_STATUS, and Send applies it as
+time-limited per-lane selector evidence through `LaneManager`; this is not a
+global UDP/TCP fallback.
 
-Per-lane transmit window (4+1 SLC, hardcoded). DATA selected for lane X enters
-lane X's `txSLCWindow` only; a full or flushed group produces a REPAIR with
-`LaneID == X`, sent on the lane's shadow transport. REPAIR never calls the
-scheduler. On receive, each lane has its own `rxSLCWindow`; reconstruction never
-crosses lanes, and recovered DATA passes the session-scoped emit dedupe so a late
-original is not double-emitted.
+## Bandwidth Probe
+
+Bandwidth probing is driven by Send's private `bwScheduler`. The scheduler owns
+target ordering, local/remote phase progress, reference selection, and final
+sample consumption. Dynamic bandwidth-probe reference state does not escape into
+Session, Recv, RecvHandler, or exported Send APIs.
+
+Local probing creates a `probe/bw.BwLoop`, registers it in `LaneManager`, sends
+BW_PROBE train packets, waits for BW_PROBE_ACK, and records the final sample.
+Passive receive-side BW_PROBE accounting lives in Runtime's `bw.Receive`, which
+returns BW_PROBE_ACK frames. When inbound BW_PROBE traffic starts or finishes,
+Runtime notifies Send through opaque `LaneManager` callbacks so the scheduler can
+advance without exposing its internals.
 
 ## Files
 
-```
+```text
 internal/tunnel/v2/
-├── README.md
-├── integration_test.go         round-trip data-flow tests (7.3/7.4/7.5)
+├── integration_test.go
 ├── probe/
-│   ├── ping/ping.go            ping/pong timing + RTT (RFC 6298)
-│   └── bw/bw.go                bandwidth probe send/ack/sample
+│   ├── bw/bw.go
+│   └── ping/ping.go
+├── recv/
+│   ├── dedupe.go
+│   ├── qos_estimator.go
+│   ├── recv.go
+│   ├── ref.go
+│   └── rx_window.go
 ├── runtime/
-│   └── recvhandler.go          recv.Handler: owns probes, adapters, dispatch
-├── send/
-│   ├── ref.go                  type Ref = transport.LegRef
-│   ├── config.go               SessionManager / BootstrapLanes
-│   ├── lane.go                 unexported laneRuntime, primary/shadow, FEC txWindow
-│   ├── send.go                 Write / WriteFrame / WriteTo / Packets
-│   └── e2e_test.go             Send→Recv FEC recovery + dedupe
-└── recv/
-    ├── ref.go                  type Ref = transport.LegRef
-    ├── recv.go                 Recv, Handler, per-session state, dispatch
-    ├── rx_window.go            per-lane FEC receive window (unexported)
-    ├── dedupe.go               session-scoped bitset emit dedupe (unexported)
-    └── accounting.go           reserved per-lane QoS arrival ledger
+│   ├── qos.go
+│   └── recvhandler.go
+└── send/
+    ├── bwscheduler.go
+    ├── config.go
+    ├── dialer.go
+    ├── lane.go
+    ├── lanemanager.go
+    ├── leg.go
+    ├── ref.go
+    └── send.go
 ```
 
-## Tests
+## Verification
 
+Use the repository-wide checks after edits:
+
+```bash
+go build ./...
+go test ./...
 ```
-go test ./internal/tunnel/v2/... -race
-ok  .../v2            (HELLO via Session, control routing, PING/PONG and
-                       BW round-trips, Send→Recv FEC recovery)
-ok  .../v2/probe/bw
-ok  .../v2/probe/ping
-ok  .../v2/recv       (per-lane window isolation, dup drop + no-account,
-                       accounting by kind×category, control dispatch)
-ok  .../v2/runtime
-ok  .../v2/send       (primary/shadow roles, single-leg degrade, REPAIR on shadow)
-```
-
-## Out of scope (spec §4)
-
-No public Lane module; lanes are not moved into Session; no QoS thresholds or
-LINK_STATUS; DRR has no token bucket; recv-side rxWindow/dedupe changes are a
-separate migration step.

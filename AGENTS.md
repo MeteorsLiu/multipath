@@ -175,6 +175,59 @@ Test:
 go test ./...
 ```
 
+Remote Live E2E:
+
+Use a real remote Linux deployment for behavior that depends on real tunnel
+traffic, carrier QoS, systemd service state, TCP behavior, live TUN devices,
+bandwidth probing, LINK_STATUS, or UDP/TCP selector decisions. This is different
+from local unit tests and from synthetic namespace tests: it validates the
+program running as the deployed service against real TUN traffic and real
+network shaping.
+
+Do not write remote credentials, passwords, private host details, or temporary
+access tokens into this repository or into `AGENTS.md`. Use user-provided
+credentials only for the current session.
+
+Typical workflow:
+
+1. Push or otherwise publish the local branch that contains the change.
+2. SSH to the user-provided remote Linux host with a login shell so `go`,
+   service tooling, and the user's environment are loaded.
+3. In the remote checkout, fetch the target branch, reset or pull to the exact
+   commit being tested, and build the real binary there.
+4. Restart the deployed service on the remote host. The current live setup has
+   used a systemd unit named `mp`; verify the unit name on the host before
+   restarting it.
+5. Drive traffic through the real tunnel, not through localhost shortcuts.
+   For reverse-direction QoS, use reverse iperf over the TUN address, for
+   example `iperf3 -c <peer-tun-ip> -R`.
+6. Observe the service logs with `journalctl` while traffic and shaping are
+   active. Do not rely only on a single command's exit status.
+
+Useful remote log signals:
+
+- `bw action=scheduler_start`
+- `bw action=sample`
+- `bandwidth_probe_decision`
+- `runtime/qos: link_status_send`
+- `runtime: link_status_apply`
+- `selector action=qos_data_leg`
+- `schedule_select`
+- `qos_state`
+
+For LINK_STATUS QoS validation, verify both directions explicitly: the receiving
+side should emit `runtime/qos: link_status_send ... kind=1 reason=1`, the peer
+should apply `runtime: link_status_apply ... kind=1 reason=1`, and DATA
+selection should move to TCP with `schedule_select ... leg={tcp ... frame=type=DATA`.
+For reverse tests, also confirm the iperf command is actually reverse mode and
+that the limited direction matches the side expected to send LINK_STATUS.
+
+When reporting remote live E2E results, include the tested commit, branch,
+remote service state, traffic command, shaping or QoS condition, relevant log
+snippets, affected lanes, and DATA leg counts where possible. If behavior differs
+from local tests, treat the remote live result as the stronger signal and debug
+from the live logs.
+
 ## Engineering Rules
 
 - Verify repository-specific claims by reading files or running commands.
@@ -191,9 +244,4 @@ go test ./...
   unless the design documents require a real semantic boundary.
 - Remove type aliases and helper wrappers that do not provide ownership,
   semantic separation, or meaningful simplification.
-- After code edits, run `gofmt` and at least `go build ./...`. During the v2
-  migration, if `go build ./...` fails only because old `internal/tunnel/send`
-  still references removed session APIs, do not change Session for old-send
-  compatibility; verify with
-  `go test ./internal/protocol ./internal/session ./internal/tunnel/v2/... -count=1`
-  and report the old-send build gap.
+- After code edits, run `gofmt` and at least `go build ./...`.

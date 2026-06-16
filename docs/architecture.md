@@ -2,8 +2,6 @@
 
 This document describes the current v2 runtime module boundaries for the
 multipath tunnel. The wire format is described in [protocol.md](protocol.md).
-Old packages under `internal/tunnel/send` are retained only for implementation
-comparison during the migration and are not the architecture source of truth.
 
 ## Module Boundaries
 
@@ -27,6 +25,20 @@ module, or shared runtime-data module between Send and Recv. Lane and transport
 leg runtime state are internal to Send. Runtime glue constructs modules
 explicitly, starts loops, and waits for cancellation or errors.
 
+Current tunnel runtime implementation packages live under `internal/tunnel/v2`:
+
+```text
+internal/tunnel/v2/send
+internal/tunnel/v2/recv
+internal/tunnel/v2/runtime
+internal/tunnel/v2/probe/ping
+internal/tunnel/v2/probe/bw
+```
+
+The former non-v2 `internal/tunnel/send`, `internal/tunnel/recv`,
+`internal/tunnel/runtime`, and `internal/tunnel/probe` packages have been
+removed. Do not import or recreate them for compatibility.
+
 ## Construction
 
 The application wires the v2 runtime explicitly:
@@ -49,10 +61,14 @@ if enableFEC {
     sender.EnableFEC()
 }
 
-handler := runtime.NewRecvHandler(sender, sessions)
+qosWriter := runtime.NewQoSWriter(sender)
+handler := runtime.NewRecvHandler(sender, sessions, runtime.Config{
+    QoSWriter: qosWriter,
+})
 receiver := recv.New(recv.Config{
     Handler:        handler,
     SessionManager: sessions,
+    OnQoSStatus:    qosWriter.Write,
 })
 ```
 
@@ -235,11 +251,23 @@ type Handler interface {
     OnClose(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error
     OnBandwidthProbe(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error
     OnBandwidthProbeAck(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error
+    OnQoS(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error
 }
+
+type QoSStatus struct {
+    SessionID    uint64
+    LaneID       uint8
+    Kind         transport.Kind
+    Reason       uint8
+    DeliveredBps uint32
+}
+
+type QoSCallback func(ctx context.Context, status QoSStatus) error
 
 type Config struct {
     Handler        Handler
     SessionManager *session.Manager
+    OnQoSStatus    QoSCallback
 }
 
 func New(configs ...Config) *Recv
@@ -262,10 +290,11 @@ Recv does not pass DATA or REPAIR to Handler.
 Recv only accepts DATA or REPAIR for sessions admitted by the shared Session Manager.
 Unknown-session DATA or REPAIR is dropped.
 Recv owns per-lane receive-side FEC windows and a session-scoped emit dedupe.
-Recv keeps a per-lane QoS arrival ledger beside the receive FEC window. The
-ledger estimates DATA delivery, FEC-derived expected bytes, repair lower-bound
-capacity, and delivered rate; abnormal status is reported through Recv's QoS
-callback.
+Recv keeps a per-lane QoS estimator beside the receive FEC window. The
+estimator consumes complete or recovered DATA/REPAIR group samples, compares
+DATA-leg delivery with FEC-derived expected delivery, estimates shadow-leg
+equivalent rate from REPAIR bytes, and reports abnormal status through Recv's
+QoS callback.
 Recv must not import or call concrete Send.
 ```
 
@@ -285,6 +314,7 @@ package runtime
 type Config struct {
     BWReferenceBps uint64
     BWCapBps       uint64
+    QoSWriter      *QoSWriter
 }
 
 func NewRecvHandler(s *send.Send, sessions *session.Manager, configs ...Config) *RecvHandler
@@ -298,6 +328,9 @@ RecvHandler constructs HELLO_ACK, PONG, BW_PROBE_ACK, and CLOSE replies and writ
 RecvHandler validates HELLO_ACK by calling Session.Ack before any send-side readiness callback can run.
 RecvHandler routes inbound PONG to the send-registered ping instance through LaneManager.
 RecvHandler routes inbound BW_PROBE_ACK to the send-registered BwLoop through LaneManager.
+RecvHandler routes inbound LINK_STATUS into the lane QoS input registered in LaneManager.
+Runtime QoSWriter converts Recv QoS callbacks into outbound LINK_STATUS frames
+after LINK_STATUS has been negotiated for that session and lane.
 RecvHandler does not touch lane/leg internals directly.
 RecvHandler does not handle DATA or REPAIR.
 ```
