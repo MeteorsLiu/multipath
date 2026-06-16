@@ -542,28 +542,47 @@ func (s *Send) startBwSchedulerAtBootstrap() bool {
 	if !s.enableBW {
 		return false
 	}
-	if s.bwCapBps > 0 || s.bwReference > 0 {
-		return true
+	return len(s.bootstrapLanes) == 0
+}
+
+func (s *Send) syncBwSchedulerAfterLegActive(ctx context.Context, sessionID uint64) {
+	if !s.enableBW || s.getBwScheduler() != nil || len(s.bootstrapLanes) == 0 {
+		return
 	}
-	if s.streamTransport == nil {
-		return true
+	if !s.allBootstrapUDPActive(sessionID) {
+		return
 	}
-	for _, lane := range s.bootstrapLanes {
-		if lane.TCPRemote != "" {
+	if s.waitBootstrapTCPForBW() && !s.allBootstrapTCPActive(sessionID) {
+		return
+	}
+	s.startBwScheduler(ctx, sessionID)
+}
+
+func (s *Send) waitBootstrapTCPForBW() bool {
+	if s.bwCapBps > 0 || s.bwReference > 0 || s.streamTransport == nil {
+		return false
+	}
+	for _, bl := range s.bootstrapLanes {
+		if bl.TCPRemote != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Send) allBootstrapUDPActive(sessionID uint64) bool {
+	if len(s.bootstrapLanes) == 0 {
+		return false
+	}
+	s.lanesMu.RLock()
+	defer s.lanesMu.RUnlock()
+	for _, bl := range s.bootstrapLanes {
+		lane := s.lanes[laneKey{sessionID: sessionID, laneID: bl.LaneID}]
+		if lane == nil || !lane.leg.isActive(transport.KindUDP) {
 			return false
 		}
 	}
 	return true
-}
-
-func (s *Send) syncBwSchedulerAfterLegActive(ctx context.Context, sessionID uint64) {
-	if !s.enableBW || s.startBwSchedulerAtBootstrap() {
-		return
-	}
-	if !s.allBootstrapTCPActive(sessionID) {
-		return
-	}
-	s.startBwScheduler(ctx, sessionID)
 }
 
 func (s *Send) allBootstrapTCPActive(sessionID uint64) bool {

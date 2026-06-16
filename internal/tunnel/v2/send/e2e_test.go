@@ -515,11 +515,20 @@ func TestUncappedBandwidthSchedulerWaitsForTCPHelloAck(t *testing.T) {
 		t.Fatal("no active session after bootstrap")
 	}
 
-	hello := waitForHelloOnLeg(t, s, sessionID, 1, transport.KindTCP)
+	hellos := waitForHellos(t, s, sessionID,
+		helloWant{laneID: 1, kind: transport.KindUDP},
+		helloWant{laneID: 1, kind: transport.KindTCP},
+	)
 	if s.getBwScheduler() != nil {
 		t.Fatal("uncapped bandwidth scheduler started before TCP HELLO_ACK")
 	}
-	if !sessionsAckHello(t, sessions, sessionID, hello.Nonce) {
+	if !sessionsAckHello(t, sessions, sessionID, hellos[helloWant{laneID: 1, kind: transport.KindUDP}].Nonce) {
+		t.Fatal("session Ack rejected UDP HELLO_ACK")
+	}
+	if s.getBwScheduler() != nil {
+		t.Fatal("uncapped bandwidth scheduler started before TCP HELLO_ACK")
+	}
+	if !sessionsAckHello(t, sessions, sessionID, hellos[helloWant{laneID: 1, kind: transport.KindTCP}].Nonce) {
 		t.Fatal("session Ack rejected TCP HELLO_ACK")
 	}
 
@@ -559,14 +568,25 @@ func TestUncappedBandwidthSchedulerWaitsForAllTCPHelloAcks(t *testing.T) {
 		t.Fatal("no active session after bootstrap")
 	}
 
-	hellos := waitForHellosOnLeg(t, s, sessionID, transport.KindTCP, 1, 2)
-	if !sessionsAckHello(t, sessions, sessionID, hellos[1].Nonce) {
+	hellos := waitForHellos(t, s, sessionID,
+		helloWant{laneID: 1, kind: transport.KindUDP},
+		helloWant{laneID: 2, kind: transport.KindUDP},
+		helloWant{laneID: 1, kind: transport.KindTCP},
+		helloWant{laneID: 2, kind: transport.KindTCP},
+	)
+	if !sessionsAckHello(t, sessions, sessionID, hellos[helloWant{laneID: 1, kind: transport.KindUDP}].Nonce) {
+		t.Fatal("session Ack rejected lane 1 UDP HELLO_ACK")
+	}
+	if !sessionsAckHello(t, sessions, sessionID, hellos[helloWant{laneID: 2, kind: transport.KindUDP}].Nonce) {
+		t.Fatal("session Ack rejected lane 2 UDP HELLO_ACK")
+	}
+	if !sessionsAckHello(t, sessions, sessionID, hellos[helloWant{laneID: 1, kind: transport.KindTCP}].Nonce) {
 		t.Fatal("session Ack rejected lane 1 TCP HELLO_ACK")
 	}
 	if s.getBwScheduler() != nil {
 		t.Fatal("uncapped bandwidth scheduler started before all TCP HELLO_ACKs")
 	}
-	if !sessionsAckHello(t, sessions, sessionID, hellos[2].Nonce) {
+	if !sessionsAckHello(t, sessions, sessionID, hellos[helloWant{laneID: 2, kind: transport.KindTCP}].Nonce) {
 		t.Fatal("session Ack rejected lane 2 TCP HELLO_ACK")
 	}
 
@@ -586,6 +606,60 @@ func TestUncappedBandwidthSchedulerWaitsForAllTCPHelloAcks(t *testing.T) {
 	for i, w := range want {
 		if targets[i].laneID != w.lane || targets[i].kind != w.kind {
 			t.Fatalf("target[%d] = lane %d kind %d, want lane %d kind %d", i, targets[i].laneID, targets[i].kind, w.lane, w.kind)
+		}
+	}
+}
+
+func TestCappedBandwidthSchedulerWaitsForAllUDPHelloAcks(t *testing.T) {
+	sessions := &sessionpkg.Manager{}
+	s := New(Config{
+		SessionManager:       sessions,
+		EnableBandwidthProbe: true,
+		IsClient:             true,
+		BWCapBps:             200_000_000,
+		BootstrapLanes: []BootstrapLane{
+			{LaneID: 1, Weight: 100, Leg: e2eUDP()},
+			{LaneID: 2, Weight: 100, Leg: e2eUDP()},
+		},
+		ProbeInterval: time.Hour,
+		ProbeTimeout:  time.Hour,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := s.Bootstrap(ctx); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	sessionID, ok := s.activeSession()
+	if !ok {
+		t.Fatal("no active session after bootstrap")
+	}
+
+	hellos := waitForHellos(t, s, sessionID,
+		helloWant{laneID: 1, kind: transport.KindUDP},
+		helloWant{laneID: 2, kind: transport.KindUDP},
+	)
+	if s.getBwScheduler() != nil {
+		t.Fatal("capped bandwidth scheduler started before UDP HELLO_ACKs")
+	}
+	if !sessionsAckHello(t, sessions, sessionID, hellos[helloWant{laneID: 1, kind: transport.KindUDP}].Nonce) {
+		t.Fatal("session Ack rejected lane 1 UDP HELLO_ACK")
+	}
+	if s.getBwScheduler() != nil {
+		t.Fatal("capped bandwidth scheduler started before all UDP HELLO_ACKs")
+	}
+	if !sessionsAckHello(t, sessions, sessionID, hellos[helloWant{laneID: 2, kind: transport.KindUDP}].Nonce) {
+		t.Fatal("session Ack rejected lane 2 UDP HELLO_ACK")
+	}
+
+	targets := waitForBwTargets(t, waitForBwScheduler(t, s))
+	want := []uint8{1, 2}
+	if len(targets) != len(want) {
+		t.Fatalf("bandwidth scheduler targets = %d, want %d: %#v", len(targets), len(want), targets)
+	}
+	for i, laneID := range want {
+		if targets[i].laneID != laneID || targets[i].kind != transport.KindUDP {
+			t.Fatalf("target[%d] = lane %d kind %d, want lane %d UDP", i, targets[i].laneID, targets[i].kind, laneID)
 		}
 	}
 }
@@ -748,6 +822,43 @@ func waitForHellosOnLeg(t *testing.T, s *Send, sessionID uint64, kind transport.
 		}
 	}
 	t.Fatalf("timed out waiting for HELLO frames on leg kind %d, got lanes %#v want %#v", kind, got, want)
+	return nil
+}
+
+type helloWant struct {
+	laneID uint8
+	kind   transport.Kind
+}
+
+func waitForHellos(t *testing.T, s *Send, sessionID uint64, wants ...helloWant) map[helloWant]protocol.HelloBody {
+	t.Helper()
+	wantSet := make(map[helloWant]struct{}, len(wants))
+	for _, want := range wants {
+		wantSet[want] = struct{}{}
+	}
+	got := make(map[helloWant]protocol.HelloBody, len(wants))
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case payload := <-s.Packets():
+			f, err := protocol.Decode(payload.Packet.Payload)
+			legKind := payload.Leg.Kind
+			payload.Packet.Release()
+			if err != nil || f.Type != protocol.TypeHELLO || f.SessionID != sessionID {
+				continue
+			}
+			key := helloWant{laneID: f.LaneID, kind: legKind}
+			if _, ok := wantSet[key]; ok {
+				got[key] = f.Body.(protocol.HelloBody)
+				if len(got) == len(wantSet) {
+					return got
+				}
+			}
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	t.Fatalf("timed out waiting for HELLO frames, got %#v want %#v", got, wantSet)
 	return nil
 }
 
