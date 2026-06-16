@@ -320,6 +320,38 @@ func TestQoSEstimatorRequiresShadowAdvantage(t *testing.T) {
 	}
 }
 
+func TestQoSEstimatorInfersShadowLegLimited(t *testing.T) {
+	now := time.Unix(0, 0)
+	var got []qosStatus
+	e := newQoSEstimator(qosConfig{SampleFloor: 1, Sustain: time.Second}, func(status qosStatus) {
+		got = append(got, status)
+	})
+
+	for i := 0; i < 2; i++ {
+		e.Observe(qosSample{
+			At:           now.Add(time.Duration(i) * 2 * time.Second),
+			Duration:     time.Second,
+			DataKind:     transport.KindTCP,
+			RepairKind:   transport.KindUDP,
+			DataArrived:  4,
+			DataExpected: 4,
+			DataBytes:    4 * 1200,
+			RepairBytes:  300,
+		})
+	}
+
+	if len(got) != 1 {
+		t.Fatalf("statuses = %+v, want one", got)
+	}
+	if got[0].Kind != transport.KindUDP || got[0].Reason != protocol.LinkStatusReasonLimited {
+		t.Fatalf("status = %+v, want UDP limited from weak shadow leg", got[0])
+	}
+	want := uint32(300 * 4 * 8)
+	if got[0].DeliveredBps != want {
+		t.Fatalf("DeliveredBps = %d, want shadow equivalent rate %d", got[0].DeliveredBps, want)
+	}
+}
+
 func TestQoSEstimatorClearsWhenShadowAdvantageDisappears(t *testing.T) {
 	now := time.Unix(0, 0)
 	var got []qosStatus

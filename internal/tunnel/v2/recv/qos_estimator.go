@@ -159,6 +159,12 @@ func (e *qosEstimator) evaluate(sample qosEstimate) []qosStatus {
 			out = append(out, status)
 		}
 	}
+	if status, ok := e.evaluateShadowLimited(sample, now); ok {
+		if e.shouldEmit(status.Kind, status.Reason, now) {
+			e.recordEvent("limited_active", status.Kind, status.Reason)
+			out = append(out, status)
+		}
+	}
 	out = append(out, e.refreshActive(now)...)
 	return out
 }
@@ -196,6 +202,31 @@ func (e *qosEstimator) evaluateLimited(sample qosEstimate, now time.Time) (qosSt
 		Kind:         sample.DataKind,
 		Reason:       protocol.LinkStatusReasonLimited,
 		DeliveredBps: sample.DeliveredBps,
+	}
+	e.setActive(status, now)
+	return status, true
+}
+
+func (e *qosEstimator) evaluateShadowLimited(sample qosEstimate, now time.Time) (qosStatus, bool) {
+	if sample.SampleTotal == 0 || sample.RateGapRatio >= qosRateGapExit || sample.ShadowBps == 0 {
+		delete(e.limitedSince, sample.RepairKind)
+		return qosStatus{}, false
+	}
+	if sample.shadowDeficitRatio() <= qosRateGapEnter {
+		delete(e.limitedSince, sample.RepairKind)
+		return qosStatus{}, false
+	}
+	ready, first := e.sustained(e.limitedSince, sample.RepairKind, now)
+	if !ready {
+		if first {
+			e.recordEvent("limited_pending", sample.RepairKind, protocol.LinkStatusReasonLimited)
+		}
+		return qosStatus{}, false
+	}
+	status := qosStatus{
+		Kind:         sample.RepairKind,
+		Reason:       protocol.LinkStatusReasonLimited,
+		DeliveredBps: sample.ShadowBps,
 	}
 	e.setActive(status, now)
 	return status, true
@@ -353,6 +384,13 @@ func (s qosEstimate) hasShadowAdvantage(ratio float64) bool {
 		return true
 	}
 	return float64(s.ShadowBps) > float64(s.ActualBps)*ratio
+}
+
+func (s qosEstimate) shadowDeficitRatio() float64 {
+	if s.ActualBps == 0 || s.ShadowBps >= s.ActualBps {
+		return 0
+	}
+	return (float64(s.ActualBps) - float64(s.ShadowBps)) / float64(s.ActualBps)
 }
 
 func shadowBetaFactor(sample qosSample) (float64, bool) {
