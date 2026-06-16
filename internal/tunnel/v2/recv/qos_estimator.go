@@ -112,6 +112,9 @@ func (e *qosEstimator) Observe(sample qosSample) {
 	if !qosKnownKind(sample.DataKind) {
 		return
 	}
+	if !qosKnownKind(sample.RepairKind) || sample.DataKind == sample.RepairKind {
+		return
+	}
 	estimate, ok := e.updateEstimate(sample)
 	if !ok {
 		return

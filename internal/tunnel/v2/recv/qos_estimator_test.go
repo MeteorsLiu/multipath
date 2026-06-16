@@ -27,6 +27,32 @@ func TestQoSEstimatorStaysSilentBelowSampleFloor(t *testing.T) {
 	}
 }
 
+func TestQoSEstimatorIgnoresSameKindSamples(t *testing.T) {
+	now := time.Unix(0, 0)
+	var got []qosStatus
+	e := newQoSEstimator(qosConfig{SampleFloor: 1, Sustain: time.Second}, func(status qosStatus) {
+		got = append(got, status)
+	})
+
+	for i := 0; i < 2; i++ {
+		e.Observe(qosSample{
+			At:             now.Add(time.Duration(i) * 2 * time.Second),
+			Duration:       time.Second,
+			DataKind:       transport.KindTCP,
+			RepairKind:     transport.KindTCP,
+			DataArrived:    1,
+			DataExpected:   4,
+			DataBytes:      1200,
+			RecoveredBytes: 3 * 1200,
+			RepairBytes:    1200,
+		})
+	}
+
+	if len(got) != 0 {
+		t.Fatalf("statuses = %+v, want none for same-kind DATA/REPAIR samples", got)
+	}
+}
+
 func TestQoSEstimatorInfersRateGapFromDifferentialSample(t *testing.T) {
 	now := time.Unix(0, 0)
 	var got []qosStatus
