@@ -385,7 +385,6 @@ func TestOutboundBandwidthProbeAckRoutesToLoop(t *testing.T) {
 		ReferenceBps: 1_000_000,
 		CapBps:       16_000_000, // single step at cap → train ends after one step
 		StepWindow:   40 * time.Millisecond,
-		AckGrace:     500 * time.Millisecond,
 		SendProbe: func(p bw.Probe) error {
 			return s.WriteFrame(ctx, protocol.Frame{
 				Version:   protocol.Version,

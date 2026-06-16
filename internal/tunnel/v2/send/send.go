@@ -1309,7 +1309,7 @@ func (s *Send) startBwScheduler(ctx context.Context, sessionID uint64) {
 					SessionID: sessionID,
 					LaneID:    t.laneID,
 					Body: protocol.BandwidthProbeBody{
-						TrainID:             p.ID,
+						TrainID:             p.TrainID,
 						ProbeID:             p.ID,
 						Seq:                 p.Seq,
 						Count:               p.Count,

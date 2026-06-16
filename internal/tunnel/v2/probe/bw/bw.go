@@ -3,10 +3,11 @@ package bw
 import (
 	"context"
 	"errors"
-	"math/bits"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/bits-and-blooms/bitset"
 	"golang.org/x/time/rate"
 )
 
@@ -18,9 +19,10 @@ var (
 // Probe is the semantic bandwidth probe value sent in one probe packet. It does
 // not reference protocol frames or transport identifiers (零身份).
 type Probe struct {
-	ID        uint64 // unique probe train ID
-	Seq       uint16 // sequence number within train
-	Count     uint16 // total packets in train
+	TrainID   uint64 // unique probe train ID
+	ID        uint64 // unique probe round/window ID
+	Seq       uint16 // sequence number within probe round/window
+	Count     uint16 // total packets in probe round/window
 	SendMS    uint64 // send timestamp
 	Total     uint64 // total bytes in train
 	Remaining uint64 // bytes remaining after this packet
@@ -29,7 +31,7 @@ type Probe struct {
 
 // Ack is the semantic acknowledgment value sent after receiving probe packets.
 type Ack struct {
-	ID        uint64 // probe train ID being acknowledged
+	ID        uint64 // probe round/window ID being acknowledged
 	Count     uint16 // total packets in train
 	Received  uint64 // bitmap of received packets
 	FirstRXMS uint64 // timestamp of first received packet
@@ -51,12 +53,11 @@ type Config struct {
 	CapBps       uint64            // hard cap; when >0 the train never exceeds it
 	SendProbe    func(Probe) error // callback to send a probe packet
 	SendAck      func(Ack) error   // callback to send an ack (passive side; optional)
-	OnSample     func(Sample)      // callback when the train's final sample is ready
+	OnSample     func(Sample)      // callback when the completed train's sample is ready
 
 	// Rate adaptation tuning. Zero values fall back to package defaults.
 	MinRateBps uint64        // starting/floor rate
 	StepWindow time.Duration // per-step send window
-	AckGrace   time.Duration // how long to wait for a step's acks before scoring it
 
 	// Payload sizing (spec: UDP randomizes 1200-1400; TCP fixes 32KB). The bw
 	// package stays zero-identity: it only sees these raw byte bounds, not the
@@ -79,7 +80,8 @@ type Config struct {
 const (
 	defaultMinRateBps = uint64(16_000_000)
 	defaultStepWindow = 200 * time.Millisecond
-	defaultAckGrace   = 100 * time.Millisecond
+	defaultAckInitial = 500 * time.Millisecond
+	defaultAckMax     = time.Second
 	additiveStepBps   = uint64(10_000_000)
 	plateauGrowth     = 1.05
 	plateauSteps      = 2
@@ -91,6 +93,8 @@ const (
 )
 
 var trainWindow = 2 * time.Second
+
+const receiveRoundKeepalive = 2 * time.Second
 
 // nextRate returns the next probing rate given the current rate, an optional
 // hard cap, and whether growth has stalled (plateau). Pure function (spec 5.8:
@@ -232,7 +236,7 @@ type BW struct {
 	capBps       uint64
 	minRateBps   uint64
 	stepWindow   time.Duration
-	ackGrace     time.Duration
+	ackMax       time.Duration
 	payloadMin   int
 	payloadMax   int
 	rateLimit    bool
@@ -240,8 +244,17 @@ type BW struct {
 	onSample     func(Sample)
 
 	mu          sync.Mutex
-	nextTrainID uint64
 	activeLoops map[uint64]*BwLoop
+}
+
+var bwIDSource atomic.Uint64
+
+func nextID() uint64 {
+	id := bwIDSource.Add(1)
+	if id == 0 {
+		return bwIDSource.Add(1)
+	}
+	return id
 }
 
 // New creates a BW active-side factory with the given configuration.
@@ -253,10 +266,6 @@ func New(cfg Config) *BW {
 	stepWindow := cfg.StepWindow
 	if stepWindow <= 0 {
 		stepWindow = defaultStepWindow
-	}
-	ackGrace := cfg.AckGrace
-	if ackGrace <= 0 {
-		ackGrace = defaultAckGrace
 	}
 	payloadMin := cfg.PayloadMin
 	if payloadMin <= 0 {
@@ -271,7 +280,7 @@ func New(cfg Config) *BW {
 		capBps:       cfg.CapBps,
 		minRateBps:   minRate,
 		stepWindow:   stepWindow,
-		ackGrace:     ackGrace,
+		ackMax:       defaultAckMax,
 		payloadMin:   payloadMin,
 		payloadMax:   payloadMax,
 		rateLimit:    cfg.RateLimit,
@@ -301,28 +310,26 @@ func payloadSize(min, max int, trainID uint64, seq uint16) int {
 // Start begins a new active probe train and returns its BwLoop. The loop runs
 // rate-adaptive steps in a background goroutine; inbound acks are fed via
 // BwLoop.Ack. When the train finishes (plateau/cap/budget/ctx) it emits the
-// final Sample through OnSample and removes itself from the active set.
+// completed train Sample through OnSample and removes itself from the active set.
 func (b *BW) Start(ctx context.Context) (*BwLoop, error) {
 	if b.sendProbe == nil {
 		return nil, errors.New("bw: no send probe callback configured")
 	}
 
-	b.mu.Lock()
-	trainID := b.nextTrainID
-	b.nextTrainID++
-	b.mu.Unlock()
+	trainID := nextID()
 
 	loop := &BwLoop{
-		bw:            b,
-		trainID:       trainID,
-		capBps:        b.capBps,
-		referenceBps:  b.referenceBps,
-		minRateBps:    b.minRateBps,
-		stepWindow:    b.stepWindow,
-		ackGrace:      b.ackGrace,
-		payloadMin:    b.payloadMin,
-		payloadMax:    b.payloadMax,
-		bytesPerProbe: (b.payloadMin + b.payloadMax) / 2, // average, for frame-count sizing
+		bw:                b,
+		trainID:           trainID,
+		capBps:            b.capBps,
+		referenceBps:      b.referenceBps,
+		minRateBps:        b.minRateBps,
+		stepWindow:        b.stepWindow,
+		ackInitialTimeout: defaultAckInitial,
+		ackTimeoutMax:     b.ackMax,
+		payloadMin:        b.payloadMin,
+		payloadMax:        b.payloadMax,
+		bytesPerProbe:     (b.payloadMin + b.payloadMax) / 2, // average, for frame-count sizing
 	}
 	if b.rateLimit {
 		// Limiter is sized per step in sendStep; start with the floor rate.
@@ -342,37 +349,43 @@ func (b *BW) Start(ctx context.Context) (*BwLoop, error) {
 // budget is spent, then emits a single Sample (best step bandwidth + aggregate
 // loss). Inbound acks are fed asynchronously via Ack.
 type BwLoop struct {
-	bw           *BW
-	trainID      uint64
-	capBps       uint64
-	referenceBps uint64
-	minRateBps   uint64
-	stepWindow   time.Duration
-	ackGrace     time.Duration
-	payloadMin   int
-	payloadMax   int
-	limiter      *rate.Limiter // nil when rate limiting is off
+	bw                *BW
+	trainID           uint64
+	capBps            uint64
+	referenceBps      uint64
+	minRateBps        uint64
+	stepWindow        time.Duration
+	ackInitialTimeout time.Duration
+	ackTimeoutMax     time.Duration
+	payloadMin        int
+	payloadMax        int
+	limiter           *rate.Limiter // nil when rate limiting is off
 
 	bytesPerProbe int
 
 	mu          sync.Mutex
 	count       uint16 // frames in the current step (last step's count for tests)
 	curStep     *stepState
+	stepsByID   map[uint64]*stepState
 	stepBps     []uint64
 	sentFrames  uint64
 	ackedFrames uint64
+	ackSRTT     time.Duration
 	done        bool
 }
 
 // stepState tracks one step's send/ack accounting.
 type stepState struct {
 	rateBps   uint64
+	probeID   uint64
 	count     uint16
 	sent      uint16
-	received  uint64
+	acked     *bitset.BitSet
+	sentSet   *bitset.BitSet
 	firstRXMS uint64
 	lastRXMS  uint64
-	bytesEach int
+	bytes     []int
+	sentAt    []time.Time
 	ackCh     chan struct{}
 	ackClosed bool
 }
@@ -390,7 +403,7 @@ func (l *BwLoop) Count() uint16 {
 }
 
 // run drives the rate-adaptive step loop until plateau/cap/budget/ctx, then
-// emits the final Sample.
+// emits the completed train Sample.
 func (l *BwLoop) run(ctx context.Context) {
 	defer l.cleanup()
 
@@ -401,7 +414,7 @@ func (l *BwLoop) run(ctx context.Context) {
 	deadline := time.Now().Add(window)
 	bestBps := uint64(0)
 
-	for remaining > 0 && time.Now().Before(deadline) {
+	for remaining > 0 && !l.isDone() && time.Now().Before(deadline) {
 		if ctx.Err() != nil {
 			return
 		}
@@ -409,10 +422,12 @@ func (l *BwLoop) run(ctx context.Context) {
 		count := stepFrameCount(effRate, l.stepWindow, l.bytesPerProbe)
 
 		step := l.beginStep(effRate, count)
-		l.sendStep(ctx, step, trainTotal, &remaining)
+		stepDeadline := time.Now().Add(l.stepWindow + l.ackTimeout())
+		if stepDeadline.After(deadline) {
+			stepDeadline = deadline
+		}
+		l.sendStep(ctx, step, trainTotal, &remaining, stepDeadline)
 
-		// Wait for this step's acks (or grace timeout) before scoring it.
-		l.waitStep(ctx, step)
 		stepBps := l.scoreStep(step)
 		l.mu.Lock()
 		l.stepBps = append(l.stepBps, stepBps)
@@ -429,7 +444,7 @@ func (l *BwLoop) run(ctx context.Context) {
 	}
 
 	if remaining > 0 {
-		l.sendComplete(ctx, trainTotal)
+		l.sendRemainingZero(ctx, trainTotal)
 	}
 	l.emitSample()
 }
@@ -441,19 +456,47 @@ func capReached(measuredBps, capBps uint64) bool {
 	return measuredBps >= capBps*capReachedNum/capReachedDen
 }
 
-func (l *BwLoop) sendComplete(ctx context.Context, trainTotal uint64) {
+func (l *BwLoop) sendRemainingZero(ctx context.Context, trainTotal uint64) {
 	if ctx.Err() != nil || l.isDone() || l.bw == nil || l.bw.sendProbe == nil {
 		return
 	}
-	_ = l.bw.sendProbe(Probe{
-		ID:        l.trainID,
-		Seq:       0,
-		Count:     1,
-		SendMS:    uint64(time.Now().UnixMilli()),
-		Total:     trainTotal,
-		Remaining: 0,
-		Bytes:     0,
-	})
+	step := l.beginStep(0, 1)
+
+	retryFor := 2 * l.ackTimeout()
+	if retryFor <= 0 {
+		retryFor = 2 * time.Millisecond
+	}
+	stepDeadline := time.Now().Add(retryFor)
+	for ctx.Err() == nil && !l.isDone() && !time.Now().After(stepDeadline) {
+		if l.stepComplete(step) {
+			break
+		}
+		sendAt := time.Now()
+		l.mu.Lock()
+		if len(step.sentAt) > 0 {
+			step.sentAt[0] = sendAt
+		}
+		l.mu.Unlock()
+		if err := l.bw.sendProbe(Probe{
+			TrainID:   l.trainID,
+			ID:        step.probeID,
+			Seq:       0,
+			Count:     1,
+			SendMS:    uint64(sendAt.UnixMilli()),
+			Total:     trainTotal,
+			Remaining: 0,
+			Bytes:     0,
+		}); err != nil {
+			break
+		}
+		if l.waitStep(ctx, step, l.retryWait(time.Until(stepDeadline))) {
+			break
+		}
+	}
+
+	l.mu.Lock()
+	delete(l.stepsByID, step.probeID)
+	l.mu.Unlock()
 }
 
 func (l *BwLoop) isDone() bool {
@@ -466,46 +509,70 @@ func (l *BwLoop) isDone() bool {
 func (l *BwLoop) stepLoss(step *stepState) float64 {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	acked := uint64(bits.OnesCount64(step.received))
-	return aggregateLoss(uint64(step.sent), acked)
+	acked := uint64(0)
+	if step.acked != nil {
+		acked = uint64(step.acked.Count())
+	}
+	return aggregateLoss(uint64(step.count), acked)
 }
 
 // beginStep installs a fresh step as the current one.
 func (l *BwLoop) beginStep(rateBps uint64, count uint16) *stepState {
+	if count == 0 {
+		count = 1
+	}
+	probeID := nextID()
 	step := &stepState{
-		rateBps:   rateBps,
-		count:     count,
-		bytesEach: l.bytesPerProbe,
-		ackCh:     make(chan struct{}),
+		rateBps: rateBps,
+		probeID: probeID,
+		count:   count,
+		acked:   bitset.New(uint(count)),
+		sentSet: bitset.New(uint(count)),
+		bytes:   make([]int, count),
+		sentAt:  make([]time.Time, count),
+		ackCh:   make(chan struct{}),
 	}
 	l.mu.Lock()
+	if l.stepsByID == nil {
+		l.stepsByID = make(map[uint64]*stepState)
+	}
 	l.curStep = step
+	l.stepsByID[probeID] = step
 	l.count = count
 	l.mu.Unlock()
 	return step
 }
 
 // sendStep emits the step's probe frames, spread across the step window, and
-// returns the number of bytes sent. Each frame carries decreasing Remaining so
-// the peer can detect train end (Remaining==0 on the final frame). Per-probe
-// payload sizes are randomized in [payloadMin,payloadMax] (spec: UDP 1200-1400);
-// when a limiter is set, sends are token-bucket paced to the step rate.
-func (l *BwLoop) sendStep(ctx context.Context, step *stepState, trainTotal uint64, remaining *uint64) uint64 {
+// returns the number of unique bytes scheduled. A step is an ACK window: missing
+// seqs are retransmitted until the step is fully ACKed or the step deadline
+// expires. Each new seq consumes train Remaining exactly once; retransmits reuse
+// the same Remaining value for that seq.
+func (l *BwLoop) sendStep(ctx context.Context, step *stepState, trainTotal uint64, remaining *uint64, deadline time.Time) uint64 {
 	if remaining == nil || *remaining == 0 {
 		return 0
 	}
-	sizes := make([]int, 0, step.count)
 	stepRemaining := *remaining
 	for seq := uint16(0); seq < step.count && stepRemaining > 0; seq++ {
-		bytes := payloadSize(l.payloadMin, l.payloadMax, l.trainID, seq)
+		bytes := payloadSize(l.payloadMin, l.payloadMax, step.probeID, seq)
 		if uint64(bytes) > stepRemaining {
 			bytes = int(stepRemaining)
 		}
-		sizes = append(sizes, bytes)
+		step.bytes[seq] = bytes
 		stepRemaining -= uint64(bytes)
 	}
 	l.mu.Lock()
-	step.count = uint16(len(sizes))
+	actualCount := uint16(0)
+	for actualCount < step.count && step.bytes[actualCount] > 0 {
+		actualCount++
+	}
+	step.count = actualCount
+	if int(step.count) < len(step.bytes) {
+		step.bytes = step.bytes[:step.count]
+		step.sentAt = step.sentAt[:step.count]
+	}
+	step.acked = bitset.New(uint(step.count))
+	step.sentSet = bitset.New(uint(step.count))
 	l.count = step.count
 	l.mu.Unlock()
 	if step.count == 0 {
@@ -529,70 +596,172 @@ func (l *BwLoop) sendStep(ctx context.Context, step *stepState, trainTotal uint6
 		defer ticker.Stop()
 	}
 
-	var sentBytes uint64
+	var uniqueBytes uint64
+	remainingBySeq := make([]uint64, step.count)
+	remainingAssigned := make([]bool, step.count)
 
-	for seq, bytes := range sizes {
-		if *remaining == 0 {
-			return sentBytes
-		}
-
-		// Pace with the limiter when enabled (token-bucket on bytes).
-		if l.limiter != nil {
-			if err := l.limiter.WaitN(ctx, bytes); err != nil {
-				return sentBytes
+	for ctx.Err() == nil && !l.isDone() && time.Now().Before(deadline) {
+		sentAny := false
+		for seq, bytes := range step.bytes {
+			if l.isDone() {
+				return uniqueBytes
 			}
-		}
+			if l.stepSeqAcked(step, uint(seq)) {
+				continue
+			}
+			sentAny = true
 
-		nowMS := uint64(time.Now().UnixMilli())
-		*remaining -= uint64(bytes)
-		probe := Probe{
-			ID:        l.trainID,
-			Seq:       uint16(seq),
-			Count:     step.count,
-			SendMS:    nowMS,
-			Total:     trainTotal,
-			Remaining: *remaining,
-			Bytes:     bytes,
-		}
+			// Pace with the limiter when enabled (token-bucket on bytes).
+			if l.limiter != nil {
+				if err := l.limiter.WaitN(ctx, bytes); err != nil {
+					return uniqueBytes
+				}
+			}
 
-		l.mu.Lock()
-		step.sent++
-		l.sentFrames++
-		l.mu.Unlock()
+			if !remainingAssigned[seq] {
+				if *remaining == 0 {
+					return uniqueBytes
+				}
+				if uint64(bytes) > *remaining {
+					bytes = int(*remaining)
+					step.bytes[seq] = bytes
+				}
+				*remaining -= uint64(bytes)
+				remainingBySeq[seq] = *remaining
+				remainingAssigned[seq] = true
+				uniqueBytes += uint64(bytes)
+			}
 
-		if err := l.bw.sendProbe(probe); err != nil {
-			return sentBytes
-		}
-		sentBytes += uint64(bytes)
+			sendAt := time.Now()
+			probe := Probe{
+				TrainID:   l.trainID,
+				ID:        step.probeID,
+				Seq:       uint16(seq),
+				Count:     step.count,
+				SendMS:    uint64(sendAt.UnixMilli()),
+				Total:     trainTotal,
+				Remaining: remainingBySeq[seq],
+				Bytes:     bytes,
+			}
 
-		if l.limiter != nil {
-			// The limiter already paced this send; no extra wait.
+			l.mu.Lock()
+			if seq < len(step.sentAt) {
+				step.sentAt[seq] = sendAt
+			}
+			if !step.sentSet.Test(uint(seq)) {
+				step.sent++
+				step.sentSet.Set(uint(seq))
+				l.sentFrames++
+			}
+			l.mu.Unlock()
+
+			if err := l.bw.sendProbe(probe); err != nil {
+				return uniqueBytes
+			}
+			if l.isDone() {
+				return uniqueBytes
+			}
+
+			if l.limiter != nil {
+				select {
+				case <-ctx.Done():
+					return uniqueBytes
+				default:
+				}
+				continue
+			}
 			select {
 			case <-ctx.Done():
-				return sentBytes
-			default:
+				return uniqueBytes
+			case <-ticker.C:
 			}
-			continue
 		}
-		select {
-		case <-ctx.Done():
-			return sentBytes
-		case <-ticker.C:
+		if !sentAny || l.waitStep(ctx, step, l.retryWait(time.Until(deadline))) {
+			return uniqueBytes
 		}
 	}
-	return sentBytes
+	return uniqueBytes
 }
 
-// waitStep blocks until the current step's acks complete or the grace period
-// elapses.
-func (l *BwLoop) waitStep(ctx context.Context, step *stepState) {
-	timer := time.NewTimer(l.ackGrace)
+func (l *BwLoop) waitStep(ctx context.Context, step *stepState, maxWait time.Duration) bool {
+	if maxWait <= 0 {
+		return false
+	}
+	if timeout := l.ackTimeout(); maxWait > timeout {
+		maxWait = timeout
+	}
+	timer := time.NewTimer(maxWait)
 	defer timer.Stop()
 	select {
 	case <-step.ackCh:
+		return true
 	case <-timer.C:
+		return false
 	case <-ctx.Done():
+		return false
 	}
+}
+
+func (l *BwLoop) retryWait(remaining time.Duration) time.Duration {
+	if remaining <= 0 {
+		return 0
+	}
+	wait := l.ackTimeout() / 2
+	if wait <= 0 {
+		wait = time.Millisecond
+	}
+	if wait > remaining {
+		return remaining
+	}
+	return wait
+}
+
+func (l *BwLoop) ackTimeout() time.Duration {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.ackTimeoutLocked()
+}
+
+func (l *BwLoop) ackTimeoutLocked() time.Duration {
+	maxTimeout := l.ackTimeoutMax
+	if maxTimeout <= 0 {
+		maxTimeout = defaultAckMax
+	}
+	if l.ackSRTT <= 0 {
+		initial := l.ackInitialTimeout
+		if initial <= 0 {
+			initial = defaultAckInitial
+		}
+		if initial > maxTimeout {
+			return maxTimeout
+		}
+		return initial
+	}
+	timeout := 4 * l.ackSRTT
+	if timeout > maxTimeout {
+		return maxTimeout
+	}
+	return timeout
+}
+
+func (l *BwLoop) observeAckDelay(delay time.Duration) {
+	if delay <= 0 {
+		return
+	}
+	l.mu.Lock()
+	l.observeAckDelayLocked(delay)
+	l.mu.Unlock()
+}
+
+func (l *BwLoop) observeAckDelayLocked(delay time.Duration) {
+	if delay <= 0 {
+		return
+	}
+	if l.ackSRTT <= 0 {
+		l.ackSRTT = delay
+		return
+	}
+	l.ackSRTT += (delay - l.ackSRTT) / 8
 }
 
 // scoreStep computes the bandwidth observed during a step and folds its acked
@@ -600,25 +769,41 @@ func (l *BwLoop) waitStep(ctx context.Context, step *stepState) {
 func (l *BwLoop) scoreStep(step *stepState) uint64 {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	acked := bits.OnesCount64(step.received)
+	if step != nil {
+		delete(l.stepsByID, step.probeID)
+	}
+	acked := 0
+	if step.acked != nil {
+		acked = int(step.acked.Count())
+	}
 	l.ackedFrames += uint64(acked)
-	receivedBytes := uint64(acked) * uint64(step.bytesEach)
+	receivedBytes := uint64(0)
+	for seq, bytes := range step.bytes {
+		if step.acked != nil && step.acked.Test(uint(seq)) {
+			receivedBytes += uint64(bytes)
+		}
+	}
 	return bandwidthBps(receivedBytes, step.firstRXMS, step.lastRXMS)
 }
 
 // Ack folds an inbound acknowledgment into the current step. When the step's
 // received set is complete it signals the run loop to score and advance.
 func (l *BwLoop) Ack(ack Ack) {
-	if ack.ID != l.trainID {
-		return
-	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	step := l.curStep
-	if step == nil || l.done || ack.Count != step.count {
+	step := l.stepsByID[ack.ID]
+	if step == nil || l.done || ack.ID != step.probeID || ack.Count != step.count {
 		return
 	}
-	step.received |= ack.Received
+	incoming := bitset.FromWithLength(uint(ack.Count), []uint64{ack.Received})
+	now := time.Now()
+	for seq := uint(0); seq < uint(step.count); seq++ {
+		if !incoming.Test(seq) || step.acked.Test(seq) || int(seq) >= len(step.sentAt) || step.sentAt[seq].IsZero() {
+			continue
+		}
+		l.observeAckDelayLocked(now.Sub(step.sentAt[seq]))
+	}
+	step.acked.InPlaceUnion(incoming)
 	if ack.FirstRXMS != 0 && (step.firstRXMS == 0 || ack.FirstRXMS < step.firstRXMS) {
 		step.firstRXMS = ack.FirstRXMS
 	}
@@ -626,19 +811,25 @@ func (l *BwLoop) Ack(ack Ack) {
 		step.lastRXMS = ack.LastRXMS
 	}
 
-	var full uint64
-	if step.count >= 64 {
-		full = ^uint64(0)
-	} else {
-		full = (uint64(1) << step.count) - 1
-	}
-	if step.received&full == full && !step.ackClosed {
+	if int(step.acked.Count()) >= int(step.count) && !step.ackClosed {
 		step.ackClosed = true
 		close(step.ackCh)
 	}
 }
 
-// scoreStep results are summarized into the final Sample here.
+func (l *BwLoop) stepSeqAcked(step *stepState, seq uint) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return step.acked != nil && step.acked.Test(seq)
+}
+
+func (l *BwLoop) stepComplete(step *stepState) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return step.acked != nil && int(step.acked.Count()) >= int(step.count)
+}
+
+// scoreStep results are summarized into the completed train Sample here.
 func (l *BwLoop) emitSample() {
 	l.mu.Lock()
 	if l.done {
@@ -728,21 +919,24 @@ func NewReceive(cfg ReceiveConfig) *Receive {
 // Probe records one inbound probe and returns the Ack to send plus whether an
 // ack is due now (spec 5.8: Receive.Probe(p) (Ack, bool)). The caller (recv
 // glue) writes the returned Ack as a BW_PROBE_ACK frame when the bool is true.
-// When the train completes (full bitmap), its round is dropped.
+// Completed rounds stay briefly so a retransmitted probe can recover a lost
+// completion ACK without restarting the bitmap from scratch.
 func (r *Receive) Probe(p Probe) (Ack, bool) {
 	if p.Count == 0 || p.Count > 64 || p.Seq >= p.Count {
 		return Ack{}, false
 	}
 
-	nowMS := uint64(time.Now().UnixMilli())
+	now := time.Now()
+	nowMS := uint64(now.UnixMilli())
 
 	r.mu.Lock()
+	r.pruneLocked(now)
 	round := r.rounds[p.ID]
 	if round == nil || round.count != p.Count {
-		round = &passiveRound{count: p.Count, firstRXMS: nowMS}
+		round = &passiveRound{count: p.Count, received: bitset.New(uint(p.Count)), firstRXMS: nowMS}
 		r.rounds[p.ID] = round
 	}
-	round.received |= uint64(1) << p.Seq
+	round.received.Set(uint(p.Seq))
 	if round.firstRXMS == 0 || nowMS < round.firstRXMS {
 		round.firstRXMS = nowMS
 	}
@@ -750,33 +944,49 @@ func (r *Receive) Probe(p Probe) (Ack, bool) {
 		round.lastRXMS = nowMS
 	}
 
-	var full uint64
-	if round.count >= 64 {
-		full = ^uint64(0)
-	} else {
-		full = (uint64(1) << round.count) - 1
+	complete := int(round.received.Count()) >= int(round.count)
+	if complete && !round.complete {
+		round.complete = true
+		round.completedAt = now
 	}
-	complete := round.received&full == full
 	shouldAck := complete || p.Seq+1 == round.count || (p.Seq+1)%r.ackEvery == 0
 
 	ack := Ack{
 		ID:        p.ID,
 		Count:     round.count,
-		Received:  round.received,
+		Received:  bitsetMask(round.received),
 		FirstRXMS: round.firstRXMS,
 		LastRXMS:  round.lastRXMS,
-	}
-	if complete {
-		delete(r.rounds, p.ID)
 	}
 	r.mu.Unlock()
 
 	return ack, shouldAck
 }
 
+func (r *Receive) pruneLocked(now time.Time) {
+	for id, round := range r.rounds {
+		if round != nil && round.complete && now.Sub(round.completedAt) > receiveRoundKeepalive {
+			delete(r.rounds, id)
+		}
+	}
+}
+
 type passiveRound struct {
-	count     uint16
-	received  uint64
-	firstRXMS uint64
-	lastRXMS  uint64
+	count       uint16
+	received    *bitset.BitSet
+	firstRXMS   uint64
+	lastRXMS    uint64
+	complete    bool
+	completedAt time.Time
+}
+
+func bitsetMask(set *bitset.BitSet) uint64 {
+	if set == nil {
+		return 0
+	}
+	words := set.Words()
+	if len(words) == 0 {
+		return 0
+	}
+	return words[0]
 }

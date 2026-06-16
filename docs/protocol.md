@@ -636,11 +636,15 @@ Receiver behavior:
 4. Maintain a per-leg cumulative receive bitmap for the current probe round.
 5. Reply with BW_PROBE_ACK on the same transport leg.
 6. When `train_bytes_remaining = 0`, release the bandwidth-probe gate for the
-   next local train phase.
-7. If the final train frame is lost, release only the bandwidth-probe gate
-   after an idle timeout of `clamp(8*SRTT, 500ms, 10s)`, falling back to the
-   configured probe timeout when SRTT is unavailable. This timeout does not
-   mark the lane or leg down.
+   next local train phase. In the normal case this value is carried by an
+   ordinary payload-bearing BW_PROBE frame as the train byte budget naturally
+   reaches zero. If a train stops before naturally consuming its byte budget,
+   the sender may send a zero-payload BW_PROBE with `train_bytes_remaining = 0`
+   only as a gate-release signal.
+7. If the BW_PROBE frame carrying `train_bytes_remaining = 0` is lost, release
+   only the bandwidth-probe gate after an idle timeout of
+   `clamp(8*SRTT, 500ms, 10s)`, falling back to the configured probe timeout
+   when SRTT is unavailable. This timeout does not mark the lane or leg down.
 
 ## Type 0x9: BW_PROBE_ACK
 
@@ -663,7 +667,9 @@ Sender behavior:
 1. Match `probe_id` to an outstanding bandwidth probe round.
 2. Merge `received` into the round's cumulative ACK bitmap.
 3. Finish the round early when the ACK bitmap covers all expected probe frames;
-   otherwise finish it after the round timeout.
+   otherwise finish it after the ACK timeout. Once ACK-delay SRTT exists, the
+   ACK timeout is `min(4*SRTT, 1s)`. Before any ACK-delay sample exists, use an
+   initial 500ms timeout.
 4. Compute received count and loss for the round.
 5. Feed the sample into per-leg bandwidth EWMA and leg selection policy.
 6. When the lane has enough TCP-vs-UDP evidence to classify the leg quality,

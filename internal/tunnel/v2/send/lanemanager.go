@@ -49,8 +49,9 @@ func KeyForLeg(sessionID uint64, laneID uint8, leg transport.LegRef) LegKey {
 // method; once the boundary is clearer it can be split.
 //
 //   - pings:   active ping per leg. Send registers; the recv glue feeds PONG.
-//   - bwLoops: active BwLoop per probe train id. The bwScheduler stores
-//     (stage④); the recv glue feeds BW_PROBE_ACK.
+//   - bwLoops: the current active local BwLoop, keyed by train id. The
+//     bwScheduler is session-serial, so a new loop replaces stale/aborted state;
+//     the recv glue feeds BW_PROBE_ACK.
 //   - remoteProbe: opaque closure the send side registers; the recv glue invokes
 //     it when an inbound BW_PROBE is observed, allowing passive send state to arm
 //     its scheduler only after the peer actually starts probing.
@@ -65,6 +66,7 @@ type LaneManager struct {
 	mu             sync.Mutex
 	pings          map[LegKey]*ping.Ping
 	bwLoops        map[uint64]*bw.BwLoop
+	bwActive       *bw.BwLoop
 	qosInputs      map[LaneKey]QoSInput
 	remoteProbe    func(key LegKey)
 	remoteComplete func(key LegKey)
@@ -177,26 +179,33 @@ func (m *LaneManager) UnregisterPing(key LegKey) {
 	m.mu.Unlock()
 }
 
-// PutBwLoop records the active BwLoop for trainID. The bwScheduler calls this
-// when it starts a local bandwidth train (stage④).
+// PutBwLoop records the current active BwLoop for trainID. Bandwidth probing is
+// serialized per session, so a newly started train replaces stale/aborted loop
+// state that may not have emitted a normal sample.
 func (m *LaneManager) PutBwLoop(trainID uint64, l *bw.BwLoop) {
 	if m == nil || l == nil {
 		return
 	}
 	m.mu.Lock()
+	m.bwLoops = make(map[uint64]*bw.BwLoop)
 	m.bwLoops[trainID] = l
+	m.bwActive = l
 	m.mu.Unlock()
 }
 
-// LookupBwLoop returns the active BwLoop for trainID, or nil. The recv glue
-// calls this on inbound BW_PROBE_ACK to feed the matching loop.
-func (m *LaneManager) LookupBwLoop(trainID uint64) *bw.BwLoop {
+// LookupBwLoop returns the active BwLoop for a train/round id, or nil. ACK
+// frames carry only probe_id, so when exactly one loop is active we can route to
+// that loop and let BwLoop.Ack validate the round id precisely.
+func (m *LaneManager) LookupBwLoop(id uint64) *bw.BwLoop {
 	if m == nil {
 		return nil
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.bwLoops[trainID]
+	if l := m.bwLoops[id]; l != nil {
+		return l
+	}
+	return m.bwActive
 }
 
 // DeleteBwLoop removes the BwLoop for trainID (train complete / aborted).
@@ -205,7 +214,12 @@ func (m *LaneManager) DeleteBwLoop(trainID uint64) {
 		return
 	}
 	m.mu.Lock()
-	delete(m.bwLoops, trainID)
+	if m.bwLoops[trainID] == m.bwActive {
+		m.bwLoops = make(map[uint64]*bw.BwLoop)
+		m.bwActive = nil
+	} else {
+		delete(m.bwLoops, trainID)
+	}
 	m.mu.Unlock()
 }
 
@@ -247,6 +261,7 @@ func (m *LaneManager) Reset() {
 	m.mu.Lock()
 	m.pings = make(map[LegKey]*ping.Ping)
 	m.bwLoops = make(map[uint64]*bw.BwLoop)
+	m.bwActive = nil
 	m.qosInputs = make(map[LaneKey]QoSInput)
 	m.mu.Unlock()
 }
