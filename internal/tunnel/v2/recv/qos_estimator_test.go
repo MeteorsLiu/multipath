@@ -352,6 +352,144 @@ func TestQoSEstimatorInfersShadowLegLimited(t *testing.T) {
 	}
 }
 
+func TestQoSEstimatorShadowLimitedUsesRateGapThreshold(t *testing.T) {
+	now := time.Unix(0, 0)
+	e := newQoSEstimator(qosConfig{SampleFloor: 1, Sustain: time.Second}, nil)
+	sample := qosEstimate{
+		At:           now,
+		DataKind:     transport.KindTCP,
+		RepairKind:   transport.KindUDP,
+		SampleTotal:  4,
+		RateGapRatio: 0,
+		ActualBps:    100_000,
+		ShadowBps:    95_000,
+	}
+
+	if status, ok := e.evaluateShadowLimited(sample, now.Add(2*time.Second)); ok {
+		t.Fatalf("status = %+v, want no shadow limited below rate gap threshold", status)
+	}
+
+	sample.ShadowBps = 80_000
+	if _, ok := e.evaluateShadowLimited(sample, now.Add(4*time.Second)); ok {
+		t.Fatal("first over-threshold shadow sample should only start sustain timer")
+	}
+	status, ok := e.evaluateShadowLimited(sample, now.Add(6*time.Second))
+	if !ok {
+		t.Fatal("missing shadow limited after sustained deficit")
+	}
+	if status.Kind != transport.KindUDP || status.Reason != protocol.LinkStatusReasonLimited {
+		t.Fatalf("status = %+v, want UDP limited", status)
+	}
+}
+
+func TestQoSEstimatorKeepsIndependentDirectionState(t *testing.T) {
+	now := time.Unix(0, 0)
+	e := newQoSEstimator(qosConfig{SampleFloor: 1}, nil)
+
+	if _, ok := e.updateEstimate(qosSample{
+		At:           now,
+		Duration:     time.Second,
+		DataKind:     transport.KindUDP,
+		RepairKind:   transport.KindTCP,
+		DataArrived:  4,
+		DataExpected: 4,
+		DataBytes:    4 * 1200,
+		RepairBytes:  1200,
+	}); !ok {
+		t.Fatal("first UDP/TCP estimate = none, want one")
+	}
+	if _, ok := e.updateEstimate(qosSample{
+		At:           now.Add(time.Second),
+		Duration:     time.Second,
+		DataKind:     transport.KindTCP,
+		RepairKind:   transport.KindUDP,
+		DataArrived:  4,
+		DataExpected: 4,
+		DataBytes:    4 * 1200,
+		RepairBytes:  300,
+	}); !ok {
+		t.Fatal("TCP/UDP estimate = none, want one")
+	}
+	if _, ok := e.updateEstimate(qosSample{
+		At:           now.Add(2 * time.Second),
+		Duration:     time.Second,
+		DataKind:     transport.KindUDP,
+		RepairKind:   transport.KindTCP,
+		DataArrived:  4,
+		DataExpected: 4,
+		DataBytes:    4 * 1200,
+		RepairBytes:  1200,
+	}); !ok {
+		t.Fatal("second UDP/TCP estimate = none, want one")
+	}
+
+	udpTCP := e.ema[qosDirectionKey{dataKind: transport.KindUDP, repairKind: transport.KindTCP}]
+	tcpUDP := e.ema[qosDirectionKey{dataKind: transport.KindTCP, repairKind: transport.KindUDP}]
+	if udpTCP == nil || tcpUDP == nil {
+		t.Fatalf("direction states udp/tcp=%v tcp/udp=%v, want both", udpTCP, tcpUDP)
+	}
+	if udpTCP.sampleTotal != 8 {
+		t.Fatalf("UDP/TCP sampleTotal = %d, want 8", udpTCP.sampleTotal)
+	}
+	if tcpUDP.sampleTotal != 4 {
+		t.Fatalf("TCP/UDP sampleTotal = %d, want 4", tcpUDP.sampleTotal)
+	}
+}
+
+func TestQoSEstimatorPIDAutoGateFreezesOnShadowDeficit(t *testing.T) {
+	state := qosEMAState{dataKind: transport.KindTCP, repairKind: transport.KindUDP}
+	for i := 0; i < qosShadowPIDWarmupSamples; i++ {
+		state.observe(qosSample{
+			Duration:     time.Second,
+			DataKind:     transport.KindTCP,
+			RepairKind:   transport.KindUDP,
+			DataArrived:  4,
+			DataExpected: 4,
+			DataBytes:    4 * 1200,
+			RepairBytes:  1200,
+		})
+	}
+
+	before := state.pidCorrection
+	state.sampleCount++
+	state.actualBpsEMA = 100_000
+	state.expectedBpsEMA = 100_000
+	state.repairBpsEMA = 10_000
+	state.profileDataEMA = 40_000
+	state.profileRepairEMA = 20_000
+	state.trainPID()
+
+	if state.pidCorrection != before {
+		t.Fatalf("pidCorrection = %.3f, want frozen correction %.3f on shadow deficit", state.pidCorrection, before)
+	}
+}
+
+func TestQoSEstimatorPIDTrainsOnHealthyResidual(t *testing.T) {
+	state := qosEMAState{dataKind: transport.KindUDP, repairKind: transport.KindTCP}
+	state.observe(qosSample{
+		Duration:     time.Second,
+		DataKind:     transport.KindUDP,
+		RepairKind:   transport.KindTCP,
+		DataArrived:  4,
+		DataExpected: 4,
+		DataBytes:    4 * 1200,
+		RepairBytes:  1200,
+	})
+	state.observe(qosSample{
+		Duration:     time.Second,
+		DataKind:     transport.KindUDP,
+		RepairKind:   transport.KindTCP,
+		DataArrived:  4,
+		DataExpected: 4,
+		DataBytes:    4 * 1200,
+		RepairBytes:  1150,
+	})
+
+	if state.pidCorrection <= 0 {
+		t.Fatalf("pidCorrection = %.3f, want positive correction after healthy residual", state.pidCorrection)
+	}
+}
+
 func TestQoSEstimatorClearsWhenShadowAdvantageDisappears(t *testing.T) {
 	now := time.Unix(0, 0)
 	var got []qosStatus
