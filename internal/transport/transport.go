@@ -59,6 +59,11 @@ type StreamTransport interface {
 	Close(ctx context.Context, connID string) error
 }
 
+type packetBatchTransport interface {
+	writeBatchTo(ctx context.Context, endpointID string, remote net.Addr, payloads []Payload) (int, error)
+	batchSize(endpointID string) int
+}
+
 func RunWriter(ctx context.Context, packets <-chan Payload, packet PacketTransport, stream StreamTransport) error {
 	dispatcher := newLegWriterDispatcher(ctx, packet, stream)
 	defer dispatcher.close()
@@ -156,6 +161,8 @@ func legWriterQueueSize(kind Kind) int {
 
 func (d *legWriterDispatcher) runUDPWriter(key writerKey, ch <-chan Payload) {
 	defer d.wg.Done()
+	batchSize := udpPayloadBatchSize(d.packet, key.endpointID)
+	batch := make([]Payload, 0, batchSize)
 	for {
 		select {
 		case <-d.ctx.Done():
@@ -165,11 +172,26 @@ func (d *legWriterDispatcher) runUDPWriter(key writerKey, ch <-chan Payload) {
 			if !ok {
 				return
 			}
-			if debuglog.Enabled() {
-				debuglog.Printf("transport", "writer dispatch %s bytes=%d", debugLeg(payload.Leg), len(payload.Packet.Payload))
+			batch = append(batch[:0], payload)
+		drain:
+			for len(batch) < cap(batch) {
+				select {
+				case next, ok := <-ch:
+					if !ok {
+						break drain
+					}
+					if next.Packet != nil {
+						batch = append(batch, next)
+					}
+				default:
+					break drain
+				}
 			}
-			err := writeUDPPayload(d.ctx, payload, d.packet)
-			payload.Packet.Release()
+			if debuglog.Enabled() {
+				debuglog.Printf("transport", "writer dispatch %s packets=%d bytes=%d", debugLeg(payload.Leg), len(batch), payloadBatchBytes(batch))
+			}
+			err := writeUDPBatch(d.ctx, batch, d.packet)
+			releasePayloads(batch)
 			if err != nil {
 				d.reportWriterError(ch, payload.Leg, err)
 				return
@@ -299,6 +321,35 @@ func writeUDPPayload(ctx context.Context, payload Payload, packet PacketTranspor
 	return err
 }
 
+func writeUDPBatch(ctx context.Context, payloads []Payload, packet PacketTransport) error {
+	if len(payloads) == 0 {
+		return nil
+	}
+	first := payloads[0]
+	if packet == nil || first.Leg.EndpointID == "" || first.Leg.RemoteAddr == nil {
+		return ErrInvalidLeg
+	}
+	if len(payloads) == 1 {
+		return writeUDPPayload(ctx, first, packet)
+	}
+	if batch, ok := packet.(packetBatchTransport); ok {
+		_, err := batch.writeBatchTo(ctx, first.Leg.EndpointID, first.Leg.RemoteAddr, payloads)
+		if err != nil && !errors.Is(err, context.Canceled) {
+			if debuglog.Enabled() {
+				debuglog.Printf("transport", "drop failed udp batch endpoint=%s remote=%v packets=%d bytes=%d err=%v", first.Leg.EndpointID, first.Leg.RemoteAddr, len(payloads), payloadBatchBytes(payloads), err)
+			}
+			return nil
+		}
+		return err
+	}
+	for _, payload := range payloads {
+		if err := writeUDPPayload(ctx, payload, packet); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func writeTCPPayload(ctx context.Context, payload Payload, stream StreamTransport) error {
 	if stream == nil || payload.Leg.ConnID == "" {
 		return ErrInvalidLeg
@@ -311,4 +362,31 @@ func writeTCPPayload(ctx context.Context, payload Payload, stream StreamTranspor
 		return nil
 	}
 	return err
+}
+
+func udpPayloadBatchSize(packet PacketTransport, endpointID string) int {
+	if batch, ok := packet.(packetBatchTransport); ok {
+		if n := batch.batchSize(endpointID); n > 1 {
+			return n
+		}
+	}
+	return 1
+}
+
+func payloadBatchBytes(payloads []Payload) int {
+	total := 0
+	for _, payload := range payloads {
+		if payload.Packet != nil {
+			total += len(payload.Packet.Payload)
+		}
+	}
+	return total
+}
+
+func releasePayloads(payloads []Payload) {
+	for _, payload := range payloads {
+		if payload.Packet != nil {
+			payload.Packet.Release()
+		}
+	}
 }
