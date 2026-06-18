@@ -3,15 +3,16 @@ module github.com/MeteorsLiu/multipath
 go 1.23.4
 
 require (
+	github.com/bits-and-blooms/bitset v1.24.5
 	github.com/klauspost/reedsolomon v1.12.6
 	github.com/prometheus/client_golang v1.23.2
+	golang.org/x/net v0.43.0
 	golang.org/x/sys v0.35.0
 	golang.org/x/time v0.12.0
 )
 
 require (
 	github.com/beorn7/perks v1.0.1 // indirect
-	github.com/bits-and-blooms/bitset v1.24.5 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/kr/text v0.2.0 // indirect

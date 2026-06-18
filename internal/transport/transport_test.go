@@ -142,6 +142,53 @@ func TestRunWriterDoesNotBlockUDPBehindBlockedTCP(t *testing.T) {
 	}
 }
 
+func TestUDPWriterBatchesQueuedPayloads(t *testing.T) {
+	ctx := context.Background()
+	packet := &runWriterBatchPacket{batch: 4}
+	dispatcher := &legWriterDispatcher{
+		ctx:    ctx,
+		packet: packet,
+		errs:   make(chan error, 1),
+	}
+	key := writerKey{kind: KindUDP, endpointID: "udp0", remote: "127.0.0.1:1234"}
+	remote := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1234}
+	ch := make(chan Payload, 3)
+	payloads := make([]Payload, 3)
+	for i := range payloads {
+		pkt := packetbuf.Acquire(16)
+		pkt.Payload[0] = byte(i)
+		pkt.SetLen(1)
+		payloads[i] = Payload{
+			Leg: LegRef{
+				Kind:       KindUDP,
+				EndpointID: "udp0",
+				RemoteAddr: remote,
+			},
+			Packet: pkt,
+		}
+		ch <- payloads[i]
+	}
+	close(ch)
+
+	dispatcher.wg.Add(1)
+	dispatcher.runUDPWriter(key, ch)
+
+	if packet.batchCalls != 1 {
+		t.Fatalf("batch calls = %d, want 1", packet.batchCalls)
+	}
+	if got := packet.batchLens[0]; got != len(payloads) {
+		t.Fatalf("batch len = %d, want %d", got, len(payloads))
+	}
+	if packet.writes != 0 {
+		t.Fatalf("fallback writes = %d, want 0", packet.writes)
+	}
+	for i, payload := range payloads {
+		if payload.Packet.Payload != nil {
+			t.Fatalf("payload %d was not released", i)
+		}
+	}
+}
+
 func TestRunWriterBlocksWhenLegQueueIsFull(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -273,4 +320,21 @@ func (p *runWriterPacket) WriteTo(ctx context.Context, endpointID string, remote
 		}
 	})
 	return len(payload), p.err
+}
+
+type runWriterBatchPacket struct {
+	runWriterPacket
+	batch      int
+	batchCalls int
+	batchLens  []int
+}
+
+func (p *runWriterBatchPacket) batchSize(endpointID string) int {
+	return p.batch
+}
+
+func (p *runWriterBatchPacket) writeBatchTo(ctx context.Context, endpointID string, remote net.Addr, payloads []Payload) (int, error) {
+	p.batchCalls++
+	p.batchLens = append(p.batchLens, len(payloads))
+	return len(payloads), nil
 }
