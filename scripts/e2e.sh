@@ -35,6 +35,7 @@ if [[ ${EUID:-0} -ne 0 ]]; then
 fi
 
 echo "real e2e workdir: ${WORKDIR}"
+mkdir -p "${WORKDIR}"
 
 SUFFIX="$$"
 NS_C="mp_c_${SUFFIX}"
@@ -77,6 +78,8 @@ PORT_MULTILANE_REBOOTSTRAP=5025
 PORT_NAT_TCP_FALLBACK=5026
 PORT_MTU_FEC=5027
 PORT_BW_PROBE_DISABLED=5028
+PORT_TCP_CORRECTNESS=5029
+PORT_UDP_CORRECTNESS=5030
 
 PATH1_C="10.201.1.1/24"
 PATH1_S="10.201.1.2/24"
@@ -131,6 +134,7 @@ build_bin() {
   require_command tc
   require_command ping
   require_command iptables
+  require_command python3
 
   if [[ "${PREBUILT_BIN}" == "1" ]]; then
     if [[ ! -x "${BIN}" ]]; then
@@ -510,6 +514,342 @@ parse_iperf_receiver_bps() {
   ' "${log_file}"
 }
 
+write_tcp_correctness_tool() {
+  local tool="${WORKDIR}/tcp_correctness.py"
+  if [[ -f "${tool}" ]]; then
+    printf '%s\n' "${tool}"
+    return 0
+  fi
+
+  cat >"${tool}" <<'PY'
+#!/usr/bin/env python3
+import argparse
+import hashlib
+import socket
+import struct
+import sys
+import time
+
+
+def recv_exact(conn, size):
+    data = bytearray()
+    while len(data) < size:
+        chunk = conn.recv(size - len(data))
+        if not chunk:
+            raise EOFError(f"short read: got {len(data)} want {size}")
+        data.extend(chunk)
+    return bytes(data)
+
+
+def payload_for(size, seed):
+    out = bytearray()
+    block = hashlib.sha256(f"{seed}:{size}".encode("ascii")).digest()
+    counter = 0
+    while len(out) < size:
+        block = hashlib.sha256(block + counter.to_bytes(8, "big")).digest()
+        out.extend(block)
+        counter += 1
+    return bytes(out[:size])
+
+
+def send_record(conn, payload):
+    conn.sendall(struct.pack("!I", len(payload)))
+    conn.sendall(payload)
+
+
+def recv_record(conn, max_size):
+    size = struct.unpack("!I", recv_exact(conn, 4))[0]
+    if size > max_size:
+        raise ValueError(f"record too large: {size} > {max_size}")
+    return recv_exact(conn, size)
+
+
+def run_server(args):
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.settimeout(args.timeout)
+    listener.bind((args.bind, args.port))
+    listener.listen(1)
+    print(f"server listening bind={args.bind} port={args.port}", flush=True)
+    conn, addr = listener.accept()
+    with conn:
+        conn.settimeout(args.timeout)
+        count = struct.unpack("!I", recv_exact(conn, 4))[0]
+        if count > args.max_records:
+            raise ValueError(f"too many records: {count} > {args.max_records}")
+        print(f"server accepted addr={addr} records={count}", flush=True)
+        for idx in range(count):
+            payload = recv_record(conn, args.max_size)
+            digest = hashlib.sha256(payload).hexdigest()
+            send_record(conn, payload)
+            print(f"server echoed index={idx} size={len(payload)} sha256={digest}", flush=True)
+    listener.close()
+
+
+def run_client(args):
+    sizes = [int(part) for part in args.sizes.split(",") if part]
+    conn = socket.create_connection((args.host, args.port), timeout=args.timeout)
+    with conn:
+        conn.settimeout(args.timeout)
+        conn.sendall(struct.pack("!I", len(sizes)))
+        for idx, size in enumerate(sizes):
+            payload = payload_for(size, idx + 1)
+            digest = hashlib.sha256(payload).hexdigest()
+            send_record(conn, payload)
+            echoed = recv_record(conn, args.max_size)
+            if echoed != payload:
+                got = hashlib.sha256(echoed).hexdigest()
+                raise ValueError(
+                    f"echo mismatch index={idx} size={size} want_sha256={digest} got_size={len(echoed)} got_sha256={got}"
+                )
+            print(f"client verified index={idx} size={size} sha256={digest}", flush=True)
+
+
+UDP_MAGIC = b"MPU1"
+UDP_DONE = UDP_MAGIC + b"DONE"
+
+
+def udp_packet_for(size, index):
+    payload = payload_for(size, index + 1)
+    return UDP_MAGIC + struct.pack("!II", index, size) + payload
+
+
+def parse_udp_packet(packet):
+    if len(packet) < 12 or packet[:4] != UDP_MAGIC:
+        return None
+    index, size = struct.unpack("!II", packet[4:12])
+    payload = packet[12:]
+    if len(payload) != size:
+        return None
+    return index, payload
+
+
+def run_udp_server(args):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.settimeout(args.idle_timeout)
+    sock.bind((args.bind, args.port))
+    print(f"udp server listening bind={args.bind} port={args.port}", flush=True)
+    while True:
+        try:
+            packet, addr = sock.recvfrom(args.max_size + 12)
+        except socket.timeout:
+            print("udp server idle timeout", flush=True)
+            break
+        if packet == UDP_DONE:
+            print("udp server done", flush=True)
+            break
+        parsed = parse_udp_packet(packet)
+        if parsed is None:
+            print(f"udp server ignored malformed size={len(packet)}", flush=True)
+            continue
+        index, payload = parsed
+        sock.sendto(packet, addr)
+        digest = hashlib.sha256(payload).hexdigest()
+        print(f"udp server echoed index={index} size={len(payload)} sha256={digest}", flush=True)
+    sock.close()
+
+
+def run_udp_client(args):
+    sizes = [int(part) for part in args.sizes.split(",") if part]
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(args.attempt_timeout)
+    remote = (args.host, args.port)
+    for index, size in enumerate(sizes):
+        expected = udp_packet_for(size, index)
+        expected_payload = expected[12:]
+        digest = hashlib.sha256(expected_payload).hexdigest()
+        verified = False
+        for attempt in range(1, args.attempts + 1):
+            sock.sendto(expected, remote)
+            deadline = time.monotonic() + args.attempt_timeout
+            while time.monotonic() < deadline:
+                try:
+                    echoed, _ = sock.recvfrom(args.max_size + 12)
+                except socket.timeout:
+                    break
+                if echoed == expected:
+                    print(
+                        f"udp client verified index={index} size={size} attempt={attempt} sha256={digest}",
+                        flush=True,
+                    )
+                    verified = True
+                    break
+                parsed = parse_udp_packet(echoed)
+                if parsed is not None and parsed[0] < index:
+                    continue
+                got = hashlib.sha256(echoed[12:] if len(echoed) >= 12 else echoed).hexdigest()
+                raise ValueError(
+                    f"udp echo mismatch index={index} size={size} want_sha256={digest} "
+                    f"got_size={len(echoed)} got_sha256={got}"
+                )
+            if verified:
+                break
+        if not verified:
+            raise TimeoutError(f"udp echo timeout index={index} size={size} attempts={args.attempts}")
+    for _ in range(3):
+        sock.sendto(UDP_DONE, remote)
+    sock.close()
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="mode", required=True)
+
+    server = sub.add_parser("server")
+    server.add_argument("--bind", required=True)
+    server.add_argument("--port", required=True, type=int)
+    server.add_argument("--timeout", type=float, default=60)
+    server.add_argument("--max-records", type=int, default=64)
+    server.add_argument("--max-size", type=int, default=8 * 1024 * 1024)
+
+    client = sub.add_parser("client")
+    client.add_argument("--host", required=True)
+    client.add_argument("--port", required=True, type=int)
+    client.add_argument("--sizes", required=True)
+    client.add_argument("--timeout", type=float, default=60)
+    client.add_argument("--max-size", type=int, default=8 * 1024 * 1024)
+
+    udp_server = sub.add_parser("udp-server")
+    udp_server.add_argument("--bind", required=True)
+    udp_server.add_argument("--port", required=True, type=int)
+    udp_server.add_argument("--idle-timeout", type=float, default=5)
+    udp_server.add_argument("--max-size", type=int, default=65500)
+
+    udp_client = sub.add_parser("udp-client")
+    udp_client.add_argument("--host", required=True)
+    udp_client.add_argument("--port", required=True, type=int)
+    udp_client.add_argument("--sizes", required=True)
+    udp_client.add_argument("--attempts", type=int, default=3)
+    udp_client.add_argument("--attempt-timeout", type=float, default=2)
+    udp_client.add_argument("--max-size", type=int, default=65500)
+
+    args = parser.parse_args()
+    if args.mode == "server":
+        run_server(args)
+    elif args.mode == "udp-server":
+        run_udp_server(args)
+    elif args.mode == "udp-client":
+        run_udp_client(args)
+    else:
+        run_client(args)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr, flush=True)
+        sys.exit(1)
+PY
+  chmod +x "${tool}"
+  printf '%s\n' "${tool}"
+}
+
+run_tcp_correctness_transfer() {
+  local label="$1"
+  local sizes="$2"
+  local timeout_s="${3:-60}"
+  local app_port="${4:-16029}"
+  local tool
+  tool="$(write_tcp_correctness_tool)"
+
+  local server_log="${WORKDIR}/${label}.tcp-server.log"
+  local client_log="${WORKDIR}/${label}.tcp-client.log"
+  echo "[${label}] TCP correctness over TUN: sizes=${sizes} timeout=${timeout_s}s"
+  ip netns exec "${NS_S}" python3 -u "${tool}" server \
+    --bind "${TUN_S_LOCAL}" \
+    --port "${app_port}" \
+    --timeout "${timeout_s}" \
+    >"${server_log}" 2>&1 &
+  local tcp_server_pid=$!
+  sleep 0.5
+
+  local client_status=0
+  if ip netns exec "${NS_C}" python3 -u "${tool}" client \
+      --host "${TUN_C_REMOTE}" \
+      --port "${app_port}" \
+      --sizes "${sizes}" \
+      --timeout "${timeout_s}" \
+      >"${client_log}" 2>&1; then
+    client_status=0
+  else
+    client_status=$?
+    kill "${tcp_server_pid}" >/dev/null 2>&1 || true
+  fi
+
+  local server_status=0
+  if wait "${tcp_server_pid}"; then
+    server_status=0
+  else
+    server_status=$?
+  fi
+
+  echo "[${label}] TCP correctness client log: ${client_log}"
+  echo "[${label}] TCP correctness server log: ${server_log}"
+  tail -n 6 "${client_log}" || true
+  tail -n 6 "${server_log}" || true
+
+  if (( client_status == 0 && server_status == 0 )); then
+    pass "${label}" "TCP byte stream echoed correctly over TUN"
+  else
+    fail "${label}" "TCP correctness failed client_status=${client_status} server_status=${server_status}"
+  fi
+}
+
+run_udp_correctness_transfer() {
+  local label="$1"
+  local sizes="$2"
+  local attempts="${3:-3}"
+  local attempt_timeout_s="${4:-2}"
+  local app_port="${5:-16030}"
+  local tool
+  tool="$(write_tcp_correctness_tool)"
+
+  local server_log="${WORKDIR}/${label}.udp-server.log"
+  local client_log="${WORKDIR}/${label}.udp-client.log"
+  echo "[${label}] UDP correctness over TUN: sizes=${sizes} attempts=${attempts} attempt_timeout=${attempt_timeout_s}s"
+  ip netns exec "${NS_S}" python3 -u "${tool}" udp-server \
+    --bind "${TUN_S_LOCAL}" \
+    --port "${app_port}" \
+    --idle-timeout 5 \
+    >"${server_log}" 2>&1 &
+  local udp_server_pid=$!
+  sleep 0.5
+
+  local client_status=0
+  if ip netns exec "${NS_C}" python3 -u "${tool}" udp-client \
+      --host "${TUN_C_REMOTE}" \
+      --port "${app_port}" \
+      --sizes "${sizes}" \
+      --attempts "${attempts}" \
+      --attempt-timeout "${attempt_timeout_s}" \
+      >"${client_log}" 2>&1; then
+    client_status=0
+  else
+    client_status=$?
+    kill "${udp_server_pid}" >/dev/null 2>&1 || true
+  fi
+
+  local server_status=0
+  if wait "${udp_server_pid}"; then
+    server_status=0
+  else
+    server_status=$?
+  fi
+
+  echo "[${label}] UDP correctness client log: ${client_log}"
+  echo "[${label}] UDP correctness server log: ${server_log}"
+  tail -n 6 "${client_log}" || true
+  tail -n 6 "${server_log}" || true
+
+  if (( client_status == 0 && server_status == 0 )); then
+    pass "${label}" "UDP datagrams echoed correctly over TUN"
+  else
+    fail "${label}" "UDP correctness failed client_status=${client_status} server_status=${server_status}"
+  fi
+}
+
 start_multipath() {
   local name="$1"
   local server_config="${WORKDIR}/server-${name}.json"
@@ -609,6 +949,27 @@ add_delay_band() {
   local handle="$4"
   local delay="$5"
   ip netns exec "${ns}" tc qdisc replace dev "${dev}" parent "1:${band}" handle "${handle}:" netem delay "${delay}"
+}
+
+add_delay_jitter_band() {
+  local ns="$1"
+  local dev="$2"
+  local band="$3"
+  local handle="$4"
+  local delay="$5"
+  local jitter="$6"
+  ip netns exec "${ns}" tc qdisc replace dev "${dev}" parent "1:${band}" handle "${handle}:" netem delay "${delay}" "${jitter}" distribution normal
+}
+
+add_loss_delay_jitter_band() {
+  local ns="$1"
+  local dev="$2"
+  local band="$3"
+  local handle="$4"
+  local loss="$5"
+  local delay="$6"
+  local jitter="$7"
+  ip netns exec "${ns}" tc qdisc replace dev "${dev}" parent "1:${band}" handle "${handle}:" netem delay "${delay}" "${jitter}" distribution normal loss "${loss}"
 }
 
 add_rate_band() {
@@ -804,6 +1165,45 @@ apply_udp_tunnel_rate_path() {
 
   setup_prio_qdisc "${NS_S}" "${server_dev}"
   add_rate_band "${NS_S}" "${server_dev}" 3 30 "${rate}"
+  add_port_filter "${NS_S}" "${server_dev}" 1 udp sport "${port}" 3
+}
+
+apply_tunnel_delay_jitter_path() {
+  local path="$1"
+  local port="$2"
+  local delay="$3"
+  local jitter="$4"
+  local client_dev server_dev
+  client_dev="$(path_client_dev "${path}")"
+  server_dev="$(path_server_dev "${path}")"
+
+  setup_prio_qdisc "${NS_C}" "${client_dev}"
+  add_delay_jitter_band "${NS_C}" "${client_dev}" 3 30 "${delay}" "${jitter}"
+  add_port_filter "${NS_C}" "${client_dev}" 1 udp dport "${port}" 3
+  add_port_filter "${NS_C}" "${client_dev}" 2 tcp dport "${port}" 3
+
+  setup_prio_qdisc "${NS_S}" "${server_dev}"
+  add_delay_jitter_band "${NS_S}" "${server_dev}" 3 30 "${delay}" "${jitter}"
+  add_port_filter "${NS_S}" "${server_dev}" 1 udp sport "${port}" 3
+  add_port_filter "${NS_S}" "${server_dev}" 2 tcp sport "${port}" 3
+}
+
+apply_udp_tunnel_loss_delay_jitter_path() {
+  local path="$1"
+  local port="$2"
+  local loss="$3"
+  local delay="$4"
+  local jitter="$5"
+  local client_dev server_dev
+  client_dev="$(path_client_dev "${path}")"
+  server_dev="$(path_server_dev "${path}")"
+
+  setup_prio_qdisc "${NS_C}" "${client_dev}"
+  add_loss_delay_jitter_band "${NS_C}" "${client_dev}" 3 30 "${loss}" "${delay}" "${jitter}"
+  add_port_filter "${NS_C}" "${client_dev}" 1 udp dport "${port}" 3
+
+  setup_prio_qdisc "${NS_S}" "${server_dev}"
+  add_loss_delay_jitter_band "${NS_S}" "${server_dev}" 3 30 "${loss}" "${delay}" "${jitter}"
   add_port_filter "${NS_S}" "${server_dev}" 1 udp sport "${port}" 3
 }
 
@@ -1077,6 +1477,81 @@ run_leg_selector_case() {
   local server_select_start_line
   server_select_start_line="$(current_log_file_line_count "${CURRENT_SERVER_LOG}")"
   wait_log_file_pattern_while_ping_from "${name}" "${CURRENT_SERVER_LOG}" "schedule_select.*leg=\\{tcp .*frame=type=DATA" 20 "server leg selector chose TCP for DATA after UDP QoS detection" "${server_select_start_line}" "${NS_S}" "${TUN_S_REMOTE}"
+
+  stop_multipath
+  clear_loss
+  echo "==== ${name} e2e end ===="
+}
+
+run_tcp_correctness_case() {
+  local name="tcp-correctness"
+  local app_port=16029
+  echo "==== ${name} e2e start ===="
+  clear_loss
+  write_two_lane_config "${name}" "${PORT_TCP_CORRECTNESS}" false true 200 3000
+  CURRENT_EXTRA_ENV=(MULTIPATH_DISABLE_BW_PROBE=1)
+  start_multipath "${name}"
+
+  wait_ping_ok "${name} baseline" 12
+  wait_log_pattern "${name}" "send: hello_ack_active session=[0-9]+ lane=1 kind=2" 20 "lane=1 TCP shadow leg reached HELLO_ACK"
+  wait_log_pattern "${name}" "send: hello_ack_active session=[0-9]+ lane=2 kind=2" 20 "lane=2 TCP shadow leg reached HELLO_ACK"
+
+  run_tcp_correctness_transfer "${name}-baseline" "1,17,257,1200,4096,65536,524288,1048576" 60 "${app_port}"
+
+  echo "[${name}] apply medium RTT jitter on both tunnel paths"
+  clear_loss
+  apply_tunnel_delay_jitter_path 1 "${PORT_TCP_CORRECTNESS}" 40ms 20ms
+  apply_tunnel_delay_jitter_path 2 "${PORT_TCP_CORRECTNESS}" 70ms 35ms
+  run_tcp_correctness_transfer "${name}-medium-rtt-jitter" "1,64,1200,32768,262144" 90 "${app_port}"
+
+  echo "[${name}] apply large RTT jitter on both tunnel paths"
+  clear_loss
+  apply_tunnel_delay_jitter_path 1 "${PORT_TCP_CORRECTNESS}" 120ms 60ms
+  apply_tunnel_delay_jitter_path 2 "${PORT_TCP_CORRECTNESS}" 180ms 90ms
+  run_tcp_correctness_transfer "${name}-large-rtt-jitter" "1,1200,32768,131072" 120 "${app_port}"
+
+  echo "[${name}] apply UDP QoS loss plus RTT jitter while TCP shadow stays clean"
+  clear_loss
+  apply_udp_tunnel_loss_delay_jitter_path 1 "${PORT_TCP_CORRECTNESS}" 20% 50ms 25ms
+  apply_udp_tunnel_loss_delay_jitter_path 2 "${PORT_TCP_CORRECTNESS}" 20% 80ms 40ms
+  run_tcp_correctness_transfer "${name}-udp-qos-jitter" "1,64,1200,16384,131072" 120 "${app_port}"
+
+  stop_multipath
+  clear_loss
+  echo "==== ${name} e2e end ===="
+}
+
+run_udp_correctness_case() {
+  local name="udp-correctness"
+  echo "==== ${name} e2e start ===="
+  clear_loss
+  write_two_lane_config "${name}" "${PORT_UDP_CORRECTNESS}" false true 200 3000
+  CURRENT_EXTRA_ENV=(MULTIPATH_DISABLE_BW_PROBE=1)
+  start_multipath "${name}"
+
+  wait_ping_ok "${name} baseline" 12
+  wait_log_pattern "${name}" "send: hello_ack_active session=[0-9]+ lane=1 kind=2" 20 "lane=1 TCP shadow leg reached HELLO_ACK"
+  wait_log_pattern "${name}" "send: hello_ack_active session=[0-9]+ lane=2 kind=2" 20 "lane=2 TCP shadow leg reached HELLO_ACK"
+
+  run_udp_correctness_transfer "${name}-baseline" "1,17,257,1200,1400" 3 2 16030
+
+  echo "[${name}] apply medium RTT jitter on both tunnel paths"
+  clear_loss
+  apply_tunnel_delay_jitter_path 1 "${PORT_UDP_CORRECTNESS}" 40ms 20ms
+  apply_tunnel_delay_jitter_path 2 "${PORT_UDP_CORRECTNESS}" 70ms 35ms
+  run_udp_correctness_transfer "${name}-medium-rtt-jitter" "1,64,1200,1400" 5 3 16031
+
+  echo "[${name}] apply large RTT jitter on both tunnel paths"
+  clear_loss
+  apply_tunnel_delay_jitter_path 1 "${PORT_UDP_CORRECTNESS}" 120ms 60ms
+  apply_tunnel_delay_jitter_path 2 "${PORT_UDP_CORRECTNESS}" 180ms 90ms
+  run_udp_correctness_transfer "${name}-large-rtt-jitter" "1,1200,1400" 5 4 16032
+
+  echo "[${name}] apply UDP QoS loss plus RTT jitter while TCP shadow stays clean"
+  clear_loss
+  apply_udp_tunnel_loss_delay_jitter_path 1 "${PORT_UDP_CORRECTNESS}" 20% 50ms 25ms
+  apply_udp_tunnel_loss_delay_jitter_path 2 "${PORT_UDP_CORRECTNESS}" 20% 80ms 40ms
+  run_udp_correctness_transfer "${name}-udp-qos-jitter" "1,64,1200" 20 4 16033
 
   stop_multipath
   clear_loss
@@ -2314,6 +2789,8 @@ run_multilane_rebootstrap_case
 run_fallback_dial_error_case
 run_tcp_established_redial_case
 run_leg_selector_case
+run_tcp_correctness_case
+run_udp_correctness_case
 run_bandwidth_probe_convergence_case
 run_bandwidth_probe_tcp_reference_case
 run_bandwidth_probe_default_cap_case

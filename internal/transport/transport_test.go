@@ -189,6 +189,48 @@ func TestUDPWriterBatchesQueuedPayloads(t *testing.T) {
 	}
 }
 
+func TestTCPWriterBatchesQueuedPayloads(t *testing.T) {
+	ctx := context.Background()
+	stream := &runWriterBatchStream{}
+	dispatcher := &legWriterDispatcher{
+		ctx:    ctx,
+		stream: stream,
+		errs:   make(chan error, 1),
+	}
+	key := writerKey{kind: KindTCP, connID: "tcp0"}
+	ch := make(chan Payload, 3)
+	payloads := make([]Payload, 3)
+	for i := range payloads {
+		pkt := packetbuf.Acquire(16)
+		pkt.Payload[0] = byte(i)
+		pkt.SetLen(1)
+		payloads[i] = Payload{
+			Leg:    LegRef{Kind: KindTCP, ConnID: "tcp0"},
+			Packet: pkt,
+		}
+		ch <- payloads[i]
+	}
+	close(ch)
+
+	dispatcher.wg.Add(1)
+	dispatcher.runTCPWriter(key, ch)
+
+	if stream.batchCalls != 1 {
+		t.Fatalf("batch calls = %d, want 1", stream.batchCalls)
+	}
+	if got := stream.batchLens[0]; got != len(payloads) {
+		t.Fatalf("batch len = %d, want %d", got, len(payloads))
+	}
+	if stream.writes != 0 {
+		t.Fatalf("fallback writes = %d, want 0", stream.writes)
+	}
+	for i, payload := range payloads {
+		if payload.Packet.Payload != nil {
+			t.Fatalf("payload %d was not released", i)
+		}
+	}
+}
+
 func TestRunWriterBlocksWhenLegQueueIsFull(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -337,4 +379,17 @@ func (p *runWriterBatchPacket) writeBatchTo(ctx context.Context, endpointID stri
 	p.batchCalls++
 	p.batchLens = append(p.batchLens, len(payloads))
 	return len(payloads), nil
+}
+
+type runWriterBatchStream struct {
+	runWriterStream
+	batchCalls int
+	batchLens  []int
+}
+
+func (s *runWriterBatchStream) writePayloadBatch(ctx context.Context, connID string, payloads []Payload) error {
+	s.batchCalls++
+	s.batchLens = append(s.batchLens, len(payloads))
+	releasePayloads(payloads)
+	return nil
 }

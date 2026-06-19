@@ -37,6 +37,7 @@ type Payload struct {
 const (
 	tcpLegWriterQueueSize = 64*1024*1024/1500 + 1
 	udpLegWriterQueueSize = 1024
+	tcpPayloadBatchSize   = 128
 )
 
 type PacketWriter interface {
@@ -202,6 +203,7 @@ func (d *legWriterDispatcher) runUDPWriter(key writerKey, ch <-chan Payload) {
 
 func (d *legWriterDispatcher) runTCPWriter(key writerKey, ch <-chan Payload) {
 	defer d.wg.Done()
+	batch := make([]Payload, 0, tcpPayloadBatchSize)
 	for {
 		select {
 		case <-d.ctx.Done():
@@ -211,11 +213,25 @@ func (d *legWriterDispatcher) runTCPWriter(key writerKey, ch <-chan Payload) {
 			if !ok {
 				return
 			}
-			if debuglog.Enabled() {
-				debuglog.Printf("transport", "writer dispatch %s bytes=%d", debugLeg(payload.Leg), len(payload.Packet.Payload))
+			batch = append(batch[:0], payload)
+		drain:
+			for len(batch) < cap(batch) {
+				select {
+				case next, ok := <-ch:
+					if !ok {
+						break drain
+					}
+					if next.Packet != nil {
+						batch = append(batch, next)
+					}
+				default:
+					break drain
+				}
 			}
-			err := writeTCPPayload(d.ctx, payload, d.stream)
-			payload.Packet.Release()
+			if debuglog.Enabled() {
+				debuglog.Printf("transport", "writer dispatch %s packets=%d bytes=%d", debugLeg(payload.Leg), len(batch), payloadBatchBytes(batch))
+			}
+			err := writeTCPBatch(d.ctx, batch, d.stream)
 			if err != nil {
 				d.reportWriterError(ch, payload.Leg, err)
 				return
@@ -362,6 +378,42 @@ func writeTCPPayload(ctx context.Context, payload Payload, stream StreamTranspor
 		return nil
 	}
 	return err
+}
+
+type streamPayloadBatchTransport interface {
+	writePayloadBatch(ctx context.Context, connID string, payloads []Payload) error
+}
+
+func writeTCPBatch(ctx context.Context, payloads []Payload, stream StreamTransport) error {
+	if len(payloads) == 0 {
+		return nil
+	}
+	first := payloads[0]
+	if stream == nil || first.Leg.ConnID == "" {
+		releasePayloads(payloads)
+		return ErrInvalidLeg
+	}
+	if batch, ok := stream.(streamPayloadBatchTransport); ok && len(payloads) > 1 {
+		err := batch.writePayloadBatch(ctx, first.Leg.ConnID, payloads)
+		if err != nil && !errors.Is(err, context.Canceled) {
+			if debuglog.Enabled() {
+				debuglog.Printf("transport", "drop stale tcp batch conn=%s packets=%d bytes=%d err=%v", first.Leg.ConnID, len(payloads), payloadBatchBytes(payloads), err)
+			}
+			return nil
+		}
+		return err
+	}
+	for i, payload := range payloads {
+		err := writeTCPPayload(ctx, payload, stream)
+		if payload.Packet != nil {
+			payload.Packet.Release()
+		}
+		if err != nil {
+			releasePayloads(payloads[i+1:])
+			return err
+		}
+	}
+	return nil
 }
 
 func udpPayloadBatchSize(packet PacketTransport, endpointID string) int {
