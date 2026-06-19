@@ -8,6 +8,8 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"github.com/MeteorsLiu/multipath/internal/packetbuf"
 )
 
 func TestStreamLengthPrefixedReadWrite(t *testing.T) {
@@ -194,6 +196,32 @@ func TestStreamWriteCompletesPartialConnWrites(t *testing.T) {
 	}
 }
 
+func TestStreamWritePayloadBatchWritesLengthPrefixedFrames(t *testing.T) {
+	conn := &partialWriteConn{maxChunk: 3}
+	stream := NewStream(nil)
+	connID := stream.addConn(conn)
+
+	first := packetbufFromString("one")
+	second := packetbufFromString("two")
+	payloads := []Payload{
+		{Leg: LegRef{Kind: KindTCP, ConnID: connID}, Packet: first},
+		{Leg: LegRef{Kind: KindTCP, ConnID: connID}, Packet: second},
+	}
+
+	if err := stream.writePayloadBatch(context.Background(), connID, payloads); err != nil {
+		t.Fatalf("writePayloadBatch failed: %v", err)
+	}
+	if first.Payload != nil || second.Payload != nil {
+		t.Fatal("batch packets were not released")
+	}
+
+	got := conn.buf.Bytes()
+	want := []byte{0, 3, 'o', 'n', 'e', 0, 3, 't', 'w', 'o'}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("written bytes = %v, want %v", got, want)
+	}
+}
+
 func TestStreamWriteErrorClosesConn(t *testing.T) {
 	conn := &errorWriteConn{err: errors.New("write failed")}
 	stream := NewStream(nil)
@@ -205,6 +233,12 @@ func TestStreamWriteErrorClosesConn(t *testing.T) {
 	if !conn.closed {
 		t.Fatal("conn was not closed after write error")
 	}
+}
+
+func packetbufFromString(value string) *packetbuf.Packet {
+	packet := packetbuf.Acquire(len(value))
+	copy(packet.Payload, value)
+	return packet
 }
 
 type partialWriteConn struct {
