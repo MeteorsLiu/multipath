@@ -50,6 +50,20 @@ func TestQualitySelectorFallsBackToTCPWhenUDPJitterHigh(t *testing.T) {
 	}
 }
 
+func TestQualitySelectorDoesNotFallbackWhenBothLegsShareHighJitter(t *testing.T) {
+	sel := QualitySelector{}
+	udp := Quality{Active: true, DeliveryRate: 0.95, SmoothedRTT: 100 * time.Millisecond, RTTVariance: 120 * time.Millisecond}
+	tcp := Quality{Active: true, DeliveryRate: 0.95, SmoothedRTT: 100 * time.Millisecond, RTTVariance: 120 * time.Millisecond}
+
+	useUDP, ok := sel.Pick(udp, tcp)
+	if !ok {
+		t.Fatal("Pick returned false, want true")
+	}
+	if !useUDP {
+		t.Fatal("Pick returned TCP for shared path jitter, want UDP")
+	}
+}
+
 func TestQualitySelectorIgnoresTinyUDPJitter(t *testing.T) {
 	sel := QualitySelector{}
 	udp := Quality{Active: true, DeliveryRate: 0.95, SmoothedRTT: time.Millisecond, RTTVariance: time.Millisecond}
@@ -110,7 +124,7 @@ func TestQualitySelectorKeepsUDPWhenTCPAlsoDegraded(t *testing.T) {
 func TestQualitySelectorQoSPrefersHealthyLeg(t *testing.T) {
 	now := time.Unix(0, 0)
 	sel := NewQualitySelectorForTest(func() time.Time { return now })
-	udp := Quality{Active: true, DeliveryRate: 1.0, QoSActive: true, QoSReason: QoSReasonLimited, QoSDeliveredBps: 2_000_000}
+	udp := Quality{Active: true, DeliveryRate: 1.0, QoSActive: true, QoSDeliveredBps: 2_000_000}
 	tcp := Quality{Active: true, DeliveryRate: 1.0}
 
 	useUDP, ok := sel.Pick(udp, tcp)
@@ -122,8 +136,8 @@ func TestQualitySelectorQoSPrefersHealthyLeg(t *testing.T) {
 func TestQualitySelectorQoSChoosesHigherBpsWhenBothBad(t *testing.T) {
 	now := time.Unix(0, 0)
 	sel := NewQualitySelectorForTest(func() time.Time { return now })
-	udp := Quality{Active: true, DeliveryRate: 1.0, QoSActive: true, QoSReason: QoSReasonLimited, QoSDeliveredBps: 2_000_000}
-	tcp := Quality{Active: true, DeliveryRate: 1.0, QoSActive: true, QoSReason: QoSReasonLimited, QoSDeliveredBps: 8_000_000}
+	udp := Quality{Active: true, DeliveryRate: 1.0, QoSActive: true, QoSDeliveredBps: 2_000_000}
+	tcp := Quality{Active: true, DeliveryRate: 1.0, QoSActive: true, QoSDeliveredBps: 8_000_000}
 
 	useUDP, ok := sel.Pick(udp, tcp)
 	if !ok || useUDP {
@@ -134,7 +148,7 @@ func TestQualitySelectorQoSChoosesHigherBpsWhenBothBad(t *testing.T) {
 func TestQualitySelectorQoSHonorsHold(t *testing.T) {
 	now := time.Unix(0, 0)
 	sel := NewQualitySelectorForTest(func() time.Time { return now })
-	udpBad := Quality{Active: true, DeliveryRate: 1.0, QoSActive: true, QoSReason: QoSReasonLimited, QoSDeliveredBps: 2_000_000}
+	udpBad := Quality{Active: true, DeliveryRate: 1.0, QoSActive: true, QoSDeliveredBps: 2_000_000}
 	tcpGood := Quality{Active: true, DeliveryRate: 1.0}
 	if useUDP, ok := sel.Pick(udpBad, tcpGood); !ok || useUDP {
 		t.Fatalf("first Pick = %v/%v, want TCP", useUDP, ok)
@@ -142,7 +156,7 @@ func TestQualitySelectorQoSHonorsHold(t *testing.T) {
 
 	now = now.Add(time.Second)
 	udpGood := Quality{Active: true, DeliveryRate: 1.0}
-	tcpBad := Quality{Active: true, DeliveryRate: 1.0, QoSActive: true, QoSReason: QoSReasonLimited, QoSDeliveredBps: 1_000_000}
+	tcpBad := Quality{Active: true, DeliveryRate: 1.0, QoSActive: true, QoSDeliveredBps: 1_000_000}
 	if useUDP, ok := sel.Pick(udpGood, tcpBad); !ok || useUDP {
 		t.Fatalf("Pick during hold = %v/%v, want held TCP", useUDP, ok)
 	}
@@ -151,7 +165,7 @@ func TestQualitySelectorQoSHonorsHold(t *testing.T) {
 func TestQualitySelectorQoSHoldBlocksFailedReturnEscape(t *testing.T) {
 	now := time.Unix(0, 0)
 	sel := NewQualitySelectorForTest(func() time.Time { return now })
-	udpBad := Quality{Active: true, DeliveryRate: 1.0, QoSActive: true, QoSReason: QoSReasonLimited, QoSDeliveredBps: 2_000_000}
+	udpBad := Quality{Active: true, DeliveryRate: 1.0, QoSActive: true, QoSDeliveredBps: 2_000_000}
 	udpGood := Quality{Active: true, DeliveryRate: 1.0}
 	tcpGood := Quality{Active: true, DeliveryRate: 1.0}
 
@@ -172,7 +186,7 @@ func TestQualitySelectorQoSHoldBlocksFailedReturnEscape(t *testing.T) {
 func TestQualitySelectorQoSHoldDoesNotMaskLocalUDPFailure(t *testing.T) {
 	now := time.Unix(0, 0)
 	sel := NewQualitySelectorForTest(func() time.Time { return now })
-	udpBadQoS := Quality{Active: true, DeliveryRate: 1.0, QoSActive: true, QoSReason: QoSReasonLimited, QoSDeliveredBps: 2_000_000}
+	udpBadQoS := Quality{Active: true, DeliveryRate: 1.0, QoSActive: true, QoSDeliveredBps: 2_000_000}
 	udpGood := Quality{Active: true, DeliveryRate: 1.0}
 	tcpGood := Quality{Active: true, DeliveryRate: 1.0}
 
@@ -194,7 +208,7 @@ func TestQualitySelectorQoSHoldDoesNotMaskLocalUDPFailure(t *testing.T) {
 func TestQualitySelectorQoSReturnsToUDPAfterPreferWait(t *testing.T) {
 	now := time.Unix(0, 0)
 	sel := NewQualitySelectorForTest(func() time.Time { return now })
-	udpBad := Quality{Active: true, DeliveryRate: 1.0, QoSActive: true, QoSReason: QoSReasonLimited, QoSDeliveredBps: 2_000_000}
+	udpBad := Quality{Active: true, DeliveryRate: 1.0, QoSActive: true, QoSDeliveredBps: 2_000_000}
 	tcpGood := Quality{Active: true, DeliveryRate: 1.0}
 	if useUDP, ok := sel.Pick(udpBad, tcpGood); !ok || useUDP {
 		t.Fatalf("first Pick = %v/%v, want TCP", useUDP, ok)
@@ -210,7 +224,7 @@ func TestQualitySelectorQoSReturnsToUDPAfterPreferWait(t *testing.T) {
 func TestQualitySelectorQoSBacksOffPreferWaitAfterFailedReturn(t *testing.T) {
 	now := time.Unix(0, 0)
 	sel := NewQualitySelectorForTest(func() time.Time { return now })
-	udpBad := Quality{Active: true, DeliveryRate: 1.0, QoSActive: true, QoSReason: QoSReasonLimited, QoSDeliveredBps: 2_000_000}
+	udpBad := Quality{Active: true, DeliveryRate: 1.0, QoSActive: true, QoSDeliveredBps: 2_000_000}
 	tcpGood := Quality{Active: true, DeliveryRate: 1.0}
 	if useUDP, ok := sel.Pick(udpBad, tcpGood); !ok || useUDP {
 		t.Fatalf("first Pick = %v/%v, want TCP", useUDP, ok)

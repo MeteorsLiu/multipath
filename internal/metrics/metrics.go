@@ -154,7 +154,7 @@ var specs = map[string]metricSpec{
 	QoSEventsTotal: {
 		kind:   metricCounter,
 		help:   "Total receive-side QoS estimator events.",
-		labels: []string{"event", "session", "lane", "leg", "reason"},
+		labels: []string{"event", "session", "lane", "leg"},
 	},
 	QoSDeliveredBps: {
 		kind:   metricGauge,
@@ -164,7 +164,7 @@ var specs = map[string]metricSpec{
 	LinkStatusEventsTotal: {
 		kind:   metricCounter,
 		help:   "Total LINK_STATUS send/apply/drop events.",
-		labels: []string{"event", "session", "lane", "leg", "reason"},
+		labels: []string{"event", "session", "lane", "udp_limited", "tcp_limited"},
 	},
 	ProbeEventsTotal: {
 		kind:   metricCounter,

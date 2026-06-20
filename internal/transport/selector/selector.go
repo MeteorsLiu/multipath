@@ -18,7 +18,6 @@ type Quality struct {
 	PreferTCP    bool // probeBW cold-start lock (old BandwidthPreferTCP)
 
 	QoSActive       bool
-	QoSReason       uint8
 	QoSDeliveredBps uint32
 }
 
@@ -31,8 +30,6 @@ const (
 	minUDPDelivery = 0.80
 	minTCPDelivery = 0.90
 	minUDPJitter   = 10 * time.Millisecond
-
-	QoSReasonLimited uint8 = 1
 
 	qosHold       = 10 * time.Second
 	qosPreferWait = 10 * time.Second
@@ -94,6 +91,7 @@ func (s *QualitySelector) Pick(udp, tcp Quality) (useUDP bool, ok bool) {
 	}
 	// 4. UDP RTT variance too high & TCP healthy → TCP.
 	if udp.RTTVariance >= minUDPJitter && udp.RTTVariance >= udp.SmoothedRTT &&
+		!(tcp.RTTVariance >= minUDPJitter && tcp.RTTVariance >= tcp.SmoothedRTT) &&
 		tcp.DeliveryRate >= minTCPDelivery {
 		s.recordPick(false, now)
 		return false, true
@@ -172,6 +170,7 @@ func localPrefersTCP(udp, tcp Quality) bool {
 		return true
 	}
 	if udp.RTTVariance >= minUDPJitter && udp.RTTVariance >= udp.SmoothedRTT &&
+		!(tcp.RTTVariance >= minUDPJitter && tcp.RTTVariance >= tcp.SmoothedRTT) &&
 		tcp.DeliveryRate >= minTCPDelivery {
 		return true
 	}

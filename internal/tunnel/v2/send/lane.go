@@ -133,11 +133,11 @@ type laneQoSInput struct {
 	lane *laneRuntime
 }
 
-func (i laneQoSInput) OnQoS(kind transport.Kind, reason uint8, deliveredBps uint32, now time.Time) {
+func (i laneQoSInput) OnQoSStatus(udpLimited bool, udpDeliveredBps uint32, tcpLimited bool, tcpDeliveredBps uint32) {
 	if i.lane == nil {
 		return
 	}
-	i.lane.leg.observeQoS(kind, reason, deliveredBps, now)
+	i.lane.leg.observeQoSStatus(udpLimited, udpDeliveredBps, tcpLimited, tcpDeliveredBps)
 }
 
 // commitPacket adds a DATA packet to this lane's FEC transmit window (spec 9.1).

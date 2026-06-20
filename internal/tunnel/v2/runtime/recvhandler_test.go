@@ -296,9 +296,9 @@ found:
 		SessionID: sessionID,
 		LaneID:    1,
 		Body: protocol.LinkStatusBody{
-			LegKind:      protocol.LinkStatusLegUDP,
-			Reason:       protocol.LinkStatusReasonLimited,
-			DeliveredBps: 2_000_000,
+			Status:          protocol.LinkStatusStateLimited << 4,
+			UDPDeliveredBps: 2_000_000,
+			TCPDeliveredBps: 8_000_000,
 		},
 	}
 	if err := handler.OnQoS(context.Background(), transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp"}, frame); err != nil {

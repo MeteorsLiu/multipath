@@ -24,10 +24,8 @@ const (
 
 	CloseReasonUnknownSession uint8 = 1
 
-	LinkStatusLegUDP uint8 = 1
-	LinkStatusLegTCP uint8 = 2
-
-	LinkStatusReasonLimited uint8 = 1
+	LinkStatusStateClear   uint8 = 0
+	LinkStatusStateLimited uint8 = 1
 )
 
 type Body interface {
@@ -106,9 +104,9 @@ type BandwidthProbeAckBody struct {
 func (BandwidthProbeAckBody) protocolBody() {}
 
 type LinkStatusBody struct {
-	LegKind      uint8
-	Reason       uint8
-	DeliveredBps uint32
+	Status          uint8
+	UDPDeliveredBps uint32
+	TCPDeliveredBps uint32
 }
 
 func (LinkStatusBody) protocolBody() {}
@@ -157,10 +155,10 @@ func encodedBodySize(frame Frame) (int, error) {
 		return 36, nil
 	case TypeLinkStatus:
 		body, ok := frame.Body.(LinkStatusBody)
-		if !ok || !validLinkStatusLeg(body.LegKind) || !validLinkStatusReason(body.Reason) {
+		if !ok || !validLinkStatusStatus(body.Status) {
 			return 0, ErrInvalidFrame
 		}
-		return 6, nil
+		return 9, nil
 	default:
 		return 0, ErrInvalidFrame
 	}
@@ -224,9 +222,9 @@ func encodeBodyInto(frame Frame, out []byte) error {
 		binary.BigEndian.PutUint64(out[28:36], body.LastRXMS)
 	case TypeLinkStatus:
 		body := frame.Body.(LinkStatusBody)
-		out[0] = body.LegKind
-		out[1] = body.Reason
-		binary.BigEndian.PutUint32(out[2:6], body.DeliveredBps)
+		out[0] = body.Status
+		binary.BigEndian.PutUint32(out[1:5], body.UDPDeliveredBps)
+		binary.BigEndian.PutUint32(out[5:9], body.TCPDeliveredBps)
 	default:
 		return ErrInvalidFrame
 	}
@@ -327,18 +325,17 @@ func decodeBody(frame *Frame, body []byte) error {
 			LastRXMS:  binary.BigEndian.Uint64(body[28:36]),
 		}
 	case TypeLinkStatus:
-		if len(body) != 6 {
+		if len(body) != 9 {
 			return ErrBodyTooShort
 		}
-		legKind := body[0]
-		reason := body[1]
-		if !validLinkStatusLeg(legKind) || !validLinkStatusReason(reason) {
+		status := body[0]
+		if !validLinkStatusStatus(status) {
 			return ErrInvalidFrame
 		}
 		frame.Body = LinkStatusBody{
-			LegKind:      legKind,
-			Reason:       reason,
-			DeliveredBps: binary.BigEndian.Uint32(body[2:6]),
+			Status:          status,
+			UDPDeliveredBps: binary.BigEndian.Uint32(body[1:5]),
+			TCPDeliveredBps: binary.BigEndian.Uint32(body[5:9]),
 		}
 	default:
 		return ErrInvalidFrame
@@ -346,10 +343,12 @@ func decodeBody(frame *Frame, body []byte) error {
 	return nil
 }
 
-func validLinkStatusLeg(legKind uint8) bool {
-	return legKind == LinkStatusLegUDP || legKind == LinkStatusLegTCP
+func validLinkStatusStatus(status uint8) bool {
+	udp := status >> 4
+	tcp := status & 0x0f
+	return validLinkStatusState(udp) && validLinkStatusState(tcp)
 }
 
-func validLinkStatusReason(reason uint8) bool {
-	return reason == LinkStatusReasonLimited
+func validLinkStatusState(state uint8) bool {
+	return state == LinkStatusStateClear || state == LinkStatusStateLimited
 }

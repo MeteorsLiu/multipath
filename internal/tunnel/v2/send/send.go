@@ -647,7 +647,17 @@ func (s *Send) Write(ctx context.Context, packet *packetbuf.Packet) error {
 // WriteFrame sends a control frame (spec 6.2).
 func (s *Send) WriteFrame(ctx context.Context, frame protocol.Frame, to Ref) error {
 	if to.Kind != 0 {
-		// Explicit transport
+		if (to.Kind == transport.KindUDP && (to.EndpointID == "" || to.RemoteAddr == nil)) ||
+			(to.Kind == transport.KindTCP && to.ConnID == "") {
+			lane := s.getLane(laneKey{sessionID: frame.SessionID, laneID: frame.LaneID})
+			if lane == nil {
+				return ErrUnknownLane
+			}
+			to = lane.leg.refForKind(to.Kind)
+			if to.Kind == 0 {
+				return ErrLaneUnavailable
+			}
+		}
 		if err := s.writeFrameOnLeg(ctx, to, frame); err != nil {
 			return err
 		}
@@ -681,6 +691,11 @@ func (s *Send) admitPassiveHelloAck(ctx context.Context, frame protocol.Frame, l
 	}
 
 	s.rebootstrapMu.Lock()
+	key := laneKey{sessionID: frame.SessionID, laneID: frame.LaneID}
+	if active, ok := s.activeSession(); ok && active != frame.SessionID && s.getLane(key) != nil {
+		s.rebootstrapMu.Unlock()
+		return
+	}
 	sessionCtx, closedTCP := s.ensurePassiveSessionContext(ctx, frame.SessionID)
 
 	s.sendStatesMu.Lock()
@@ -689,7 +704,6 @@ func (s *Send) admitPassiveHelloAck(ctx context.Context, frame protocol.Frame, l
 	}
 	s.sendStatesMu.Unlock()
 
-	key := laneKey{sessionID: frame.SessionID, laneID: frame.LaneID}
 	lane := s.getLane(key)
 	if lane == nil {
 		lane = newLaneRuntime(frame.LaneID, 1)
@@ -865,10 +879,10 @@ func (s *Send) sendDataFrame(ctx context.Context, lane *laneRuntime, frame proto
 	s.recordQoSDataLegSelection(frame.SessionID, lane, leg.Kind, qosEnabled)
 	if debuglog.Enabled() {
 		udpQ, tcpQ := lane.leg.qualitySnapshot()
-		debuglog.Printf("send", "schedule_select session=%d lane=%d leg={%s} frame=type=DATA packet_id=%d payload_len=%d udp_active=%t udp_rate=%.3f udp_qos=%t udp_qos_reason=%d udp_prefer_tcp=%t udp_rttvar_ms=%d tcp_active=%t tcp_rate=%.3f tcp_qos=%t tcp_qos_reason=%d",
+		debuglog.Printf("send", "schedule_select session=%d lane=%d leg={%s} frame=type=DATA packet_id=%d payload_len=%d udp_active=%t udp_rate=%.3f udp_qos=%t udp_qos_bps=%d udp_prefer_tcp=%t udp_rttvar_ms=%d tcp_active=%t tcp_rate=%.3f tcp_qos=%t tcp_qos_bps=%d",
 			frame.SessionID, lane.id, debugLeg(leg), packetID, len(payload),
-			udpQ.Active, udpQ.DeliveryRate, udpQ.QoSActive, udpQ.QoSReason, udpQ.PreferTCP, udpQ.RTTVariance.Milliseconds(),
-			tcpQ.Active, tcpQ.DeliveryRate, tcpQ.QoSActive, tcpQ.QoSReason)
+			udpQ.Active, udpQ.DeliveryRate, udpQ.QoSActive, udpQ.QoSDeliveredBps, udpQ.PreferTCP, udpQ.RTTVariance.Milliseconds(),
+			tcpQ.Active, tcpQ.DeliveryRate, tcpQ.QoSActive, tcpQ.QoSDeliveredBps)
 	}
 
 	// Add to FEC window if enabled

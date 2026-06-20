@@ -105,10 +105,10 @@ estimate:
 - FEC-derived expected DATA rate
 - REPAIR shadow equivalent rate
 
-The estimator can report either the DATA leg as limited or the REPAIR shadow leg
-as limited. Runtime `QoSWriter` sends LINK_STATUS, and Send applies it as
-time-limited per-lane selector evidence through `LaneManager`; this is not a
-global UDP/TCP fallback.
+The estimator maintains UDP and TCP limited state for the lane. Runtime
+`QoSWriter` sends LINK_STATUS snapshots carrying both leg states and their
+delivered bps estimates, and Send applies each snapshot through `LaneManager`;
+this is not a global UDP/TCP fallback.
 
 ## Bandwidth Probe
 

@@ -12,19 +12,18 @@ const (
 	defaultRxSLCWindowDataLimit   = 4096
 	defaultRxSLCWindowRepairLimit = 1024
 	defaultRxSLCWindowClosedLimit = 4096
+	defaultRxSLCWindowRepairGrace = 64
 )
 
 // rxSLCWindow buffers received DATA shards and REPAIR symbols so a complete
-// FEC group with one missing data shard can be reconstructed. The same group
-// facts also drive receive-side QoS samples; there is no separate packet-id
-// accounting ledger outside the window.
+// FEC group with one missing data shard can be reconstructed.
 //
 // Storage uses pooled packetbuf.Packet buffers so steady-state operation does
 // not allocate per packet.
 //
-// The window is concerned only with FEC storage, recovery, and group-level QoS
-// evidence. Deciding whether a packet has already been emitted to TUN is the
-// job of the session-scoped emitDedupe, not the window.
+// The window is concerned only with FEC storage and recovery. Deciding whether
+// a packet has already been emitted to TUN is the job of the session-scoped
+// emitDedupe, not the window.
 //
 // All methods must be called with the caller's per-session lock held.
 type rxSLCWindow struct {
@@ -73,6 +72,7 @@ type rxWindowResult struct {
 	hasRecoverable bool
 	sample         qosSample
 	hasSample      bool
+	health         []qosHealthSample
 }
 
 // rxRecoverable identifies an FEC group that can be reconstructed. It does
@@ -163,7 +163,8 @@ func (w *rxSLCWindow) addData(kind transport.Kind, packetID uint32, packet []byt
 			}
 		}
 	}
-	w.prune()
+	out.health = append(out.health, w.pruneStaleRepairs(packetID, at)...)
+	out.health = append(out.health, w.prune(at)...)
 	return out
 }
 
@@ -192,11 +193,11 @@ func (w *rxSLCWindow) addRepair(kind transport.Kind, basePacketID uint32, key ui
 	if sample, ok := w.completeGroupSample(repair, at); ok {
 		repair.symbol.Release()
 		w.closeGroup(repair, -1)
-		w.prune()
+		health := w.prune(at)
 		if debuglog.Enabled() {
 			debuglog.Printf("recv/fec_window", "rx_repair_complete base_packet_id=%d key=%d source_span=%d symbol_len=%d", basePacketID, key, sourceSpan, len(symbol))
 		}
-		return rxWindowResult{sample: sample, hasSample: true}
+		return rxWindowResult{sample: sample, hasSample: true, health: health}
 	}
 	if w.allKnown(repair) {
 		repair.symbol.Release()
@@ -212,14 +213,15 @@ func (w *rxSLCWindow) addRepair(kind transport.Kind, basePacketID uint32, key ui
 	}
 	w.repairs[basePacketID] = repair
 	recoverable, ok := w.recoverable(repair)
-	w.prune()
+	health := w.pruneStaleRepairs(basePacketID, at)
+	health = append(health, w.prune(at)...)
 	if debuglog.Enabled() {
 		debuglog.Printf("recv/fec_window", "rx_repair base_packet_id=%d key=%d source_span=%d symbol_len=%d recoverable=%t data=%d repairs=%d", basePacketID, key, sourceSpan, len(symbol), ok, len(w.data), len(w.repairs))
 	}
 	if ok {
-		return rxWindowResult{recoverable: recoverable, hasRecoverable: true}
+		return rxWindowResult{recoverable: recoverable, hasRecoverable: true, health: health}
 	}
-	return rxWindowResult{}
+	return rxWindowResult{health: health}
 }
 
 func (w *rxSLCWindow) observeLateData(kind transport.Kind, packetID uint32, packet []byte, at time.Time) rxWindowResult {
@@ -232,17 +234,17 @@ func (w *rxSLCWindow) observeLateData(kind transport.Kind, packetID uint32, pack
 	}
 	w.storeData(packetID, packet, kind, at, true)
 	sample, ok := w.lateClosedGroupSample(packetID, at)
-	w.prune()
+	health := w.prune(at)
 	if !ok {
-		return rxWindowResult{}
+		return rxWindowResult{health: health}
 	}
 	if debuglog.Enabled() {
 		debuglog.Printf("recv/fec_window", "rx_late_data_sample packet_id=%d kind=%d", packetID, kind)
 	}
-	return rxWindowResult{sample: sample, hasSample: true}
+	return rxWindowResult{sample: sample, hasSample: true, health: health}
 }
 
-func (w *rxSLCWindow) finishRecovery(r rxRecoverable, recovered []byte, at time.Time) (qosSample, bool) {
+func (w *rxSLCWindow) finishRecovery(r rxRecoverable, recovered []byte, at time.Time) (qosSample, []qosHealthSample, bool) {
 	packetID := r.basePacketID + uint32(r.missingIndex)
 	sample, ok := w.recoveredGroupSample(r, uint64(len(recovered)), at)
 	w.storeData(packetID, recovered, 0, at, false)
@@ -250,8 +252,8 @@ func (w *rxSLCWindow) finishRecovery(r rxRecoverable, recovered []byte, at time.
 		w.closeGroup(repair, r.missingIndex)
 	}
 	w.dropRepair(r.basePacketID)
-	w.prune()
-	return sample, ok
+	health := w.prune(at)
+	return sample, health, ok
 }
 
 // buildShardsLocked materializes the shard slices for a recoverable group from
@@ -360,6 +362,7 @@ func (w *rxSLCWindow) completeGroupSample(repair rxRepair, at time.Time) (qosSam
 		DataExpected: uint64(repair.sourceSpan),
 		DataBytes:    dataBytes,
 		RepairKind:   repair.kind,
+		RepairAt:     repair.at,
 		RepairBytes:  uint64(len(repair.symbol.Payload)),
 	}, true
 }
@@ -411,6 +414,7 @@ func (w *rxSLCWindow) recoveredGroupSample(r rxRecoverable, recoveredBytes uint6
 		DataBytes:      dataBytes,
 		RecoveredBytes: recoveredBytes,
 		RepairKind:     repair.kind,
+		RepairAt:       repair.at,
 		RepairBytes:    uint64(len(repair.symbol.Payload)),
 	}, true
 }
@@ -467,6 +471,7 @@ func (w *rxSLCWindow) closedCompleteGroupSample(basePacketID uint32, sourceSpan 
 		DataExpected: uint64(sourceSpan),
 		DataBytes:    dataBytes,
 		RepairKind:   closed.repairKind,
+		RepairAt:     closed.repairAt,
 		RepairBytes:  closed.repairBytes,
 	}, true
 }
@@ -530,7 +535,8 @@ func (w *rxSLCWindow) dropRepair(basePacketID uint32) {
 	delete(w.repairs, basePacketID)
 }
 
-func (w *rxSLCWindow) prune() {
+func (w *rxSLCWindow) prune(at time.Time) []qosHealthSample {
+	var health []qosHealthSample
 	if w.maxData > 0 {
 		for len(w.data) > w.maxData && len(w.dataOrder) > 0 {
 			packetID := w.dataOrder[0]
@@ -552,6 +558,11 @@ func (w *rxSLCWindow) prune() {
 		for len(w.repairs) > w.maxRepairs && len(w.repairOrder) > 0 {
 			basePacketID := w.repairOrder[0]
 			w.repairOrder = w.repairOrder[1:]
+			if repair, ok := w.repairs[basePacketID]; ok {
+				if sample, ok := w.unrecoverableHealthSample(repair, at); ok {
+					health = append(health, sample)
+				}
+			}
 			w.dropRepair(basePacketID)
 			if debuglog.Enabled() {
 				debuglog.Printf("recv/fec_window", "rx_prune_repair base_packet_id=%d repairs=%d", basePacketID, len(w.repairs))
@@ -567,6 +578,84 @@ func (w *rxSLCWindow) prune() {
 			delete(w.closed, key)
 		}
 	}
+	return health
+}
+
+func (w *rxSLCWindow) pruneStaleRepairs(watermark uint32, at time.Time) []qosHealthSample {
+	var health []qosHealthSample
+	w.dropStaleRepairOrder()
+	for len(w.repairOrder) > 0 {
+		basePacketID := w.repairOrder[0]
+		repair, ok := w.repairs[basePacketID]
+		if !ok {
+			w.repairOrder = w.repairOrder[1:]
+			continue
+		}
+		if !staleRepair(repair, watermark) {
+			break
+		}
+		w.repairOrder = w.repairOrder[1:]
+		if sample, ok := w.unrecoverableHealthSample(repair, at); ok {
+			health = append(health, sample)
+		}
+		w.dropRepair(basePacketID)
+		if debuglog.Enabled() {
+			debuglog.Printf("recv/fec_window", "rx_prune_stale_repair base_packet_id=%d watermark=%d repairs=%d", basePacketID, watermark, len(w.repairs))
+		}
+		w.dropStaleRepairOrder()
+	}
+	return health
+}
+
+func staleRepair(repair rxRepair, watermark uint32) bool {
+	if repair.kind != transport.KindTCP || repair.sourceSpan <= 0 {
+		return false
+	}
+	end := repair.basePacketID + uint32(repair.sourceSpan)
+	delta := watermark - end
+	return delta < dedupeBehindThreshold && delta >= defaultRxSLCWindowRepairGrace
+}
+
+func (w *rxSLCWindow) unrecoverableHealthSample(repair rxRepair, at time.Time) (qosHealthSample, bool) {
+	if repair.sourceSpan <= 0 || repair.sourceSpan > w.sourceCount || !qosKnownKind(repair.kind) {
+		return qosHealthSample{}, false
+	}
+	if repair.kind != transport.KindTCP {
+		return qosHealthSample{}, false
+	}
+	var (
+		dataKind transport.Kind
+		arrived  uint64
+	)
+	for i := 0; i < repair.sourceSpan; i++ {
+		packetID := repair.basePacketID + uint32(i)
+		data, ok := w.data[packetID]
+		if !ok || data.packet == nil {
+			continue
+		}
+		if !data.wire || !qosKnownKind(data.kind) {
+			return qosHealthSample{}, false
+		}
+		if dataKind == 0 {
+			dataKind = data.kind
+		} else if dataKind != data.kind {
+			return qosHealthSample{}, false
+		}
+		arrived++
+	}
+	if int(arrived)+1 >= repair.sourceSpan {
+		return qosHealthSample{}, false
+	}
+	if dataKind == 0 {
+		dataKind = otherTransportKind(repair.kind)
+	}
+	return qosHealthSample{
+		At:           at,
+		DataKind:     dataKind,
+		RepairKind:   repair.kind,
+		DataArrived:  arrived,
+		DataExpected: uint64(repair.sourceSpan),
+	}, true
 }
 
 // releaseAll returns every pooled buffer held by the window back to its

@@ -1513,6 +1513,61 @@ func TestCloseSessionDoesNotResetNewPassiveAdmission(t *testing.T) {
 	}
 }
 
+func TestStalePassiveHelloAckDoesNotResetActiveSession(t *testing.T) {
+	sessions := &sessionpkg.Manager{}
+	s := New(Config{
+		SessionManager: sessions,
+		ProbeInterval:  time.Hour,
+		ProbeTimeout:   time.Hour,
+	})
+
+	const oldSessionID = uint64(194)
+	const newSessionID = uint64(195)
+	const laneID = uint8(1)
+	if _, ok := sessions.GetOrCreate(oldSessionID); !ok {
+		t.Fatal("failed to create old session")
+	}
+	if _, ok := sessions.GetOrCreate(newSessionID); !ok {
+		t.Fatal("failed to create new session")
+	}
+
+	oldLane := newLaneRuntime(laneID, 1)
+	oldLane.bindUDP(e2eUDP())
+	newLane := newLaneRuntime(laneID, 1)
+	newLane.bindUDP(e2eUDP())
+	s.lanesMu.Lock()
+	s.lanes[laneKey{sessionID: oldSessionID, laneID: laneID}] = oldLane
+	s.lanes[laneKey{sessionID: newSessionID, laneID: laneID}] = newLane
+	s.lanesMu.Unlock()
+	s.registerLaneQoS(newSessionID, newLane)
+	s.startLanePing(context.Background(), newSessionID, newLane, e2eUDP())
+	s.activateSession(newSessionID)
+
+	staleAck := protocol.Frame{
+		Version:   protocol.Version,
+		Type:      protocol.TypeHELLOACK,
+		SessionID: oldSessionID,
+		LaneID:    laneID,
+		Body: protocol.HelloAckBody{
+			Nonce:    1,
+			Accepted: 1,
+		},
+	}
+	if err := s.WriteFrame(context.Background(), staleAck, e2eUDP()); err != nil {
+		t.Fatalf("stale passive ack write failed: %v", err)
+	}
+
+	if active, ok := s.activeSession(); !ok || active != newSessionID {
+		t.Fatalf("active session = %d/%v, want new session %d", active, ok, newSessionID)
+	}
+	if s.LaneManager().LookupPing(KeyForLeg(newSessionID, laneID, e2eUDP())) == nil {
+		t.Fatal("new active ping registration was reset by stale passive ack")
+	}
+	if s.getLane(laneKey{sessionID: newSessionID, laneID: laneID}) == nil {
+		t.Fatal("new active lane was removed by stale passive ack")
+	}
+}
+
 // TestCloseSessionClearsState verifies a plain session CLOSE releases all
 // send-side per-session state (lane, sendState, ping) so it does not leak under
 // session churn (spec 7). Unlike Rebootstrap, it does not rebuild.
