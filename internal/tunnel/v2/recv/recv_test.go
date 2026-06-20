@@ -100,7 +100,7 @@ func TestRecvDispatchesControlFramesToHandler(t *testing.T) {
 		{Type: protocol.TypeCLOSE, SessionID: 1, LaneID: 1, Body: protocol.CloseBody{Scope: protocol.CloseScopeLane}},
 		{Type: protocol.TypeBandwidthProbe, SessionID: 1, LaneID: 1, Body: protocol.BandwidthProbeBody{Count: 1, TrainBytesTotal: 1}},
 		{Type: protocol.TypeBandwidthProbeAck, SessionID: 1, LaneID: 1, Body: protocol.BandwidthProbeAckBody{Count: 1}},
-		{Type: protocol.TypeLinkStatus, SessionID: 1, LaneID: 1, Body: protocol.LinkStatusBody{LegKind: protocol.LinkStatusLegUDP, Reason: protocol.LinkStatusReasonLimited, DeliveredBps: 1}},
+		{Type: protocol.TypeLinkStatus, SessionID: 1, LaneID: 1, Body: protocol.LinkStatusBody{Status: protocol.LinkStatusStateLimited << 4, UDPDeliveredBps: 1}},
 	}
 	for _, frame := range frames {
 		if err := out.Write(context.Background(), encodedTestFrame(t, frame)); err != nil {
@@ -231,14 +231,14 @@ func TestRecvReportsQoSStatusThroughCallback(t *testing.T) {
 	state.qos[1] = newQoSEstimator(qosConfig{
 		Sustain:     time.Second,
 		SampleFloor: 4,
-		Refresh:     time.Second,
 	}, func(status qosStatus) {
 		statuses = append(statuses, QoSStatus{
-			SessionID:    10,
-			LaneID:       1,
-			Kind:         status.Kind,
-			Reason:       status.Reason,
-			DeliveredBps: status.DeliveredBps,
+			SessionID:       10,
+			LaneID:          1,
+			UDPLimited:      status.UDPLimited,
+			TCPLimited:      status.TCPLimited,
+			UDPDeliveredBps: status.UDPDeliveredBps,
+			TCPDeliveredBps: status.TCPDeliveredBps,
 		})
 	})
 	state.mu.Unlock()
@@ -275,7 +275,7 @@ func TestRecvReportsQoSStatusThroughCallback(t *testing.T) {
 	if len(statuses) != 1 {
 		t.Fatalf("statuses = %+v, want one", statuses)
 	}
-	if statuses[0].SessionID != 10 || statuses[0].LaneID != 1 || statuses[0].Kind != transport.KindUDP || statuses[0].Reason != protocol.LinkStatusReasonLimited {
+	if statuses[0].SessionID != 10 || statuses[0].LaneID != 1 || !statuses[0].UDPLimited || statuses[0].TCPLimited {
 		t.Fatalf("status = %+v, want UDP limited for session 10 lane 1", statuses[0])
 	}
 }

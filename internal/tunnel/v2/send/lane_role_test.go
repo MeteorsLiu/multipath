@@ -3,7 +3,6 @@ package send
 import (
 	"context"
 	"testing"
-	"time"
 
 	"github.com/MeteorsLiu/multipath/internal/packetbuf"
 	"github.com/MeteorsLiu/multipath/internal/protocol"
@@ -87,7 +86,7 @@ func TestLaneQoSOverridesSelector(t *testing.T) {
 	l := newLaneRuntime(1, 100)
 	bindBoth(l)
 
-	laneQoSInput{lane: l}.OnQoS(transport.KindUDP, protocol.LinkStatusReasonLimited, 2_000_000, time.Now())
+	laneQoSInput{lane: l}.OnQoSStatus(true, 2_000_000, false, 8_000_000)
 
 	if got := l.primaryTransport(); got.Kind != transport.KindTCP {
 		t.Fatalf("primary kind = %v, want TCP after UDP QoS", got.Kind)
@@ -102,7 +101,7 @@ func TestLaneQoSSelectionWaitsForBandwidthGate(t *testing.T) {
 	bindBoth(l)
 
 	l.leg.setPreferTCP(true)
-	laneQoSInput{lane: l}.OnQoS(transport.KindTCP, protocol.LinkStatusReasonLimited, 2_000_000, time.Now())
+	laneQoSInput{lane: l}.OnQoSStatus(false, 8_000_000, true, 2_000_000)
 
 	if got := l.primaryTransportWithQoS(false); got.Kind != transport.KindTCP {
 		t.Fatalf("primary kind with QoS gated = %v, want TCP from BW PreferTCP", got.Kind)
@@ -116,7 +115,7 @@ func TestLaneQoSSeenDisablesBandwidthPreferTCP(t *testing.T) {
 	gated := newLaneRuntime(1, 100)
 	bindBoth(gated)
 	gated.leg.setPreferTCP(true)
-	laneQoSInput{lane: gated}.OnQoS(transport.KindUDP, protocol.LinkStatusReasonLimited, 2_000_000, time.Now().Add(-301*time.Second))
+	laneQoSInput{lane: gated}.OnQoSStatus(false, 0, false, 0)
 	if got := gated.primaryTransportWithQoS(false); got.Kind != transport.KindTCP {
 		t.Fatalf("primary kind with QoS gated = %v, want TCP from BW PreferTCP", got.Kind)
 	}
@@ -124,7 +123,7 @@ func TestLaneQoSSeenDisablesBandwidthPreferTCP(t *testing.T) {
 	enabled := newLaneRuntime(1, 100)
 	bindBoth(enabled)
 	enabled.leg.setPreferTCP(true)
-	laneQoSInput{lane: enabled}.OnQoS(transport.KindUDP, protocol.LinkStatusReasonLimited, 2_000_000, time.Now().Add(-301*time.Second))
+	laneQoSInput{lane: enabled}.OnQoSStatus(false, 0, false, 0)
 	if got := enabled.primaryTransportWithQoS(true); got.Kind != transport.KindUDP {
 		t.Fatalf("primary kind after QoS evidence = %v, want UDP with BW PreferTCP suppressed", got.Kind)
 	}

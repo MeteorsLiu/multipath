@@ -2,7 +2,6 @@ package send
 
 import (
 	"sync"
-	"time"
 
 	"github.com/MeteorsLiu/multipath/internal/transport"
 	"github.com/MeteorsLiu/multipath/internal/tunnel/v2/probe/bw"
@@ -27,7 +26,7 @@ type LaneKey struct {
 }
 
 type QoSInput interface {
-	OnQoS(kind transport.Kind, reason uint8, deliveredBps uint32, now time.Time)
+	OnQoSStatus(udpLimited bool, udpDeliveredBps uint32, tcpLimited bool, tcpDeliveredBps uint32)
 }
 
 // KeyForLeg builds a LegKey from a session/lane/leg triple.

@@ -156,6 +156,42 @@ func TestSendWriteFrameExplicitTransport(t *testing.T) {
 	}
 }
 
+func TestSendWriteFrameExplicitTransportKindSelectsBoundLeg(t *testing.T) {
+	s := New()
+	sessionID := uint64(99)
+	lane := newLaneRuntime(1, 100)
+	lane.bindTCP(transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp-lane-1"})
+
+	s.lanesMu.Lock()
+	s.lanes[laneKey{sessionID: sessionID, laneID: 1}] = lane
+	s.lanesMu.Unlock()
+
+	frame := protocol.Frame{
+		Version:   protocol.Version,
+		Type:      protocol.TypePING,
+		SessionID: sessionID,
+		LaneID:    1,
+		Body: protocol.PingBody{
+			PingID: 123,
+			TimeMS: 1000,
+		},
+	}
+
+	if err := s.WriteFrame(context.Background(), frame, transport.LegRef{Kind: transport.KindTCP}); err != nil {
+		t.Fatalf("WriteFrame with kind-only TCP ref failed: %v", err)
+	}
+
+	select {
+	case payload := <-s.Packets():
+		defer payload.Packet.Release()
+		if payload.Leg.Kind != transport.KindTCP || payload.Leg.ConnID != "tcp-lane-1" {
+			t.Fatalf("payload leg = %+v, want tcp-lane-1", payload.Leg)
+		}
+	default:
+		t.Fatal("expected packet in output queue")
+	}
+}
+
 func TestSendWriteDropsWhenNoRunnableLane(t *testing.T) {
 	s := New()
 

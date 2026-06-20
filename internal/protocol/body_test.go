@@ -156,14 +156,14 @@ func TestBandwidthProbeDecodeRejectsInvalidTrainBudget(t *testing.T) {
 func TestLinkStatusRoundTrip(t *testing.T) {
 	frame := Frame{
 		Type:      TypeLinkStatus,
-		SessionID: 11,
-		LaneID:    1,
-		Body: LinkStatusBody{
-			LegKind:      LinkStatusLegUDP,
-			Reason:       LinkStatusReasonLimited,
-			DeliveredBps: 2_000_000,
-		},
-	}
+			SessionID: 11,
+			LaneID:    1,
+			Body: LinkStatusBody{
+				Status:          LinkStatusStateLimited << 4,
+				UDPDeliveredBps: 2_000_000,
+				TCPDeliveredBps: 8_000_000,
+			},
+		}
 	encoded, err := Encode(frame, nil)
 	if err != nil {
 		t.Fatalf("Encode LINK_STATUS failed: %v", err)
@@ -177,10 +177,10 @@ func TestLinkStatusRoundTrip(t *testing.T) {
 
 func TestLinkStatusRejectsInvalidBody(t *testing.T) {
 	tests := []LinkStatusBody{
-		{LegKind: 0, Reason: LinkStatusReasonLimited, DeliveredBps: 1},
-		{LegKind: LinkStatusLegUDP, Reason: 0, DeliveredBps: 1},
-		{LegKind: LinkStatusLegTCP + 1, Reason: LinkStatusReasonLimited, DeliveredBps: 1},
-		{LegKind: LinkStatusLegUDP, Reason: LinkStatusReasonLimited + 1, DeliveredBps: 1},
+		{Status: 0x20, UDPDeliveredBps: 1},
+		{Status: 0x02, TCPDeliveredBps: 1},
+		{Status: 0xf0, UDPDeliveredBps: 1},
+		{Status: 0x0f, TCPDeliveredBps: 1},
 	}
 	for _, body := range tests {
 		_, err := Encode(Frame{Type: TypeLinkStatus, SessionID: 1, LaneID: 1, Body: body}, nil)

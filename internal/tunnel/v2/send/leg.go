@@ -113,8 +113,8 @@ func (g *leg) setPreferTCP(prefer bool) {
 	g.observer.SetPreferTCP(prefer)
 }
 
-func (g *leg) observeQoS(k transport.Kind, reason uint8, deliveredBps uint32, now time.Time) {
-	g.observer.OnQoS(k, reason, deliveredBps, now)
+func (g *leg) observeQoSStatus(udpLimited bool, udpDeliveredBps uint32, tcpLimited bool, tcpDeliveredBps uint32) {
+	g.observer.OnQoSStatus(udpLimited, udpDeliveredBps, tcpLimited, tcpDeliveredBps)
 }
 
 // srtt returns the smoothed RTT for kind (0 if no samples). Used by the
@@ -264,7 +264,6 @@ func (g *leg) qualityLocked(k transport.Kind, qosEnabled bool) selector.Quality 
 		RTTVariance:     q.RTTVariance,
 		PreferTCP:       q.PreferTCP,
 		QoSActive:       oq.QoSActive,
-		QoSReason:       oq.QoSReason,
 		QoSDeliveredBps: oq.QoSDeliveredBps,
 	}
 }

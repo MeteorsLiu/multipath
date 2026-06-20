@@ -18,7 +18,6 @@ import (
 	"github.com/MeteorsLiu/multipath/internal/packetbuf"
 	"github.com/MeteorsLiu/multipath/internal/protocol"
 	sessionpkg "github.com/MeteorsLiu/multipath/internal/session"
-	"github.com/MeteorsLiu/multipath/internal/transport"
 )
 
 const (
@@ -41,11 +40,12 @@ type Handler interface {
 }
 
 type QoSStatus struct {
-	SessionID    uint64
-	LaneID       uint8
-	Kind         transport.Kind
-	Reason       uint8
-	DeliveredBps uint32
+	SessionID       uint64
+	LaneID          uint8
+	UDPLimited      bool
+	TCPLimited      bool
+	UDPDeliveredBps uint32
+	TCPDeliveredBps uint32
 }
 
 type QoSCallback func(ctx context.Context, status QoSStatus) error
@@ -122,8 +122,14 @@ func (s *recvState) qosFor(laneID uint8, emit func(qosStatus)) *qosEstimator {
 }
 
 func (s *recvState) observeQoSResult(laneID uint8, result rxWindowResult) {
+	q := s.qosFor(laneID, s.emitQoS)
 	if result.hasSample {
-		s.qosFor(laneID, s.emitQoS).Observe(result.sample)
+		q.Observe(result.sample)
+	}
+	for _, sample := range result.health {
+		if status, ok := q.ObserveHealth(sample); ok {
+			s.emitQoS(status)
+		}
 	}
 }
 
@@ -391,11 +397,12 @@ func (o *Recv) reportQoS(ctx context.Context, sessionID uint64, laneID uint8, st
 	}
 	for _, status := range statuses {
 		if err := o.onQoS(ctx, QoSStatus{
-			SessionID:    sessionID,
-			LaneID:       laneID,
-			Kind:         status.Kind,
-			Reason:       status.Reason,
-			DeliveredBps: status.DeliveredBps,
+			SessionID:       sessionID,
+			LaneID:          laneID,
+			UDPLimited:      status.UDPLimited,
+			TCPLimited:      status.TCPLimited,
+			UDPDeliveredBps: status.UDPDeliveredBps,
+			TCPDeliveredBps: status.TCPDeliveredBps,
 		}); err != nil {
 			return err
 		}
@@ -483,8 +490,17 @@ func (o *Recv) recoverPacket(sessionID uint64, laneID uint8, state *recvState, r
 	if !ipOK {
 		return nil, nil, false
 	}
-	if sample, ok := window.finishRecovery(recoverable, payload, time.Now()); ok {
-		state.qosFor(laneID, state.emitQoS).Observe(sample)
+	sample, health, ok := window.finishRecovery(recoverable, payload, time.Now())
+	if ok || len(health) > 0 {
+		q := state.qosFor(laneID, state.emitQoS)
+		if ok {
+			q.Observe(sample)
+		}
+		for _, healthSample := range health {
+			if status, ok := q.ObserveHealth(healthSample); ok {
+				state.emitQoS(status)
+			}
+		}
 	}
 	statuses := state.takeQoSStatuses()
 	if !state.dedupe.mark(packetID) {

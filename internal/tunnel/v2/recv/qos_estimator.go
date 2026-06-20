@@ -6,18 +6,22 @@ import (
 
 	"github.com/MeteorsLiu/multipath/internal/eventlog"
 	"github.com/MeteorsLiu/multipath/internal/metrics"
-	"github.com/MeteorsLiu/multipath/internal/protocol"
 	"github.com/MeteorsLiu/multipath/internal/transport"
 )
 
 const (
 	defaultQoSSustain     = 3 * time.Second
 	defaultQoSSampleFloor = 4
-	defaultQoSRefresh     = time.Second
 	defaultQoSAlpha       = 0.10
 
-	qosRateGapEnter = 0.10
-	qosRateGapExit  = 0.03
+	qosRateGapEnter       = 0.10
+	qosRateGapExit        = 0.03
+	qosSevereRateGapEnter = 0.50
+	qosSevereRateSustain  = time.Second
+
+	qosFECHealthEnter   = 0.70
+	qosFECHealthExit    = 0.90
+	qosFECHealthSustain = time.Second
 
 	qosShadowAdvantageEnter = 1.10
 	qosShadowAdvantageExit  = 1.05
@@ -34,15 +38,15 @@ const (
 type qosConfig struct {
 	Sustain     time.Duration
 	SampleFloor uint64
-	Refresh     time.Duration
 	SessionID   uint64
 	LaneID      uint8
 }
 
 type qosStatus struct {
-	Kind         transport.Kind
-	Reason       uint8
-	DeliveredBps uint32
+	UDPLimited      bool
+	TCPLimited      bool
+	UDPDeliveredBps uint32
+	TCPDeliveredBps uint32
 }
 
 type qosSample struct {
@@ -54,22 +58,46 @@ type qosSample struct {
 	DataBytes      uint64
 	RecoveredBytes uint64
 	RepairKind     transport.Kind
+	RepairAt       time.Time
 	RepairBytes    uint64
+}
+
+type qosHealthSample struct {
+	At           time.Time
+	DataKind     transport.Kind
+	RepairKind   transport.Kind
+	DataArrived  uint64
+	DataExpected uint64
+	DeliveredBps uint32
 }
 
 type qosEstimator struct {
 	cfg  qosConfig
 	emit func(qosStatus)
 
-	limitedSince map[transport.Kind]time.Time
-	lastEmit     map[transport.Kind]map[uint8]time.Time
+	limitedSince map[qosEvidenceKey]time.Time
 	ema          map[qosDirectionKey]*qosEMAState
-	active       map[transport.Kind]map[uint8]qosActiveEvidence
+	health       map[qosDirectionKey]*qosHealthState
+	active       map[transport.Kind]map[qosEvidence]qosActiveEvidence
 }
 
 type qosDirectionKey struct {
 	dataKind   transport.Kind
 	repairKind transport.Kind
+}
+
+type qosEvidence uint8
+
+const (
+	qosEvidenceRate qosEvidence = iota + 1
+	qosEvidenceShadow
+	qosEvidenceHealth
+	qosEvidenceShadowClear
+)
+
+type qosEvidenceKey struct {
+	kind     transport.Kind
+	evidence qosEvidence
 }
 
 type qosEstimate struct {
@@ -85,24 +113,32 @@ type qosEstimate struct {
 }
 
 type qosEMAState struct {
-	dataKind         transport.Kind
-	repairKind       transport.Kind
-	initialized      bool
-	sampleCount      uint64
-	sampleTotal      uint64
-	actualBpsEMA     float64
-	expectedBpsEMA   float64
-	repairBpsEMA     float64
-	profileDataEMA   float64
-	profileRepairEMA float64
-	pidCorrection    float64
-	pidIntegral      float64
-	pidPrevError     float64
+	dataKind          transport.Kind
+	repairKind        transport.Kind
+	initialized       bool
+	sampleCount       uint64
+	sampleTotal       uint64
+	actualBpsEMA      float64
+	expectedBpsEMA    float64
+	repairBpsEMA      float64
+	repairInitialized bool
+	profileDataEMA    float64
+	profileRepairEMA  float64
+	lastRepairAt      time.Time
+	pidCorrection     float64
+	pidIntegral       float64
+	pidPrevError      float64
+}
+
+type qosHealthState struct {
+	initialized  bool
+	sampleTotal  uint64
+	healthEMA    float64
+	deliveredBps uint32
 }
 
 type qosActiveEvidence struct {
-	lastEvidence time.Time
-	status       qosStatus
+	deliveredBps uint32
 }
 
 func newQoSEstimator(cfg qosConfig, emit func(qosStatus)) *qosEstimator {
@@ -112,16 +148,13 @@ func newQoSEstimator(cfg qosConfig, emit func(qosStatus)) *qosEstimator {
 	if cfg.SampleFloor == 0 {
 		cfg.SampleFloor = defaultQoSSampleFloor
 	}
-	if cfg.Refresh <= 0 {
-		cfg.Refresh = defaultQoSRefresh
-	}
 	return &qosEstimator{
 		cfg:          cfg,
 		emit:         emit,
-		limitedSince: make(map[transport.Kind]time.Time),
-		lastEmit:     make(map[transport.Kind]map[uint8]time.Time),
+		limitedSince: make(map[qosEvidenceKey]time.Time),
 		ema:          make(map[qosDirectionKey]*qosEMAState),
-		active:       make(map[transport.Kind]map[uint8]qosActiveEvidence),
+		health:       make(map[qosDirectionKey]*qosHealthState),
+		active:       make(map[transport.Kind]map[qosEvidence]qosActiveEvidence),
 	}
 }
 
@@ -132,15 +165,21 @@ func (e *qosEstimator) Observe(sample qosSample) {
 	if !qosKnownKind(sample.RepairKind) || sample.DataKind == sample.RepairKind {
 		return
 	}
-	estimate, ok := e.updateEstimate(sample)
-	if !ok {
-		return
+	var out []qosStatus
+	if estimate, ok := e.updateEstimate(sample); ok {
+		out = append(out, e.evaluate(estimate)...)
 	}
-	for _, status := range e.evaluate(estimate) {
-		if e.emit != nil {
-			e.emit(status)
-		}
+	if status, ok := e.ObserveHealth(qosHealthSample{
+		At:           sample.At,
+		DataKind:     sample.DataKind,
+		RepairKind:   sample.RepairKind,
+		DataArrived:  sample.DataExpected,
+		DataExpected: sample.DataExpected,
+		DeliveredBps: deliveredBps(sample.DataBytes, sample.Duration),
+	}); ok {
+		out = append(out, status)
 	}
+	e.emitLast(out)
 }
 
 func (e *qosEstimator) updateEstimate(sample qosSample) (qosEstimate, bool) {
@@ -157,7 +196,7 @@ func (e *qosEstimator) updateEstimate(sample qosSample) (qosEstimate, bool) {
 	}
 	state.observe(sample)
 	if state.sampleTotal < e.cfg.SampleFloor {
-		e.recordEvent("below_floor", sample.DataKind, 0)
+		e.recordEvent("below_floor", sample.DataKind)
 		return qosEstimate{}, false
 	}
 	estimate := state.estimate(now)
@@ -166,158 +205,353 @@ func (e *qosEstimator) updateEstimate(sample qosSample) (qosEstimate, bool) {
 }
 
 func (e *qosEstimator) evaluate(sample qosEstimate) []qosStatus {
-	var out []qosStatus
 	now := sample.At
 	if now.IsZero() {
 		now = time.Now()
 	}
-	if status, ok := e.evaluateLimited(sample, now); ok {
-		if e.shouldEmit(status.Kind, status.Reason, now) {
-			e.recordEvent("limited_active", status.Kind, status.Reason)
-			out = append(out, status)
-		}
+	changed := e.evaluateLimited(sample, now)
+	changed = e.evaluateShadowLimited(sample, now) || changed
+	if changed {
+		return []qosStatus{e.snapshot(sample)}
 	}
-	if status, ok := e.evaluateShadowLimited(sample, now); ok {
-		if e.shouldEmit(status.Kind, status.Reason, now) {
-			e.recordEvent("limited_active", status.Kind, status.Reason)
-			out = append(out, status)
-		}
-	}
-	out = append(out, e.refreshActive(now)...)
-	return out
+	return nil
 }
 
-func (e *qosEstimator) evaluateLimited(sample qosEstimate, now time.Time) (qosStatus, bool) {
+func (e *qosEstimator) evaluateLimited(sample qosEstimate, now time.Time) bool {
 	if sample.SampleTotal == 0 {
-		delete(e.limitedSince, sample.DataKind)
-		return qosStatus{}, false
-	}
-	if sample.RateGapRatio < qosRateGapExit || !sample.hasShadowAdvantage(qosShadowAdvantageExit) {
-		_, pending := e.limitedSince[sample.DataKind]
-		delete(e.limitedSince, sample.DataKind)
-		cleared := e.clearActive(sample.DataKind, protocol.LinkStatusReasonLimited)
-		if pending || cleared {
-			e.recordEvent("limited_clear", sample.DataKind, protocol.LinkStatusReasonLimited)
-		}
-		return qosStatus{}, false
-	}
-	if sample.RateGapRatio <= qosRateGapEnter {
-		delete(e.limitedSince, sample.DataKind)
-		return qosStatus{}, false
-	}
-	if !sample.hasShadowAdvantage(qosShadowAdvantageEnter) {
-		delete(e.limitedSince, sample.DataKind)
-		return qosStatus{}, false
-	}
-	ready, first := e.sustained(e.limitedSince, sample.DataKind, now)
-	if !ready {
-		if first {
-			e.recordEvent("limited_pending", sample.DataKind, protocol.LinkStatusReasonLimited)
-		}
-		return qosStatus{}, false
-	}
-	status := qosStatus{
-		Kind:         sample.DataKind,
-		Reason:       protocol.LinkStatusReasonLimited,
-		DeliveredBps: sample.DeliveredBps,
-	}
-	e.setActive(status, now)
-	return status, true
-}
-
-func (e *qosEstimator) evaluateShadowLimited(sample qosEstimate, now time.Time) (qosStatus, bool) {
-	if sample.SampleTotal == 0 || sample.RateGapRatio >= qosRateGapExit || sample.ShadowBps == 0 {
-		delete(e.limitedSince, sample.RepairKind)
-		return qosStatus{}, false
-	}
-	if sample.shadowDeficitRatio() <= qosRateGapEnter {
-		delete(e.limitedSince, sample.RepairKind)
-		return qosStatus{}, false
-	}
-	ready, first := e.sustained(e.limitedSince, sample.RepairKind, now)
-	if !ready {
-		if first {
-			e.recordEvent("limited_pending", sample.RepairKind, protocol.LinkStatusReasonLimited)
-		}
-		return qosStatus{}, false
-	}
-	status := qosStatus{
-		Kind:         sample.RepairKind,
-		Reason:       protocol.LinkStatusReasonLimited,
-		DeliveredBps: sample.ShadowBps,
-	}
-	e.setActive(status, now)
-	return status, true
-}
-
-func (e *qosEstimator) setActive(status qosStatus, now time.Time) {
-	byReason := e.active[status.Kind]
-	if byReason == nil {
-		byReason = make(map[uint8]qosActiveEvidence)
-		e.active[status.Kind] = byReason
-	}
-	byReason[status.Reason] = qosActiveEvidence{lastEvidence: now, status: status}
-}
-
-func (e *qosEstimator) clearActive(kind transport.Kind, reason uint8) bool {
-	byReason := e.active[kind]
-	if byReason == nil {
+		delete(e.limitedSince, qosEvidenceKey{kind: sample.DataKind, evidence: qosEvidenceRate})
 		return false
 	}
-	_, existed := byReason[reason]
-	delete(byReason, reason)
-	if len(byReason) == 0 {
+	if e.kindActive(sample.RepairKind) {
+		key := qosEvidenceKey{kind: sample.DataKind, evidence: qosEvidenceRate}
+		delete(e.limitedSince, key)
+		cleared := e.clearActive(sample.DataKind, qosEvidenceRate)
+		if cleared {
+			e.recordEvent("limited_clear", sample.DataKind)
+		}
+		return cleared
+	}
+	if sample.RateGapRatio < qosRateGapExit || !sample.hasShadowAdvantage(qosShadowAdvantageExit) {
+		key := qosEvidenceKey{kind: sample.DataKind, evidence: qosEvidenceRate}
+		delete(e.limitedSince, key)
+		cleared := e.clearActive(sample.DataKind, qosEvidenceRate)
+		if cleared {
+			e.recordEvent("limited_clear", sample.DataKind)
+		}
+		return cleared
+	}
+	if sample.RateGapRatio <= qosRateGapEnter {
+		delete(e.limitedSince, qosEvidenceKey{kind: sample.DataKind, evidence: qosEvidenceRate})
+		return false
+	}
+	if !sample.hasShadowAdvantage(qosShadowAdvantageEnter) {
+		delete(e.limitedSince, qosEvidenceKey{kind: sample.DataKind, evidence: qosEvidenceRate})
+		return false
+	}
+	if e.isActive(sample.DataKind, qosEvidenceRate) {
+		e.setActive(sample.DataKind, qosEvidenceRate, sample.DeliveredBps)
+		return false
+	}
+	ready, first := e.sustainedFor(sample.DataKind, qosEvidenceRate, now, e.rateSustain(sample.RateGapRatio))
+	if !ready {
+		if first {
+			e.recordEvent("limited_pending", sample.DataKind)
+		}
+		return false
+	}
+	e.setActive(sample.DataKind, qosEvidenceRate, sample.DeliveredBps)
+	e.recordEvent("limited_active", sample.DataKind)
+	return true
+}
+
+func (e *qosEstimator) evaluateShadowLimited(sample qosEstimate, now time.Time) bool {
+	if sample.SampleTotal == 0 || sample.ShadowBps == 0 {
+		delete(e.limitedSince, qosEvidenceKey{kind: sample.RepairKind, evidence: qosEvidenceShadow})
+		delete(e.limitedSince, qosEvidenceKey{kind: sample.RepairKind, evidence: qosEvidenceShadowClear})
+		return false
+	}
+	deficit := sample.shadowDeficitRatio()
+	if deficit < qosRateGapExit {
+		if !e.kindActive(sample.RepairKind) {
+			delete(e.limitedSince, qosEvidenceKey{kind: sample.RepairKind, evidence: qosEvidenceShadow})
+			delete(e.limitedSince, qosEvidenceKey{kind: sample.RepairKind, evidence: qosEvidenceShadowClear})
+			return false
+		}
+		ready, _ := e.sustainedFor(sample.RepairKind, qosEvidenceShadowClear, now, e.cfg.Sustain)
+		if !ready {
+			delete(e.limitedSince, qosEvidenceKey{kind: sample.RepairKind, evidence: qosEvidenceShadow})
+			return false
+		}
+		pending := e.clearKindPending(sample.RepairKind)
+		cleared := e.clearKindActive(sample.RepairKind)
+		if cleared {
+			e.recordEvent("limited_clear", sample.RepairKind)
+		} else if !pending {
+			delete(e.limitedSince, qosEvidenceKey{kind: sample.RepairKind, evidence: qosEvidenceShadowClear})
+		}
+		return cleared
+	}
+	delete(e.limitedSince, qosEvidenceKey{kind: sample.RepairKind, evidence: qosEvidenceShadowClear})
+	if sample.RateGapRatio >= qosRateGapExit {
+		delete(e.limitedSince, qosEvidenceKey{kind: sample.RepairKind, evidence: qosEvidenceShadow})
+		return false
+	}
+	if deficit <= qosRateGapEnter {
+		delete(e.limitedSince, qosEvidenceKey{kind: sample.RepairKind, evidence: qosEvidenceShadow})
+		return false
+	}
+	if e.isActive(sample.RepairKind, qosEvidenceShadow) {
+		e.setActive(sample.RepairKind, qosEvidenceShadow, sample.ShadowBps)
+		return false
+	}
+	ready, first := e.sustained(sample.RepairKind, qosEvidenceShadow, now)
+	if !ready {
+		if first {
+			e.recordEvent("limited_pending", sample.RepairKind)
+		}
+		return false
+	}
+	e.setActive(sample.RepairKind, qosEvidenceShadow, sample.ShadowBps)
+	e.recordEvent("limited_active", sample.RepairKind)
+	return true
+}
+
+func (e *qosEstimator) ObserveHealth(sample qosHealthSample) (qosStatus, bool) {
+	if !qosKnownKind(sample.DataKind) {
+		return qosStatus{}, false
+	}
+	if !qosKnownKind(sample.RepairKind) || sample.DataKind == sample.RepairKind || sample.DataExpected == 0 {
+		return qosStatus{}, false
+	}
+	now := sample.At
+	if now.IsZero() {
+		now = time.Now()
+	}
+	key := qosDirectionKey{dataKind: sample.DataKind, repairKind: sample.RepairKind}
+	state := e.health[key]
+	if state == nil {
+		state = &qosHealthState{}
+		e.health[key] = state
+	}
+	score := fecHealthScore(sample.DataArrived, sample.DataExpected)
+	state.observe(score, sample.DataExpected, sample.DeliveredBps)
+	if state.sampleTotal < e.cfg.SampleFloor {
+		return qosStatus{}, false
+	}
+	if state.healthEMA >= qosFECHealthExit {
+		delete(e.limitedSince, qosEvidenceKey{kind: sample.DataKind, evidence: qosEvidenceHealth})
+		cleared := e.clearActive(sample.DataKind, qosEvidenceHealth)
+		if cleared {
+			e.recordEvent("limited_clear", sample.DataKind)
+			return e.snapshotForKind(sample.DataKind), true
+		}
+		return qosStatus{}, false
+	}
+	if state.healthEMA >= qosFECHealthEnter {
+		delete(e.limitedSince, qosEvidenceKey{kind: sample.DataKind, evidence: qosEvidenceHealth})
+		return qosStatus{}, false
+	}
+	if e.isActive(sample.DataKind, qosEvidenceHealth) {
+		e.setActive(sample.DataKind, qosEvidenceHealth, state.deliveredBps)
+		return qosStatus{}, false
+	}
+	ready, first := e.sustained(sample.DataKind, qosEvidenceHealth, now)
+	if !ready {
+		if first {
+			e.recordEvent("limited_pending", sample.DataKind)
+		}
+		return qosStatus{}, false
+	}
+	e.setActive(sample.DataKind, qosEvidenceHealth, state.deliveredBps)
+	e.recordEvent("limited_active", sample.DataKind)
+	return e.snapshotForKind(sample.DataKind), true
+}
+
+func fecHealthScore(arrived, expected uint64) float64 {
+	if expected == 0 {
+		return 1
+	}
+	if arrived+1 >= expected {
+		return 1
+	}
+	return float64(arrived) / float64(expected)
+}
+
+func (s *qosHealthState) observe(score float64, expected uint64, deliveredBps uint32) {
+	s.sampleTotal += expected
+	s.deliveredBps = deliveredBps
+	if !s.initialized {
+		s.healthEMA = score
+		s.initialized = true
+		return
+	}
+	s.healthEMA = emaUpdate(s.healthEMA, score, defaultQoSAlpha)
+}
+
+func (e *qosEstimator) setActive(kind transport.Kind, evidence qosEvidence, deliveredBps uint32) {
+	byEvidence := e.active[kind]
+	if byEvidence == nil {
+		byEvidence = make(map[qosEvidence]qosActiveEvidence)
+		e.active[kind] = byEvidence
+	}
+	byEvidence[evidence] = qosActiveEvidence{deliveredBps: deliveredBps}
+}
+
+func (e *qosEstimator) isActive(kind transport.Kind, evidence qosEvidence) bool {
+	byEvidence := e.active[kind]
+	if byEvidence == nil {
+		return false
+	}
+	_, ok := byEvidence[evidence]
+	return ok
+}
+
+func (e *qosEstimator) kindActive(kind transport.Kind) bool {
+	byEvidence := e.active[kind]
+	return len(byEvidence) > 0
+}
+
+func (e *qosEstimator) clearActive(kind transport.Kind, evidence qosEvidence) bool {
+	byEvidence := e.active[kind]
+	if byEvidence == nil {
+		return false
+	}
+	_, existed := byEvidence[evidence]
+	delete(byEvidence, evidence)
+	if len(byEvidence) == 0 {
 		delete(e.active, kind)
 	}
 	return existed
 }
 
-func (e *qosEstimator) refreshActive(now time.Time) []qosStatus {
-	var out []qosStatus
-	for kind, byReason := range e.active {
-		for reason, evidence := range byReason {
-			if now.Sub(evidence.lastEvidence) > e.cfg.Sustain {
-				delete(byReason, reason)
-				continue
-			}
-			if !e.shouldEmit(kind, reason, now) {
-				continue
-			}
-			e.recordEvent(activeEventName(reason), kind, reason)
-			out = append(out, evidence.status)
+func (e *qosEstimator) clearKindActive(kind transport.Kind) bool {
+	byEvidence := e.active[kind]
+	if len(byEvidence) == 0 {
+		return false
+	}
+	delete(e.active, kind)
+	return true
+}
+
+func (e *qosEstimator) clearKindPending(kind transport.Kind) bool {
+	cleared := false
+	for key := range e.limitedSince {
+		if key.kind != kind {
+			continue
 		}
-		if len(byReason) == 0 {
-			delete(e.active, kind)
+		delete(e.limitedSince, key)
+		cleared = true
+	}
+	return cleared
+}
+
+func (e *qosEstimator) snapshot(sample qosEstimate) qosStatus {
+	status := qosStatus{}
+	switch sample.DataKind {
+	case transport.KindUDP:
+		status.UDPDeliveredBps = sample.ActualBps
+	case transport.KindTCP:
+		status.TCPDeliveredBps = sample.ActualBps
+	}
+	switch sample.RepairKind {
+	case transport.KindUDP:
+		status.UDPDeliveredBps = sample.ShadowBps
+	case transport.KindTCP:
+		status.TCPDeliveredBps = sample.ShadowBps
+	}
+	if bps, ok := e.activeDeliveredBps(transport.KindUDP); ok {
+		status.UDPLimited = true
+		status.UDPDeliveredBps = bps
+	}
+	if bps, ok := e.activeDeliveredBps(transport.KindTCP); ok {
+		status.TCPLimited = true
+		status.TCPDeliveredBps = bps
+	}
+	return status
+}
+
+func (e *qosEstimator) snapshotForKind(kind transport.Kind) qosStatus {
+	status := qosStatus{}
+	if bps, ok := e.activeDeliveredBps(transport.KindUDP); ok {
+		status.UDPLimited = true
+		status.UDPDeliveredBps = bps
+	}
+	if bps, ok := e.activeDeliveredBps(transport.KindTCP); ok {
+		status.TCPLimited = true
+		status.TCPDeliveredBps = bps
+	}
+	if !status.UDPLimited && kind == transport.KindUDP {
+		status.UDPDeliveredBps = e.lastDeliveredBps(kind)
+	}
+	if !status.TCPLimited && kind == transport.KindTCP {
+		status.TCPDeliveredBps = e.lastDeliveredBps(kind)
+	}
+	return status
+}
+
+func (e *qosEstimator) activeDeliveredBps(kind transport.Kind) (uint32, bool) {
+	byEvidence := e.active[kind]
+	if len(byEvidence) == 0 {
+		return 0, false
+	}
+	var out uint32
+	first := true
+	for _, evidence := range byEvidence {
+		bps := evidence.deliveredBps
+		if first || bps < out {
+			out = bps
+			first = false
+		}
+	}
+	return out, true
+}
+
+func (e *qosEstimator) lastDeliveredBps(kind transport.Kind) uint32 {
+	var out uint32
+	for key, state := range e.ema {
+		if key.dataKind == kind {
+			bps := clampUint32Float(state.actualBpsEMA)
+			if bps != 0 && (out == 0 || bps < out) {
+				out = bps
+			}
 		}
 	}
 	return out
 }
 
-func activeEventName(reason uint8) string {
-	return "limited_active"
+func (e *qosEstimator) sustained(kind transport.Kind, evidence qosEvidence, now time.Time) (ready bool, first bool) {
+	return e.sustainedFor(kind, evidence, now, e.sustainFor(evidence))
 }
 
-func (e *qosEstimator) shouldEmit(kind transport.Kind, reason uint8, now time.Time) bool {
-	byReason := e.lastEmit[kind]
-	if byReason == nil {
-		byReason = make(map[uint8]time.Time)
-		e.lastEmit[kind] = byReason
-	}
-	last := byReason[reason]
-	if !last.IsZero() && now.Sub(last) < e.cfg.Refresh {
-		return false
-	}
-	byReason[reason] = now
-	return true
-}
-
-func (e *qosEstimator) sustained(m map[transport.Kind]time.Time, kind transport.Kind, now time.Time) (ready bool, first bool) {
-	since, ok := m[kind]
+func (e *qosEstimator) sustainedFor(kind transport.Kind, evidence qosEvidence, now time.Time, sustain time.Duration) (ready bool, first bool) {
+	key := qosEvidenceKey{kind: kind, evidence: evidence}
+	since, ok := e.limitedSince[key]
 	if !ok {
-		m[kind] = now
+		e.limitedSince[key] = now
 		return false, true
 	}
-	return now.Sub(since) >= e.cfg.Sustain, false
+	return now.Sub(since) >= sustain, false
+}
+
+func (e *qosEstimator) sustainFor(evidence qosEvidence) time.Duration {
+	if evidence == qosEvidenceHealth && qosFECHealthSustain < e.cfg.Sustain {
+		return qosFECHealthSustain
+	}
+	return e.cfg.Sustain
+}
+
+func (e *qosEstimator) rateSustain(rateGapRatio float64) time.Duration {
+	if rateGapRatio >= qosSevereRateGapEnter && qosSevereRateSustain < e.cfg.Sustain {
+		return qosSevereRateSustain
+	}
+	return e.cfg.Sustain
+}
+
+func (e *qosEstimator) emitLast(statuses []qosStatus) {
+	if e.emit == nil || len(statuses) == 0 {
+		return
+	}
+	e.emit(statuses[len(statuses)-1])
 }
 
 func deliveredBps(bytes uint64, duration time.Duration) uint32 {
@@ -358,13 +592,16 @@ func (s *qosEMAState) observe(sample qosSample) {
 	s.sampleCount++
 	actualBps := float64(deliveredBps(sample.DataBytes, sample.Duration))
 	expectedBps := float64(deliveredBps(groupBytes, sample.Duration))
-	repairBps := float64(deliveredBps(sample.RepairBytes, sample.Duration))
+	repairBps, hasRepairBps := s.repairIntervalBps(sample)
 	profileData := float64(groupBytes)
 	profileFEC := float64(sample.RepairBytes)
 	if !s.initialized {
 		s.actualBpsEMA = actualBps
 		s.expectedBpsEMA = expectedBps
-		s.repairBpsEMA = repairBps
+		if hasRepairBps {
+			s.repairBpsEMA = repairBps
+			s.repairInitialized = true
+		}
 		s.profileDataEMA = profileData
 		s.profileRepairEMA = profileFEC
 		s.initialized = true
@@ -373,7 +610,14 @@ func (s *qosEMAState) observe(sample qosSample) {
 	}
 	s.actualBpsEMA = emaUpdate(s.actualBpsEMA, actualBps, defaultQoSAlpha)
 	s.expectedBpsEMA = emaUpdate(s.expectedBpsEMA, expectedBps, defaultQoSAlpha)
-	s.repairBpsEMA = emaUpdate(s.repairBpsEMA, repairBps, defaultQoSAlpha)
+	if hasRepairBps {
+		if s.repairInitialized {
+			s.repairBpsEMA = emaUpdate(s.repairBpsEMA, repairBps, defaultQoSAlpha)
+		} else {
+			s.repairBpsEMA = repairBps
+			s.repairInitialized = true
+		}
+	}
 	s.profileDataEMA = emaUpdate(s.profileDataEMA, profileData, defaultQoSAlpha)
 	s.profileRepairEMA = emaUpdate(s.profileRepairEMA, profileFEC, defaultQoSAlpha)
 	s.trainPID()
@@ -381,20 +625,53 @@ func (s *qosEMAState) observe(sample qosSample) {
 
 func (s *qosEMAState) estimate(at time.Time) qosEstimate {
 	actual := clampUint32Float(s.actualBpsEMA)
-	expected := clampUint32Float(s.expectedBpsEMA)
-	shadow := clampUint32Float(s.shadowBpsEstimate())
+	shadowEstimate := s.shadowBpsEstimate()
+	reference := s.expectedBpsEMA
+	if shadowEstimate > reference {
+		reference = shadowEstimate
+	}
+	expected := clampUint32Float(reference)
+	shadow := clampUint32Float(shadowEstimate)
 	delivered := actual
 	return qosEstimate{
 		At:           at,
 		DataKind:     s.dataKind,
 		RepairKind:   s.repairKind,
 		SampleTotal:  s.sampleTotal,
-		RateGapRatio: rateGapRatio(s.expectedBpsEMA, s.actualBpsEMA),
+		RateGapRatio: rateGapRatio(reference, s.actualBpsEMA),
 		ActualBps:    actual,
 		ExpectedBps:  expected,
 		ShadowBps:    shadow,
 		DeliveredBps: delivered,
 	}
+}
+
+func (s *qosEMAState) repairIntervalBps(sample qosSample) (float64, bool) {
+	if sample.RepairBytes == 0 {
+		return 0, false
+	}
+	repairAt := sample.RepairAt
+	if repairAt.IsZero() {
+		repairAt = sample.At
+	}
+	if repairAt.IsZero() {
+		return 0, false
+	}
+	if s.lastRepairAt.IsZero() {
+		if sample.Duration <= 0 {
+			s.lastRepairAt = repairAt
+			return 0, false
+		}
+		s.lastRepairAt = repairAt
+		return float64(deliveredBps(sample.RepairBytes, sample.Duration)), true
+	}
+	if !repairAt.After(s.lastRepairAt) {
+		s.lastRepairAt = repairAt
+		return 0, false
+	}
+	duration := repairAt.Sub(s.lastRepairAt)
+	s.lastRepairAt = repairAt
+	return float64(deliveredBps(sample.RepairBytes, duration)), true
 }
 
 func (s *qosEMAState) trainPID() {
@@ -406,6 +683,9 @@ func (s *qosEMAState) trainPID() {
 		return
 	}
 	estimate := s.shadowBpsEstimate()
+	if rateGapRatio(estimate, s.actualBpsEMA) > qosShadowPIDGate {
+		return
+	}
 	if s.sampleCount > qosShadowPIDWarmupSamples {
 		if shadowDeficitRatio(referenceBps, estimate) > qosShadowPIDGate {
 			return
@@ -503,7 +783,7 @@ func (e *qosEstimator) recordSampleMetrics(sample qosEstimate) {
 	metrics.SetGauge(metrics.QoSDeliveredBps, float64(sample.DeliveredBps), labels...)
 }
 
-func (e *qosEstimator) recordEvent(event string, kind transport.Kind, reason uint8) {
+func (e *qosEstimator) recordEvent(event string, kind transport.Kind) {
 	if e == nil || e.cfg.SessionID == 0 {
 		return
 	}
@@ -512,11 +792,10 @@ func (e *qosEstimator) recordEvent(event string, kind transport.Kind, reason uin
 		metrics.LU64("session", e.cfg.SessionID),
 		metrics.LU8("lane", e.cfg.LaneID),
 		metrics.LStr("leg", kindMetricLabel(kind)),
-		metrics.LU8("reason", reason),
 	)
 	switch event {
 	case "limited_active", "limited_clear":
-		eventlog.Printf("qos_state", "event=%s session=%d lane=%d leg=%s reason=%d",
-			event, e.cfg.SessionID, e.cfg.LaneID, kindMetricLabel(kind), reason)
+		eventlog.Printf("qos_state", "event=%s session=%d lane=%d leg=%s",
+			event, e.cfg.SessionID, e.cfg.LaneID, kindMetricLabel(kind))
 	}
 }

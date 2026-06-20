@@ -686,15 +686,22 @@ Receiver behavior:
 
 ## Type 0xa: LINK_STATUS
 
-LINK_STATUS carries receive-side QoS evidence for one lane transport leg. It is
-not a liveness frame and does not mark a leg up or down.
+LINK_STATUS carries receive-side QoS evidence for one lane as a UDP/TCP status
+snapshot. It is not a liveness frame and does not mark a leg up or down.
 
 Body:
 
 ```text
-leg_kind      uint8  // 1 = UDP, 2 = TCP
-reason        uint8  // 1 = limited
-delivered_bps uint32
+status            uint8   // high nibble = UDP state, low nibble = TCP state
+udp_delivered_bps uint32
+tcp_delivered_bps uint32
+```
+
+State values:
+
+```text
+0 = clear
+1 = limited
 ```
 
 Sender behavior:
@@ -703,17 +710,18 @@ Sender behavior:
 2. Send LINK_STATUS only from receive-side QoS evidence derived from DATA and
    REPAIR observations. Do not synthesize it from local ping timeout, TCP write
    error, or bandwidth-probe state alone.
-3. Set `leg_kind` to the leg that the receiver judges limited. This can be the
-   DATA leg or the REPAIR shadow leg.
-4. Set `delivered_bps` to the receive-side estimate for the limited leg.
+3. Set `status` as a complete lane snapshot. The high nibble carries UDP state
+   and the low nibble carries TCP state. A clear state clears the peer's
+   selector QoS state for that transport kind.
+4. Set `udp_delivered_bps` and `tcp_delivered_bps` to the receive-side rate
+   estimates for each transport kind when available. Use `0` when the receiver
+   has no estimate for that kind.
 
 Receiver behavior:
 
-1. Validate session, lane, `leg_kind`, and `reason`.
-2. Apply the status to the matching lane transport leg's selector quality.
-3. Treat the status as time-limited evidence. If no fresh LINK_STATUS arrives,
-   selector quality eventually expires the active QoS status and may probe a
-   return to UDP according to local selector policy.
+1. Validate session, lane, and `status`.
+2. Apply the snapshot atomically to the matching lane selector quality.
+3. Keep the applied QoS state until a later LINK_STATUS snapshot changes it.
 4. Do not emit anything to TUN.
 
 ## Lane State Machine
@@ -830,11 +838,11 @@ shadowEquivalentRate = REPAIR bytes / duration scaled by the observed group rati
 There are two limited-leg evidence paths:
 
 1. DATA-leg limited: when `actualRate` is materially below `expectedRate` and
-   the shadow leg estimate is materially better than the DATA leg, emit
-   `LINK_STATUS` for the DATA leg.
+   the shadow leg estimate is materially better than the DATA leg, mark the DATA
+   leg limited in the next LINK_STATUS snapshot.
 2. Shadow-leg limited: when the DATA leg is clean, but
-   `shadowEquivalentRate` is materially below the DATA leg's `actualRate`, emit
-   `LINK_STATUS` for the REPAIR shadow leg.
+   `shadowEquivalentRate` is materially below the DATA leg's `actualRate`, mark
+   the REPAIR shadow leg limited in the next LINK_STATUS snapshot.
 
 This makes the feedback stable across a fallback transition:
 
@@ -843,24 +851,23 @@ Initial:
   DATA = UDP
   REPAIR = TCP
   UDP DATA under-delivers
-  -> receiver sends LINK_STATUS(UDP, limited)
+  -> receiver sends LINK_STATUS(status=UDP limited, TCP clear)
 
 After selector switches DATA to TCP:
   DATA = TCP
   REPAIR = UDP
   TCP DATA is clean
   UDP shadow remains weak
-  -> receiver continues sending LINK_STATUS(UDP, limited)
+  -> receiver sends LINK_STATUS(status=UDP limited, TCP clear)
 ```
 
 Without the shadow-leg path, the UDP limited state would lose fresh evidence as
 soon as DATA moves to TCP, even though UDP is still observable as the REPAIR
 shadow leg.
 
-If the receiver later sees the limited leg perform normally in the DATA role,
-or stops seeing fresh limited evidence, the sender-side selector's QoS status
-expires according to its local time-based policy. LINK_STATUS does not carry an
-explicit clear frame.
+If the receiver later sees the limited leg perform normally, it sends a new
+LINK_STATUS snapshot with that transport kind clear. Clear and limited state are
+represented in the same `status` byte.
 
 ## UDP QoS Bandwidth Probe Design
 

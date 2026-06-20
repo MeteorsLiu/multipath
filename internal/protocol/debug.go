@@ -54,7 +54,7 @@ func debugFrame(frame Frame) string {
 	case BandwidthProbeAckBody:
 		return fmt.Sprintf("%s probe_id=%d base_seq=%d count=%d received=%#x first_rx_ms=%d last_rx_ms=%d", base, body.ProbeID, body.BaseSeq, body.Count, body.Received, body.FirstRXMS, body.LastRXMS)
 	case LinkStatusBody:
-		return fmt.Sprintf("%s leg_kind=%d reason=%d delivered_bps=%d", base, body.LegKind, body.Reason, body.DeliveredBps)
+		return fmt.Sprintf("%s status=%#02x udp_delivered_bps=%d tcp_delivered_bps=%d", base, body.Status, body.UDPDeliveredBps, body.TCPDeliveredBps)
 	default:
 		return base
 	}

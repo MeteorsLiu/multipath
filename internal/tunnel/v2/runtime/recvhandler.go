@@ -275,7 +275,7 @@ func (h *RecvHandler) OnClose(ctx context.Context, leg transport.LegRef, frame p
 	}
 
 	if body.Reason == protocol.CloseReasonUnknownSession {
-		eventlog.Printf("reconnect", "action=unknown_session_close session=%d leg=%s", frame.SessionID, linkStatusKindLabel(leg.Kind))
+		eventlog.Printf("reconnect", "action=unknown_session_close session=%d leg=%s", frame.SessionID, runtimeKindLabel(leg.Kind))
 		// The peer forgot our session (it restarted). Rebuild a fresh one. Only
 		// the client (with bootstrap lanes) acts; the server side is a no-op and
 		// just awaits the peer's new HELLO. Rebootstrap tears down the old session
@@ -382,26 +382,19 @@ func (h *RecvHandler) OnQoS(ctx context.Context, leg transport.LegRef, frame pro
 	if !h.sessionKnown(frame.SessionID) {
 		return h.closeUnknownSession(ctx, leg, frame.SessionID)
 	}
-	kind := transport.Kind(0)
-	switch body.LegKind {
-	case protocol.LinkStatusLegUDP:
-		kind = transport.KindUDP
-	case protocol.LinkStatusLegTCP:
-		kind = transport.KindTCP
-	default:
-		return protocol.ErrInvalidFrame
-	}
+	udpLimited := body.Status>>4 == protocol.LinkStatusStateLimited
+	tcpLimited := body.Status&0x0f == protocol.LinkStatusStateLimited
 	qos := h.lanes.LookupQoS(send.LaneKey{SessionID: frame.SessionID, LaneID: frame.LaneID})
 	if qos == nil {
 		debuglog.Printf("runtime", "link_status_drop no_qos session=%d lane=%d", frame.SessionID, frame.LaneID)
-		recordLinkStatusEvent("apply_drop_no_qos", frame.SessionID, frame.LaneID, kind, body.Reason)
-		eventlog.Printf("link_status", "action=apply_drop_no_qos session=%d lane=%d leg=%s reason=%d",
-			frame.SessionID, frame.LaneID, linkStatusKindLabel(kind), body.Reason)
+		recordLinkStatusEvent("apply_drop_no_qos", frame.SessionID, frame.LaneID, udpLimited, tcpLimited)
+		eventlog.Printf("link_status", "action=apply_drop_no_qos session=%d lane=%d status=%#02x",
+			frame.SessionID, frame.LaneID, body.Status)
 		return nil
 	}
-	qos.OnQoS(kind, body.Reason, body.DeliveredBps, time.Now())
-	debuglog.Printf("runtime", "link_status_apply session=%d lane=%d kind=%d reason=%d delivered_bps=%d",
-		frame.SessionID, frame.LaneID, kind, body.Reason, body.DeliveredBps)
-	recordLinkStatusEvent("apply", frame.SessionID, frame.LaneID, kind, body.Reason)
+	qos.OnQoSStatus(udpLimited, body.UDPDeliveredBps, tcpLimited, body.TCPDeliveredBps)
+	debuglog.Printf("runtime", "link_status_apply session=%d lane=%d status=%#02x udp_limited=%t udp_delivered_bps=%d tcp_limited=%t tcp_delivered_bps=%d",
+		frame.SessionID, frame.LaneID, body.Status, udpLimited, body.UDPDeliveredBps, tcpLimited, body.TCPDeliveredBps)
+	recordLinkStatusEvent("apply", frame.SessionID, frame.LaneID, udpLimited, tcpLimited)
 	return nil
 }

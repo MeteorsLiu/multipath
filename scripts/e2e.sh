@@ -80,6 +80,12 @@ PORT_MTU_FEC=5027
 PORT_BW_PROBE_DISABLED=5028
 PORT_TCP_CORRECTNESS=5029
 PORT_UDP_CORRECTNESS=5030
+PORT_LINK_STATUS_QOS_IPERF=5031
+PORT_LINK_STATUS_QOS_IPERF_REPEAT=5032
+PORT_LINK_STATUS_QOS_IPERF_JITTER=5033
+PORT_LINK_STATUS_QOS_IPERF_RTT200=5034
+PORT_TCP_FALLBACK_RATE_DYNAMIC=5035
+PORT_LINK_STATUS_QOS_JITTER_NO_QOS=5036
 
 PATH1_C="10.201.1.1/24"
 PATH1_S="10.201.1.2/24"
@@ -512,6 +518,139 @@ parse_iperf_receiver_bps() {
       }
     }
   ' "${log_file}"
+}
+
+parse_iperf_json_window_avg_bps() {
+  local log_file="$1"
+  local window_start="$2"
+  local window_end="$3"
+  if [[ ! -f "${log_file}" ]]; then
+    return 0
+  fi
+  python3 - "${log_file}" "${window_start}" "${window_end}" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+window_start = float(sys.argv[2])
+window_end = float(sys.argv[3])
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(0)
+
+weighted_bps = 0.0
+weighted_seconds = 0.0
+for interval in data.get("intervals", []):
+    summary = interval.get("sum") or interval.get("sum_received") or interval.get("sum_sent")
+    if not summary:
+        continue
+    start = float(summary.get("start", 0.0))
+    end = float(summary.get("end", start))
+    bps = float(summary.get("bits_per_second", 0.0))
+    overlap = max(0.0, min(end, window_end) - max(start, window_start))
+    if overlap <= 0:
+        continue
+    weighted_bps += bps * overlap
+    weighted_seconds += overlap
+
+if weighted_seconds > 0:
+    print(f"{weighted_bps / weighted_seconds:.0f}")
+PY
+}
+
+assert_iperf_window_recovered() {
+  local label="$1"
+  local baseline="$2"
+  local limited="$3"
+  local recovered="$4"
+  local min_recovered_vs_baseline="$5"
+  local min_recovered_vs_limited="$6"
+  local min_limited_vs_baseline="$7"
+
+  echo "[${label}] iperf_window_bps baseline=${baseline} limited=${limited} recovered=${recovered}"
+  if [[ -z "${baseline}" || -z "${limited}" || -z "${recovered}" ]]; then
+    fail "${label}" "could not parse staged iperf window rates"
+    return 1
+  fi
+  if awk \
+      -v baseline="${baseline}" \
+      -v limited="${limited}" \
+      -v recovered="${recovered}" \
+      -v min_rb="${min_recovered_vs_baseline}" \
+      -v min_rl="${min_recovered_vs_limited}" \
+      -v min_lb="${min_limited_vs_baseline}" '
+        BEGIN {
+          ok = baseline > 0 &&
+               limited >= baseline * min_lb &&
+               recovered >= baseline * min_rb &&
+               recovered >= limited * min_rl
+          exit !ok
+        }'; then
+    pass "${label}" "iperf throughput stayed usable and recovered after shaping cleared"
+  else
+    fail "${label}" "bad staged iperf rates: baseline=${baseline} limited=${limited} recovered=${recovered}"
+    return 1
+  fi
+}
+
+assert_iperf_window_limited_drop() {
+  local label="$1"
+  local baseline="$2"
+  local limited="$3"
+  local max_limited_vs_baseline="$4"
+
+  if [[ -z "${baseline}" || -z "${limited}" ]]; then
+    fail "${label}" "could not parse iperf drop windows"
+    return 1
+  fi
+  if awk \
+      -v baseline="${baseline}" \
+      -v limited="${limited}" \
+      -v max_lb="${max_limited_vs_baseline}" '
+        BEGIN {
+          ok = baseline > 0 && limited <= baseline * max_lb
+          exit !ok
+        }'; then
+    pass "${label}" "limited window dropped as expected"
+  else
+    fail "${label}" "limited window did not drop enough: baseline=${baseline} limited=${limited}"
+    return 1
+  fi
+}
+
+assert_selector_switches_since_le() {
+  local label="$1"
+  local log_file="$2"
+  local start_line="$3"
+  local max_count="$4"
+  local count
+  count="$(count_log_file_pattern_since "${log_file}" "${start_line}" "selector action=qos_data_leg")"
+  count="${count:-0}"
+  echo "[${label}] selector_switch_count=${count} max=${max_count}"
+  if (( count <= max_count )); then
+    pass "${label}" "selector switch count stayed bounded"
+  else
+    fail "${label}" "selector switch count ${count} > ${max_count}"
+  fi
+}
+
+assert_link_status_since_ge() {
+  local label="$1"
+  local log_file="$2"
+  local start_line="$3"
+  local pattern="$4"
+  local min_count="$5"
+  local message="$6"
+  local count
+  count="$(count_log_file_pattern_since "${log_file}" "${start_line}" "${pattern}")"
+  count="${count:-0}"
+  if (( count >= min_count )); then
+    pass "${label}" "${message}: count=${count}"
+  else
+    fail "${label}" "${message}: count=${count}, want >=${min_count}"
+  fi
 }
 
 write_tcp_correctness_tool() {
@@ -981,6 +1120,17 @@ add_rate_band() {
   ip netns exec "${ns}" tc qdisc replace dev "${dev}" parent "1:${band}" handle "${handle}:" tbf rate "${rate}" burst 1mbit latency 100ms
 }
 
+add_delay_jitter_rate_band() {
+  local ns="$1"
+  local dev="$2"
+  local band="$3"
+  local handle="$4"
+  local delay="$5"
+  local jitter="$6"
+  local rate="$7"
+  ip netns exec "${ns}" tc qdisc replace dev "${dev}" parent "1:${band}" handle "${handle}:" netem delay "${delay}" "${jitter}" distribution normal rate "${rate}"
+}
+
 add_port_filter() {
   local ns="$1"
   local dev="$2"
@@ -1166,6 +1316,50 @@ apply_udp_tunnel_rate_path() {
   setup_prio_qdisc "${NS_S}" "${server_dev}"
   add_rate_band "${NS_S}" "${server_dev}" 3 30 "${rate}"
   add_port_filter "${NS_S}" "${server_dev}" 1 udp sport "${port}" 3
+}
+
+apply_udp_tunnel_rate_with_delay_jitter_path() {
+  local path="$1"
+  local port="$2"
+  local rate="$3"
+  local delay="$4"
+  local jitter="$5"
+  local client_dev server_dev
+  client_dev="$(path_client_dev "${path}")"
+  server_dev="$(path_server_dev "${path}")"
+
+  setup_prio_qdisc "${NS_C}" "${client_dev}"
+  add_delay_jitter_rate_band "${NS_C}" "${client_dev}" 3 30 "${delay}" "${jitter}" "${rate}"
+  add_port_filter "${NS_C}" "${client_dev}" 1 udp dport "${port}" 3
+  add_delay_jitter_band "${NS_C}" "${client_dev}" 4 40 "${delay}" "${jitter}"
+  add_port_filter "${NS_C}" "${client_dev}" 2 tcp dport "${port}" 4
+
+  setup_prio_qdisc "${NS_S}" "${server_dev}"
+  add_delay_jitter_rate_band "${NS_S}" "${server_dev}" 3 30 "${delay}" "${jitter}" "${rate}"
+  add_port_filter "${NS_S}" "${server_dev}" 1 udp sport "${port}" 3
+  add_delay_jitter_band "${NS_S}" "${server_dev}" 4 40 "${delay}" "${jitter}"
+  add_port_filter "${NS_S}" "${server_dev}" 2 tcp sport "${port}" 4
+}
+
+apply_udp_block_tcp_rate_path() {
+  local path="$1"
+  local port="$2"
+  local rate="$3"
+  local client_dev server_dev
+  client_dev="$(path_client_dev "${path}")"
+  server_dev="$(path_server_dev "${path}")"
+
+  setup_prio_qdisc "${NS_C}" "${client_dev}"
+  add_loss_band "${NS_C}" "${client_dev}" 3 30 100%
+  add_port_filter "${NS_C}" "${client_dev}" 1 udp dport "${port}" 3
+  add_rate_band "${NS_C}" "${client_dev}" 4 40 "${rate}"
+  add_port_filter "${NS_C}" "${client_dev}" 2 tcp dport "${port}" 4
+
+  setup_prio_qdisc "${NS_S}" "${server_dev}"
+  add_loss_band "${NS_S}" "${server_dev}" 3 30 100%
+  add_port_filter "${NS_S}" "${server_dev}" 1 udp sport "${port}" 3
+  add_rate_band "${NS_S}" "${server_dev}" 4 40 "${rate}"
+  add_port_filter "${NS_S}" "${server_dev}" 2 tcp sport "${port}" 4
 }
 
 apply_tunnel_delay_jitter_path() {
@@ -1591,8 +1785,8 @@ run_bandwidth_probe_tcp_reference_case() {
   echo "==== ${name} e2e start ===="
   clear_loss
   write_one_lane_config "${name}" "${PORT_BW_PROBE_GUARD}" false false 200 1000 -1
-  echo "[${name}] apply 50mbit UDP tunnel bottleneck; bandwidth probe should classify UDP relative to TCP reference"
-  apply_udp_tunnel_rate_path 1 "${PORT_BW_PROBE_GUARD}" 50mbit
+  echo "[${name}] apply 20mbit UDP tunnel bottleneck; bandwidth probe should classify UDP relative to TCP reference"
+  apply_udp_tunnel_rate_path 1 "${PORT_BW_PROBE_GUARD}" 20mbit
   local client_start_line
   local server_start_line
   local client_log_file="${WORKDIR}/${name}.client.log"
@@ -1605,7 +1799,7 @@ run_bandwidth_probe_tcp_reference_case() {
   wait_client_tcp_reference_probe "${name}" "${client_start_line}"
   assert_no_bandwidth_probe_remote_timeout_since "${name}" "${CURRENT_CLIENT_LOG}" "${client_start_line}" "client BW gate did not rely on remote timeout"
   assert_no_bandwidth_probe_remote_timeout_since "${name}" "${CURRENT_SERVER_LOG}" "${server_start_line}" "server BW gate did not rely on remote timeout"
-  wait_bandwidth_probe_udp_rate_window "${name}" "${CURRENT_CLIENT_LOG}" "${client_start_line}" 40 "client UDP probe measured veth throughput" 20000000 80000000 200000000
+  wait_bandwidth_probe_udp_rate_window "${name}" "${CURRENT_CLIENT_LOG}" "${client_start_line}" 40 "client UDP probe measured veth throughput" 10000000 60000000 200000000
   wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "send/bw: sample session=[0-9]+ lane=1 kind=1" 35 "client measured UDP bandwidth after TCP reference" "${client_start_line}"
   wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "bandwidth_probe_decision .*prefer_tcp=true selected_leg=tcp" 10 "client classified UDP below TCP reference and selected TCP" "${client_start_line}"
 
@@ -1777,6 +1971,23 @@ assert_log_file_pattern_count_since_ge() {
     pass "${label}" "${message}: count=${count}"
   else
     fail "${label}" "${message}: count=${count}, want >=${min_count}; pattern=${pattern}"
+  fi
+}
+
+assert_log_file_pattern_count_since_le() {
+  local label="$1"
+  local log_file="$2"
+  local start_line="$3"
+  local pattern="$4"
+  local max_count="$5"
+  local message="$6"
+  local count
+  count="$(count_log_file_pattern_since "${log_file}" "${start_line}" "${pattern}")"
+  count="${count:-0}"
+  if (( count <= max_count )); then
+    pass "${label}" "${message}: count=${count}"
+  else
+    fail "${label}" "${message}: count=${count}, want <=${max_count}; pattern=${pattern}"
   fi
 }
 
@@ -2431,18 +2642,16 @@ run_link_status_qos_case() {
 
   run_ping_sample "${name}-qos"
 
-  wait_log_file_pattern_while_ping "${name}" "${CURRENT_SERVER_LOG}" "runtime/qos: link_status_send session=[0-9]+ lane=1 kind=1 reason=1" 5 "server emitted UDP limited LINK_STATUS from receive-side QoS" "${server_status_line}"
-  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "runtime: link_status_apply session=[0-9]+ lane=1 kind=1 reason=1" 5 "client applied server LINK_STATUS to lane selector" "${client_apply_line}"
-  assert_log_file_pattern_count_since_ge "${name}" "${CURRENT_SERVER_LOG}" "${server_status_line}" "runtime/qos: link_status_send session=[0-9]+ lane=1 kind=1 reason=1" 2 "server refreshed sustained UDP limited LINK_STATUS"
-
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_SERVER_LOG}" "runtime/qos: link_status_send session=[0-9]+ lane=1 status=0x10 .*udp_limited=true" 5 "server emitted UDP limited LINK_STATUS from receive-side QoS" "${server_status_line}"
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "runtime: link_status_apply session=[0-9]+ lane=1 status=0x10 .*udp_limited=true" 5 "client applied server LINK_STATUS to lane selector" "${client_apply_line}"
   client_select_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
   wait_log_file_pattern_while_ping_from "${name}" "${CURRENT_CLIENT_LOG}" "schedule_select.*lane=1 .*leg=\\{tcp .*frame=type=DATA" 20 "client selector sent DATA over TCP after receive-side QoS feedback" "${client_select_line}" "${NS_C}" "${TUN_C_REMOTE}"
 
-  echo "[${name}] clear UDP loss; LINK_STATUS should expire and selector should return DATA to UDP"
+  echo "[${name}] clear UDP loss; receiver should send clear LINK_STATUS and selector should return DATA to UDP"
   clear_loss
   local client_return_line
   client_return_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
-  wait_log_file_pattern_while_ping_from "${name}" "${CURRENT_CLIENT_LOG}" "schedule_select.*lane=1 .*leg=\\{udp .*frame=type=DATA" 35 "client selector returned DATA to UDP after QoS TTL and preferWait" "${client_return_line}" "${NS_C}" "${TUN_C_REMOTE}"
+  wait_log_file_pattern_while_ping_from "${name}" "${CURRENT_CLIENT_LOG}" "schedule_select.*lane=1 .*leg=\\{udp .*frame=type=DATA" 35 "client selector returned DATA to UDP after QoS clear" "${client_return_line}" "${NS_C}" "${TUN_C_REMOTE}"
   wait_ping_ok "${name} post-qos-clear" 12
 
   stop_multipath
@@ -2476,8 +2685,8 @@ run_link_status_qos_reverse_case() {
 
   run_ping_sample_from "${name}-qos" "${NS_S}" "${TUN_S_REMOTE}"
 
-  wait_log_file_pattern_while_ping_from "${name}" "${CURRENT_CLIENT_LOG}" "runtime/qos: link_status_send session=[0-9]+ lane=1 kind=1 reason=1" 5 "client emitted UDP limited LINK_STATUS from receive-side QoS" "${client_status_line}" "${NS_S}" "${TUN_S_REMOTE}"
-  wait_log_file_pattern_while_ping_from "${name}" "${CURRENT_SERVER_LOG}" "runtime: link_status_apply session=[0-9]+ lane=1 kind=1 reason=1" 5 "server applied client LINK_STATUS to lane selector" "${server_apply_line}" "${NS_S}" "${TUN_S_REMOTE}"
+  wait_log_file_pattern_while_ping_from "${name}" "${CURRENT_CLIENT_LOG}" "runtime/qos: link_status_send session=[0-9]+ lane=1 status=0x10 .*udp_limited=true" 5 "client emitted UDP limited LINK_STATUS from receive-side QoS" "${client_status_line}" "${NS_S}" "${TUN_S_REMOTE}"
+  wait_log_file_pattern_while_ping_from "${name}" "${CURRENT_SERVER_LOG}" "runtime: link_status_apply session=[0-9]+ lane=1 status=0x10 .*udp_limited=true" 5 "server applied client LINK_STATUS to lane selector" "${server_apply_line}" "${NS_S}" "${TUN_S_REMOTE}"
 
   local server_select_line
   server_select_line="$(current_log_file_line_count "${CURRENT_SERVER_LOG}")"
@@ -2487,8 +2696,265 @@ run_link_status_qos_reverse_case() {
   clear_loss
   local server_return_line
   server_return_line="$(current_log_file_line_count "${CURRENT_SERVER_LOG}")"
-  wait_log_file_pattern_while_ping_from "${name}" "${CURRENT_SERVER_LOG}" "schedule_select.*lane=1 .*leg=\\{udp .*frame=type=DATA" 35 "server selector returned DATA to UDP after QoS TTL and preferWait" "${server_return_line}" "${NS_S}" "${TUN_S_REMOTE}"
+  wait_log_file_pattern_while_ping_from "${name}" "${CURRENT_SERVER_LOG}" "schedule_select.*lane=1 .*leg=\\{udp .*frame=type=DATA" 35 "server selector returned DATA to UDP after QoS clear" "${server_return_line}" "${NS_S}" "${TUN_S_REMOTE}"
   wait_ping_ok "${name} post-qos-clear" 12
+
+  stop_multipath
+  clear_loss
+  echo "==== ${name} e2e end ===="
+}
+
+run_link_status_qos_jitter_no_qos_case() {
+  local name="link-status-qos-jitter-no-qos"
+  echo "==== ${name} e2e start ===="
+  clear_loss
+  write_one_lane_config "${name}" "${PORT_LINK_STATUS_QOS_JITTER_NO_QOS}" false true 200 3000
+  CURRENT_EXTRA_ENV=(MULTIPATH_DISABLE_BW_PROBE=1)
+  start_multipath "${name}"
+
+  wait_ping_ok "${name} baseline" 12
+  wait_log_pattern "${name}" "send: hello_ack_active session=[0-9]+ lane=1 kind=2" 20 "TCP shadow leg reached HELLO_ACK"
+
+  local server_status_line
+  local client_select_line
+  server_status_line="$(current_log_file_line_count "${CURRENT_SERVER_LOG}")"
+  client_select_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
+
+  echo "[${name}] apply shared high RTT/jitter without UDP QoS; low-rate traffic should stay on UDP"
+  apply_tunnel_delay_jitter_path 1 "${PORT_LINK_STATUS_QOS_JITTER_NO_QOS}" 100ms 100ms
+  run_short_ping_load "${name}-shared-jitter-low-rate" 120 0.05
+  wait_ping_ok "${name} post-shared-jitter" 20
+
+  assert_log_file_pattern_count_since_le "${name}" "${CURRENT_SERVER_LOG}" "${server_status_line}" "runtime/qos: link_status_send .*udp_limited=true" 0 "server did not report UDP limited under shared jitter"
+  assert_log_file_pattern_count_since_le "${name}" "${CURRENT_CLIENT_LOG}" "${client_select_line}" "schedule_select.*lane=1 .*leg=\\{tcp .*frame=type=DATA" 0 "client kept DATA on UDP under shared jitter"
+
+  stop_multipath
+  clear_loss
+  echo "==== ${name} e2e end ===="
+}
+
+run_link_status_qos_iperf_dynamic_case() {
+  local name="$1"
+  local port="$2"
+  local shape_mode="$3"
+  local repeat_limit="$4"
+  local rate="$5"
+  local delay="${6:-}"
+  local jitter="${7:-}"
+  local min_recovered_vs_baseline="${8:-0.40}"
+  local min_limited_vs_baseline="${9:-0.15}"
+  local min_recovered_vs_limited="0.75"
+  local cycles=1
+  local duration=38
+  if [[ "${repeat_limit}" == "true" ]]; then
+    cycles=2
+    duration=52
+  fi
+
+  echo "==== ${name} e2e start ===="
+  if ! command -v iperf3 >/dev/null 2>&1; then
+    echo "[${name}] iperf3 not found, skip dynamic QoS throughput case"
+    echo "==== ${name} e2e end ===="
+    return 0
+  fi
+  if ! command -v timeout >/dev/null 2>&1; then
+    echo "[${name}] timeout not found, skip dynamic QoS throughput case"
+    echo "==== ${name} e2e end ===="
+    return 0
+  fi
+
+  clear_loss
+  write_one_lane_config "${name}" "${port}" false true 200 3000
+  CURRENT_EXTRA_ENV=(MULTIPATH_DISABLE_BW_PROBE=1)
+  start_multipath "${name}"
+
+  wait_ping_ok "${name} baseline" 12
+  wait_log_pattern "${name}" "send: hello_ack_active session=[0-9]+ lane=1 kind=2" 20 "TCP shadow leg reached HELLO_ACK"
+
+  if [[ "${shape_mode}" == "udp-rate-jitter" ]]; then
+    echo "[${name}] apply baseline RTT/jitter: delay=${delay} jitter=${jitter}"
+    apply_tunnel_delay_jitter_path 1 "${port}" "${delay}" "${jitter}"
+    wait_ping_ok "${name} jitter-baseline" 20
+  fi
+
+  local server_status_line
+  local client_selector_line
+  server_status_line="$(current_log_file_line_count "${CURRENT_SERVER_LOG}")"
+  client_selector_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
+
+  local iperf_server_log="${WORKDIR}/${name}.iperf-server.log"
+  local iperf_client_json="${WORKDIR}/${name}.iperf-client.json"
+  local iperf_client_err="${WORKDIR}/${name}.iperf-client.err"
+  echo "[${name}] start staged iperf3 over TUN: duration=${duration}s rate_limit=${rate} mode=${shape_mode} repeat=${repeat_limit}"
+  ip netns exec "${NS_S}" iperf3 -s -1 -B "${TUN_S_LOCAL}" >"${iperf_server_log}" 2>&1 &
+  local iperf_server=$!
+  sleep 1
+  timeout "$((duration + 8))s" ip netns exec "${NS_C}" iperf3 -c "${TUN_C_REMOTE}" -t "${duration}" -i 1 -J \
+    >"${iperf_client_json}" 2>"${iperf_client_err}" &
+  local iperf_client=$!
+
+  sleep 7
+  echo "[${name}] apply UDP rate limit: ${rate}"
+  case "${shape_mode}" in
+  udp-rate)
+    apply_udp_tunnel_rate_path 1 "${port}" "${rate}"
+    ;;
+  udp-rate-jitter)
+    apply_udp_tunnel_rate_with_delay_jitter_path 1 "${port}" "${rate}" "${delay}" "${jitter}"
+    ;;
+  *)
+    fail "${name}" "unsupported dynamic QoS shape mode: ${shape_mode}"
+    kill "${iperf_client}" "${iperf_server}" >/dev/null 2>&1 || true
+    wait "${iperf_client}" >/dev/null 2>&1 || true
+    wait "${iperf_server}" >/dev/null 2>&1 || true
+    stop_multipath
+    clear_loss
+    echo "==== ${name} e2e end ===="
+    return 0
+    ;;
+  esac
+
+  sleep 14
+  echo "[${name}] clear UDP rate limit"
+  if [[ "${shape_mode}" == "udp-rate-jitter" ]]; then
+    apply_tunnel_delay_jitter_path 1 "${port}" "${delay}" "${jitter}"
+  else
+    clear_loss
+  fi
+
+  if [[ "${repeat_limit}" == "true" ]]; then
+    sleep 10
+    echo "[${name}] re-apply UDP rate limit: ${rate}"
+    if [[ "${shape_mode}" == "udp-rate-jitter" ]]; then
+      apply_udp_tunnel_rate_with_delay_jitter_path 1 "${port}" "${rate}" "${delay}" "${jitter}"
+    else
+      apply_udp_tunnel_rate_path 1 "${port}" "${rate}"
+    fi
+    sleep 10
+    echo "[${name}] clear UDP rate limit again"
+    if [[ "${shape_mode}" == "udp-rate-jitter" ]]; then
+      apply_tunnel_delay_jitter_path 1 "${port}" "${delay}" "${jitter}"
+    else
+      clear_loss
+    fi
+  fi
+
+  local client_status=0
+  set +e
+  wait "${iperf_client}"
+  client_status=$?
+  set -e
+  kill "${iperf_server}" >/dev/null 2>&1 || true
+  wait "${iperf_server}" >/dev/null 2>&1 || true
+
+  echo "[${name}] iperf3 client json: ${iperf_client_json}"
+  echo "[${name}] iperf3 client err: ${iperf_client_err}"
+  echo "[${name}] iperf3 server log: ${iperf_server_log}"
+  if (( client_status != 0 )); then
+    fail "${name}" "iperf3 client failed status=${client_status}"
+  fi
+
+  local baseline_bps
+  local limited_bps
+  local recovered_bps
+  baseline_bps="$(parse_iperf_json_window_avg_bps "${iperf_client_json}" 2 6)"
+  limited_bps="$(parse_iperf_json_window_avg_bps "${iperf_client_json}" 13 20)"
+  recovered_bps="$(parse_iperf_json_window_avg_bps "${iperf_client_json}" 26 36)"
+  assert_iperf_window_recovered "${name}" "${baseline_bps}" "${limited_bps}" "${recovered_bps}" "${min_recovered_vs_baseline}" "${min_recovered_vs_limited}" "${min_limited_vs_baseline}"
+
+  if [[ "${repeat_limit}" == "true" ]]; then
+    local limited2_bps
+    local recovered2_bps
+    limited2_bps="$(parse_iperf_json_window_avg_bps "${iperf_client_json}" 34 40)"
+    recovered2_bps="$(parse_iperf_json_window_avg_bps "${iperf_client_json}" 44 50)"
+    assert_iperf_window_recovered "${name}-repeat" "${baseline_bps}" "${limited2_bps}" "${recovered2_bps}" "${min_recovered_vs_baseline}" "${min_recovered_vs_limited}" "${min_limited_vs_baseline}"
+  fi
+
+  assert_link_status_since_ge "${name}" "${CURRENT_SERVER_LOG}" "${server_status_line}" "runtime/qos: link_status_send .*udp_limited=true" "${cycles}" "server sent UDP-limited LINK_STATUS snapshots"
+  assert_link_status_since_ge "${name}" "${CURRENT_SERVER_LOG}" "${server_status_line}" "runtime/qos: link_status_send .*udp_limited=false" "${cycles}" "server sent UDP-clear LINK_STATUS snapshots"
+  assert_link_status_since_ge "${name}" "${CURRENT_CLIENT_LOG}" "${client_selector_line}" "selector action=qos_data_leg .*from=udp to=tcp" "${cycles}" "client switched DATA selector to TCP"
+  assert_link_status_since_ge "${name}" "${CURRENT_CLIENT_LOG}" "${client_selector_line}" "selector action=qos_data_leg .*from=tcp to=udp" "${cycles}" "client switched DATA selector back to UDP"
+  assert_selector_switches_since_le "${name}" "${CURRENT_CLIENT_LOG}" "${client_selector_line}" "$((cycles * 4))"
+
+  stop_multipath
+  clear_loss
+  echo "==== ${name} e2e end ===="
+}
+
+run_tcp_fallback_rate_dynamic_case() {
+  local name="tcp-fallback-rate-dynamic"
+  local port="${PORT_TCP_FALLBACK_RATE_DYNAMIC}"
+  local rate="8mbit"
+  local duration=38
+
+  echo "==== ${name} e2e start ===="
+  if ! command -v iperf3 >/dev/null 2>&1; then
+    echo "[${name}] iperf3 not found, skip TCP fallback rate case"
+    echo "==== ${name} e2e end ===="
+    return 0
+  fi
+  if ! command -v timeout >/dev/null 2>&1; then
+    echo "[${name}] timeout not found, skip TCP fallback rate case"
+    echo "==== ${name} e2e end ===="
+    return 0
+  fi
+
+  clear_loss
+  write_one_lane_config "${name}" "${port}" false true 200 3000
+  CURRENT_EXTRA_ENV=(MULTIPATH_DISABLE_BW_PROBE=1)
+  start_multipath "${name}"
+  wait_ping_ok "${name} baseline" 12
+  wait_log_pattern "${name}" "send: hello_ack_active session=[0-9]+ lane=1 kind=2" 20 "TCP shadow leg reached HELLO_ACK"
+
+  local client_selector_line
+  client_selector_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
+  echo "[${name}] block UDP so DATA uses TCP fallback"
+  apply_udp_tunnel_block_path 1 "${port}"
+  wait_ping_ok "${name} tcp-fallback" 25
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "schedule_select.*lane=1 .*leg=\\{tcp .*frame=type=DATA" 20 "client sent DATA over TCP fallback before TCP shaping" "${client_selector_line}"
+
+  local iperf_server_log="${WORKDIR}/${name}.iperf-server.log"
+  local iperf_client_json="${WORKDIR}/${name}.iperf-client.json"
+  local iperf_client_err="${WORKDIR}/${name}.iperf-client.err"
+  echo "[${name}] start staged iperf3 over TCP fallback: duration=${duration}s tcp_rate=${rate}"
+  ip netns exec "${NS_S}" iperf3 -s -1 -B "${TUN_S_LOCAL}" >"${iperf_server_log}" 2>&1 &
+  local iperf_server=$!
+  sleep 1
+  timeout "$((duration + 8))s" ip netns exec "${NS_C}" iperf3 -c "${TUN_C_REMOTE}" -t "${duration}" -i 1 -J \
+    >"${iperf_client_json}" 2>"${iperf_client_err}" &
+  local iperf_client=$!
+
+  sleep 7
+  echo "[${name}] apply TCP fallback rate limit: ${rate}"
+  apply_udp_block_tcp_rate_path 1 "${port}" "${rate}"
+  sleep 14
+  echo "[${name}] clear TCP fallback rate limit while keeping UDP blocked"
+  apply_udp_tunnel_block_path 1 "${port}"
+
+  local client_status=0
+  set +e
+  wait "${iperf_client}"
+  client_status=$?
+  set -e
+  kill "${iperf_server}" >/dev/null 2>&1 || true
+  wait "${iperf_server}" >/dev/null 2>&1 || true
+
+  echo "[${name}] iperf3 client json: ${iperf_client_json}"
+  echo "[${name}] iperf3 client err: ${iperf_client_err}"
+  echo "[${name}] iperf3 server log: ${iperf_server_log}"
+  if (( client_status != 0 )); then
+    fail "${name}" "iperf3 client failed status=${client_status}"
+  fi
+
+  local baseline_bps
+  local limited_bps
+  local recovered_bps
+  baseline_bps="$(parse_iperf_json_window_avg_bps "${iperf_client_json}" 2 6)"
+  limited_bps="$(parse_iperf_json_window_avg_bps "${iperf_client_json}" 13 20)"
+  recovered_bps="$(parse_iperf_json_window_avg_bps "${iperf_client_json}" 26 36)"
+  echo "[${name}] iperf_window_bps baseline=${baseline_bps} limited=${limited_bps} recovered=${recovered_bps}"
+  assert_iperf_window_limited_drop "${name}" "${baseline_bps}" "${limited_bps}" 0.80
+  assert_iperf_window_recovered "${name}" "${baseline_bps}" "${limited_bps}" "${recovered_bps}" 0.50 1.20 0.01
 
   stop_multipath
   clear_loss
@@ -2803,6 +3269,12 @@ run_fec_tcp_fallback_case
 run_multipath_fec_case
 run_link_status_qos_case
 run_link_status_qos_reverse_case
+run_link_status_qos_jitter_no_qos_case
+run_link_status_qos_iperf_dynamic_case "link-status-qos-iperf" "${PORT_LINK_STATUS_QOS_IPERF}" udp-rate false 5mbit "" "" 0.40 0.15
+run_link_status_qos_iperf_dynamic_case "link-status-qos-iperf-repeat" "${PORT_LINK_STATUS_QOS_IPERF_REPEAT}" udp-rate true 5mbit "" "" 0.40 0.15
+run_link_status_qos_iperf_dynamic_case "link-status-qos-iperf-jitter" "${PORT_LINK_STATUS_QOS_IPERF_JITTER}" udp-rate-jitter false 5mbit 60ms 80ms 0.25 0.10
+run_link_status_qos_iperf_dynamic_case "link-status-qos-iperf-rtt200-jitter" "${PORT_LINK_STATUS_QOS_IPERF_RTT200}" udp-rate-jitter false 5mbit 100ms 100ms 0.20 0.08
+run_tcp_fallback_rate_dynamic_case
 run_fec_loaded_latency_case
 run_weighted_scheduling_case
 run_mtu_case

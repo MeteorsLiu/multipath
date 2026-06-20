@@ -4,7 +4,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MeteorsLiu/multipath/internal/protocol"
 	"github.com/MeteorsLiu/multipath/internal/transport"
 )
 
@@ -86,7 +85,7 @@ func TestQoSEstimatorInfersRateGapFromDifferentialSample(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("statuses = %+v, want one", got)
 	}
-	if got[0].Kind != transport.KindUDP || got[0].Reason != protocol.LinkStatusReasonLimited {
+	if !got[0].UDPLimited || got[0].TCPLimited {
 		t.Fatalf("status = %+v, want UDP limited", got[0])
 	}
 }
@@ -129,7 +128,7 @@ func TestQoSEstimatorAggregatesSmallFECSamples(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("statuses = %+v, want one after aggregated sustained rate gap", got)
 	}
-	if got[0].Kind != transport.KindUDP || got[0].Reason != protocol.LinkStatusReasonLimited {
+	if !got[0].UDPLimited || got[0].TCPLimited {
 		t.Fatalf("status = %+v, want UDP limited", got[0])
 	}
 }
@@ -137,7 +136,7 @@ func TestQoSEstimatorAggregatesSmallFECSamples(t *testing.T) {
 func TestQoSEstimatorSustainsRateGapAcrossCleanSmallSamples(t *testing.T) {
 	now := time.Unix(0, 0)
 	var got []qosStatus
-	e := newQoSEstimator(qosConfig{SampleFloor: 4, Sustain: 3 * time.Second, Refresh: time.Second}, func(status qosStatus) {
+	e := newQoSEstimator(qosConfig{SampleFloor: 4, Sustain: 3 * time.Second}, func(status qosStatus) {
 		got = append(got, status)
 	})
 
@@ -164,14 +163,14 @@ func TestQoSEstimatorSustainsRateGapAcrossCleanSmallSamples(t *testing.T) {
 	if len(got) == 0 {
 		t.Fatal("statuses = none, want UDP limited despite clean samples inside sustained 20% rate gap")
 	}
-	if got[0].Kind != transport.KindUDP || got[0].Reason != protocol.LinkStatusReasonLimited {
+	if !got[0].UDPLimited || got[0].TCPLimited {
 		t.Fatalf("status = %+v, want UDP limited", got[0])
 	}
 }
 
 func TestQoSEstimatorEMAClearsAfterSustainedCleanSamples(t *testing.T) {
 	now := time.Unix(0, 0)
-	e := newQoSEstimator(qosConfig{SampleFloor: 4, Sustain: 3 * time.Second, Refresh: time.Second}, nil)
+	e := newQoSEstimator(qosConfig{SampleFloor: 4, Sustain: 3 * time.Second}, nil)
 
 	var gap float64
 	for i := 0; i < 100; i++ {
@@ -235,8 +234,8 @@ func TestQoSEstimatorReportsActualDeliveredRate(t *testing.T) {
 		t.Fatalf("statuses = %+v, want one", got)
 	}
 	want := uint32(2400 * 8)
-	if got[0].DeliveredBps != want {
-		t.Fatalf("DeliveredBps = %d, want actual DATA rate %d", got[0].DeliveredBps, want)
+	if got[0].UDPDeliveredBps != want {
+		t.Fatalf("UDPDeliveredBps = %d, want actual DATA rate %d", got[0].UDPDeliveredBps, want)
 	}
 }
 
@@ -329,7 +328,7 @@ func TestQoSEstimatorInfersShadowLegLimited(t *testing.T) {
 
 	for i := 0; i < 2; i++ {
 		e.Observe(qosSample{
-			At:           now.Add(time.Duration(i) * 2 * time.Second),
+			At:           now.Add(time.Duration(i) * time.Second),
 			Duration:     time.Second,
 			DataKind:     transport.KindTCP,
 			RepairKind:   transport.KindUDP,
@@ -343,12 +342,12 @@ func TestQoSEstimatorInfersShadowLegLimited(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("statuses = %+v, want one", got)
 	}
-	if got[0].Kind != transport.KindUDP || got[0].Reason != protocol.LinkStatusReasonLimited {
+	if !got[0].UDPLimited || got[0].TCPLimited {
 		t.Fatalf("status = %+v, want UDP limited from weak shadow leg", got[0])
 	}
 	want := uint32(300 * 4 * 8)
-	if got[0].DeliveredBps != want {
-		t.Fatalf("DeliveredBps = %d, want shadow equivalent rate %d", got[0].DeliveredBps, want)
+	if got[0].UDPDeliveredBps != want {
+		t.Fatalf("UDPDeliveredBps = %d, want shadow equivalent rate %d", got[0].UDPDeliveredBps, want)
 	}
 }
 
@@ -365,19 +364,18 @@ func TestQoSEstimatorShadowLimitedUsesRateGapThreshold(t *testing.T) {
 		ShadowBps:    95_000,
 	}
 
-	if status, ok := e.evaluateShadowLimited(sample, now.Add(2*time.Second)); ok {
-		t.Fatalf("status = %+v, want no shadow limited below rate gap threshold", status)
+	if ok := e.evaluateShadowLimited(sample, now.Add(2*time.Second)); ok {
+		t.Fatal("want no shadow limited below rate gap threshold")
 	}
 
 	sample.ShadowBps = 80_000
-	if _, ok := e.evaluateShadowLimited(sample, now.Add(4*time.Second)); ok {
+	if ok := e.evaluateShadowLimited(sample, now.Add(4*time.Second)); ok {
 		t.Fatal("first over-threshold shadow sample should only start sustain timer")
 	}
-	status, ok := e.evaluateShadowLimited(sample, now.Add(6*time.Second))
-	if !ok {
+	if ok := e.evaluateShadowLimited(sample, now.Add(6*time.Second)); !ok {
 		t.Fatal("missing shadow limited after sustained deficit")
 	}
-	if status.Kind != transport.KindUDP || status.Reason != protocol.LinkStatusReasonLimited {
+	if status := e.snapshot(sample); !status.UDPLimited || status.TCPLimited {
 		t.Fatalf("status = %+v, want UDP limited", status)
 	}
 }
@@ -465,8 +463,10 @@ func TestQoSEstimatorPIDAutoGateFreezesOnShadowDeficit(t *testing.T) {
 }
 
 func TestQoSEstimatorPIDTrainsOnHealthyResidual(t *testing.T) {
+	now := time.Unix(0, 0)
 	state := qosEMAState{dataKind: transport.KindUDP, repairKind: transport.KindTCP}
 	state.observe(qosSample{
+		At:           now,
 		Duration:     time.Second,
 		DataKind:     transport.KindUDP,
 		RepairKind:   transport.KindTCP,
@@ -476,6 +476,7 @@ func TestQoSEstimatorPIDTrainsOnHealthyResidual(t *testing.T) {
 		RepairBytes:  1200,
 	})
 	state.observe(qosSample{
+		At:           now.Add(time.Second),
 		Duration:     time.Second,
 		DataKind:     transport.KindUDP,
 		RepairKind:   transport.KindTCP,
@@ -493,7 +494,7 @@ func TestQoSEstimatorPIDTrainsOnHealthyResidual(t *testing.T) {
 func TestQoSEstimatorClearsWhenShadowAdvantageDisappears(t *testing.T) {
 	now := time.Unix(0, 0)
 	var got []qosStatus
-	e := newQoSEstimator(qosConfig{SampleFloor: 1, Sustain: time.Second, Refresh: time.Hour}, func(status qosStatus) {
+	e := newQoSEstimator(qosConfig{SampleFloor: 1, Sustain: time.Second}, func(status qosStatus) {
 		got = append(got, status)
 	})
 
@@ -537,15 +538,18 @@ func TestQoSEstimatorClearsWhenShadowAdvantageDisappears(t *testing.T) {
 		DataBytes:    4 * 1200,
 		RepairBytes:  1200,
 	})
-	if len(got) != 1 {
-		t.Fatalf("statuses after shadow clear = %+v, want no refreshed limited status", got)
+	if len(got) != 2 {
+		t.Fatalf("statuses after shadow clear = %+v, want active plus clear", got)
+	}
+	if got[1].UDPLimited || got[1].TCPLimited {
+		t.Fatalf("clear status = %+v, want both legs clear", got[1])
 	}
 }
 
-func TestQoSEstimatorRefreshesSustainedStatus(t *testing.T) {
+func TestQoSEstimatorDoesNotRefreshSustainedStatus(t *testing.T) {
 	now := time.Unix(0, 0)
 	var got []qosStatus
-	e := newQoSEstimator(qosConfig{SampleFloor: 4, Sustain: time.Second, Refresh: time.Second}, func(status qosStatus) {
+	e := newQoSEstimator(qosConfig{SampleFloor: 4, Sustain: time.Second}, func(status qosStatus) {
 		got = append(got, status)
 	})
 
@@ -586,7 +590,7 @@ func TestQoSEstimatorRefreshesSustainedStatus(t *testing.T) {
 		RepairBytes:    1200,
 	})
 	if len(got) != 1 {
-		t.Fatalf("pre-refresh statuses = %+v, want no duplicate", got)
+		t.Fatalf("continued active statuses = %+v, want no duplicate", got)
 	}
 	e.Observe(qosSample{
 		At:             now.Add(3 * time.Second),
@@ -599,15 +603,15 @@ func TestQoSEstimatorRefreshesSustainedStatus(t *testing.T) {
 		RecoveredBytes: 3 * 1200,
 		RepairBytes:    1200,
 	})
-	if len(got) != 2 {
-		t.Fatalf("refresh statuses = %+v, want refreshed status", got)
+	if len(got) != 1 {
+		t.Fatalf("continued active statuses = %+v, want no refresh", got)
 	}
 }
 
-func TestQoSEstimatorRefreshesActiveStatusFromOtherLegSamples(t *testing.T) {
+func TestQoSEstimatorDoesNotRefreshActiveStatusFromOtherLegSamples(t *testing.T) {
 	now := time.Unix(0, 0)
 	var got []qosStatus
-	e := newQoSEstimator(qosConfig{SampleFloor: 4, Sustain: 3 * time.Second, Refresh: time.Second}, func(status qosStatus) {
+	e := newQoSEstimator(qosConfig{SampleFloor: 4, Sustain: 3 * time.Second}, func(status qosStatus) {
 		got = append(got, status)
 	})
 
@@ -646,11 +650,8 @@ func TestQoSEstimatorRefreshesActiveStatusFromOtherLegSamples(t *testing.T) {
 		DataExpected: 4,
 		DataBytes:    4800,
 	})
-	if len(got) != 2 {
-		t.Fatalf("refresh from other leg statuses = %+v, want two", got)
-	}
-	if got[1].Kind != transport.KindUDP || got[1].Reason != protocol.LinkStatusReasonLimited {
-		t.Fatalf("refresh status = %+v, want UDP limited", got[1])
+	if len(got) != 1 {
+		t.Fatalf("other leg sample statuses = %+v, want no duplicate", got)
 	}
 
 	e.Observe(qosSample{
@@ -662,7 +663,221 @@ func TestQoSEstimatorRefreshesActiveStatusFromOtherLegSamples(t *testing.T) {
 		DataExpected: 4,
 		DataBytes:    4800,
 	})
-	if len(got) != 2 {
-		t.Fatalf("stale active status refreshed = %+v, want no third status", got)
+	if len(got) != 1 {
+		t.Fatalf("persistent active status = %+v, want no refresh", got)
+	}
+}
+
+func TestQoSEstimatorFECHealthTriggersLimited(t *testing.T) {
+	now := time.Unix(0, 0)
+	var got []qosStatus
+	e := newQoSEstimator(qosConfig{SampleFloor: 4, Sustain: time.Second}, func(status qosStatus) {
+		got = append(got, status)
+	})
+
+	if status, ok := e.ObserveHealth(qosHealthSample{
+		At:           now,
+		DataKind:     transport.KindUDP,
+		RepairKind:   transport.KindTCP,
+		DataArrived:  0,
+		DataExpected: 4,
+	}); ok {
+		t.Fatalf("first health status = %+v, want pending only", status)
+	}
+	status, ok := e.ObserveHealth(qosHealthSample{
+		At:           now.Add(2 * time.Second),
+		DataKind:     transport.KindUDP,
+		RepairKind:   transport.KindTCP,
+		DataArrived:  0,
+		DataExpected: 4,
+	})
+	if !ok {
+		t.Fatal("missing health limited status after sustained unrecoverable groups")
+	}
+	if !status.UDPLimited || status.TCPLimited {
+		t.Fatalf("status = %+v, want UDP limited", status)
+	}
+	if len(got) != 0 {
+		t.Fatalf("callback statuses = %+v, want direct ObserveHealth caller to emit", got)
+	}
+}
+
+func TestQoSEstimatorFECHealthUsesShorterSustain(t *testing.T) {
+	now := time.Unix(0, 0)
+	e := newQoSEstimator(qosConfig{SampleFloor: 4, Sustain: 3 * time.Second}, nil)
+
+	if _, ok := e.ObserveHealth(qosHealthSample{
+		At:           now,
+		DataKind:     transport.KindUDP,
+		RepairKind:   transport.KindTCP,
+		DataArrived:  0,
+		DataExpected: 4,
+	}); ok {
+		t.Fatal("first unhealthy sample should only start health sustain timer")
+	}
+	status, ok := e.ObserveHealth(qosHealthSample{
+		At:           now.Add(qosFECHealthSustain + time.Millisecond),
+		DataKind:     transport.KindUDP,
+		RepairKind:   transport.KindTCP,
+		DataArrived:  0,
+		DataExpected: 4,
+	})
+	if !ok || !status.UDPLimited {
+		t.Fatalf("health status = %+v ok=%t, want UDP limited after health sustain", status, ok)
+	}
+}
+
+func TestQoSEstimatorFECHealthClearsAfterRecovery(t *testing.T) {
+	now := time.Unix(0, 0)
+	e := newQoSEstimator(qosConfig{SampleFloor: 4, Sustain: time.Second}, nil)
+
+	if _, ok := e.ObserveHealth(qosHealthSample{
+		At:           now,
+		DataKind:     transport.KindUDP,
+		RepairKind:   transport.KindTCP,
+		DataArrived:  0,
+		DataExpected: 4,
+	}); ok {
+		t.Fatal("first unhealthy sample should only start sustain timer")
+	}
+	if status, ok := e.ObserveHealth(qosHealthSample{
+		At:           now.Add(2 * time.Second),
+		DataKind:     transport.KindUDP,
+		RepairKind:   transport.KindTCP,
+		DataArrived:  0,
+		DataExpected: 4,
+	}); !ok || !status.UDPLimited {
+		t.Fatalf("limited status = %+v ok=%t, want UDP limited", status, ok)
+	}
+
+	var cleared qosStatus
+	var clearedOK bool
+	for i := 0; i < 40; i++ {
+		cleared, clearedOK = e.ObserveHealth(qosHealthSample{
+			At:           now.Add(3*time.Second + time.Duration(i)*100*time.Millisecond),
+			DataKind:     transport.KindUDP,
+			RepairKind:   transport.KindTCP,
+			DataArrived:  4,
+			DataExpected: 4,
+		})
+		if clearedOK {
+			break
+		}
+	}
+	if !clearedOK {
+		t.Fatal("missing health clear after sustained healthy groups")
+	}
+	if cleared.UDPLimited || cleared.TCPLimited {
+		t.Fatalf("clear status = %+v, want both clear", cleared)
+	}
+}
+
+func TestQoSEstimatorActiveDeliveredBpsTreatsZeroAsLimited(t *testing.T) {
+	e := newQoSEstimator(qosConfig{}, nil)
+	e.setActive(transport.KindUDP, qosEvidenceRate, 80_000_000)
+	e.setActive(transport.KindUDP, qosEvidenceHealth, 0)
+
+	bps, ok := e.activeDeliveredBps(transport.KindUDP)
+	if !ok {
+		t.Fatal("missing active UDP evidence")
+	}
+	if bps != 0 {
+		t.Fatalf("active delivered bps = %d, want health evidence zero to win", bps)
+	}
+}
+
+func TestQoSEstimatorHealthyShadowClearsPriorPrimaryEvidence(t *testing.T) {
+	now := time.Unix(0, 0)
+	e := newQoSEstimator(qosConfig{SampleFloor: 1, Sustain: 3 * time.Second}, nil)
+	e.setActive(transport.KindUDP, qosEvidenceRate, 80_000_000)
+	e.setActive(transport.KindUDP, qosEvidenceHealth, 0)
+	e.limitedSince[qosEvidenceKey{kind: transport.KindUDP, evidence: qosEvidenceRate}] = now
+
+	sample := qosEstimate{
+		At:           now.Add(2 * time.Second),
+		DataKind:     transport.KindTCP,
+		RepairKind:   transport.KindUDP,
+		SampleTotal:  4,
+		RateGapRatio: 0.50,
+		ActualBps:    50_000,
+		ExpectedBps:  100_000,
+		ShadowBps:    99_000,
+	}
+	if e.evaluateShadowLimited(sample, sample.At) {
+		t.Fatal("first healthy UDP shadow sample cleared prior evidence without sustain")
+	}
+	if !e.kindActive(transport.KindUDP) {
+		t.Fatal("UDP active evidence cleared before shadow clear sustain elapsed")
+	}
+
+	sample.At = sample.At.Add(e.cfg.Sustain + time.Millisecond)
+	if !e.evaluateShadowLimited(sample, sample.At) {
+		t.Fatal("healthy UDP shadow did not clear prior primary UDP evidence")
+	}
+	if e.kindActive(transport.KindUDP) {
+		t.Fatal("UDP active evidence remained after healthy shadow clear")
+	}
+	if len(e.limitedSince) != 0 {
+		t.Fatalf("limitedSince = %+v, want cleared pending UDP state", e.limitedSince)
+	}
+	status := e.snapshot(sample)
+	if status.UDPLimited || status.TCPLimited {
+		t.Fatalf("status = %+v, want both legs clear", status)
+	}
+	if status.UDPDeliveredBps != sample.ShadowBps || status.TCPDeliveredBps != sample.ActualBps {
+		t.Fatalf("delivered bps = udp:%d tcp:%d, want udp:%d tcp:%d",
+			status.UDPDeliveredBps, status.TCPDeliveredBps, sample.ShadowBps, sample.ActualBps)
+	}
+}
+
+func TestQoSEstimatorDoesNotMarkDataLimitedWhenShadowAlreadyLimited(t *testing.T) {
+	now := time.Unix(0, 0)
+	e := newQoSEstimator(qosConfig{SampleFloor: 1, Sustain: time.Second}, nil)
+	e.setActive(transport.KindUDP, qosEvidenceHealth, 0)
+	e.setActive(transport.KindTCP, qosEvidenceRate, 1_000)
+
+	changed := e.evaluateLimited(qosEstimate{
+		At:           now,
+		DataKind:     transport.KindTCP,
+		RepairKind:   transport.KindUDP,
+		SampleTotal:  4,
+		RateGapRatio: 0.50,
+		ActualBps:    1_000,
+		ShadowBps:    10_000,
+	}, now)
+	if !changed {
+		t.Fatal("evaluateLimited did not report clearing stale data-leg evidence")
+	}
+	if e.isActive(transport.KindTCP, qosEvidenceRate) {
+		t.Fatal("TCP rate evidence remained active while UDP shadow was already limited")
+	}
+	if !e.kindActive(transport.KindUDP) {
+		t.Fatal("shadow limited evidence was unexpectedly cleared")
+	}
+}
+
+func TestQoSEstimatorSevereRateGapUsesShorterSustain(t *testing.T) {
+	now := time.Unix(0, 0)
+	e := newQoSEstimator(qosConfig{SampleFloor: 1, Sustain: 3 * time.Second}, nil)
+	sample := qosEstimate{
+		At:           now,
+		DataKind:     transport.KindUDP,
+		RepairKind:   transport.KindTCP,
+		SampleTotal:  4,
+		RateGapRatio: qosSevereRateGapEnter,
+		ActualBps:    1_000,
+		ShadowBps:    10_000,
+		DeliveredBps: 1_000,
+	}
+
+	if e.evaluateLimited(sample, now) {
+		t.Fatal("first severe rate sample should only start sustain timer")
+	}
+	sample.At = now.Add(qosSevereRateSustain + time.Millisecond)
+	if !e.evaluateLimited(sample, sample.At) {
+		t.Fatal("severe rate gap did not activate after shorter sustain")
+	}
+	if !e.isActive(transport.KindUDP, qosEvidenceRate) {
+		t.Fatal("UDP rate evidence is not active after severe gap")
 	}
 }

@@ -255,11 +255,12 @@ type Handler interface {
 }
 
 type QoSStatus struct {
-    SessionID    uint64
-    LaneID       uint8
-    Kind         transport.Kind
-    Reason       uint8
-    DeliveredBps uint32
+    SessionID       uint64
+    LaneID          uint8
+    UDPLimited      bool
+    TCPLimited      bool
+    UDPDeliveredBps uint32
+    TCPDeliveredBps uint32
 }
 
 type QoSCallback func(ctx context.Context, status QoSStatus) error
@@ -562,7 +563,7 @@ Protocol behavior is only Encode and Decode.
 Frame carries one concrete Body, and Frame.Type selects which body type is valid.
 Do not add public per-type body helper functions.
 Current v2 negotiates CapLinkStatus with FEC. LINK_STATUS is a control frame for
-receive-side QoS status; protocol only encodes and decodes it.
+receive-side lane QoS snapshots; protocol only encodes and decodes it.
 ```
 
 ## FEC

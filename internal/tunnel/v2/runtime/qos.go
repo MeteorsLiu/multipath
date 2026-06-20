@@ -48,58 +48,62 @@ func (w *QoSWriter) Write(ctx context.Context, status recv.QoSStatus) error {
 	_, enabled := w.enabled[qosKey{sessionID: status.SessionID, laneID: status.LaneID}]
 	w.mu.RUnlock()
 	if !enabled {
-		recordLinkStatusEvent("send_drop_not_enabled", status.SessionID, status.LaneID, status.Kind, status.Reason)
+		recordLinkStatusEvent("send_drop_not_enabled", status.SessionID, status.LaneID, status.UDPLimited, status.TCPLimited)
 		return nil
 	}
-	legKind, ok := protocolLegKind(status.Kind)
-	if !ok {
-		return protocol.ErrInvalidFrame
-	}
-	debuglog.Printf("runtime/qos", "link_status_send session=%d lane=%d kind=%d reason=%d delivered_bps=%d",
-		status.SessionID, status.LaneID, status.Kind, status.Reason, status.DeliveredBps)
+	linkStatus := linkStatusByte(status.UDPLimited, status.TCPLimited)
+	debuglog.Printf("runtime/qos", "link_status_send session=%d lane=%d status=%#02x udp_limited=%t udp_delivered_bps=%d tcp_limited=%t tcp_delivered_bps=%d",
+		status.SessionID, status.LaneID, linkStatus, status.UDPLimited, status.UDPDeliveredBps, status.TCPLimited, status.TCPDeliveredBps)
 	err := w.send.WriteFrame(ctx, protocol.Frame{
 		Version:   protocol.Version,
 		Type:      protocol.TypeLinkStatus,
 		SessionID: status.SessionID,
 		LaneID:    status.LaneID,
 		Body: protocol.LinkStatusBody{
-			LegKind:      legKind,
-			Reason:       status.Reason,
-			DeliveredBps: status.DeliveredBps,
+			Status:          linkStatus,
+			UDPDeliveredBps: status.UDPDeliveredBps,
+			TCPDeliveredBps: status.TCPDeliveredBps,
 		},
-	}, transport.LegRef{})
+	}, transport.LegRef{Kind: transport.KindTCP})
 	if err != nil {
-		recordLinkStatusEvent("send_error", status.SessionID, status.LaneID, status.Kind, status.Reason)
-		eventlog.Printf("link_status", "action=send_error session=%d lane=%d leg=%s reason=%d err=%v",
-			status.SessionID, status.LaneID, linkStatusKindLabel(status.Kind), status.Reason, err)
+		recordLinkStatusEvent("send_error", status.SessionID, status.LaneID, status.UDPLimited, status.TCPLimited)
+		eventlog.Printf("link_status", "action=send_error session=%d lane=%d status=%#02x err=%v",
+			status.SessionID, status.LaneID, linkStatus, err)
 		return err
 	}
-	recordLinkStatusEvent("send", status.SessionID, status.LaneID, status.Kind, status.Reason)
+	recordLinkStatusEvent("send", status.SessionID, status.LaneID, status.UDPLimited, status.TCPLimited)
 	return nil
 }
 
-func protocolLegKind(kind transport.Kind) (uint8, bool) {
-	switch kind {
-	case transport.KindUDP:
-		return protocol.LinkStatusLegUDP, true
-	case transport.KindTCP:
-		return protocol.LinkStatusLegTCP, true
-	default:
-		return 0, false
+func linkStatusByte(udpLimited, tcpLimited bool) uint8 {
+	var status uint8
+	if udpLimited {
+		status |= protocol.LinkStatusStateLimited << 4
 	}
+	if tcpLimited {
+		status |= protocol.LinkStatusStateLimited
+	}
+	return status
 }
 
-func recordLinkStatusEvent(event string, sessionID uint64, laneID uint8, kind transport.Kind, reason uint8) {
+func recordLinkStatusEvent(event string, sessionID uint64, laneID uint8, udpLimited, tcpLimited bool) {
 	metrics.IncCounter(metrics.LinkStatusEventsTotal,
 		metrics.LStr("event", event),
 		metrics.LU64("session", sessionID),
 		metrics.LU8("lane", laneID),
-		metrics.LStr("leg", linkStatusKindLabel(kind)),
-		metrics.LU8("reason", reason),
+		metrics.LStr("udp_limited", boolMetricLabel(udpLimited)),
+		metrics.LStr("tcp_limited", boolMetricLabel(tcpLimited)),
 	)
 }
 
-func linkStatusKindLabel(kind transport.Kind) string {
+func boolMetricLabel(v bool) string {
+	if v {
+		return "true"
+	}
+	return "false"
+}
+
+func runtimeKindLabel(kind transport.Kind) string {
 	switch kind {
 	case transport.KindUDP:
 		return "udp"
