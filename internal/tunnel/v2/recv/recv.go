@@ -45,6 +45,7 @@ type QoSStatus struct {
 	LaneID          uint8
 	UDPLimited      bool
 	TCPLimited      bool
+	RepairCount     uint8
 	UDPDeliveredBps uint32
 	TCPDeliveredBps uint32
 }
@@ -246,7 +247,7 @@ func (o *Recv) cancelFECGroupTimer(state *recvState, key rxLaneGroupKey) {
 }
 
 type fecCodec interface {
-	Reconstruct(shards [][]byte, key uint16) error
+	Reconstruct(shards [][]byte, keys []uint16) error
 }
 
 func New(configs ...Config) *Recv {
@@ -581,7 +582,7 @@ func (o *Recv) recoverPacket(sessionID uint64, laneID uint8, state *recvState, r
 	if len(repairKeys) != 1 {
 		return nil, nil, false
 	}
-	if err := codec.Reconstruct(shards, repairKeys[0]); err != nil {
+	if err := codec.Reconstruct(shards, repairKeys); err != nil {
 		debuglog.Printf("recv", "recover_err session=%d lane=%d base_packet_id=%d key=%d source_span=%d err=%v",
 			sessionID, laneID, recoverable.group.basePacketID, repairKeys[0], recoverable.group.sourceSpan, err)
 		metrics.IncCounter(metrics.FECEventsTotal,

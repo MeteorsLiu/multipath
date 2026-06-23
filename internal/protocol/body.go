@@ -350,5 +350,5 @@ func validLinkStatusStatus(status uint8) bool {
 }
 
 func validLinkStatusState(state uint8) bool {
-	return state == LinkStatusStateClear || state == LinkStatusStateLimited
+	return state <= 7
 }
