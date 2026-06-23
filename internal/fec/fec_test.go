@@ -38,7 +38,7 @@ func TestCodecReconstructsOneMissingShard(t *testing.T) {
 		[]byte("klm"),
 		nil,
 	}
-	if err := codec.Encode(shards, 7); err != nil {
+	if err := codec.Encode(shards, []uint16{7}); err != nil {
 		t.Fatalf("Encode: %v", err)
 	}
 	repair := append([]byte(nil), shards[4]...)
@@ -50,7 +50,7 @@ func TestCodecReconstructsOneMissingShard(t *testing.T) {
 		[]byte("klm"),
 		repair,
 	}
-	if err := codec.Reconstruct(recovered, 7); err != nil {
+	if err := codec.Reconstruct(recovered, []uint16{7}); err != nil {
 		t.Fatalf("Reconstruct: %v", err)
 	}
 	if !bytes.Equal(recovered[1], []byte{'e', 'f', 0, 0}) {
@@ -70,7 +70,7 @@ func TestCodecReconstructsEachMissingShard(t *testing.T) {
 		[]byte("d"),
 		nil,
 	}
-	if err := codec.Encode(source, 99); err != nil {
+	if err := codec.Encode(source, []uint16{99}); err != nil {
 		t.Fatalf("Encode: %v", err)
 	}
 	repair := append([]byte(nil), source[4]...)
@@ -85,7 +85,7 @@ func TestCodecReconstructsEachMissingShard(t *testing.T) {
 		}
 		shards[4] = repair
 
-		if err := codec.Reconstruct(shards, 99); err != nil {
+		if err := codec.Reconstruct(shards, []uint16{99}); err != nil {
 			t.Fatalf("Reconstruct missing %d: %v", missing, err)
 		}
 		want := append([]byte(nil), source[missing]...)
@@ -141,7 +141,7 @@ func TestCodecMatchesReedSolomonCustomMatrix(t *testing.T) {
 		t.Run(fmt.Sprintf("key_%d", tt.key), func(t *testing.T) {
 			got := cloneDataShards(tt.shards)
 			got = append(got, nil)
-			if err := codec.Encode(got, tt.key); err != nil {
+			if err := codec.Encode(got, []uint16{tt.key}); err != nil {
 				t.Fatalf("Encode: %v", err)
 			}
 
@@ -157,7 +157,7 @@ func TestCodecMatchesReedSolomonCustomMatrix(t *testing.T) {
 				recovered := cloneDataShards(tt.shards)
 				recovered[missing] = nil
 				recovered = append(recovered, append([]byte(nil), got[4]...))
-				if err := codec.Reconstruct(recovered, tt.key); err != nil {
+				if err := codec.Reconstruct(recovered, []uint16{tt.key}); err != nil {
 					t.Fatalf("Reconstruct missing %d: %v", missing, err)
 				}
 
@@ -190,13 +190,108 @@ func TestCodecRejectsUnrecoverableShards(t *testing.T) {
 		[]byte("klm"),
 		[]byte("repair"),
 	}
-	if err := codec.Reconstruct(shards, 7); !errors.Is(err, ErrUnrecoverable) {
+	if err := codec.Reconstruct(shards, []uint16{7}); !errors.Is(err, ErrUnrecoverable) {
 		t.Fatalf("Reconstruct err = %v, want ErrUnrecoverable", err)
 	}
 }
 
-func TestNewCodecRejectsUnsupportedRepairCount(t *testing.T) {
-	if _, err := NewCodec(4, 2); !errors.Is(err, ErrInvalidShardConfig) {
+func TestCodecReconstructsTwoMissingShardsWithTwoRepairs(t *testing.T) {
+	codec, err := NewCodec(4, 2)
+	if err != nil {
+		t.Fatalf("NewCodec: %v", err)
+	}
+	source := [][]byte{
+		[]byte("aaaa"),
+		[]byte("bbb"),
+		[]byte("cc"),
+		[]byte("d"),
+		nil,
+		nil,
+	}
+	keys := []uint16{7, 8}
+	if err := codec.Encode(source, keys); err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	repairs := [][]byte{
+		append([]byte(nil), source[4]...),
+		append([]byte(nil), source[5]...),
+	}
+	recovered := [][]byte{
+		append([]byte(nil), source[0]...),
+		nil,
+		append([]byte(nil), source[2]...),
+		nil,
+		repairs[0],
+		repairs[1],
+	}
+	if err := codec.Reconstruct(recovered, keys); err != nil {
+		t.Fatalf("Reconstruct: %v", err)
+	}
+	if !bytes.Equal(recovered[1], []byte{'b', 'b', 'b', 0}) {
+		t.Fatalf("recovered[1] = %v, want padded bbb", recovered[1])
+	}
+	if !bytes.Equal(recovered[3], []byte{'d', 0, 0, 0}) {
+		t.Fatalf("recovered[3] = %v, want padded d", recovered[3])
+	}
+}
+
+func TestCodecReconstructsThreeMissingShardsWithThreeRepairs(t *testing.T) {
+	codec, err := NewCodec(4, 3)
+	if err != nil {
+		t.Fatalf("NewCodec: %v", err)
+	}
+	source := [][]byte{
+		[]byte("abcd"),
+		[]byte("ef"),
+		[]byte("ghij"),
+		[]byte("k"),
+		nil,
+		nil,
+		nil,
+	}
+	keys := []uint16{11, 12, 13}
+	if err := codec.Encode(source, keys); err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	recovered := [][]byte{
+		nil,
+		append([]byte(nil), source[1]...),
+		nil,
+		nil,
+		append([]byte(nil), source[4]...),
+		append([]byte(nil), source[5]...),
+		append([]byte(nil), source[6]...),
+	}
+	if err := codec.Reconstruct(recovered, keys); err != nil {
+		t.Fatalf("Reconstruct: %v", err)
+	}
+	if !bytes.Equal(recovered[0], []byte("abcd")) {
+		t.Fatalf("recovered[0] = %q, want abcd", recovered[0])
+	}
+	if !bytes.Equal(recovered[2], []byte("ghij")) {
+		t.Fatalf("recovered[2] = %q, want ghij", recovered[2])
+	}
+	if !bytes.Equal(recovered[3], []byte{'k', 0, 0, 0}) {
+		t.Fatalf("recovered[3] = %v, want padded k", recovered[3])
+	}
+}
+
+func TestCodecRejectsWrongKeyCount(t *testing.T) {
+	codec, err := NewCodec(4, 2)
+	if err != nil {
+		t.Fatalf("NewCodec: %v", err)
+	}
+	shards := [][]byte{[]byte("a"), []byte("b"), []byte("c"), []byte("d"), nil, nil}
+	if err := codec.Encode(shards, []uint16{1}); !errors.Is(err, ErrInvalidShardConfig) {
+		t.Fatalf("Encode err = %v, want ErrInvalidShardConfig", err)
+	}
+	if err := codec.Reconstruct(shards, []uint16{1}); !errors.Is(err, ErrInvalidShardConfig) {
+		t.Fatalf("Reconstruct err = %v, want ErrInvalidShardConfig", err)
+	}
+}
+
+func TestNewCodecRejectsInvalidRepairCount(t *testing.T) {
+	if _, err := NewCodec(4, 0); !errors.Is(err, ErrInvalidShardConfig) {
 		t.Fatalf("NewCodec err = %v, want ErrInvalidShardConfig", err)
 	}
 }
