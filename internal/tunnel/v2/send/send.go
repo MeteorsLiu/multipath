@@ -1060,7 +1060,7 @@ func (s *Send) sendRepair(ctx context.Context, sessionID uint64, lane *laneRunti
 		shards[i] = pkt.Payload
 	}
 
-	if err := codec.Encode(shards, repairKey); err != nil {
+	if err := codec.Encode(shards, []uint16{repairKey}); err != nil {
 		debuglog.Printf("send/fec", "encode_err session=%d lane=%d err=%v", sessionID, lane.id, err)
 		for _, pkt := range group.packets {
 			pkt.Release()

@@ -89,6 +89,7 @@ func TestQoSWriterWritesLinkStatusFrame(t *testing.T) {
 		SessionID:       sessionID,
 		LaneID:          1,
 		UDPLimited:      true,
+		RepairCount:     3,
 		UDPDeliveredBps: 2_000_000,
 		TCPDeliveredBps: 8_000_000,
 	})
@@ -115,7 +116,7 @@ func TestQoSWriterWritesLinkStatusFrame(t *testing.T) {
 			if !ok {
 				t.Fatalf("body type = %T, want LinkStatusBody", frame.Body)
 			}
-			if body.Status != protocol.LinkStatusStateLimited<<4 || body.UDPDeliveredBps != 2_000_000 || body.TCPDeliveredBps != 8_000_000 {
+			if body.Status != 0x54 || body.UDPDeliveredBps != 2_000_000 || body.TCPDeliveredBps != 8_000_000 {
 				t.Fatalf("body = %+v, want UDP limited snapshot", body)
 			}
 			return
