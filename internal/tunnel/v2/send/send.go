@@ -298,11 +298,10 @@ func (s *Send) bootstrapSession(ctx context.Context) error {
 		s.openLaneHello(sessionCtx, session, sessionID, lane, laneID, legRef)
 
 		// Create and drive the active ping for this lane's UDP leg (spec 5.5, 7.3).
-		// The ping starts dead; its first RecoverSuccess pongs fire OnUp →
-		// leg.markActive, which is how a leg first comes up (initial activation
-		// goes through PONG, not HELLO_ACK). Subsequent MaxLoss timeouts fire
-		// OnDown → leg.markDown. The ping is registered in the shared LaneManager
-		// so the recv glue can route inbound PONG to it without touching send.
+		// The ping starts dead unless the leg has already been activated by a
+		// same-leg HELLO_ACK. Subsequent MaxLoss timeouts fire OnDown →
+		// leg.markDown. The ping is registered in the shared LaneManager so the
+		// recv glue can route inbound PONG to it without touching send.
 		s.startLanePing(sessionCtx, sessionID, lane, legRef)
 
 		// Start the TCP dialer for this lane if a TCP remote is configured and a
@@ -530,6 +529,11 @@ func (s *Send) openLaneHello(ctx context.Context, session *sessionpkg.Session, s
 		TimeoutMS:     30000,
 		OnAck: func() {
 			lane.markActive(legRef.Kind)
+			if legRef.Kind == transport.KindUDP && s.laneManager != nil {
+				if p := s.laneManager.LookupPing(KeyForLeg(sessionID, laneID, legRef)); p != nil {
+					p.MarkAlive()
+				}
+			}
 			s.markRunnableLanesDirty(sessionID)
 			s.syncBwSchedulerAfterLegActive(ctx, sessionID)
 			debuglog.Printf("send", "hello_ack_active session=%d lane=%d kind=%d", sessionID, laneID, legRef.Kind)
@@ -724,6 +728,11 @@ func (s *Send) admitPassiveHelloAck(ctx context.Context, frame protocol.Frame, l
 		lane.bindTCP(legRef)
 	}
 	lane.markActive(legRef.Kind)
+	if legRef.Kind == transport.KindUDP && s.laneManager != nil {
+		if p := s.laneManager.LookupPing(KeyForLeg(frame.SessionID, frame.LaneID, legRef)); p != nil {
+			p.MarkAlive()
+		}
+	}
 	if body.Caps&protocol.CapFEC != 0 && body.FECProfile == protocol.FECProfileSLC4Plus1 {
 		s.enableSessionFEC(frame.SessionID)
 	}
@@ -741,7 +750,7 @@ func (s *Send) registerLaneQoS(sessionID uint64, lane *laneRuntime) {
 	if lane == nil {
 		return
 	}
-	s.laneManager.RegisterQoS(LaneKey{SessionID: sessionID, LaneID: lane.id}, laneQoSInput{lane: lane})
+	s.laneManager.RegisterQoS(LaneKey{SessionID: sessionID, LaneID: lane.id}, laneQoSInput{sessionID: sessionID, lane: lane})
 }
 
 func (s *Send) ensurePassiveSessionContext(ctx context.Context, sessionID uint64) (context.Context, []transport.LegRef) {
@@ -879,10 +888,11 @@ func (s *Send) sendDataFrame(ctx context.Context, lane *laneRuntime, frame proto
 	s.recordQoSDataLegSelection(frame.SessionID, lane, leg.Kind, qosEnabled)
 	if debuglog.Enabled() {
 		udpQ, tcpQ := lane.leg.qualitySnapshot()
-		debuglog.Printf("send", "schedule_select session=%d lane=%d leg={%s} frame=type=DATA packet_id=%d payload_len=%d udp_active=%t udp_rate=%.3f udp_qos=%t udp_qos_bps=%d udp_prefer_tcp=%t udp_rttvar_ms=%d tcp_active=%t tcp_rate=%.3f tcp_qos=%t tcp_qos_bps=%d",
-			frame.SessionID, lane.id, debugLeg(leg), packetID, len(payload),
-			udpQ.Active, udpQ.DeliveryRate, udpQ.QoSActive, udpQ.QoSDeliveredBps, udpQ.PreferTCP, udpQ.RTTVariance.Milliseconds(),
-			tcpQ.Active, tcpQ.DeliveryRate, tcpQ.QoSActive, tcpQ.QoSDeliveredBps)
+		shadow := lane.shadowTransportWithQoS(qosEnabled)
+		debuglog.Printf("send", "schedule_select session=%d lane=%d primary={%s} shadow={%s} leg={%s} frame=type=DATA packet_id=%d payload_len=%d udp_active=%t udp_qos=%t udp_qos_bps=%d udp_prefer_tcp=%t tcp_active=%t tcp_qos=%t tcp_qos_bps=%d",
+			frame.SessionID, lane.id, debugLeg(leg), debugLeg(shadow), debugLeg(leg), packetID, len(payload),
+			udpQ.Active, udpQ.QoSActive, udpQ.QoSDeliveredBps, udpQ.PreferTCP,
+			tcpQ.Active, tcpQ.QoSActive, tcpQ.QoSDeliveredBps)
 	}
 
 	// Add to FEC window if enabled
@@ -913,10 +923,13 @@ func (s *Send) recordQoSDataLegSelection(sessionID uint64, lane *laneRuntime, ki
 	if !changed {
 		return
 	}
-	eventlog.Printf("selector", "action=qos_data_leg session=%d lane=%d from=%s to=%s udp_active=%t udp_delivery=%.3f udp_qos=%t udp_qos_bps=%d udp_prefer_tcp=%t tcp_active=%t tcp_delivery=%.3f tcp_qos=%t tcp_qos_bps=%d",
+	primary := lane.primaryTransportWithQoS(qosEnabled)
+	shadow := lane.shadowTransportWithQoS(qosEnabled)
+	eventlog.Printf("selector", "action=qos_data_leg session=%d lane=%d from=%s to=%s primary={%s} shadow={%s} udp_active=%t udp_qos=%t udp_qos_bps=%d udp_prefer_tcp=%t tcp_active=%t tcp_qos=%t tcp_qos_bps=%d",
 		sessionID, lane.id, kindEventLabel(previousKind), kindEventLabel(kind),
-		udpQ.Active, udpQ.DeliveryRate, udpQ.QoSActive, udpQ.QoSDeliveredBps, udpQ.PreferTCP,
-		tcpQ.Active, tcpQ.DeliveryRate, tcpQ.QoSActive, tcpQ.QoSDeliveredBps)
+		debugLeg(primary), debugLeg(shadow),
+		udpQ.Active, udpQ.QoSActive, udpQ.QoSDeliveredBps, udpQ.PreferTCP,
+		tcpQ.Active, tcpQ.QoSActive, tcpQ.QoSDeliveredBps)
 }
 
 func (s *Send) logBandwidthProbeDecision(target bwTarget, sample bw.Sample, preferTCP bool) {
@@ -1080,10 +1093,17 @@ func (s *Send) sendRepair(ctx context.Context, sessionID uint64, lane *laneRunti
 		return
 	}
 
-	leg := lane.shadowTransportWithQoS(s.qosSelectionEnabled())
+	qosEnabled := s.qosSelectionEnabled()
+	leg := lane.shadowTransportWithQoS(qosEnabled)
 	if leg.Kind == 0 {
 		packet.Release()
 		return
+	}
+	if debuglog.Enabled() {
+		primary := lane.primaryTransportWithQoS(qosEnabled)
+		debuglog.Printf("send", "schedule_select session=%d lane=%d primary={%s} shadow={%s} leg={%s} frame=type=REPAIR base_packet_id=%d key=%d source_span=%d symbol_len=%d",
+			sessionID, lane.id, debugLeg(primary), debugLeg(leg), debugLeg(leg),
+			group.basePacketID, repairKey, group.sourceSpan, len(shards[group.sourceSpan]))
 	}
 
 	_ = s.WriteTo(ctx, leg, packet)
@@ -1174,11 +1194,10 @@ func (s *Send) OnLegFailure(ctx context.Context, legRef transport.LegRef, err er
 }
 
 // startLanePing creates and drives the active ping for one lane transport path
-// (spec 5.5, 7.3). The ping starts dead (a leg begins inactive): its first
-// RecoverSuccess pongs fire OnUp → leg.markActive, which is how the leg first
-// comes up — initial activation flows through PONG, not HELLO_ACK (per design
-// decision). After it is up, MaxLoss consecutive ping timeouts fire OnDown →
-// leg.markDown.
+// (spec 5.5, 7.3). The ping starts dead when the leg is still inactive; its
+// first RecoverSuccess pongs fire OnUp → leg.markActive. If HELLO_ACK already
+// activated the same leg, the ping starts alive so later MaxLoss timeouts can
+// still fire OnDown → leg.markDown.
 //
 // The closures capture this lane's leg, so liveness lands on leg.markActive /
 // leg.markDown entirely inside send — no transport method is exposed. The ping
@@ -1198,6 +1217,7 @@ func (s *Send) startLanePing(ctx context.Context, sessionID uint64, lane *laneRu
 
 	laneID := lane.id
 	kind := legRef.Kind
+	initDead := !lane.leg.isActive(kind)
 
 	sendMsg := func(m ping.Message) error {
 		frame := protocol.Frame{
@@ -1217,7 +1237,7 @@ func (s *Send) startLanePing(ctx context.Context, sessionID uint64, lane *laneRu
 		Interval: s.probeInterval,
 		Timeout:  s.probeTimeout,
 		SendMsg:  sendMsg,
-		InitDead: true, // leg starts inactive; first pongs bring it up
+		InitDead: initDead,
 		OnUp: func() {
 			lane.markActive(kind)
 			debuglog.Printf("send", "ping_up session=%d lane=%d kind=%d", sessionID, laneID, kind)

@@ -5,6 +5,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/MeteorsLiu/multipath/internal/debuglog"
 	"github.com/MeteorsLiu/multipath/internal/packetbuf"
 	"github.com/MeteorsLiu/multipath/internal/transport"
 	"github.com/MeteorsLiu/multipath/internal/transport/selector"
@@ -130,7 +131,8 @@ func (l *laneRuntime) setPrimary(kind transport.Kind) {
 }
 
 type laneQoSInput struct {
-	lane *laneRuntime
+	sessionID uint64
+	lane      *laneRuntime
 }
 
 func (i laneQoSInput) OnQoSStatus(udpLimited bool, udpDeliveredBps uint32, tcpLimited bool, tcpDeliveredBps uint32) {
@@ -138,6 +140,13 @@ func (i laneQoSInput) OnQoSStatus(udpLimited bool, udpDeliveredBps uint32, tcpLi
 		return
 	}
 	i.lane.leg.observeQoSStatus(udpLimited, udpDeliveredBps, tcpLimited, tcpDeliveredBps)
+	if debuglog.Enabled() {
+		primary := i.lane.primaryTransport()
+		shadow := i.lane.shadowTransport()
+		debuglog.Printf("send/qos", "apply session=%d lane=%d primary={%s} shadow={%s} udp_limited=%t udp_delivered_bps=%d tcp_limited=%t tcp_delivered_bps=%d",
+			i.sessionID, i.lane.id, debugLeg(primary), debugLeg(shadow),
+			udpLimited, udpDeliveredBps, tcpLimited, tcpDeliveredBps)
+	}
 }
 
 // commitPacket adds a DATA packet to this lane's FEC transmit window (spec 9.1).

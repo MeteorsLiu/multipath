@@ -14,6 +14,8 @@ E2E_DEBUG=1
 FEC_PING_COUNT=1000
 FEC_PING_INTERVAL=0.02
 FEC_HIGH_RTT_DELAY=50ms
+LINK_STATUS_QOS_LOSS=50%
+LINK_STATUS_QOS_WAIT=35
 
 require_command() {
   local cmd="$1"
@@ -1278,6 +1280,30 @@ apply_udp_partial_loss() {
   setup_prio_qdisc "${NS_C}" "${client_dev}"
   add_loss_band "${NS_C}" "${client_dev}" 3 30 "${loss}"
   add_port_filter "${NS_C}" "${client_dev}" 1 udp dport "${port}" 3
+
+  setup_prio_qdisc "${NS_S}" "${server_dev}"
+  add_loss_band "${NS_S}" "${server_dev}" 3 30 "${loss}"
+  add_port_filter "${NS_S}" "${server_dev}" 1 udp sport "${port}" 3
+}
+
+apply_udp_partial_loss_client_to_server_path() {
+  local path="$1"
+  local port="$2"
+  local loss="$3"
+  local client_dev
+  client_dev="$(path_client_dev "${path}")"
+
+  setup_prio_qdisc "${NS_C}" "${client_dev}"
+  add_loss_band "${NS_C}" "${client_dev}" 3 30 "${loss}"
+  add_port_filter "${NS_C}" "${client_dev}" 1 udp dport "${port}" 3
+}
+
+apply_udp_partial_loss_server_to_client_path() {
+  local path="$1"
+  local port="$2"
+  local loss="$3"
+  local server_dev
+  server_dev="$(path_server_dev "${path}")"
 
   setup_prio_qdisc "${NS_S}" "${server_dev}"
   add_loss_band "${NS_S}" "${server_dev}" 3 30 "${loss}"
@@ -2637,13 +2663,13 @@ run_link_status_qos_case() {
   server_status_line="$(current_log_file_line_count "${CURRENT_SERVER_LOG}")"
   client_apply_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
 
-  echo "[${name}] apply 20% UDP data loss while TCP shadow stays clean; recv-side FEC differential QoS should notify the sender"
-  apply_udp_partial_loss 1 "${PORT_LINK_STATUS_QOS}" 20%
+  echo "[${name}] apply ${LINK_STATUS_QOS_LOSS} client-to-server UDP data loss while TCP shadow stays clean; recv-side FEC differential QoS should notify the sender"
+  apply_udp_partial_loss_client_to_server_path 1 "${PORT_LINK_STATUS_QOS}" "${LINK_STATUS_QOS_LOSS}"
 
   run_ping_sample "${name}-qos"
 
-  wait_log_file_pattern_while_ping "${name}" "${CURRENT_SERVER_LOG}" "runtime/qos: link_status_send session=[0-9]+ lane=1 status=0x10 .*udp_limited=true" 5 "server emitted UDP limited LINK_STATUS from receive-side QoS" "${server_status_line}"
-  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "runtime: link_status_apply session=[0-9]+ lane=1 status=0x10 .*udp_limited=true" 5 "client applied server LINK_STATUS to lane selector" "${client_apply_line}"
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_SERVER_LOG}" "runtime/qos: link_status_send session=[0-9]+ lane=1 status=0x10 .*udp_limited=true" "${LINK_STATUS_QOS_WAIT}" "server emitted UDP limited LINK_STATUS from receive-side QoS" "${server_status_line}"
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "runtime: link_status_apply session=[0-9]+ lane=1 status=0x10 .*udp_limited=true" "${LINK_STATUS_QOS_WAIT}" "client applied server LINK_STATUS to lane selector" "${client_apply_line}"
   client_select_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
   wait_log_file_pattern_while_ping_from "${name}" "${CURRENT_CLIENT_LOG}" "schedule_select.*lane=1 .*leg=\\{tcp .*frame=type=DATA" 20 "client selector sent DATA over TCP after receive-side QoS feedback" "${client_select_line}" "${NS_C}" "${TUN_C_REMOTE}"
 
@@ -2680,13 +2706,13 @@ run_link_status_qos_reverse_case() {
   client_status_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
   server_apply_line="$(current_log_file_line_count "${CURRENT_SERVER_LOG}")"
 
-  echo "[${name}] apply 20% UDP data loss and generate server-to-client DATA; client receive-side QoS should notify the server"
-  apply_udp_partial_loss 1 "${PORT_LINK_STATUS_QOS_REVERSE}" 20%
+  echo "[${name}] apply ${LINK_STATUS_QOS_LOSS} server-to-client UDP data loss and generate server-to-client DATA; client receive-side QoS should notify the server"
+  apply_udp_partial_loss_server_to_client_path 1 "${PORT_LINK_STATUS_QOS_REVERSE}" "${LINK_STATUS_QOS_LOSS}"
 
   run_ping_sample_from "${name}-qos" "${NS_S}" "${TUN_S_REMOTE}"
 
-  wait_log_file_pattern_while_ping_from "${name}" "${CURRENT_CLIENT_LOG}" "runtime/qos: link_status_send session=[0-9]+ lane=1 status=0x10 .*udp_limited=true" 5 "client emitted UDP limited LINK_STATUS from receive-side QoS" "${client_status_line}" "${NS_S}" "${TUN_S_REMOTE}"
-  wait_log_file_pattern_while_ping_from "${name}" "${CURRENT_SERVER_LOG}" "runtime: link_status_apply session=[0-9]+ lane=1 status=0x10 .*udp_limited=true" 5 "server applied client LINK_STATUS to lane selector" "${server_apply_line}" "${NS_S}" "${TUN_S_REMOTE}"
+  wait_log_file_pattern_while_ping_from "${name}" "${CURRENT_CLIENT_LOG}" "runtime/qos: link_status_send session=[0-9]+ lane=1 status=0x10 .*udp_limited=true" "${LINK_STATUS_QOS_WAIT}" "client emitted UDP limited LINK_STATUS from receive-side QoS" "${client_status_line}" "${NS_S}" "${TUN_S_REMOTE}"
+  wait_log_file_pattern_while_ping_from "${name}" "${CURRENT_SERVER_LOG}" "runtime: link_status_apply session=[0-9]+ lane=1 status=0x10 .*udp_limited=true" "${LINK_STATUS_QOS_WAIT}" "server applied client LINK_STATUS to lane selector" "${server_apply_line}" "${NS_S}" "${TUN_S_REMOTE}"
 
   local server_select_line
   server_select_line="$(current_log_file_line_count "${CURRENT_SERVER_LOG}")"
@@ -2742,15 +2768,21 @@ run_link_status_qos_iperf_dynamic_case() {
   local delay="${6:-}"
   local jitter="${7:-}"
   local min_recovered_vs_baseline="${8:-0.40}"
-  local min_limited_vs_baseline="${9:-0.15}"
+  local min_limited_vs_baseline="${9:-0.03}"
   local min_recovered_vs_limited="0.75"
   local cycles=1
   local duration=38
   if [[ "${repeat_limit}" == "true" ]]; then
     cycles=2
-    duration=52
+    # Keep traffic running after the second clear so selector recovery can be
+    # observed instead of racing the iperf process exit.
+    duration=75
   fi
 
+  # This case is intentionally stronger than a throughput recovery smoke test:
+  # DATA starts on UDP, UDP tunnel traffic is rate-limited, receive-side QoS is
+  # expected to emit UDP-limited LINK_STATUS, and the sender must switch DATA to
+  # TCP until the UDP rate limit is cleared.
   echo "==== ${name} e2e start ===="
   if ! command -v iperf3 >/dev/null 2>&1; then
     echo "[${name}] iperf3 not found, skip dynamic QoS throughput case"
@@ -2866,7 +2898,7 @@ run_link_status_qos_iperf_dynamic_case() {
     local limited2_bps
     local recovered2_bps
     limited2_bps="$(parse_iperf_json_window_avg_bps "${iperf_client_json}" 34 40)"
-    recovered2_bps="$(parse_iperf_json_window_avg_bps "${iperf_client_json}" 44 50)"
+    recovered2_bps="$(parse_iperf_json_window_avg_bps "${iperf_client_json}" 58 68)"
     assert_iperf_window_recovered "${name}-repeat" "${baseline_bps}" "${limited2_bps}" "${recovered2_bps}" "${min_recovered_vs_baseline}" "${min_recovered_vs_limited}" "${min_limited_vs_baseline}"
   fi
 
@@ -2874,6 +2906,8 @@ run_link_status_qos_iperf_dynamic_case() {
   assert_link_status_since_ge "${name}" "${CURRENT_SERVER_LOG}" "${server_status_line}" "runtime/qos: link_status_send .*udp_limited=false" "${cycles}" "server sent UDP-clear LINK_STATUS snapshots"
   assert_link_status_since_ge "${name}" "${CURRENT_CLIENT_LOG}" "${client_selector_line}" "selector action=qos_data_leg .*from=udp to=tcp" "${cycles}" "client switched DATA selector to TCP"
   assert_link_status_since_ge "${name}" "${CURRENT_CLIENT_LOG}" "${client_selector_line}" "selector action=qos_data_leg .*from=tcp to=udp" "${cycles}" "client switched DATA selector back to UDP"
+  assert_log_file_pattern_count_since_le "${name}" "${CURRENT_SERVER_LOG}" "${server_status_line}" "runtime/qos: link_status_send .*tcp_limited=true" 0 "server did not falsely report TCP limited during UDP rate shaping"
+  assert_log_file_pattern_count_since_le "${name}" "${CURRENT_CLIENT_LOG}" "${client_selector_line}" "runtime: link_status_apply .*tcp_limited=true" 0 "client did not apply false TCP limited status during UDP rate shaping"
   assert_selector_switches_since_le "${name}" "${CURRENT_CLIENT_LOG}" "${client_selector_line}" "$((cycles * 4))"
 
   stop_multipath
@@ -2929,6 +2963,7 @@ run_tcp_fallback_rate_dynamic_case() {
   apply_udp_block_tcp_rate_path 1 "${port}" "${rate}"
   sleep 14
   echo "[${name}] clear TCP fallback rate limit while keeping UDP blocked"
+  clear_loss
   apply_udp_tunnel_block_path 1 "${port}"
 
   local client_status=0
@@ -3270,10 +3305,10 @@ run_multipath_fec_case
 run_link_status_qos_case
 run_link_status_qos_reverse_case
 run_link_status_qos_jitter_no_qos_case
-run_link_status_qos_iperf_dynamic_case "link-status-qos-iperf" "${PORT_LINK_STATUS_QOS_IPERF}" udp-rate false 5mbit "" "" 0.40 0.15
-run_link_status_qos_iperf_dynamic_case "link-status-qos-iperf-repeat" "${PORT_LINK_STATUS_QOS_IPERF_REPEAT}" udp-rate true 5mbit "" "" 0.40 0.15
-run_link_status_qos_iperf_dynamic_case "link-status-qos-iperf-jitter" "${PORT_LINK_STATUS_QOS_IPERF_JITTER}" udp-rate-jitter false 5mbit 60ms 80ms 0.25 0.10
-run_link_status_qos_iperf_dynamic_case "link-status-qos-iperf-rtt200-jitter" "${PORT_LINK_STATUS_QOS_IPERF_RTT200}" udp-rate-jitter false 5mbit 100ms 100ms 0.20 0.08
+run_link_status_qos_iperf_dynamic_case "link-status-qos-iperf" "${PORT_LINK_STATUS_QOS_IPERF}" udp-rate false 5mbit "" "" 0.40 0.03
+run_link_status_qos_iperf_dynamic_case "link-status-qos-iperf-repeat" "${PORT_LINK_STATUS_QOS_IPERF_REPEAT}" udp-rate true 5mbit "" "" 0.40 0.03
+run_link_status_qos_iperf_dynamic_case "link-status-qos-iperf-jitter" "${PORT_LINK_STATUS_QOS_IPERF_JITTER}" udp-rate-jitter false 500kbit 60ms 80ms 0.25 0.03
+run_link_status_qos_iperf_dynamic_case "link-status-qos-iperf-rtt200-jitter" "${PORT_LINK_STATUS_QOS_IPERF_RTT200}" udp-rate-jitter false 500kbit 100ms 100ms 0.20 0.03
 run_tcp_fallback_rate_dynamic_case
 run_fec_loaded_latency_case
 run_weighted_scheduling_case

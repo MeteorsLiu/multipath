@@ -176,7 +176,7 @@ func TestRecvDuplicateDATAIsNotEmittedOrInsertedIntoWindow(t *testing.T) {
 	window := st.rxWindows[1]
 	var dataCount int
 	if window != nil {
-		dataCount = len(window.data)
+		dataCount = len(window.recentData)
 	}
 	st.mu.Unlock()
 	if dataCount != 1 {
@@ -212,6 +212,41 @@ func TestRecvPerLaneWindowIsolation(t *testing.T) {
 	}
 }
 
+func TestRecvRepairCreatesGroupWindowEntry(t *testing.T) {
+	var manager session.Manager
+	if _, ok := manager.Create(6); !ok {
+		t.Fatal("Create session failed")
+	}
+	out := New(Config{SessionManager: &manager})
+
+	repair := protocol.Frame{
+		Type:      protocol.TypeREPAIR,
+		SessionID: 6,
+		LaneID:    1,
+		Body: protocol.RepairBody{
+			BasePacketID: 10,
+			Key:          3,
+			SourceSpan:   2,
+			Symbol:       []byte("repair"),
+		},
+	}
+	if err := out.WriteTo(context.Background(), tcpLeg(), encodedTestFrame(t, repair)); err != nil {
+		t.Fatalf("Write REPAIR: %v", err)
+	}
+
+	st := out.recvState(6)
+	st.mu.Lock()
+	window := st.rxWindows[1]
+	group := window.groups[rxGroupKey{basePacketID: 10, sourceSpan: 2}]
+	st.mu.Unlock()
+	if group == nil {
+		t.Fatal("missing repair group")
+	}
+	if len(group.repairs) != 1 || group.repairs[0].key != 3 {
+		t.Fatalf("repairs = %+v, want one key=3", group.repairs)
+	}
+}
+
 func TestRecvReportsQoSStatusThroughCallback(t *testing.T) {
 	var manager session.Manager
 	if _, ok := manager.Create(10); !ok {
@@ -231,16 +266,7 @@ func TestRecvReportsQoSStatusThroughCallback(t *testing.T) {
 	state.qos[1] = newQoSEstimator(qosConfig{
 		Sustain:     time.Second,
 		SampleFloor: 4,
-	}, func(status qosStatus) {
-		statuses = append(statuses, QoSStatus{
-			SessionID:       10,
-			LaneID:          1,
-			UDPLimited:      status.UDPLimited,
-			TCPLimited:      status.TCPLimited,
-			UDPDeliveredBps: status.UDPDeliveredBps,
-			TCPDeliveredBps: status.TCPDeliveredBps,
-		})
-	})
+	}, nil)
 	state.mu.Unlock()
 
 	for group := uint32(0); group < 4; group++ {
@@ -250,27 +276,36 @@ func TestRecvReportsQoSStatusThroughCallback(t *testing.T) {
 		}
 	}
 	state.mu.Lock()
-	state.qos[1].Observe(qosSample{
-		At:             time.Now(),
-		Duration:       time.Second,
-		DataKind:       transport.KindUDP,
-		RepairKind:     transport.KindTCP,
-		DataArrived:    0,
-		DataExpected:   16,
-		RecoveredBytes: 16 * 1200,
-		RepairBytes:    4 * 1200,
+	now := time.Now()
+	var qosStatuses []qosStatus
+	state.qos[1].ObserveHealth(qosHealthSample{
+		At:           now,
+		DataKind:     transport.KindUDP,
+		RepairKind:   transport.KindTCP,
+		DataArrived:  0,
+		DataExpected: 16,
 	})
-	state.qos[1].Observe(qosSample{
-		At:             time.Now().Add(2 * time.Second),
-		Duration:       time.Second,
-		DataKind:       transport.KindUDP,
-		RepairKind:     transport.KindTCP,
-		DataArrived:    0,
-		DataExpected:   16,
-		RecoveredBytes: 16 * 1200,
-		RepairBytes:    4 * 1200,
+	qosStatuses = append(qosStatuses, state.qos[1].Tick(now.Add(time.Second))...)
+	state.qos[1].ObserveHealth(qosHealthSample{
+		At:           now.Add(2 * time.Second),
+		DataKind:     transport.KindUDP,
+		RepairKind:   transport.KindTCP,
+		DataArrived:  0,
+		DataExpected: 16,
 	})
+	qosStatuses = append(qosStatuses, state.qos[1].Tick(now.Add(2*time.Second))...)
+	state.qos[1].ObserveHealth(qosHealthSample{
+		At:           now.Add(3 * time.Second),
+		DataKind:     transport.KindUDP,
+		RepairKind:   transport.KindTCP,
+		DataArrived:  0,
+		DataExpected: 16,
+	})
+	qosStatuses = append(qosStatuses, state.qos[1].Tick(now.Add(3*time.Second))...)
 	state.mu.Unlock()
+	if err := out.reportQoS(ctx, 10, 1, qosStatuses); err != nil {
+		t.Fatalf("reportQoS: %v", err)
+	}
 
 	if len(statuses) != 1 {
 		t.Fatalf("statuses = %+v, want one", statuses)

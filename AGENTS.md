@@ -13,6 +13,12 @@ is:
 Do not infer architecture from deleted historical packages. If docs and old
 mental models conflict, follow the docs.
 
+When actively modifying protocol or architecture from a new spec document, treat
+that spec as the source of truth for the change being implemented. Do not use
+older implementation docs, existing code shape, or historical behavior to
+preserve conflicting old protocol or architecture semantics unless the user
+explicitly asks for a compatibility path.
+
 ## Critical Multipath Semantics
 
 This project is a TUN-based multipath tunnel. It carries complete IP packets
@@ -26,6 +32,37 @@ delay. FEC should opportunistically repair recoverable packet loss before that
 upper-layer ARQ delay is paid; it must not turn the tunnel into a fully reliable
 transport, add tunnel-level retransmission semantics, or chase unrecoverable loss
 with reliability machinery.
+
+QoS detection is based on FEC differential observations. Within one FEC group,
+the DATA leg and REPAIR leg carry differential observations of the same source
+data under the FEC rules. QoS detection may compare values derived from that
+same-group relationship, for example expected DATA bytes versus actual DATA
+bytes or unrecoverable group health. Do not treat primary and shadow legs as the
+same capacity reference across different transport protocols. Do not introduce
+cross-leg capacity heuristics such as using shadow throughput as primary
+capacity, `max(expectedBps, shadowBps)`, or a `CapacityGap`-style signal for
+primary-leg QoS decisions.
+
+QoS detection must not use duplicate or discarded DATA packets as late
+bookkeeping inputs. Once `emitDedupe` rejects a DATA packet, it must be dropped
+without updating rx windows, rate samples, mature samples, or QoS estimator
+state. Unrecovered missing DATA may only contribute to FEC health observations
+such as `DataArrived/DataExpected`; do not convert unrecovered, discarded, or
+late duplicate packets into synthetic DATA bytes, recovered bytes, rate samples,
+or bandwidth-estimation inputs.
+
+QoS estimator rate state, PID correction state, limited state, and
+decision-filter state must be scoped to the DATA/REPAIR direction, for example
+`data=UDP, repair=TCP` is independent from `data=TCP, repair=UDP`. The final
+LINK_STATUS snapshot is aggregated per transport kind only after a direction's
+role-local decision filter commits clear/limited state. Do not interpret this
+as an additional wall-clock sustain wait on every estimator path. Do not use
+one transport kind's aggregated LINK_STATUS state as a gate for another
+direction's DATA-leg or REPAIR-leg QoS judgment. LINK_STATUS is state-change
+feedback; delivered-bps fields are auxiliary snapshot data and are not a
+continuous telemetry stream. A delivered-bps-only update may emit a fresh
+LINK_STATUS only when both UDP and TCP are already limited and the updated
+relative bps changes the QoS-preferred primary leg.
 
 Do not reduce this project to a single-path transport with a global UDP/TCP
 fallback. Multiple lanes may be active at the same time, and the scheduler

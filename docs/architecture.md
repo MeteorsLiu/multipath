@@ -292,10 +292,54 @@ Recv only accepts DATA or REPAIR for sessions admitted by the shared Session Man
 Unknown-session DATA or REPAIR is dropped.
 Recv owns per-lane receive-side FEC windows and a session-scoped emit dedupe.
 Recv keeps a per-lane QoS estimator beside the receive FEC window. The
-estimator consumes complete or recovered DATA/REPAIR group samples, compares
-DATA-leg delivery with FEC-derived expected delivery, estimates shadow-leg
-equivalent rate from REPAIR bytes, and reports abnormal status through Recv's
-QoS callback.
+estimator is event-counter based: when a non-duplicate DATA frame is accepted,
+it adds the DATA payload bytes to the DATA leg's pending byte counter; when a
+REPAIR frame is accepted, it adds the REPAIR payload bytes to the REPAIR leg's
+pending byte counter. A periodic estimator tick converts the pending DATA and
+REPAIR byte counters into rate observations, updates estimator state, and
+clears the pending counters for the next tick. For an already-observed DATA /
+REPAIR direction, an empty tick is still a zero-byte rate observation so the
+rate EMAs decay without synthesizing packet bytes.
+QoS limited/clear decisions are made only by estimator ticks. DATA and REPAIR
+arrival paths only add bytes to pending counters and must not submit limited or
+clear state directly.
+FEC health observations such as incomplete-group `DataArrived/DataExpected`
+must be refreshed by new health samples before they can advance a limited or
+clear decision; an old health sample must not be re-used by empty ticks as
+fresh evidence.
+The estimator records the current primary transport direction for the lane. The
+shadow direction is the opposite transport kind and does not need separate
+storage. Rate EMAs, PID correction, limited state, and decision-filter state are
+scoped to the DATA/REPAIR direction and role: primary/DATA role state is used to
+judge the current primary DATA leg, and shadow/REPAIR role state is used to
+observe the current shadow leg. Each tick evaluates only the state for the
+current role; non-current role state does not consume the tick, advance the
+decision filter, or emit LINK_STATUS state. The current rate and health
+estimator paths use a short decision-sample filter before committing
+clear/limited state; this should not be read as an additional wall-clock sustain
+duration on every path.
+Before changing the current primary direction, the estimator resets the target
+primary/DATA state that would otherwise carry stale `actual` or `expected` rate
+history into the new primary leg. It also resets the old primary's
+shadow/REPAIR state that would otherwise carry stale `repair` or `shadowBps`
+history into shadow observation. The unrelated side of each transport's role
+state is left intact.
+The final LINK_STATUS snapshot is aggregated per transport kind after
+direction-local role state is committed by the estimator's decision filter.
+An aggregated UDP/TCP status must not gate another direction's QoS judgment.
+LINK_STATUS is emitted as state-change feedback, not as continuous bandwidth
+telemetry. `UDPDeliveredBps` and `TCPDeliveredBps` are auxiliary values carried
+with a clear/limited snapshot; a delivered-bps-only change generally does not
+require a new LINK_STATUS frame. The exception is the both-limited case: if
+updated delivered-bps estimates change the QoS-preferred primary leg, the
+receiver sends a fresh LINK_STATUS snapshot so the sender selector is not held
+to stale relative bps.
+Recv must not feed duplicate DATA into the FEC window or the QoS estimator after
+session emit dedupe rejects that packet id. QoS must not create synthetic DATA
+bytes, recovered bytes, mature rate samples, or bandwidth-estimation inputs from
+discarded DATA, late duplicate DATA, unrecovered DATA, or FEC-recovered DATA.
+Unrecovered missing DATA may only contribute to FEC health observations such as
+`DataArrived/DataExpected`.
 Recv must not import or call concrete Send.
 ```
 
@@ -331,7 +375,9 @@ RecvHandler routes inbound PONG to the send-registered ping instance through Lan
 RecvHandler routes inbound BW_PROBE_ACK to the send-registered BwLoop through LaneManager.
 RecvHandler routes inbound LINK_STATUS into the lane QoS input registered in LaneManager.
 Runtime QoSWriter converts Recv QoS callbacks into outbound LINK_STATUS frames
-after LINK_STATUS has been negotiated for that session and lane.
+after LINK_STATUS has been negotiated for that session and lane. QoSWriter sends
+those LINK_STATUS frames through `Send.WriteFrame` with a TCP transport ref for
+the target lane, not through the lane's default control-transport policy.
 RecvHandler does not touch lane/leg internals directly.
 RecvHandler does not handle DATA or REPAIR.
 ```

@@ -311,6 +311,36 @@ func TestPingInitDeadActivatesOnFirstPongs(t *testing.T) {
 		t.Fatalf("OnDown fired %d times during initial activation, want 0", downs)
 	}
 }
+
+func TestPingMarkAliveAllowsInitDeadPathToGoDown(t *testing.T) {
+	var downs, ups int
+	p := New(Config{
+		Interval:       time.Second,
+		Timeout:        50 * time.Millisecond,
+		SendMsg:        func(Message) error { return nil },
+		MaxLoss:        3,
+		RecoverSuccess: 3,
+		InitDead:       true,
+		OnDown:         func() { downs++ },
+		OnUp:           func() { ups++ },
+	})
+
+	p.MarkAlive()
+	if ups != 0 {
+		t.Fatalf("MarkAlive fired OnUp: %d", ups)
+	}
+
+	loseOnce(p, 1)
+	loseOnce(p, 2)
+	if downs != 0 {
+		t.Fatalf("OnDown fired %d times before MaxLoss, want 0", downs)
+	}
+	loseOnce(p, 3)
+	if downs != 1 {
+		t.Fatalf("OnDown fired %d times after MarkAlive+MaxLoss, want 1", downs)
+	}
+}
+
 func TestPingObserverReceivesSamples(t *testing.T) {
 	var samples []Quality
 	p := New(Config{

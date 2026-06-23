@@ -444,6 +444,52 @@ func TestBootstrapLaneActivatesOnAcceptedHelloAck(t *testing.T) {
 	}
 }
 
+func TestUDPHelloAckSyncsPingLiveness(t *testing.T) {
+	sessions := &sessionpkg.Manager{}
+	s := New(Config{
+		SessionManager: sessions,
+		BootstrapLanes: []BootstrapLane{{LaneID: 1, Weight: 100, Leg: e2eUDP()}},
+		ProbeInterval:  15 * time.Millisecond,
+		ProbeTimeout:   20 * time.Millisecond,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := s.Bootstrap(ctx); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+
+	sessionID, ok := s.activeSession()
+	if !ok {
+		t.Fatal("no active session after bootstrap")
+	}
+	lane := s.getLane(laneKey{sessionID: sessionID, laneID: 1})
+	if lane == nil {
+		t.Fatal("bootstrap lane not found")
+	}
+
+	hello := waitForHello(t, s, sessionID, 1)
+	if !sessionsAckHello(t, sessions, sessionID, hello.Nonce) {
+		t.Fatal("session Ack rejected accepted HELLO_ACK")
+	}
+	if !lane.ready() {
+		t.Fatal("accepted HELLO_ACK did not mark bootstrap leg active")
+	}
+
+	downDeadline := time.Now().Add(2 * time.Second)
+	for lane.ready() && time.Now().Before(downDeadline) {
+		select {
+		case payload := <-s.Packets():
+			payload.Packet.Release()
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if lane.ready() {
+		t.Fatal("lane stayed ready after HELLO_ACK activation and ping timeouts")
+	}
+}
+
 func TestTCPFallbackRequiresHelloAckBeforeActive(t *testing.T) {
 	sessions := &sessionpkg.Manager{}
 	stream := &fakeStreamTransport{nextRef: e2eTCP("tcp-1")}
@@ -1122,6 +1168,57 @@ func TestAcceptedHelloAckPassivelyAdmitsServerLane(t *testing.T) {
 	}
 	if !sawData {
 		t.Fatal("expected DATA after passive admission")
+	}
+}
+
+func TestPassiveUDPHelloAckStartsPingAlive(t *testing.T) {
+	sessions := &sessionpkg.Manager{}
+	s := New(Config{
+		SessionManager: sessions,
+		ProbeInterval:  15 * time.Millisecond,
+		ProbeTimeout:   20 * time.Millisecond,
+	})
+
+	const sessionID = uint64(79)
+	const laneID = uint8(6)
+	if _, ok := sessions.GetOrCreate(sessionID); !ok {
+		t.Fatal("failed to create passive session")
+	}
+
+	leg := e2eUDP()
+	ack := protocol.Frame{
+		Version:   protocol.Version,
+		Type:      protocol.TypeHELLOACK,
+		SessionID: sessionID,
+		LaneID:    laneID,
+		Body: protocol.HelloAckBody{
+			Nonce:    12,
+			Accepted: 1,
+		},
+	}
+	if err := s.WriteFrame(context.Background(), ack, leg); err != nil {
+		t.Fatalf("WriteFrame HELLO_ACK: %v", err)
+	}
+
+	lane := s.getLane(laneKey{sessionID: sessionID, laneID: laneID})
+	if lane == nil || !lane.ready() {
+		t.Fatal("passive UDP HELLO_ACK did not mark lane ready")
+	}
+	if p := s.laneManager.LookupPing(KeyForLeg(sessionID, laneID, leg)); p == nil {
+		t.Fatal("passive UDP HELLO_ACK did not register ping")
+	}
+
+	downDeadline := time.Now().Add(2 * time.Second)
+	for lane.ready() && time.Now().Before(downDeadline) {
+		select {
+		case payload := <-s.Packets():
+			payload.Packet.Release()
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if lane.ready() {
+		t.Fatal("passive UDP lane stayed ready after ping timeouts")
 	}
 }
 

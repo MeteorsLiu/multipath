@@ -7,76 +7,148 @@ import (
 	"github.com/MeteorsLiu/multipath/internal/transport"
 )
 
-func TestRxWindowCompleteGroupSampleFromRepair(t *testing.T) {
+func TestRxWindowProducesArrivalRateSamples(t *testing.T) {
+	now := time.Unix(0, 0)
+	w := newRxSLCWindow(4)
+
+	data := w.addData(transport.KindUDP, 0, make([]byte, 46), now)
+	if len(data.rates) != 1 {
+		t.Fatalf("DATA rates = %+v, want one", data.rates)
+	}
+	if data.rates[0].DataKind != transport.KindUDP || data.rates[0].RepairKind != transport.KindTCP {
+		t.Fatalf("DATA rate kinds = data %d repair %d, want UDP/TCP", data.rates[0].DataKind, data.rates[0].RepairKind)
+	}
+	if data.rates[0].DataBytes != 46 || data.rates[0].RepairBytes != 0 {
+		t.Fatalf("DATA rate = %+v, want DATA bytes only", data.rates[0])
+	}
+
+	repair := w.addRepair(transport.KindTCP, 0, 7, 1, make([]byte, 64), now.Add(time.Millisecond))
+	if len(repair.rates) != 1 {
+		t.Fatalf("REPAIR rates = %+v, want one", repair.rates)
+	}
+	if repair.rates[0].DataKind != transport.KindUDP || repair.rates[0].RepairKind != transport.KindTCP {
+		t.Fatalf("REPAIR rate kinds = data %d repair %d, want UDP/TCP", repair.rates[0].DataKind, repair.rates[0].RepairKind)
+	}
+	if repair.rates[0].DataBytes != 0 || repair.rates[0].RepairBytes != 64 {
+		t.Fatalf("REPAIR rate = %+v, want REPAIR bytes only", repair.rates[0])
+	}
+	if repair.rates[0].ProfileDataBytes != 64 || repair.rates[0].ProfileRepairBytes != 64 {
+		t.Fatalf("REPAIR profile = %+v, want 64/64 for source_span=1", repair.rates[0])
+	}
+}
+
+func TestRxWindowCompleteGroupDoesNotProduceQoSSample(t *testing.T) {
 	now := time.Unix(0, 0)
 	w := newRxSLCWindow(4)
 
 	for i := uint32(0); i < 4; i++ {
 		result := w.addData(transport.KindUDP, i, make([]byte, 10+i), now.Add(time.Duration(i)*time.Millisecond))
-		if result.hasSample || result.hasRecoverable {
-			t.Fatalf("DATA %d result = %+v, want no sample/recovery before REPAIR", i, result)
+		if result.hasRecoverable {
+			t.Fatalf("DATA %d result = %+v, want no recovery before REPAIR", i, result)
+		}
+		if len(result.rates) != 1 {
+			t.Fatalf("DATA %d rates = %+v, want one arrival rate", i, result.rates)
 		}
 	}
 
 	result := w.addRepair(transport.KindTCP, 0, 7, 4, make([]byte, 64), now.Add(10*time.Millisecond))
-	sample, ok := result.sample, result.hasSample
-	if !ok {
-		t.Fatal("missing complete-group QoS sample")
-	}
 	if result.hasRecoverable {
 		t.Fatal("complete group should not request recovery")
 	}
-	if sample.DataKind != transport.KindUDP || sample.RepairKind != transport.KindTCP {
-		t.Fatalf("sample kinds = data %d repair %d, want UDP/TCP", sample.DataKind, sample.RepairKind)
+	if len(result.rates) != 1 || result.rates[0].RepairBytes != 64 {
+		t.Fatalf("REPAIR result rates = %+v, want one REPAIR arrival rate", result.rates)
 	}
-	if sample.DataExpected != 4 || sample.DataArrived != 4 {
-		t.Fatalf("sample counts = expected %d arrived %d, want 4/4", sample.DataExpected, sample.DataArrived)
+	if result.rates[0].ProfileDataBytes != 256 || result.rates[0].ProfileRepairBytes != 64 {
+		t.Fatalf("REPAIR profile = %+v, want 256/64 for source_span=4", result.rates[0])
 	}
-	if sample.DataBytes != 46 {
-		t.Fatalf("DataBytes = %d, want 46", sample.DataBytes)
-	}
-	if sample.RepairBytes != 64 {
-		t.Fatalf("RepairBytes = %d, want 64", sample.RepairBytes)
+	if !result.hasComplete {
+		t.Fatal("complete group should cancel mature tracking")
 	}
 	if len(w.repairs) != 0 {
-		t.Fatalf("repairs retained after complete sample = %d, want 0", len(w.repairs))
+		t.Fatalf("repairs retained after complete group = %d, want 0", len(w.repairs))
 	}
 
 	again := w.addRepair(transport.KindTCP, 0, 8, 4, make([]byte, 64), now.Add(11*time.Millisecond))
-	if again.hasSample || again.hasRecoverable {
-		t.Fatalf("duplicate closed-group repair result = %+v, want no sample/recovery", again)
+	if len(again.rates) != 0 || again.hasRecoverable {
+		t.Fatalf("duplicate closed-group repair result = %+v, want no rate/recovery", again)
 	}
 }
 
-func TestRxWindowCompleteGroupSampleFromLateDATA(t *testing.T) {
+func TestRxWindowPostRepairDATACompletesGroupWithoutQoSSample(t *testing.T) {
 	now := time.Unix(0, 0)
 	w := newRxSLCWindow(4)
 
 	repair := w.addRepair(transport.KindTCP, 10, 9, 4, make([]byte, 64), now)
-	if repair.hasSample || repair.hasRecoverable {
-		t.Fatalf("empty repair result = %+v, want no sample/recovery", repair)
+	if repair.hasRecoverable {
+		t.Fatalf("empty repair result = %+v, want no recovery", repair)
+	}
+	if len(repair.rates) != 1 || repair.rates[0].RepairBytes != 64 {
+		t.Fatalf("repair result rates = %+v, want one REPAIR arrival rate", repair.rates)
 	}
 	for i := uint32(0); i < 3; i++ {
 		result := w.addData(transport.KindUDP, 10+i, make([]byte, 20), now.Add(time.Duration(i+1)*time.Millisecond))
-		if result.hasSample {
-			t.Fatalf("DATA %d produced sample before group completion", i)
+		if len(result.rates) != 1 || result.rates[0].DataBytes != 20 {
+			t.Fatalf("DATA %d rates = %+v, want one DATA arrival rate", i, result.rates)
 		}
 	}
 
 	result := w.addData(transport.KindUDP, 13, make([]byte, 20), now.Add(4*time.Millisecond))
-	sample, ok := result.sample, result.hasSample
-	if !ok {
-		t.Fatal("late DATA should complete the repair-proven group")
-	}
 	if result.hasRecoverable {
 		t.Fatal("complete group should not be recoverable")
 	}
-	if sample.DataExpected != 4 || sample.DataArrived != 4 || sample.DataBytes != 80 {
-		t.Fatalf("sample = %+v, want expected=4 arrived=4 bytes=80", sample)
+	if len(result.rates) != 1 || result.rates[0].DataBytes != 20 {
+		t.Fatalf("final DATA rates = %+v, want one DATA arrival rate", result.rates)
+	}
+	if !result.hasComplete {
+		t.Fatal("post-repair DATA should complete the repair-proven group")
 	}
 }
 
-func TestRxWindowRecoveredGroupSampleUsesRecoveredPayloadLength(t *testing.T) {
+func TestRxWindowMatureIncompleteGroupProducesHealthOnly(t *testing.T) {
+	now := time.Unix(0, 0)
+	w := newRxSLCWindow(4)
+
+	w.addData(transport.KindUDP, 20, make([]byte, 40), now)
+	w.addData(transport.KindUDP, 22, make([]byte, 60), now.Add(time.Millisecond))
+	repair := w.addRepair(transport.KindTCP, 20, 9, 4, make([]byte, 100), now.Add(2*time.Millisecond))
+	if len(repair.rates) != 1 {
+		t.Fatalf("repair rate samples = %+v, want one", repair.rates)
+	}
+	rate := repair.rates[0]
+	if rate.DataKind != transport.KindUDP || rate.RepairKind != transport.KindTCP {
+		t.Fatalf("rate kinds = data %d repair %d, want UDP/TCP", rate.DataKind, rate.RepairKind)
+	}
+	if rate.RepairBytes != 100 {
+		t.Fatalf("rate RepairBytes = %d, want repair arrival bytes 100", rate.RepairBytes)
+	}
+	if rate.ProfileDataBytes != 400 || rate.ProfileRepairBytes != 100 {
+		t.Fatalf("rate profile = %+v, want 400/100 for source_span=4", rate)
+	}
+	if rate.DataBytes != 0 {
+		t.Fatalf("repair arrival rate = %+v, want REPAIR-only rate event", rate)
+	}
+
+	mature := w.matureQoSGroup(repair.matureGroup, now.Add(1500*time.Millisecond))
+	if len(mature.rates) != 0 {
+		t.Fatalf("mature rates = %+v, want none", mature.rates)
+	}
+	if len(mature.health) != 1 {
+		t.Fatalf("mature health = %+v, want one FEC health sample", mature.health)
+	}
+	if mature.health[0].DataExpected != 4 || mature.health[0].DataArrived != 2 {
+		t.Fatalf("mature health counts = expected %d arrived %d, want 4/2", mature.health[0].DataExpected, mature.health[0].DataArrived)
+	}
+
+	data := w.addData(transport.KindUDP, 21, make([]byte, 50), now.Add(3*time.Millisecond))
+	if len(data.rates) != 1 {
+		t.Fatalf("post-repair DATA rate samples = %+v, want one", data.rates)
+	}
+	if data.rates[0].DataBytes != 50 || data.rates[0].RepairBytes != 0 {
+		t.Fatalf("post-repair DATA rate = %+v, want DATA-only rate event", data.rates[0])
+	}
+}
+
+func TestRxWindowRecoveredGroupDoesNotProduceQoSSample(t *testing.T) {
 	now := time.Unix(0, 0)
 	w := newRxSLCWindow(4)
 
@@ -88,35 +160,25 @@ func TestRxWindowRecoveredGroupSampleUsesRecoveredPayloadLength(t *testing.T) {
 	if !result.hasRecoverable {
 		t.Fatal("group with one missing DATA should be recoverable")
 	}
-	if result.hasSample {
-		t.Fatal("recoverable group should wait for successful reconstruction before sampling")
-	}
 	if result.recoverable.missingIndex != 2 {
 		t.Fatalf("missing index = %d, want 2", result.recoverable.missingIndex)
 	}
 
-	sample, health, ok := w.finishRecovery(result.recoverable, make([]byte, 37), now.Add(4*time.Millisecond))
-	if !ok {
-		t.Fatal("missing recovered-group QoS sample")
-	}
+	health := w.finishRecovery(result.recoverable, make([]byte, 37), now.Add(4*time.Millisecond))
 	if len(health) != 0 {
 		t.Fatalf("health samples = %+v, want none", health)
 	}
-	if sample.DataExpected != 4 || sample.DataArrived != 3 {
-		t.Fatalf("sample counts = expected %d arrived %d, want 4/3", sample.DataExpected, sample.DataArrived)
-	}
-	if sample.DataBytes != 124 {
-		t.Fatalf("DataBytes = %d, want direct DATA bytes 124", sample.DataBytes)
-	}
-	if sample.RecoveredBytes != 37 {
-		t.Fatalf("RecoveredBytes = %d, want exact recovered payload length 37", sample.RecoveredBytes)
+
+	mature := w.matureQoSGroup(rxGroupKey{basePacketID: 20, sourceSpan: 4}, now.Add(1500*time.Millisecond))
+	if len(mature.rates) != 0 || len(mature.health) != 0 || mature.hasRecoverable {
+		t.Fatalf("mature recovered-group result = %+v, want no QoS sample/rate/health", mature)
 	}
 	if len(w.repairs) != 0 {
-		t.Fatalf("repairs retained after recovery sample = %d, want 0", len(w.repairs))
+		t.Fatalf("repairs retained after recovery = %d, want 0", len(w.repairs))
 	}
 }
 
-func TestRxWindowDefersTCPRecoverySampleUntilLateData(t *testing.T) {
+func TestRxWindowTCPRecoveredGroupDoesNotProduceQoSSample(t *testing.T) {
 	now := time.Unix(0, 0)
 	w := newRxSLCWindow(1)
 
@@ -125,10 +187,7 @@ func TestRxWindowDefersTCPRecoverySampleUntilLateData(t *testing.T) {
 		t.Fatal("UDP repair with one missing TCP DATA should be recoverable")
 	}
 
-	sample, health, ok := w.finishRecovery(result.recoverable, make([]byte, 80), now.Add(10*time.Millisecond))
-	if ok {
-		t.Fatalf("recovery sample = %+v, want no TCP limited evidence before late DATA", sample)
-	}
+	health := w.finishRecovery(result.recoverable, make([]byte, 80), now.Add(10*time.Millisecond))
 	if len(health) != 0 {
 		t.Fatalf("health samples = %+v, want none", health)
 	}
@@ -136,34 +195,23 @@ func TestRxWindowDefersTCPRecoverySampleUntilLateData(t *testing.T) {
 		t.Fatalf("repairs retained after recovery = %d, want 0", len(w.repairs))
 	}
 
-	late := w.observeLateData(transport.KindTCP, 300, make([]byte, 100), now.Add(900*time.Millisecond))
-	sample, ok = late.sample, late.hasSample
-	if !ok {
-		t.Fatal("late TCP DATA should produce a QoS sample")
-	}
-	if sample.DataKind != transport.KindTCP || sample.RepairKind != transport.KindUDP {
-		t.Fatalf("sample kinds = data %d repair %d, want TCP/UDP", sample.DataKind, sample.RepairKind)
-	}
-	if sample.DataExpected != 1 || sample.DataArrived != 1 {
-		t.Fatalf("sample counts = expected %d arrived %d, want 1/1", sample.DataExpected, sample.DataArrived)
-	}
-	if sample.DataBytes != 100 {
-		t.Fatalf("DataBytes = %d, want late DATA bytes 100", sample.DataBytes)
-	}
-	again := w.observeLateData(transport.KindTCP, 300, make([]byte, 100), now.Add(time.Second))
-	if again.hasSample || again.hasRecoverable {
-		t.Fatalf("second duplicate result = %+v, want no repeated sample", again)
+	mature := w.matureQoSGroup(result.matureGroup, now.Add(1500*time.Millisecond))
+	if len(mature.rates) != 0 || len(mature.health) != 0 || mature.hasRecoverable {
+		t.Fatalf("mature recovered-group result = %+v, want no QoS sample/rate/health", mature)
 	}
 }
 
-func TestRxWindowDoesNotEstimateWithoutFECProof(t *testing.T) {
+func TestRxWindowDATAWithoutRepairOnlyProducesArrivalRate(t *testing.T) {
 	now := time.Unix(0, 0)
 	w := newRxSLCWindow(4)
 
 	for i := uint32(0); i < 4; i++ {
 		result := w.addData(transport.KindUDP, 100+i, make([]byte, 20), now.Add(time.Duration(i)*time.Millisecond))
-		if result.hasSample || result.hasRecoverable {
-			t.Fatalf("DATA without REPAIR result = %+v, want no QoS evidence", result)
+		if result.hasRecoverable || len(result.health) != 0 {
+			t.Fatalf("DATA without REPAIR result = %+v, want no recovery/health", result)
+		}
+		if len(result.rates) != 1 || result.rates[0].DataBytes != 20 {
+			t.Fatalf("DATA without REPAIR rates = %+v, want one DATA arrival rate", result.rates)
 		}
 	}
 
@@ -171,8 +219,11 @@ func TestRxWindowDoesNotEstimateWithoutFECProof(t *testing.T) {
 	w.addData(transport.KindUDP, 200, make([]byte, 20), now)
 	w.addData(transport.KindUDP, 203, make([]byte, 20), now.Add(time.Millisecond))
 	result := w.addRepair(transport.KindTCP, 200, 11, 4, make([]byte, 64), now.Add(2*time.Millisecond))
-	if result.hasSample || result.hasRecoverable {
-		t.Fatalf("unrecoverable group result = %+v, want no sample/recovery", result)
+	if result.hasRecoverable {
+		t.Fatalf("unrecoverable group result = %+v, want no recovery", result)
+	}
+	if len(result.rates) != 1 || result.rates[0].RepairBytes != 64 {
+		t.Fatalf("unrecoverable group rates = %+v, want one REPAIR arrival rate", result.rates)
 	}
 }
 
@@ -184,8 +235,8 @@ func TestRxWindowPrunedUnrecoverableGroupProducesHealthSample(t *testing.T) {
 	w.addData(transport.KindUDP, 100, make([]byte, 100), now)
 	w.addData(transport.KindUDP, 103, make([]byte, 120), now.Add(time.Millisecond))
 	first := w.addRepair(transport.KindTCP, 100, 11, 4, make([]byte, 128), now.Add(2*time.Millisecond))
-	if first.hasSample || first.hasRecoverable || len(first.health) != 0 {
-		t.Fatalf("first unrecoverable result = %+v, want no immediate sample/recovery/health", first)
+	if first.hasRecoverable || len(first.health) != 0 {
+		t.Fatalf("first unrecoverable result = %+v, want no immediate recovery/health", first)
 	}
 
 	second := w.addRepair(transport.KindTCP, 200, 12, 4, make([]byte, 128), now.Add(5*time.Second))
@@ -209,8 +260,8 @@ func TestRxWindowRepairProgressProducesUnrecoverableHealthSample(t *testing.T) {
 	w := newRxSLCWindow(4)
 
 	first := w.addRepair(transport.KindTCP, 100, 11, 4, make([]byte, 128), now)
-	if first.hasSample || first.hasRecoverable || len(first.health) != 0 {
-		t.Fatalf("first repair result = %+v, want no immediate sample/recovery/health", first)
+	if first.hasRecoverable || len(first.health) != 0 {
+		t.Fatalf("first repair result = %+v, want no immediate recovery/health", first)
 	}
 
 	second := w.addRepair(transport.KindTCP, 200, 12, 4, make([]byte, 128), now.Add(time.Second))
