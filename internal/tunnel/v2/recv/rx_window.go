@@ -361,12 +361,10 @@ func (w *rxSLCWindow) repairArrivalRateSample(repair rxRepair, at time.Time) (qo
 	}
 	repairBytes := uint64(len(repair.symbol.Payload))
 	return qosRateSample{
-		At:                 at,
-		DataKind:           dataKind,
-		RepairKind:         repair.kind,
-		RepairBytes:        repairBytes,
-		ProfileDataBytes:   uint64(repair.sourceSpan) * repairBytes,
-		ProfileRepairBytes: repairBytes,
+		At:          at,
+		DataKind:    dataKind,
+		RepairKind:  repair.kind,
+		RepairBytes: repairBytes,
 	}, true
 }
 

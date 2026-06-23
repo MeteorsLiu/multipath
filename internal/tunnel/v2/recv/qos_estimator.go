@@ -47,6 +47,7 @@ type qosConfig struct {
 type qosStatus struct {
 	UDPLimited      bool
 	TCPLimited      bool
+	RepairCount     uint8
 	UDPDeliveredBps uint32
 	TCPDeliveredBps uint32
 }
@@ -449,9 +450,6 @@ func (e *qosEstimator) evaluateDirection(state *qosDirectionState, now time.Time
 		}
 	}
 
-	if state.role == qosRoleData {
-		return e.evaluateHealthState(state, estimate, rateReady, now)
-	}
 	return qosStatus{}, false
 }
 
@@ -729,9 +727,20 @@ func (e *qosEstimator) snapshot() qosStatus {
 	return qosStatus{
 		UDPLimited:      udp.limited,
 		TCPLimited:      tcp.limited,
+		RepairCount:     1,
 		UDPDeliveredBps: udp.deliveredBps,
 		TCPDeliveredBps: tcp.deliveredBps,
 	}
+}
+
+func (e *qosEstimator) snapshotStatus() qosStatus {
+	if e == nil {
+		return qosStatus{RepairCount: 1}
+	}
+	e.mu.Lock()
+	status := e.snapshot()
+	e.mu.Unlock()
+	return status
 }
 
 func (e *qosEstimator) clearLimitStateForKind(kind transport.Kind) {
