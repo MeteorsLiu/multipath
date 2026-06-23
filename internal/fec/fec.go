@@ -22,6 +22,7 @@ const (
 type Codec struct {
 	dataShards   int
 	repairShards int
+	low          reedsolomon.LowLevel
 }
 
 func NewCodec(dataShards, repairShards int) (*Codec, error) {
@@ -41,6 +42,9 @@ func (c *Codec) Encode(shards [][]byte, keys []uint16) error {
 	if err := c.validate(shards, keys); err != nil {
 		debuglog.Printf("fec", "encode_validate_err keys=%v err=%v", keys, err)
 		return err
+	}
+	if c.repairShards == 1 {
+		return c.encodeSingle(shards, keys[0])
 	}
 
 	repairLen := maxShardLen(shards[:c.dataShards])
@@ -92,6 +96,9 @@ func (c *Codec) Reconstruct(shards [][]byte, keys []uint16) error {
 		debuglog.Printf("fec", "reconstruct_validate_err keys=%v err=%v", keys, err)
 		return err
 	}
+	if c.repairShards == 1 {
+		return c.reconstructSingle(shards, keys[0])
+	}
 
 	shardLen := maxShardLen(shards)
 	if shardLen == 0 {
@@ -102,6 +109,7 @@ func (c *Codec) Reconstruct(shards [][]byte, keys []uint16) error {
 	for i := 0; i < c.dataShards; i++ {
 		if len(shards[i]) == 0 {
 			missingData++
+			work[i] = shards[i]
 			continue
 		}
 		if len(shards[i]) > shardLen {
@@ -137,6 +145,109 @@ func (c *Codec) Reconstruct(shards [][]byte, keys []uint16) error {
 	}
 	if debuglog.Enabled() {
 		debuglog.Printf("fec", "reconstruct_done keys=%v recovered_len=%d", keys, shardLen)
+	}
+	return nil
+}
+
+func (c *Codec) encodeSingle(shards [][]byte, key uint16) error {
+	repairLen := maxShardLen(shards[:c.dataShards])
+	if repairLen == 0 {
+		debuglog.Printf("fec", "encode_err keys=[%d] err=%v reason=empty_repair", key, ErrInvalidShardConfig)
+		return ErrInvalidShardConfig
+	}
+
+	for i := 0; i < c.dataShards; i++ {
+		if shards[i] == nil {
+			debuglog.Printf("fec", "encode_err keys=[%d] shard=%d err=%v reason=nil_data_shard", key, i, ErrInvalidShardConfig)
+			return ErrInvalidShardConfig
+		}
+	}
+
+	repair := shards[c.dataShards]
+	if cap(repair) < repairLen {
+		repair = make([]byte, repairLen)
+	} else {
+		repair = repair[:repairLen]
+	}
+	clear(repair)
+
+	var coeffBuf [32]byte
+	var coeffs []byte
+	if c.dataShards > len(coeffBuf) {
+		coeffs = make([]byte, c.dataShards)
+	} else {
+		coeffs = coeffBuf[:c.dataShards]
+	}
+	fillCodingCoefficients(key, coeffs)
+	for i := 0; i < c.dataShards; i++ {
+		c.low.GalMulSliceXor(coeffs[i], shards[i], repair[:len(shards[i])])
+	}
+
+	shards[c.dataShards] = repair
+	if debuglog.Enabled() {
+		debuglog.Printf("fec", "encode_done keys=[%d] repair_len=%d", key, len(repair))
+	}
+	return nil
+}
+
+func (c *Codec) reconstructSingle(shards [][]byte, key uint16) error {
+	repair := shards[c.dataShards]
+	if len(repair) == 0 {
+		debuglog.Printf("fec", "reconstruct_err keys=[%d] err=%v reason=empty_repair", key, ErrUnrecoverable)
+		return ErrUnrecoverable
+	}
+	repairLen := len(repair)
+
+	missingIndex := -1
+	missingCount := 0
+	for i := 0; i < c.dataShards; i++ {
+		if len(shards[i]) == 0 {
+			missingIndex = i
+			missingCount++
+		}
+	}
+	if missingCount != 1 {
+		debuglog.Printf("fec", "reconstruct_err keys=[%d] missing_count=%d err=%v", key, missingCount, ErrUnrecoverable)
+		return ErrUnrecoverable
+	}
+
+	for i := 0; i < c.dataShards; i++ {
+		if i == missingIndex {
+			continue
+		}
+		if len(shards[i]) > repairLen {
+			debuglog.Printf("fec", "reconstruct_err keys=[%d] shard=%d shard_len=%d repair_len=%d err=%v", key, i, len(shards[i]), repairLen, ErrUnrecoverable)
+			return ErrUnrecoverable
+		}
+	}
+
+	var coeffBuf [32]byte
+	var coeffs []byte
+	if c.dataShards > len(coeffBuf) {
+		coeffs = make([]byte, c.dataShards)
+	} else {
+		coeffs = coeffBuf[:c.dataShards]
+	}
+	fillCodingCoefficients(key, coeffs)
+
+	recovered := shards[missingIndex]
+	if cap(recovered) < repairLen {
+		recovered = make([]byte, repairLen)
+	} else {
+		recovered = recovered[:repairLen]
+	}
+	copy(recovered, repair)
+	for i := 0; i < c.dataShards; i++ {
+		if i == missingIndex {
+			continue
+		}
+		c.low.GalMulSliceXor(coeffs[i], shards[i], recovered[:len(shards[i])])
+	}
+	c.low.GalMulSlice(reedsolomon.Inv(coeffs[missingIndex]), recovered, recovered)
+
+	shards[missingIndex] = recovered
+	if debuglog.Enabled() {
+		debuglog.Printf("fec", "reconstruct_done keys=[%d] recovered_len=%d", key, len(recovered))
 	}
 	return nil
 }
