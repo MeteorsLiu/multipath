@@ -198,6 +198,35 @@ func TestRecvDuplicateDATAIsNotEmittedOrInsertedIntoWindow(t *testing.T) {
 	}
 }
 
+func TestRecvDoesNotStoreFECBytesForUngroupedDATA(t *testing.T) {
+	var manager session.Manager
+	if _, ok := manager.Create(17); !ok {
+		t.Fatal("Create session failed")
+	}
+	out := New(Config{SessionManager: &manager})
+	frame := protocol.Frame{
+		Type:      protocol.TypeDATA,
+		SessionID: 17,
+		LaneID:    1,
+		Body: protocol.DataBody{
+			PacketID: 1,
+			Packet:   []byte("packet"),
+		},
+	}
+	if err := out.WriteTo(context.Background(), udpLeg(), encodedTestFrame(t, frame)); err != nil {
+		t.Fatalf("Write DATA: %v", err)
+	}
+	readRecvPacket(t, out).Release()
+
+	state := out.recvState(17)
+	state.mu.Lock()
+	got := len(state.fecDataBytes)
+	state.mu.Unlock()
+	if got != 0 {
+		t.Fatalf("FEC data byte entries = %d, want none without a repair group", got)
+	}
+}
+
 func TestRecvPerLaneWindowIsolation(t *testing.T) {
 	var manager session.Manager
 	if _, ok := manager.Create(5); !ok {
@@ -358,45 +387,8 @@ func TestRecvReportsQoSStatusThroughCallback(t *testing.T) {
 	})
 	state := out.recvState(10)
 	state.mu.Lock()
-	state.qos[1] = newQoSEstimator(qosConfig{
-		Sustain:     time.Second,
-		SampleFloor: 4,
-	}, nil)
-	state.mu.Unlock()
-
-	for group := uint32(0); group < 4; group++ {
-		repair := protocol.Frame{Type: protocol.TypeREPAIR, SessionID: 10, LaneID: 1, Body: protocol.RepairBody{BasePacketID: group * 4, Key: uint16(group), SourceSpan: 4, Symbol: []byte("rrrr")}}
-		if err := out.WriteTo(ctx, tcpLeg(), encodedTestFrame(t, repair)); err != nil {
-			t.Fatalf("Write REPAIR %d: %v", group, err)
-		}
-	}
-	state.mu.Lock()
-	now := time.Now()
-	var qosStatuses []qosStatus
-	state.qos[1].ObserveHealth(qosHealthSample{
-		At:           now,
-		DataKind:     transport.KindUDP,
-		RepairKind:   transport.KindTCP,
-		DataArrived:  0,
-		DataExpected: 16,
-	})
-	qosStatuses = append(qosStatuses, state.qos[1].Tick(now.Add(time.Second))...)
-	state.qos[1].ObserveHealth(qosHealthSample{
-		At:           now.Add(2 * time.Second),
-		DataKind:     transport.KindUDP,
-		RepairKind:   transport.KindTCP,
-		DataArrived:  0,
-		DataExpected: 16,
-	})
-	qosStatuses = append(qosStatuses, state.qos[1].Tick(now.Add(2*time.Second))...)
-	state.qos[1].ObserveHealth(qosHealthSample{
-		At:           now.Add(3 * time.Second),
-		DataKind:     transport.KindUDP,
-		RepairKind:   transport.KindTCP,
-		DataArrived:  0,
-		DataExpected: 16,
-	})
-	qosStatuses = append(qosStatuses, state.qos[1].Tick(now.Add(3*time.Second))...)
+	qosStatuses := []qosStatus{{UDPLimited: true}}
+	state.attachRepairCount(1, qosStatuses)
 	state.mu.Unlock()
 	if err := out.reportQoS(ctx, 10, 1, qosStatuses); err != nil {
 		t.Fatalf("reportQoS: %v", err)
@@ -405,8 +397,53 @@ func TestRecvReportsQoSStatusThroughCallback(t *testing.T) {
 	if len(statuses) != 1 {
 		t.Fatalf("statuses = %+v, want one", statuses)
 	}
-	if statuses[0].SessionID != 10 || statuses[0].LaneID != 1 || !statuses[0].UDPLimited || statuses[0].TCPLimited {
-		t.Fatalf("status = %+v, want UDP limited for session 10 lane 1", statuses[0])
+	if statuses[0].SessionID != 10 || statuses[0].LaneID != 1 || !statuses[0].UDPLimited || statuses[0].TCPLimited || statuses[0].RepairCount != 1 {
+		t.Fatalf("status = %+v, want UDP limited for session 10 lane 1 with repair count 1", statuses[0])
+	}
+}
+
+func TestRecvAdaptiveRepairCountUsesGroupLoss(t *testing.T) {
+	var manager session.Manager
+	if _, ok := manager.Create(11); !ok {
+		t.Fatal("Create session failed")
+	}
+	var statuses []QoSStatus
+	ctx := context.Background()
+	out := New(Config{
+		SessionManager: &manager,
+		OnQoSStatus: func(ctx context.Context, status QoSStatus) error {
+			statuses = append(statuses, status)
+			return nil
+		},
+	})
+
+	state := out.recvState(11)
+	group := rxGroupKey{basePacketID: 100, sourceSpan: 4}
+	state.mu.Lock()
+	state.fecGroups[rxLaneGroupKey{laneID: 1, group: group}] = rxGroupObservation{
+		dataKind:   transport.KindUDP,
+		repairKind: transport.KindTCP,
+	}
+	qosStatuses := out.observeGroupResult(state, 1, rxGroupWindowResult{done: []rxGroupDone{{
+		group:        group,
+		dataArrived:  2,
+		dataExpected: 4,
+		expired:      true,
+	}}}, time.Now())
+	state.attachRepairCount(1, qosStatuses)
+	state.mu.Unlock()
+	if err := out.reportQoS(ctx, 11, 1, qosStatuses); err != nil {
+		t.Fatalf("reportQoS: %v", err)
+	}
+
+	if len(statuses) != 1 {
+		t.Fatalf("statuses = %+v, want one", statuses)
+	}
+	if statuses[0].RepairCount != 2 {
+		t.Fatalf("status = %+v, want repair count 2", statuses[0])
+	}
+	if statuses[0].UDPLimited || statuses[0].TCPLimited {
+		t.Fatalf("status = %+v, want repair-only QoS snapshot", statuses[0])
 	}
 }
 

@@ -32,8 +32,8 @@ func TestRxWindowProducesArrivalRateSamples(t *testing.T) {
 	if repair.rates[0].DataBytes != 0 || repair.rates[0].RepairBytes != 64 {
 		t.Fatalf("REPAIR rate = %+v, want REPAIR bytes only", repair.rates[0])
 	}
-	if repair.rates[0].ProfileDataBytes != 64 || repair.rates[0].ProfileRepairBytes != 64 {
-		t.Fatalf("REPAIR profile = %+v, want 64/64 for source_span=1", repair.rates[0])
+	if repair.rates[0].ProfileDataBytes != 0 || repair.rates[0].ProfileRepairBytes != 0 {
+		t.Fatalf("REPAIR profile = %+v, want no profile bytes from repair arrival", repair.rates[0])
 	}
 }
 
@@ -58,8 +58,8 @@ func TestRxWindowCompleteGroupDoesNotProduceQoSSample(t *testing.T) {
 	if len(result.rates) != 1 || result.rates[0].RepairBytes != 64 {
 		t.Fatalf("REPAIR result rates = %+v, want one REPAIR arrival rate", result.rates)
 	}
-	if result.rates[0].ProfileDataBytes != 256 || result.rates[0].ProfileRepairBytes != 64 {
-		t.Fatalf("REPAIR profile = %+v, want 256/64 for source_span=4", result.rates[0])
+	if result.rates[0].ProfileDataBytes != 0 || result.rates[0].ProfileRepairBytes != 0 {
+		t.Fatalf("REPAIR profile = %+v, want no profile bytes from repair arrival", result.rates[0])
 	}
 	if !result.hasComplete {
 		t.Fatal("complete group should cancel mature tracking")
@@ -121,8 +121,8 @@ func TestRxWindowMatureIncompleteGroupProducesHealthOnly(t *testing.T) {
 	if rate.RepairBytes != 100 {
 		t.Fatalf("rate RepairBytes = %d, want repair arrival bytes 100", rate.RepairBytes)
 	}
-	if rate.ProfileDataBytes != 400 || rate.ProfileRepairBytes != 100 {
-		t.Fatalf("rate profile = %+v, want 400/100 for source_span=4", rate)
+	if rate.ProfileDataBytes != 0 || rate.ProfileRepairBytes != 0 {
+		t.Fatalf("rate profile = %+v, want no profile bytes from repair arrival", rate)
 	}
 	if rate.DataBytes != 0 {
 		t.Fatalf("repair arrival rate = %+v, want REPAIR-only rate event", rate)

@@ -566,31 +566,26 @@ func TestQoSEstimatorDoesNotLearnProfileFromRateLimitedGap(t *testing.T) {
 	}
 }
 
-func TestQoSEstimatorShadowCleanClearsHealthLimitedLeg(t *testing.T) {
+func TestQoSEstimatorHealthDoesNotCommitLimitedState(t *testing.T) {
 	now := time.Unix(0, 0)
 	var got []qosStatus
 	e := newQoSEstimator(qosConfig{SampleFloor: 1, Sustain: time.Second, Tick: time.Second}, nil)
 
-	observeHealth(e, now, transport.KindUDP, transport.KindTCP, 0, 4)
-	got = append(got, e.Tick(now.Add(time.Second))...)
-	observeHealth(e, now.Add(2*time.Second), transport.KindUDP, transport.KindTCP, 0, 4)
-	got = append(got, e.Tick(now.Add(2*time.Second))...)
-	observeHealth(e, now.Add(3*time.Second), transport.KindUDP, transport.KindTCP, 0, 4)
-	got = append(got, e.Tick(now.Add(3*time.Second))...)
-	if len(got) != 1 || !got[0].UDPLimited || got[0].TCPLimited {
-		t.Fatalf("initial statuses = %+v, want UDP health-limited", got)
+	for i := 0; i < 6; i++ {
+		at := now.Add(time.Duration(i) * time.Second)
+		observeHealth(e, at, transport.KindUDP, transport.KindTCP, 0, 4)
+		got = append(got, e.Tick(at.Add(time.Second))...)
 	}
 
-	for i := 0; i < 16; i++ {
-		at := now.Add(time.Duration(4+i) * time.Second)
-		got = append(got, observeRateTick(e, at, transport.KindTCP, transport.KindUDP, 4800, 1200)...)
+	if len(got) != 0 {
+		t.Fatalf("statuses = %+v, want none from health samples", got)
 	}
-
-	if len(got) != 2 {
-		t.Fatalf("statuses = %+v, want limited then clear", got)
+	if status := e.snapshotStatus(); status.UDPLimited || status.TCPLimited {
+		t.Fatalf("snapshot = %+v, want clear limited state", status)
 	}
-	if got[1].UDPLimited || got[1].TCPLimited {
-		t.Fatalf("clear status = %+v, want both legs clear", got[1])
+	state := e.directionIfExists(transport.KindUDP, transport.KindTCP, qosRoleData)
+	if state == nil || state.health.sampleTotal == 0 {
+		t.Fatalf("health state = %+v, want stored health samples", state)
 	}
 }
 
@@ -624,7 +619,7 @@ func TestQoSEstimatorShadowCleanResetsStalePendingState(t *testing.T) {
 	}
 }
 
-func TestQoSEstimatorHealthCanMarkDespiteHealthyRate(t *testing.T) {
+func TestQoSEstimatorHealthDoesNotOverrideHealthyRate(t *testing.T) {
 	now := time.Unix(0, 0)
 	e := newQoSEstimator(qosConfig{SampleFloor: 1, Sustain: time.Second, Tick: time.Second}, nil)
 
@@ -635,12 +630,12 @@ func TestQoSEstimatorHealthCanMarkDespiteHealthyRate(t *testing.T) {
 		got = append(got, observeRateTick(e, at, transport.KindUDP, transport.KindTCP, 4800, 1200)...)
 	}
 
-	if len(got) != 1 || !got[0].UDPLimited || got[0].TCPLimited {
-		t.Fatalf("statuses = %+v, want UDP health-limited despite healthy rate estimate", got)
+	if len(got) != 0 {
+		t.Fatalf("statuses = %+v, want none from health samples with healthy rate estimate", got)
 	}
 }
 
-func TestQoSEstimatorHealthMarksDataLegAndShadowClearRestoresIt(t *testing.T) {
+func TestQoSEstimatorHealthDoesNotSwitchPrimary(t *testing.T) {
 	now := time.Unix(0, 0)
 	e := newQoSEstimator(qosConfig{SampleFloor: 4, Sustain: time.Second}, nil)
 
@@ -655,23 +650,11 @@ func TestQoSEstimatorHealthMarksDataLegAndShadowClearRestoresIt(t *testing.T) {
 	}
 	observeHealth(e, now.Add(3*time.Second), transport.KindUDP, transport.KindTCP, 0, 4)
 	statuses = e.Tick(now.Add(3 * time.Second))
-	if len(statuses) != 1 || !statuses[0].UDPLimited {
-		t.Fatalf("limited statuses = %+v, want UDP limited", statuses)
-	}
-	if e.currentPrimary != transport.KindTCP || e.currentRoleLocked() != qosRoleShadow {
-		t.Fatalf("after UDP limited primary=%v role=%v, want TCP shadow role", e.currentPrimary, e.currentRoleLocked())
-	}
-
-	shadow := e.direction(transport.KindTCP, transport.KindUDP, qosRoleShadow)
-	if status, ok := e.driveLimitState(shadow, qosLimitStateShadow, false, 100, now.Add(4*time.Second)); ok {
-		t.Fatalf("first shadow clear status = %+v, want pending only", status)
-	}
-	status, ok := e.driveLimitState(shadow, qosLimitStateShadow, false, 100, now.Add(5*time.Second))
-	if !ok || status.UDPLimited || status.TCPLimited {
-		t.Fatalf("shadow clear status = %+v ok=%t, want both legs clear", status, ok)
+	if len(statuses) != 0 {
+		t.Fatalf("health statuses = %+v, want none", statuses)
 	}
 	if e.currentPrimary != transport.KindUDP || e.currentRoleLocked() != qosRoleData {
-		t.Fatalf("after UDP clear primary=%v role=%v, want UDP data role", e.currentPrimary, e.currentRoleLocked())
+		t.Fatalf("after health samples primary=%v role=%v, want UDP data role", e.currentPrimary, e.currentRoleLocked())
 	}
 }
 
