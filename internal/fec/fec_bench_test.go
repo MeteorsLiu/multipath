@@ -17,9 +17,11 @@ func BenchmarkCodecEncode4Plus1(b *testing.B) {
 
 	b.ReportAllocs()
 	b.SetBytes(int64(4 * 1436))
+	keys := []uint16{0}
 	for i := 0; i < b.N; i++ {
 		shards[4] = shards[4][:0]
-		if err := codec.Encode(shards, []uint16{uint16(i)}); err != nil {
+		keys[0] = uint16(i)
+		if err := codec.Encode(shards, keys); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -37,7 +39,8 @@ func BenchmarkCodecReconstruct4Plus1(b *testing.B) {
 		make([]byte, 1436),
 		nil,
 	}
-	if err := codec.Encode(source, []uint16{7}); err != nil {
+	keys := []uint16{7}
+	if err := codec.Encode(source, keys); err != nil {
 		b.Fatal(err)
 	}
 	repair := source[4]
@@ -54,7 +57,7 @@ func BenchmarkCodecReconstruct4Plus1(b *testing.B) {
 	b.SetBytes(int64(4 * 1436))
 	for i := 0; i < b.N; i++ {
 		shards[1] = recovered[:0]
-		if err := codec.Reconstruct(shards, []uint16{7}); err != nil {
+		if err := codec.Reconstruct(shards, keys); err != nil {
 			b.Fatal(err)
 		}
 		recovered = shards[1]

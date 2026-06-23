@@ -276,6 +276,92 @@ func TestCodecReconstructsThreeMissingShardsWithThreeRepairs(t *testing.T) {
 	}
 }
 
+func TestCodecReconstructsFourMissingShardsWithFourRepairs(t *testing.T) {
+	codec, err := NewCodec(4, 4)
+	if err != nil {
+		t.Fatalf("NewCodec: %v", err)
+	}
+	source := [][]byte{
+		[]byte("abcd"),
+		[]byte("efgh"),
+		[]byte("ijkl"),
+		[]byte("mnop"),
+		nil,
+		nil,
+		nil,
+		nil,
+	}
+	keys := []uint16{21, 22, 23, 24}
+	if err := codec.Encode(source, keys); err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	recovered := [][]byte{
+		nil,
+		nil,
+		nil,
+		nil,
+		append([]byte(nil), source[4]...),
+		append([]byte(nil), source[5]...),
+		append([]byte(nil), source[6]...),
+		append([]byte(nil), source[7]...),
+	}
+	if err := codec.Reconstruct(recovered, keys); err != nil {
+		t.Fatalf("Reconstruct: %v", err)
+	}
+	for i, want := range source[:4] {
+		if !bytes.Equal(recovered[i], want) {
+			t.Fatalf("recovered[%d] = %q, want %q", i, recovered[i], want)
+		}
+	}
+}
+
+func TestCodecReconstructReusesMissingShardCapacity(t *testing.T) {
+	codec, err := NewCodec(4, 2)
+	if err != nil {
+		t.Fatalf("NewCodec: %v", err)
+	}
+	source := [][]byte{
+		[]byte("aaaa"),
+		[]byte("bbbb"),
+		[]byte("cccc"),
+		[]byte("dddd"),
+		nil,
+		nil,
+	}
+	keys := []uint16{7, 8}
+	if err := codec.Encode(source, keys); err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+
+	missing1 := make([]byte, 0, len(source[4]))
+	missing3 := make([]byte, 0, len(source[4]))
+	missing1Backing := missing1[:cap(missing1)]
+	missing3Backing := missing3[:cap(missing3)]
+	recovered := [][]byte{
+		append([]byte(nil), source[0]...),
+		missing1,
+		append([]byte(nil), source[2]...),
+		missing3,
+		append([]byte(nil), source[4]...),
+		append([]byte(nil), source[5]...),
+	}
+	if err := codec.Reconstruct(recovered, keys); err != nil {
+		t.Fatalf("Reconstruct: %v", err)
+	}
+	if !bytes.Equal(recovered[1], source[1]) {
+		t.Fatalf("recovered[1] = %q, want %q", recovered[1], source[1])
+	}
+	if !bytes.Equal(recovered[3], source[3]) {
+		t.Fatalf("recovered[3] = %q, want %q", recovered[3], source[3])
+	}
+	if &recovered[1][0] != &missing1Backing[0] {
+		t.Fatalf("recovered[1] did not reuse caller capacity")
+	}
+	if &recovered[3][0] != &missing3Backing[0] {
+		t.Fatalf("recovered[3] did not reuse caller capacity")
+	}
+}
+
 func TestCodecRejectsWrongKeyCount(t *testing.T) {
 	codec, err := NewCodec(4, 2)
 	if err != nil {
@@ -291,8 +377,10 @@ func TestCodecRejectsWrongKeyCount(t *testing.T) {
 }
 
 func TestNewCodecRejectsInvalidRepairCount(t *testing.T) {
-	if _, err := NewCodec(4, 0); !errors.Is(err, ErrInvalidShardConfig) {
-		t.Fatalf("NewCodec err = %v, want ErrInvalidShardConfig", err)
+	for _, repairShards := range []int{0, 5} {
+		if _, err := NewCodec(4, repairShards); !errors.Is(err, ErrInvalidShardConfig) {
+			t.Fatalf("NewCodec(4, %d) err = %v, want ErrInvalidShardConfig", repairShards, err)
+		}
 	}
 }
 
