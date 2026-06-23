@@ -114,7 +114,7 @@ func TestRecvDispatchesControlFramesToHandler(t *testing.T) {
 		{Type: protocol.TypeCLOSE, SessionID: 1, LaneID: 1, Body: protocol.CloseBody{Scope: protocol.CloseScopeLane}},
 		{Type: protocol.TypeBandwidthProbe, SessionID: 1, LaneID: 1, Body: protocol.BandwidthProbeBody{Count: 1, TrainBytesTotal: 1}},
 		{Type: protocol.TypeBandwidthProbeAck, SessionID: 1, LaneID: 1, Body: protocol.BandwidthProbeAckBody{Count: 1}},
-		{Type: protocol.TypeLinkStatus, SessionID: 1, LaneID: 1, Body: protocol.LinkStatusBody{Status: protocol.LinkStatusStateLimited << 4, UDPDeliveredBps: 1}},
+		{Type: protocol.TypeLinkStatus, SessionID: 1, LaneID: 1, Body: protocol.LinkStatusBody{Status: 0x10, UDPDeliveredBps: 1}},
 	}
 	for _, frame := range frames {
 		if err := out.Write(context.Background(), encodedTestFrame(t, frame)); err != nil {
