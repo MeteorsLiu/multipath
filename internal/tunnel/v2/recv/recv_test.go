@@ -1,10 +1,12 @@
 package recv
 
 import (
+	"bytes"
 	"context"
 	"testing"
 	"time"
 
+	fecpkg "github.com/MeteorsLiu/multipath/internal/fec"
 	"github.com/MeteorsLiu/multipath/internal/packetbuf"
 	"github.com/MeteorsLiu/multipath/internal/protocol"
 	"github.com/MeteorsLiu/multipath/internal/session"
@@ -56,6 +58,18 @@ func encodedTestFrame(t *testing.T, frame protocol.Frame) *packetbuf.Packet {
 	}
 	packet := packetbuf.Acquire(len(payload))
 	copy(packet.Payload, payload)
+	return packet
+}
+
+func ipv4Packet(payloadLen int, fill byte) []byte {
+	packet := make([]byte, 20+payloadLen)
+	packet[0] = 0x45
+	totalLen := len(packet)
+	packet[2] = byte(totalLen >> 8)
+	packet[3] = byte(totalLen)
+	for i := 20; i < len(packet); i++ {
+		packet[i] = fill
+	}
 	return packet
 }
 
@@ -245,6 +259,87 @@ func TestRecvRepairCreatesGroupWindowEntry(t *testing.T) {
 	if len(group.repairs) != 1 || group.repairs[0].key != 3 {
 		t.Fatalf("repairs = %+v, want one key=3", group.repairs)
 	}
+}
+
+func TestRecvRecoversTwoMissingPacketsWithTwoRepairs(t *testing.T) {
+	var manager session.Manager
+	if _, ok := manager.Create(8); !ok {
+		t.Fatal("Create session failed")
+	}
+	out := New(Config{SessionManager: &manager})
+
+	codec, err := fecpkg.NewCodec(4, 2)
+	if err != nil {
+		t.Fatalf("NewCodec: %v", err)
+	}
+	shards := [][]byte{
+		ipv4Packet(14, 'a'),
+		ipv4Packet(5, 'b'),
+		ipv4Packet(13, 'c'),
+		ipv4Packet(7, 'd'),
+		nil,
+		nil,
+	}
+	keys := []uint16{7, 8}
+	if err := codec.Encode(shards, keys); err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+
+	ctx := context.Background()
+	sendData := func(packetID uint32, packet []byte) {
+		t.Helper()
+		frame := protocol.Frame{
+			Type:      protocol.TypeDATA,
+			SessionID: 8,
+			LaneID:    1,
+			Body: protocol.DataBody{
+				PacketID: packetID,
+				Packet:   packet,
+			},
+		}
+		if err := out.WriteTo(ctx, udpLeg(), encodedTestFrame(t, frame)); err != nil {
+			t.Fatalf("Write DATA %d: %v", packetID, err)
+		}
+		got := readRecvPacket(t, out)
+		defer got.Release()
+		if !bytes.Equal(got.Payload, packet) {
+			t.Fatalf("DATA %d payload len/content mismatch", packetID)
+		}
+	}
+	sendData(100, shards[0])
+	sendData(102, shards[2])
+
+	for i, key := range keys {
+		repair := protocol.Frame{
+			Type:      protocol.TypeREPAIR,
+			SessionID: 8,
+			LaneID:    1,
+			Body: protocol.RepairBody{
+				BasePacketID: 100,
+				Key:          key,
+				SourceSpan:   4,
+				Symbol:       shards[4+i],
+			},
+		}
+		if err := out.WriteTo(ctx, tcpLeg(), encodedTestFrame(t, repair)); err != nil {
+			t.Fatalf("Write REPAIR %d: %v", i, err)
+		}
+	}
+
+	recovered101 := readRecvPacket(t, out)
+	if !bytes.Equal(recovered101.Payload, shards[1]) {
+		t.Fatalf("recovered packet 101 = len %d %v, want len %d %v",
+			len(recovered101.Payload), recovered101.Payload, len(shards[1]), shards[1])
+	}
+	recovered101.Release()
+
+	recovered103 := readRecvPacket(t, out)
+	if !bytes.Equal(recovered103.Payload, shards[3]) {
+		t.Fatalf("recovered packet 103 = len %d %v, want len %d %v",
+			len(recovered103.Payload), recovered103.Payload, len(shards[3]), shards[3])
+	}
+	recovered103.Release()
+	assertNoRecvPacket(t, out)
 }
 
 func TestRecvReportsQoSStatusThroughCallback(t *testing.T) {
