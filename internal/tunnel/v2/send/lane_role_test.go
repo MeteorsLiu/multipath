@@ -285,3 +285,72 @@ func TestRepairUsesShadowLeg(t *testing.T) {
 		t.Errorf("REPAIR on TCP(shadow) = %d, want 1", repairOnTCP)
 	}
 }
+
+func TestRepairCountEmitsMultipleRepairFrames(t *testing.T) {
+	s := New()
+	s.EnableFEC()
+
+	const sessionID uint64 = 1001
+	s.sendStatesMu.Lock()
+	s.sendStates[sessionID] = &sendState{}
+	s.sendStatesMu.Unlock()
+
+	lane := newLaneRuntime(1, 100)
+	bindBoth(lane)
+	lane.setFEC(3)
+
+	packets := make([]*packetbuf.Packet, maxFECSourceSpan)
+	for i := range packets {
+		pkt := packetbuf.Acquire(24)
+		for j := range pkt.Payload {
+			pkt.Payload[j] = byte(i + j + 1)
+		}
+		packets[i] = pkt
+	}
+
+	group := txRepairGroup{
+		basePacketID: 44,
+		sourceSpan:   maxFECSourceSpan,
+		packets:      packets,
+	}
+
+	s.sendRepair(context.Background(), sessionID, lane, group)
+
+	seenKeys := make(map[uint16]bool)
+	for i := 0; i < 3; i++ {
+		select {
+		case payload := <-s.Packets():
+			if payload.Leg.Kind != transport.KindTCP {
+				t.Fatalf("repair %d leg kind = %v, want TCP shadow", i, payload.Leg.Kind)
+			}
+			f, err := protocol.Decode(payload.Packet.Payload)
+			payload.Packet.Release()
+			if err != nil {
+				t.Fatalf("decode repair %d: %v", i, err)
+			}
+			if f.Type != protocol.TypeREPAIR {
+				t.Fatalf("frame %d type = %v, want REPAIR", i, f.Type)
+			}
+			body := f.Body.(protocol.RepairBody)
+			if body.BasePacketID != group.basePacketID {
+				t.Fatalf("repair %d base_packet_id = %d, want %d", i, body.BasePacketID, group.basePacketID)
+			}
+			if body.SourceSpan != group.sourceSpan {
+				t.Fatalf("repair %d source_span = %d, want %d", i, body.SourceSpan, group.sourceSpan)
+			}
+			if seenKeys[body.Key] {
+				t.Fatalf("repair %d repeated key %d", i, body.Key)
+			}
+			seenKeys[body.Key] = true
+		default:
+			t.Fatalf("got %d REPAIR frames, want 3", i)
+		}
+	}
+
+	select {
+	case payload := <-s.Packets():
+		payload.Packet.Release()
+		t.Fatal("got extra REPAIR frame, want exactly 3")
+	default:
+	}
+}
