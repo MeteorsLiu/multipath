@@ -312,6 +312,20 @@ func (p *Ping) Pong(pong Message, nowMS uint64) (Quality, bool) {
 	return quality, true
 }
 
+// MarkAlive synchronizes the ping's liveness state with an external transport
+// proof, such as a HELLO_ACK received on the same leg. It does not fire OnUp:
+// the caller already owns the corresponding leg activation.
+func (p *Ping) MarkAlive() {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	p.dead = false
+	p.lossCount = 0
+	p.recoverCount = 0
+	p.mu.Unlock()
+}
+
 // markRecoveredLocked records one successful pong toward recovery and reports
 // whether this pong is the transition back to alive (so the caller fires OnUp
 // exactly once). Caller holds p.mu. Mirrors old probe/core handlePONG.

@@ -61,18 +61,17 @@ type rxGroupKey struct {
 }
 
 type rxClosedGroup struct {
-	repairKind   transport.Kind
-	repairAt     time.Time
-	repairBytes  uint64
-	missingIndex int
 }
 
 type rxWindowResult struct {
 	recoverable    rxRecoverable
 	hasRecoverable bool
-	sample         qosSample
-	hasSample      bool
+	rates          []qosRateSample
 	health         []qosHealthSample
+	matureGroup    rxGroupKey
+	hasMatureGroup bool
+	completeGroup  rxGroupKey
+	hasComplete    bool
 }
 
 // rxRecoverable identifies an FEC group that can be reconstructed. It does
@@ -118,6 +117,9 @@ func (w *rxSLCWindow) addData(kind transport.Kind, packetID uint32, packet []byt
 	}
 
 	var out rxWindowResult
+	if rate, ok := dataArrivalRateSample(kind, uint64(len(packet)), at); ok {
+		out.rates = append(out.rates, rate)
+	}
 	// Only the (at most sourceCount) repair groups whose basePacketID is in
 	// [packetID-sourceCount+1, packetID] can contain packetID. Probe each
 	// candidate with an O(1) map lookup instead of scanning every stored repair.
@@ -136,13 +138,11 @@ func (w *rxSLCWindow) addData(kind transport.Kind, packetID uint32, packet []byt
 			w.dropRepair(base)
 			continue
 		}
-		if sample, ok := w.completeGroupSample(repair, at); ok {
-			w.closeGroup(repair, -1)
+		if w.allKnown(repair) {
+			w.closeGroup(repair)
 			w.dropRepair(base)
-			if !out.hasSample {
-				out.sample = sample
-				out.hasSample = true
-			}
+			out.completeGroup = w.groupKey(repair)
+			out.hasComplete = true
 			if debuglog.Enabled() {
 				debuglog.Printf("recv/fec_window", "rx_group_complete base_packet_id=%d key=%d source_span=%d", repair.basePacketID, repair.key, repair.sourceSpan)
 			}
@@ -157,6 +157,7 @@ func (w *rxSLCWindow) addData(kind transport.Kind, packetID uint32, packet []byt
 			}
 		}
 		if w.allKnown(repair) {
+			w.closeGroup(repair)
 			w.dropRepair(base)
 			if debuglog.Enabled() {
 				debuglog.Printf("recv/fec_window", "rx_repair_complete_drop base_packet_id=%d key=%d", repair.basePacketID, repair.key)
@@ -190,21 +191,23 @@ func (w *rxSLCWindow) addRepair(kind transport.Kind, basePacketID uint32, key ui
 		}
 		return rxWindowResult{}
 	}
-	if sample, ok := w.completeGroupSample(repair, at); ok {
-		repair.symbol.Release()
-		w.closeGroup(repair, -1)
-		health := w.prune(at)
-		if debuglog.Enabled() {
-			debuglog.Printf("recv/fec_window", "rx_repair_complete base_packet_id=%d key=%d source_span=%d symbol_len=%d", basePacketID, key, sourceSpan, len(symbol))
-		}
-		return rxWindowResult{sample: sample, hasSample: true, health: health}
-	}
+	rate, hasRate := w.repairArrivalRateSample(repair, at)
 	if w.allKnown(repair) {
 		repair.symbol.Release()
+		w.closeGroup(repair)
+		health := w.prune(at)
 		if debuglog.Enabled() {
 			debuglog.Printf("recv/fec_window", "rx_repair_drop all_known base_packet_id=%d key=%d source_span=%d", basePacketID, key, sourceSpan)
 		}
-		return rxWindowResult{}
+		out := rxWindowResult{
+			health:        health,
+			completeGroup: w.groupKey(repair),
+			hasComplete:   true,
+		}
+		if hasRate {
+			out.rates = append(out.rates, rate)
+		}
+		return out
 	}
 	if existing, ok := w.repairs[basePacketID]; ok {
 		existing.symbol.Release()
@@ -219,41 +222,37 @@ func (w *rxSLCWindow) addRepair(kind transport.Kind, basePacketID uint32, key ui
 		debuglog.Printf("recv/fec_window", "rx_repair base_packet_id=%d key=%d source_span=%d symbol_len=%d recoverable=%t data=%d repairs=%d", basePacketID, key, sourceSpan, len(symbol), ok, len(w.data), len(w.repairs))
 	}
 	if ok {
-		return rxWindowResult{recoverable: recoverable, hasRecoverable: true, health: health}
+		out := rxWindowResult{
+			recoverable:    recoverable,
+			hasRecoverable: true,
+			health:         health,
+			matureGroup:    w.groupKey(repair),
+			hasMatureGroup: true,
+		}
+		if hasRate {
+			out.rates = append(out.rates, rate)
+		}
+		return out
 	}
-	return rxWindowResult{health: health}
+	out := rxWindowResult{
+		health:         health,
+		matureGroup:    w.groupKey(repair),
+		hasMatureGroup: true,
+	}
+	if hasRate {
+		out.rates = append(out.rates, rate)
+	}
+	return out
 }
 
-func (w *rxSLCWindow) observeLateData(kind transport.Kind, packetID uint32, packet []byte, at time.Time) rxWindowResult {
-	if w.sourceCount <= 0 || !qosKnownKind(kind) {
-		return rxWindowResult{}
-	}
-	existing, ok := w.data[packetID]
-	if !ok || existing.packet == nil || existing.wire {
-		return rxWindowResult{}
-	}
-	w.storeData(packetID, packet, kind, at, true)
-	sample, ok := w.lateClosedGroupSample(packetID, at)
-	health := w.prune(at)
-	if !ok {
-		return rxWindowResult{health: health}
-	}
-	if debuglog.Enabled() {
-		debuglog.Printf("recv/fec_window", "rx_late_data_sample packet_id=%d kind=%d", packetID, kind)
-	}
-	return rxWindowResult{sample: sample, hasSample: true, health: health}
-}
-
-func (w *rxSLCWindow) finishRecovery(r rxRecoverable, recovered []byte, at time.Time) (qosSample, []qosHealthSample, bool) {
+func (w *rxSLCWindow) finishRecovery(r rxRecoverable, recovered []byte, at time.Time) []qosHealthSample {
 	packetID := r.basePacketID + uint32(r.missingIndex)
-	sample, ok := w.recoveredGroupSample(r, uint64(len(recovered)), at)
 	w.storeData(packetID, recovered, 0, at, false)
 	if repair, exists := w.repairs[r.basePacketID]; exists {
-		w.closeGroup(repair, r.missingIndex)
+		w.closeGroup(repair)
 	}
 	w.dropRepair(r.basePacketID)
-	health := w.prune(at)
-	return sample, health, ok
+	return w.prune(at)
 }
 
 // buildShardsLocked materializes the shard slices for a recoverable group from
@@ -330,150 +329,91 @@ func (w *rxSLCWindow) allKnown(repair rxRepair) bool {
 	return true
 }
 
-func (w *rxSLCWindow) completeGroupSample(repair rxRepair, at time.Time) (qosSample, bool) {
-	if repair.sourceSpan <= 0 || repair.sourceSpan > w.sourceCount || w.isClosed(repair) || !qosKnownKind(repair.kind) {
-		return qosSample{}, false
+func dataArrivalRateSample(dataKind transport.Kind, dataBytes uint64, at time.Time) (qosRateSample, bool) {
+	if !qosKnownKind(dataKind) {
+		return qosRateSample{}, false
 	}
-	var (
-		dataKind  transport.Kind
-		firstAt   time.Time
-		dataBytes uint64
-	)
-	for i := 0; i < repair.sourceSpan; i++ {
-		packetID := repair.basePacketID + uint32(i)
-		data, ok := w.data[packetID]
-		if !ok || data.packet == nil || !data.wire || !qosKnownKind(data.kind) {
-			return qosSample{}, false
-		}
-		if dataKind == 0 {
-			dataKind = data.kind
-		} else if dataKind != data.kind {
-			return qosSample{}, false
-		}
-		firstAt = earliest(firstAt, data.at)
-		dataBytes += uint64(len(data.packet.Payload))
+	repairKind := otherTransportKind(dataKind)
+	if !qosKnownKind(repairKind) || dataKind == repairKind {
+		return qosRateSample{}, false
 	}
-	firstAt = earliest(firstAt, repair.at)
-	return qosSample{
-		At:           at,
-		Duration:     sampleDuration(firstAt, at),
-		DataKind:     dataKind,
-		DataArrived:  uint64(repair.sourceSpan),
-		DataExpected: uint64(repair.sourceSpan),
-		DataBytes:    dataBytes,
-		RepairKind:   repair.kind,
-		RepairAt:     repair.at,
-		RepairBytes:  uint64(len(repair.symbol.Payload)),
+	return qosRateSample{
+		At:         at,
+		DataKind:   dataKind,
+		RepairKind: repairKind,
+		DataBytes:  dataBytes,
 	}, true
 }
 
-func (w *rxSLCWindow) recoveredGroupSample(r rxRecoverable, recoveredBytes uint64, at time.Time) (qosSample, bool) {
-	if recoveredBytes == 0 || r.sourceSpan <= 0 || r.sourceSpan > w.sourceCount {
-		return qosSample{}, false
+func (w *rxSLCWindow) repairArrivalRateSample(repair rxRepair, at time.Time) (qosRateSample, bool) {
+	if repair.sourceSpan <= 0 || repair.sourceSpan > w.sourceCount || !qosKnownKind(repair.kind) || repair.symbol == nil {
+		return qosRateSample{}, false
 	}
-	repair, ok := w.repairs[r.basePacketID]
-	if !ok || w.isClosed(repair) || repair.sourceSpan != r.sourceSpan || !qosKnownKind(repair.kind) {
-		return qosSample{}, false
-	}
-	var (
-		dataKind    transport.Kind
-		firstAt     = repair.at
-		dataBytes   uint64
-		dataArrived uint64
-	)
-	for i := 0; i < r.sourceSpan; i++ {
-		if i == r.missingIndex {
-			continue
-		}
-		packetID := r.basePacketID + uint32(i)
-		data, ok := w.data[packetID]
-		if !ok || data.packet == nil || !data.wire || !qosKnownKind(data.kind) {
-			return qosSample{}, false
-		}
-		if dataKind == 0 {
-			dataKind = data.kind
-		} else if dataKind != data.kind {
-			return qosSample{}, false
-		}
-		firstAt = earliest(firstAt, data.at)
-		dataBytes += uint64(len(data.packet.Payload))
-		dataArrived++
+	dataKind, ok := w.groupDataKind(repair)
+	if !ok {
+		return qosRateSample{}, false
 	}
 	if dataKind == 0 {
 		dataKind = otherTransportKind(repair.kind)
 	}
-	if dataKind == transport.KindTCP && repair.kind == transport.KindUDP && dataArrived < uint64(r.sourceSpan) {
-		return qosSample{}, false
+	if dataKind == repair.kind {
+		return qosRateSample{}, false
 	}
-	return qosSample{
-		At:             at,
-		Duration:       sampleDuration(firstAt, at),
-		DataKind:       dataKind,
-		DataArrived:    dataArrived,
-		DataExpected:   uint64(r.sourceSpan),
-		DataBytes:      dataBytes,
-		RecoveredBytes: recoveredBytes,
-		RepairKind:     repair.kind,
-		RepairAt:       repair.at,
-		RepairBytes:    uint64(len(repair.symbol.Payload)),
+	repairBytes := uint64(len(repair.symbol.Payload))
+	return qosRateSample{
+		At:                 at,
+		DataKind:           dataKind,
+		RepairKind:         repair.kind,
+		RepairBytes:        repairBytes,
+		ProfileDataBytes:   uint64(repair.sourceSpan) * repairBytes,
+		ProfileRepairBytes: repairBytes,
 	}, true
 }
 
-func (w *rxSLCWindow) lateClosedGroupSample(packetID uint32, at time.Time) (qosSample, bool) {
-	for offset := 0; offset < w.sourceCount; offset++ {
-		if packetID < uint32(offset) {
-			break
-		}
-		base := packetID - uint32(offset)
-		for sourceSpan := offset + 1; sourceSpan <= w.sourceCount; sourceSpan++ {
-			key := rxGroupKey{basePacketID: base, sourceSpan: sourceSpan}
-			closed, ok := w.closed[key]
-			if !ok || closed.missingIndex != offset || !qosKnownKind(closed.repairKind) {
-				continue
-			}
-			sample, ok := w.closedCompleteGroupSample(base, sourceSpan, closed, at)
-			if ok {
-				return sample, true
-			}
-		}
-	}
-	return qosSample{}, false
-}
-
-func (w *rxSLCWindow) closedCompleteGroupSample(basePacketID uint32, sourceSpan int, closed rxClosedGroup, at time.Time) (qosSample, bool) {
-	if sourceSpan <= 0 || sourceSpan > w.sourceCount {
-		return qosSample{}, false
-	}
-	var (
-		dataKind  transport.Kind
-		firstAt   = closed.repairAt
-		dataBytes uint64
-	)
-	for i := 0; i < sourceSpan; i++ {
-		packetID := basePacketID + uint32(i)
+func (w *rxSLCWindow) groupDataKind(repair rxRepair) (transport.Kind, bool) {
+	var dataKind transport.Kind
+	for i := 0; i < repair.sourceSpan; i++ {
+		packetID := repair.basePacketID + uint32(i)
 		data, ok := w.data[packetID]
-		if !ok || data.packet == nil || !data.wire || !qosKnownKind(data.kind) {
-			return qosSample{}, false
+		if !ok || data.packet == nil {
+			continue
+		}
+		if !data.wire || !qosKnownKind(data.kind) {
+			return 0, false
 		}
 		if dataKind == 0 {
 			dataKind = data.kind
 		} else if dataKind != data.kind {
-			return qosSample{}, false
+			return 0, false
 		}
-		firstAt = earliest(firstAt, data.at)
-		dataBytes += uint64(len(data.packet.Payload))
 	}
-	return qosSample{
-		At:           at,
-		Duration:     sampleDuration(firstAt, at),
-		DataKind:     dataKind,
-		DataArrived:  uint64(sourceSpan),
-		DataExpected: uint64(sourceSpan),
-		DataBytes:    dataBytes,
-		RepairKind:   closed.repairKind,
-		RepairAt:     closed.repairAt,
-		RepairBytes:  closed.repairBytes,
-	}, true
+	return dataKind, true
+}
+
+func (w *rxSLCWindow) matureQoSGroup(key rxGroupKey, at time.Time) rxWindowResult {
+	var out rxWindowResult
+	if _, ok := w.closed[key]; ok {
+		out.health = append(out.health, w.prune(at)...)
+		return out
+	}
+
+	repair, ok := w.repairs[key.basePacketID]
+	if !ok || repair.sourceSpan != key.sourceSpan || w.isClosed(repair) {
+		return rxWindowResult{}
+	}
+	if w.allKnown(repair) {
+		w.closeGroup(repair)
+		w.dropRepair(repair.basePacketID)
+		out.completeGroup = key
+		out.hasComplete = true
+		out.health = append(out.health, w.prune(at)...)
+		return out
+	}
+	if sample, ok := w.unrecoverableHealthSample(repair, at); ok {
+		out.health = append(out.health, sample)
+	}
+	out.health = append(out.health, w.prune(at)...)
+	return out
 }
 
 // recoverable inspects the window and returns identifiers for the repair group
@@ -512,17 +452,12 @@ func (w *rxSLCWindow) isClosed(repair rxRepair) bool {
 	return ok
 }
 
-func (w *rxSLCWindow) closeGroup(repair rxRepair, missingIndex int) {
+func (w *rxSLCWindow) closeGroup(repair rxRepair) {
 	key := w.groupKey(repair)
 	if _, ok := w.closed[key]; ok {
 		return
 	}
-	w.closed[key] = rxClosedGroup{
-		repairKind:   repair.kind,
-		repairAt:     repair.at,
-		repairBytes:  uint64(len(repair.symbol.Payload)),
-		missingIndex: missingIndex,
-	}
+	w.closed[key] = rxClosedGroup{}
 	w.closedOrder = append(w.closedOrder, key)
 }
 
@@ -685,25 +620,4 @@ func (w *rxSLCWindow) dropStaleRepairOrder() {
 		}
 		w.repairOrder = w.repairOrder[1:]
 	}
-}
-
-func earliest(current, candidate time.Time) time.Time {
-	if candidate.IsZero() {
-		return current
-	}
-	if current.IsZero() || candidate.Before(current) {
-		return candidate
-	}
-	return current
-}
-
-func sampleDuration(first, at time.Time) time.Duration {
-	if first.IsZero() || at.IsZero() {
-		return 0
-	}
-	d := at.Sub(first)
-	if d <= 0 {
-		return time.Nanosecond
-	}
-	return d
 }

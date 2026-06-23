@@ -248,20 +248,14 @@ func (g *leg) qualityLocked(k transport.Kind, qosEnabled bool) selector.Quality 
 		preferTCP = false
 	}
 	q := selector.Quality{
-		Active:       g.activeLocked(k),
-		DeliveryRate: oq.DeliveryRate,
-		SmoothedRTT:  oq.SmoothedRTT,
-		RTTVariance:  oq.RTTVariance,
-		PreferTCP:    preferTCP,
+		Active:    g.activeLocked(k),
+		PreferTCP: preferTCP,
 	}
 	if !qosEnabled {
 		return q
 	}
 	return selector.Quality{
 		Active:          q.Active,
-		DeliveryRate:    q.DeliveryRate,
-		SmoothedRTT:     q.SmoothedRTT,
-		RTTVariance:     q.RTTVariance,
 		PreferTCP:       q.PreferTCP,
 		QoSActive:       oq.QoSActive,
 		QoSDeliveredBps: oq.QoSDeliveredBps,

@@ -68,7 +68,7 @@ change.
 
 ### REPAIR
 
-The REPAIR frame wire layout does not change:
+The REPAIR frame body does not change:
 
 ```text
 base_packet_id uint32
@@ -85,22 +85,37 @@ target, lane id, transport kind, or role. The sender allocates a unique key for
 each REPAIR equation. The receiver uses the keys for the received REPAIR
 symbols to reconstruct a compact Reed-Solomon codec for that group.
 
+There is no REPAIR count field in the REPAIR frame. The number of REPAIR frames
+is the count:
+
+```text
+repairCount = 3
+
+REPAIR base_packet_id=100 source_span=4 key=20 repair_symbol=...
+REPAIR base_packet_id=100 source_span=4 key=21 repair_symbol=...
+REPAIR base_packet_id=100 source_span=4 key=22 repair_symbol=...
+```
+
 ### LINK_STATUS
 
-`LINK_STATUS.status` remains the unified feedback byte. It carries both QoS
-limited state and adaptive FEC repair count:
+`LINK_STATUS.status` is reused as the unified state byte. There is no separate
+FEC control frame.
 
 ```text
 status = UUUU TTTT
 
-high nibble = UDP snapshot
-low nibble  = TCP snapshot
+high uint4 = UDP state
+low uint4  = TCP state
 
-nibble bit 0    = QoS limited
-nibble bits 1-3 = repairCount - 1
+each uint4:
+  bit0    = QoS limited state
+  bits1-3 = repairCount - 1
 ```
 
-Initial valid repair counts are `1..4`:
+The default repair count is `1`, which is the current `4+1` behavior. Therefore
+repair bits `000` mean one repair packet, not zero repair packets.
+
+Initial valid per-transport state values are:
 
 ```text
 0000 = repair count 1, QoS clear
@@ -113,30 +128,56 @@ Initial valid repair counts are `1..4`:
 0111 = repair count 4, QoS limited
 ```
 
-Outbound LINK_STATUS duplicates the lane-level repair count into both nibbles.
-QoS limited bits remain per transport kind.
+Values `1000..1111` are outside the current maximum repair count and are not
+emitted by this design.
+
+Encoding:
+
+```text
+repairCode = repairCount - 1
+state      = (repairCode << 1) | qosLimitedBit
+status     = (udpState << 4) | tcpState
+```
+
+Decoding:
+
+```text
+qosLimited  = (state & 0b0001) != 0
+repairCount = ((state >> 1) & 0b0111) + 1
+```
+
+QoS limited state remains per transport kind. Repair count bits are the adaptive
+FEC control signal carried by the same uint4 state value.
+
+Because repair count is lane-local rather than transport-kind-local, outbound
+LINK_STATUS writes the same repair-count bits into both the UDP and TCP uint4
+states. The QoS bit in each uint4 remains transport-kind specific.
 
 Example:
 
 ```text
-UDP limited = true
-TCP limited = false
-repairCount = 3
+UDP state with repairCount = 3 and QoS limited = true
 
 UDP nibble = 0101
-TCP nibble = 0100
-status     = 0101 0100
 ```
 
 Inbound LINK_STATUS applies the QoS bits to the selector as today and applies
-the decoded repair count to the matching lane's FEC transmit state. If the two
-nibbles carry different repair counts, the receiver of the status applies the
-larger count and logs the mismatch. This keeps the sender conservative if a
-future peer sends inconsistent snapshots.
+the decoded repair count to the matching lane's FEC transmit state. The sender
+does not interpret the repair count as a target transport or target role; it is
+the number of REPAIR frames to emit for future FEC groups on that lane.
 
 LINK_STATUS is emitted when either committed QoS state changes or the requested
 lane repair count changes. Delivered-bps fields remain auxiliary snapshot data;
 they are not a continuous telemetry stream.
+
+The sender does not need target role, DATA/REPAIR direction, or
+transport-kind-scoped FEC state from LINK_STATUS. The selector continues to
+choose primary and shadow roles.
+
+LINK_STATUS is a peer-to-local-send feedback frame. When local runtime receives
+it, the frame updates the local send lane that matches `(session_id, lane_id)`.
+It does not update the local receive FEC window and does not participate in
+receive-side estimation.
 
 ## Codec
 
@@ -155,15 +196,14 @@ func (c *Codec) Reconstruct(shards [][]byte, keys []uint16) error
 
 Codec behavior:
 
-1. Accept variable-length DATA shards.
-2. Build internal equal-length work buffers using the maximum known shard
-   length.
-3. Generate one coefficient row per key using the existing TinyMT coefficient
-   generator.
-4. Use `github.com/klauspost/reedsolomon` with a custom matrix for encode and
-   reconstruct.
-5. Return recovered DATA shards at coded shard length.
-6. Leave IP total length truncation to Recv.
+- DATA shards may have different lengths.
+- Coded shards are based on the maximum known shard length in the group.
+- Each key identifies one repair equation generated from the existing TinyMT
+  coefficient generator.
+- Encode and reconstruct use `github.com/klauspost/reedsolomon` with a custom
+  matrix.
+- Recovered DATA shards are returned at coded shard length.
+- Recv owns IP total length parsing and truncation.
 
 Existing `4+1` behavior is the `repairShards=1` case with a single key in the
 slice.
@@ -194,6 +234,22 @@ default: 1
 
 The repair count is lane-local. It is not stored as UDP state or TCP state.
 
+### Applying Peer Feedback
+
+Inbound LINK_STATUS changes the local send lane's future behavior:
+
+```text
+peer LINK_STATUS
+ -> local runtime control dispatcher
+ -> matching local send lane
+ -> QoS bits update selector quality
+ -> repair count bits update lane FEC transmit repair count
+```
+
+The send lane does not inspect why the peer requested that count. It only
+stores the current lane repair count and uses it when emitting future FEC
+groups.
+
 ### Emission Flow
 
 When `Send.Write` selects a lane and writes a DATA frame successfully:
@@ -205,32 +261,39 @@ TUN packet
  -> DATA packet copied into that lane's FEC transmit window
 ```
 
-When the transmit window produces a group:
+When the transmit window emits a group, the group snapshots the lane's current
+`fecRepairCount`. The group uses the maximum DATA packet length as
+`repair_symbol_size`, creates that many independent REPAIR equations, and emits
+one REPAIR frame for each equation. Each REPAIR frame carries the group's
+`base_packet_id`, the group's `source_span`, and that repair equation's `key`.
 
-1. Read the lane's current `fecRepairCount`.
-2. Compute `repair_symbol_size = max(len(DATA[i]))`.
-3. Build source shards for FEC coding.
-4. Allocate `fecRepairCount` unique REPAIR keys.
-5. Build `repairShards = fecRepairCount`.
-6. Call `Codec.Encode(shards, keys)`.
-7. Emit one REPAIR frame per repair shard with the matching key.
-8. Send each REPAIR through the lane shadow role.
-9. Release the buffered DATA packets after all repair symbols are encoded.
+All emitted REPAIR frames for the group go through the lane shadow role. The
+selector chooses the concrete transport leg for that role.
 
 Partial groups created by the existing flush path use the same repair count.
 Their `source_span` is the number of protected DATA packets in that partial
 group.
 
-### Applying LINK_STATUS
+### Repair Count Change Semantics
 
-The runtime handler decodes `LINK_STATUS.status` and delivers:
+A repair count change affects future FEC emission only:
 
-- UDP limited state and UDP delivered bps to selector quality;
-- TCP limited state and TCP delivered bps to selector quality;
-- decoded lane repair count to the lane's FEC transmit state.
+- already-emitted groups are not revisited;
+- no immediate REPAIR burst is sent when the value changes;
+- the transmit window is not cleared or rebuilt;
+- a pending group uses the repair count that is current when the group emits
+  REPAIR;
+- every emitted group sends exactly `fecRepairCount` REPAIR frames.
 
-The selector still decides DATA and REPAIR roles. FEC count only controls how
-many REPAIR frames are emitted for a completed group.
+For one group and `fecRepairCount = N`:
+
+```text
+DATA group base_packet_id=100 source_span=4
+ -> REPAIR #1 base_packet_id=100 source_span=4 key=K0
+ -> REPAIR #2 base_packet_id=100 source_span=4 key=K1
+ ...
+ -> REPAIR #N base_packet_id=100 source_span=4 key=K(N-1)
+```
 
 ## Receiver Design
 
@@ -250,42 +313,96 @@ through the existing QoS writer callback path.
 
 ### Receive Window
 
-The receive window stores group state by:
+The receive window is a lane-local FEC-only internal module. It does not know
+QoS, adaptive repair policy, LINK_STATUS, or how callers will consume group
+results. It only stores FEC shards, determines group state, builds
+reconstruction inputs, and releases buffers it owns.
+
+The receive window has two core stores:
 
 ```text
-group key = (base_packet_id, source_span)
-repair key = key carried by the REPAIR frame
+recent DATA cache:
+  packet_id -> DATA shard
+
+groups:
+  (base_packet_id, source_span) -> group
 ```
 
-Each group tracks:
+DATA does not create a group, because a DATA frame does not carry
+`source_span`. A REPAIR frame declares the group by carrying
+`base_packet_id` and `source_span`; only then can the receiver know the exact
+group boundary, including partial groups created by flush.
 
-- received DATA shards;
-- received REPAIR shards keyed by `key`;
-- which DATA shards arrived from the DATA leg;
-- which DATA shards were recovered by FEC;
-- DATA wire bytes from original DATA arrivals;
-- REPAIR wire bytes from REPAIR arrivals;
-- group completion/recovery state.
+The group data model is direct:
+
+```go
+type rxGroupKey struct {
+    basePacketID uint32
+    sourceSpan   uint8
+}
+
+type rxGroup struct {
+    key     rxGroupKey
+    data    []*rxDataShard  // len == sourceSpan
+    repairs []rxRepairShard // unique repair keys for this group
+    at      time.Time
+}
+```
+
+`group.data[i]` corresponds to:
+
+```text
+packet_id = base_packet_id + i
+```
+
+The window keeps `recentData` as the owner of DATA buffers. Groups reference
+those DATA shards; they do not copy or release DATA. Groups own REPAIR buffers
+and release them when the group completes, recovers, expires, or the window is
+closed.
+
+All receive-window functions and helper types stay unexported because this is
+an internal Go module. The window exposes only the minimum facts other receive
+side code needs:
+
+```go
+type rxWindowResult struct {
+    recoverable []rxRecoverable
+    done        []rxGroupDone
+}
+
+type rxRecoverable struct {
+    group       rxGroupKey
+    missingMask uint8
+}
+
+type rxGroupDone struct {
+    group        rxGroupKey
+    dataArrived  uint8
+    dataExpected uint8
+    recovered    bool
+    expired      bool
+}
+```
+
+The result intentionally does not expose QoS samples, estimator inputs,
+adaptive-policy decisions, DATA/REPAIR direction state, or the group's internal
+slices. Callers that need those policies derive them outside the FEC window from
+the FEC facts and from the transport/frame context they already have.
 
 The current "one repair per base packet id" storage is replaced by "many repair
 shards per group".
 
 ### Recovery Flow
 
-On DATA arrival:
+DATA enters the FEC receive window only after duplicate DATA has already been
+rejected by Recv. The window stores the DATA shard in `recentData`, then attaches
+it to any already-open group whose range contains that `packet_id`.
 
-1. Drop duplicates before touching FEC or QoS bookkeeping.
-2. Store the DATA shard in the lane receive window.
-3. Mark it as DATA-leg wire delivery.
-4. Try recovery for any live group containing this packet.
-
-On REPAIR arrival:
-
-1. Validate session, lane, source span, and group bounds.
-2. Store the REPAIR shard if its key is new for the group.
-3. Ignore duplicate repair keys for the same group.
-4. Add its payload length to REPAIR wire bytes.
-5. Try recovery for the group.
+REPAIR is stored under its group `(base_packet_id, source_span)`. If the group
+does not exist, the window creates it, allocates `group.data` with
+`len == source_span`, and attaches any matching DATA already present in
+`recentData`. A duplicate REPAIR key inside the same group is dropped and is not
+an independent equation.
 
 Recovery is attempted when:
 
@@ -294,21 +411,29 @@ known DATA shards + known REPAIR shards >= source_span
 and at least one DATA shard is missing
 ```
 
-The window builds a compact shard set from all received DATA shards and enough
-received REPAIR shards, creates a codec with `repairShards = selected repair
-count`, and calls `Reconstruct(shards, keys)`.
+In code terms:
 
-After successful recovery:
+```text
+knownData  = count(group.data[i] != nil)
+missing    = source_span - knownData
+recoverable = missing > 0 && knownData + len(group.repairs) >= source_span
+complete    = missing == 0
+```
 
-1. Parse each recovered DATA shard as an IP packet.
-2. Read IP total length.
-3. Truncate the recovered shard to the IP total length.
-4. Emit recovered DATA to TUN only if it has not already been emitted.
-5. Mark recovered DATA as recovered source bytes, not DATA-leg delivery.
-6. Close the group and produce a group observation for the estimator.
+The window builds a compact shard set from all received DATA shards and the
+received REPAIR shards selected for reconstruction. The caller creates a codec
+with `repairShards = len(selectedRepairKeys)` and calls
+`Reconstruct(shards, keys)`.
 
-If a group expires before recovery, the receiver records packet-count loss
-pressure for adaptive FEC. It does not synthesize missing source bytes.
+After successful recovery, Recv parses recovered DATA shards as IP packets,
+uses the IP total length to truncate each packet, emits recovered DATA to TUN
+only if that packet has not already been emitted, and tells the receive window
+to close the recovered group.
+
+If a group expires before recovery, the receive window closes it and returns
+`rxGroupDone{expired: true, dataArrived, dataExpected}`. The window does not
+synthesize missing source bytes and does not decide how that expired-group fact
+affects QoS or adaptive FEC.
 
 ## Source Byte Accounting
 
@@ -369,8 +494,7 @@ missing samples.
 
 ## Adaptive FEC Policy
 
-The receiver tracks group outcomes per session and lane over a bounded rolling
-window:
+The receiver tracks group outcomes per session and lane:
 
 ```text
 observed groups
@@ -381,36 +505,60 @@ missing DATA packet count
 received REPAIR packet count
 ```
 
-The initial policy derives a requested repair count from observed packet-loss
-pressure:
+The repair count is driven by FEC health/loss ratio. In this design, that means
+packet-level group loss pressure, not byte-level missing size, because
+unrecoverable groups do not reveal missing DATA byte lengths.
+
+FEC health is the DATA packet arrival ratio observed from FEC group outcomes:
 
 ```text
-missing_per_group = missing DATA packet count / observed groups
-smoothed_missing_per_group = EMA(missing_per_group)
+fecHealth = sum(DataArrived) / sum(DataExpected)
+```
 
-if smoothed_missing_per_group < 0.25:
-  requestedRepairCount = 1
-else:
-  requestedRepairCount = clamp(1 + ceil(smoothed_missing_per_group), 1, 4)
+The adaptive policy converts FEC loss ratio into a target lane repair count.
+For the current full group size, `K = 4`:
+
+```text
+lossRatio = (sum(DataExpected) - sum(DataArrived)) / sum(DataExpected)
+targetRepairCount = ceil(lossRatio * K)
+repairCount = clamp(targetRepairCount, 1, 4)
 ```
 
 Examples:
 
 ```text
-mostly healthy:    smoothed_missing_per_group = 0.1 -> repairCount 1
-one missing often: smoothed_missing_per_group = 1.0 -> repairCount 2
-two missing often: smoothed_missing_per_group = 2.0 -> repairCount 3
-three missing often: smoothed_missing_per_group = 3.0 -> repairCount 4
+DataArrived=3, DataExpected=4
+lossRatio = 25%
+repairCount = ceil(0.25 * 4) = 1
+=> 4+1
+
+DataArrived=2, DataExpected=4
+lossRatio = 50%
+repairCount = ceil(0.50 * 4) = 2
+=> 4+2
+
+DataArrived=1, DataExpected=4
+lossRatio = 75%
+repairCount = ceil(0.75 * 4) = 3
+=> 4+3
+
+DataArrived=0, DataExpected=4
+lossRatio = 100%
+repairCount = ceil(1.00 * 4) = 4
+=> 4+4
 ```
 
-To avoid oscillation, the policy applies smoothing and hysteresis:
+This formula controls only adaptive FEC. It does not directly commit QoS
+limited or clear state.
 
-- increases may happen quickly after sustained unrecoverable pressure;
-- decreases require a longer healthy window;
-- repair count changes are emitted only when the committed count changes.
+The output of the adaptive policy is only:
 
-This policy is intentionally based on packet loss pressure, not byte estimates,
-because unrecoverable groups do not reveal missing DATA byte lengths.
+```text
+repairCount = 1..4
+```
+
+`repairCount = 1` is the default `4+1` behavior. Higher values request more
+REPAIR frames per future group.
 
 ## End-To-End Flow
 
@@ -432,7 +580,7 @@ sender emits 1 REPAIR
 receiver sees many groups with 2+ missing DATA packets
 groups are unrecoverable
 receiver does not synthesize missing DATA bytes
-adaptive policy raises requested repairCount
+adaptive FEC raises repairCount from FEC health/loss ratio
 QoS writer sends LINK_STATUS with repairCount bits increased
 sender applies lane-local fecRepairCount
 future groups get multiple REPAIR frames
@@ -480,7 +628,7 @@ Implement in layers so each layer has direct tests:
 6. Estimator stops using repair symbol size as source-byte input.
 7. QoS writer encodes repair count into LINK_STATUS.
 8. RecvHandler decodes repair count and applies it to lane-local Send FEC.
-9. Adaptive policy computes repair count from rolling group loss pressure.
+9. Adaptive policy computes repair count from group loss pressure.
 
 Each layer should preserve existing `4+1` behavior when repair count is `1`.
 
@@ -512,7 +660,7 @@ Codec tests:
 Protocol tests:
 
 - LINK_STATUS accepts nibble values for repair counts `1..4`.
-- LINK_STATUS rejects reserved repair count values.
+- LINK_STATUS encodes the valid state values `0000..0111`.
 - QoS bit extraction remains correct while repair bits are set.
 
 Send tests:

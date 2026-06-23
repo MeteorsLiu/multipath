@@ -393,8 +393,8 @@ func (h *RecvHandler) OnQoS(ctx context.Context, leg transport.LegRef, frame pro
 		return nil
 	}
 	qos.OnQoSStatus(udpLimited, body.UDPDeliveredBps, tcpLimited, body.TCPDeliveredBps)
-	debuglog.Printf("runtime", "link_status_apply session=%d lane=%d status=%#02x udp_limited=%t udp_delivered_bps=%d tcp_limited=%t tcp_delivered_bps=%d",
-		frame.SessionID, frame.LaneID, body.Status, udpLimited, body.UDPDeliveredBps, tcpLimited, body.TCPDeliveredBps)
+	debuglog.Printf("runtime", "link_status_apply session=%d lane=%d status=%#02x control_leg=%s udp_limited=%t udp_delivered_bps=%d tcp_limited=%t tcp_delivered_bps=%d",
+		frame.SessionID, frame.LaneID, body.Status, runtimeKindLabel(leg.Kind), udpLimited, body.UDPDeliveredBps, tcpLimited, body.TCPDeliveredBps)
 	recordLinkStatusEvent("apply", frame.SessionID, frame.LaneID, udpLimited, tcpLimited)
 	return nil
 }
