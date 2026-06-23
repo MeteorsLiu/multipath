@@ -166,6 +166,23 @@ the decoded repair count to the matching lane's FEC transmit state. The sender
 does not interpret the repair count as a target transport or target role; it is
 the number of REPAIR frames to emit for future FEC groups on that lane.
 
+The implementation uses the existing lane QoS input path. It does not add an
+external FEC setter on Send or LaneManager:
+
+```text
+RecvHandler.OnQoS(LINK_STATUS)
+ -> decode UDP/TCP QoS bits
+ -> decode repairCount from the status nibbles
+ -> LaneManager.LookupQoS(session_id, lane_id)
+ -> QoSInput.OnQoSStatus(udpLimited, udpBps, tcpLimited, tcpBps, repairCount)
+ -> laneQoSInput.OnQoSStatus(...)
+ -> lane.leg.observeQoSStatus(...)
+ -> lane.setFEC(repairCount)
+```
+
+`lane.setFEC` is an unexported lane-internal method. It stores only the current
+lane repair count used by future FEC groups.
+
 LINK_STATUS is emitted when either committed QoS state changes or the requested
 lane repair count changes. Delivered-bps fields remain auxiliary snapshot data;
 they are not a continuous telemetry stream.
@@ -233,6 +250,8 @@ default: 1
 ```
 
 The repair count is lane-local. It is not stored as UDP state or TCP state.
+The only write path for peer-requested repair count is the lane-internal
+`setFEC(repairCount)` call reached through `laneQoSInput.OnQoSStatus`.
 
 ### Applying Peer Feedback
 
@@ -241,9 +260,10 @@ Inbound LINK_STATUS changes the local send lane's future behavior:
 ```text
 peer LINK_STATUS
  -> local runtime control dispatcher
- -> matching local send lane
- -> QoS bits update selector quality
- -> repair count bits update lane FEC transmit repair count
+ -> LaneManager QoS input for (session_id, lane_id)
+ -> laneQoSInput.OnQoSStatus(..., repairCount)
+ -> QoS bits update lane selector quality
+ -> lane.setFEC(repairCount)
 ```
 
 The send lane does not inspect why the peer requested that count. It only
@@ -345,7 +365,6 @@ type rxGroup struct {
     key     rxGroupKey
     data    []*rxDataShard  // len == sourceSpan
     repairs []rxRepairShard // unique repair keys for this group
-    at      time.Time
 }
 ```
 
@@ -611,7 +630,10 @@ Public architecture boundaries remain unchanged:
 - Recv owns lane-local receive windows, recovery, estimator inputs, and local
   QoS/FEC feedback.
 - Runtime QoS writer converts Recv feedback into LINK_STATUS frames.
-- Runtime RecvHandler applies inbound LINK_STATUS to Send's lane QoS/FEC input.
+- Runtime RecvHandler decodes inbound LINK_STATUS and calls the existing lane
+  QoS input with QoS bits plus `repairCount`.
+- The lane QoS input updates selector quality and calls the unexported
+  lane-internal `setFEC(repairCount)`.
 - Session does not know lanes, FEC, protocol frames, or transports.
 - Transport works with bytes and Go network primitives only.
 
@@ -627,7 +649,8 @@ Implement in layers so each layer has direct tests:
 5. Recv group observations use actual IP lengths for expected source bytes.
 6. Estimator stops using repair symbol size as source-byte input.
 7. QoS writer encodes repair count into LINK_STATUS.
-8. RecvHandler decodes repair count and applies it to lane-local Send FEC.
+8. RecvHandler decodes repair count and passes it through lane QoS input;
+   `laneQoSInput` calls lane-local `setFEC`.
 9. Adaptive policy computes repair count from group loss pressure.
 
 Each layer should preserve existing `4+1` behavior when repair count is `1`.
@@ -689,7 +712,8 @@ Estimator tests:
 Runtime tests:
 
 - QoS writer encodes the same repair count into both status nibbles.
-- RecvHandler decodes repair count and applies it to lane-local Send FEC.
+- RecvHandler decodes repair count and passes it through `QoSInput.OnQoSStatus`.
+- `laneQoSInput.OnQoSStatus` calls lane-internal `setFEC`.
 - QoS limited state and repair count changes can be emitted in one LINK_STATUS.
 
 Integration tests:
