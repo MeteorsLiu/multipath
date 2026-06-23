@@ -73,7 +73,7 @@ type Recv struct {
 	handler   Handler
 	manager   *sessionpkg.Manager
 	onQoS     QoSCallback
-	fecCodecs [maxFECSourceSpan + 1]fecCodec
+	fecCodecs [maxFECSourceSpan + 1][5]fecCodec
 	packets   chan *packetbuf.Packet
 	states    map[*sessionpkg.Session]*recvState
 }
@@ -100,7 +100,7 @@ type recvState struct {
 	fecGroups map[rxLaneGroupKey]rxGroupObservation
 	fecTimers map[rxLaneGroupKey]*time.Timer
 
-	// shardScratch is reused by recoverPacket to materialize the shard slice for
+	// shardScratch is reused by recoverPackets to materialize the shard slice for
 	// fec.Reconstruct without per-call allocation.
 	shardScratch     [8][]byte
 	repairKeyScratch [4]uint16
@@ -257,7 +257,9 @@ func New(configs ...Config) *Recv {
 		manager: &sessionpkg.Manager{},
 	}
 	for sourceSpan := 1; sourceSpan <= maxFECSourceSpan; sourceSpan++ {
-		out.fecCodecs[sourceSpan], _ = fecpkg.NewCodec(sourceSpan, 1)
+		for repairs := 1; repairs <= 4; repairs++ {
+			out.fecCodecs[sourceSpan][repairs], _ = fecpkg.NewCodec(sourceSpan, repairs)
+		}
 	}
 	for _, cfg := range configs {
 		if cfg.Handler != nil {
@@ -539,33 +541,46 @@ func (o *Recv) handleCLOSE(ctx context.Context, leg Ref, frame protocol.Frame) e
 }
 
 func (o *Recv) maybeRecover(ctx context.Context, sessionID uint64, laneID uint8, state *recvState, recoverable rxGroupRecoverable) error {
-	if countMissing(recoverable.missingMask, recoverable.group.sourceSpan) != 1 {
+	missing := countMissing(recoverable.missingMask, recoverable.group.sourceSpan)
+	if missing == 0 {
 		return nil
 	}
-	codec := o.fecCodecForSourceSpan(recoverable.group.sourceSpan)
+	codec := o.fecCodecFor(recoverable.group.sourceSpan, missing)
 	if state == nil || codec == nil {
 		return nil
 	}
-	pkt, statuses, ok := o.recoverPacket(sessionID, laneID, state, recoverable, codec)
+	packets, statuses, ok := o.recoverPackets(sessionID, laneID, state, recoverable, codec)
 	if err := o.reportQoS(ctx, sessionID, laneID, statuses); err != nil {
-		if pkt != nil {
-			pkt.Release()
+		for _, packet := range packets {
+			packet.Release()
 		}
 		return err
 	}
 	if !ok {
 		return nil
 	}
-	select {
-	case o.packets <- pkt:
-		return nil
-	case <-ctx.Done():
-		pkt.Release()
-		return ctx.Err()
+	for i, packet := range packets {
+		select {
+		case <-ctx.Done():
+			for _, unsent := range packets[i:] {
+				unsent.Release()
+			}
+			return ctx.Err()
+		default:
+		}
+		select {
+		case o.packets <- packet:
+		case <-ctx.Done():
+			for _, unsent := range packets[i:] {
+				unsent.Release()
+			}
+			return ctx.Err()
+		}
 	}
+	return nil
 }
 
-func (o *Recv) recoverPacket(sessionID uint64, laneID uint8, state *recvState, recoverable rxGroupRecoverable, codec fecCodec) (*packetbuf.Packet, []qosStatus, bool) {
+func (o *Recv) recoverPackets(sessionID uint64, laneID uint8, state *recvState, recoverable rxGroupRecoverable, codec fecCodec) ([]*packetbuf.Packet, []qosStatus, bool) {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	if state.closed {
@@ -579,12 +594,9 @@ func (o *Recv) recoverPacket(sessionID uint64, laneID uint8, state *recvState, r
 	if !ok {
 		return nil, nil, false
 	}
-	if len(repairKeys) != 1 {
-		return nil, nil, false
-	}
 	if err := codec.Reconstruct(shards, repairKeys); err != nil {
-		debuglog.Printf("recv", "recover_err session=%d lane=%d base_packet_id=%d key=%d source_span=%d err=%v",
-			sessionID, laneID, recoverable.group.basePacketID, repairKeys[0], recoverable.group.sourceSpan, err)
+		debuglog.Printf("recv", "recover_err session=%d lane=%d base_packet_id=%d keys=%v source_span=%d err=%v",
+			sessionID, laneID, recoverable.group.basePacketID, repairKeys, recoverable.group.sourceSpan, err)
 		metrics.IncCounter(metrics.FECEventsTotal,
 			metrics.L("event", "recover_err"),
 			metrics.L("session", sessionID),
@@ -598,38 +610,43 @@ func (o *Recv) recoverPacket(sessionID uint64, laneID uint8, state *recvState, r
 		metrics.L("source_span", recoverable.group.sourceSpan),
 	)
 
-	missingIndex := firstMissingIndex(recoverable.missingMask, recoverable.group.sourceSpan)
-	if missingIndex < 0 {
-		return nil, nil, false
-	}
-	packetID := recoverable.group.basePacketID + uint32(missingIndex)
-	reconstructed := shards[missingIndex]
-	payload, ipOK := recoveredIPv4Packet(reconstructed)
-	if !ipOK {
-		return nil, nil, false
+	var packets []*packetbuf.Packet
+	for missingIndex := 0; missingIndex < recoverable.group.sourceSpan; missingIndex++ {
+		if recoverable.missingMask&(1<<uint(missingIndex)) == 0 {
+			continue
+		}
+		packetID := recoverable.group.basePacketID + uint32(missingIndex)
+		payload, ipOK := recoveredIPv4Packet(shards[missingIndex])
+		if !ipOK {
+			for _, packet := range packets {
+				packet.Release()
+			}
+			return nil, nil, false
+		}
+		if !state.dedupe.mark(packetID) {
+			continue
+		}
+		metrics.IncCounter(metrics.FECEventsTotal,
+			metrics.L("event", "recover_emit"),
+			metrics.L("session", sessionID),
+			metrics.L("source_span", recoverable.group.sourceSpan),
+		)
+		debuglog.Printf("recv", "recover_emit session=%d lane=%d packet_id=%d base_packet_id=%d keys=%v source_span=%d bytes=%d",
+			sessionID, laneID, packetID, recoverable.group.basePacketID, repairKeys, recoverable.group.sourceSpan, len(payload))
+		packet := packetbuf.Acquire(len(payload))
+		copy(packet.Payload, payload)
+		packets = append(packets, packet)
 	}
 	result := window.finishRecovery(recoverable)
 	statuses := o.observeGroupResult(state, laneID, result, time.Now())
-	if !state.dedupe.mark(packetID) {
-		return nil, statuses, false
-	}
-	metrics.IncCounter(metrics.FECEventsTotal,
-		metrics.L("event", "recover_emit"),
-		metrics.L("session", sessionID),
-		metrics.L("source_span", recoverable.group.sourceSpan),
-	)
-	debuglog.Printf("recv", "recover_emit session=%d lane=%d packet_id=%d base_packet_id=%d key=%d source_span=%d bytes=%d",
-		sessionID, laneID, packetID, recoverable.group.basePacketID, repairKeys[0], recoverable.group.sourceSpan, len(payload))
-	pkt := packetbuf.Acquire(len(payload))
-	copy(pkt.Payload, payload)
-	return pkt, statuses, true
+	return packets, statuses, len(packets) > 0
 }
 
-func (o *Recv) fecCodecForSourceSpan(sourceSpan int) fecCodec {
-	if sourceSpan <= 0 || sourceSpan > maxFECSourceSpan {
+func (o *Recv) fecCodecFor(sourceSpan int, repairCount int) fecCodec {
+	if sourceSpan <= 0 || sourceSpan > maxFECSourceSpan || repairCount <= 0 || repairCount > 4 {
 		return nil
 	}
-	return o.fecCodecs[sourceSpan]
+	return o.fecCodecs[sourceSpan][repairCount]
 }
 
 func (o *Recv) emitTransportPacket(ctx context.Context, packet *packetbuf.Packet, payload []byte) (bool, error) {
