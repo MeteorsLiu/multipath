@@ -36,17 +36,19 @@ type laneRuntime struct {
 	dialer *dialer
 
 	// Per-lane FEC transmit window (spec 9.1).
-	fecMu         sync.Mutex
-	txWindow      *txSLCWindow
-	fecFlushTimer *time.Timer
-	fecFlushArmed bool
+	fecMu          sync.Mutex
+	txWindow       *txSLCWindow
+	fecRepairCount uint8
+	fecFlushTimer  *time.Timer
+	fecFlushArmed  bool
 }
 
 func newLaneRuntime(id uint8, weight uint32) *laneRuntime {
 	l := &laneRuntime{
-		id:       id,
-		txWindow: newTxSLCWindow(maxFECSourceSpan),
-		leg:      newLeg(transport.KindUDP, &selector.QualitySelector{}),
+		id:             id,
+		txWindow:       newTxSLCWindow(maxFECSourceSpan),
+		fecRepairCount: 1,
+		leg:            newLeg(transport.KindUDP, &selector.QualitySelector{}),
 	}
 	l.weight.Store(weight)
 	return l
@@ -130,16 +132,38 @@ func (l *laneRuntime) setPrimary(kind transport.Kind) {
 	l.leg.setPrimary(kind)
 }
 
+func (l *laneRuntime) setFEC(repairCount uint8) {
+	if repairCount == 0 || repairCount > 4 {
+		return
+	}
+	l.fecMu.Lock()
+	l.fecRepairCount = repairCount
+	l.fecMu.Unlock()
+}
+
+func (l *laneRuntime) currentFECRepairCount() uint8 {
+	if l == nil {
+		return 1
+	}
+	l.fecMu.Lock()
+	defer l.fecMu.Unlock()
+	if l.fecRepairCount == 0 {
+		return 1
+	}
+	return l.fecRepairCount
+}
+
 type laneQoSInput struct {
 	sessionID uint64
 	lane      *laneRuntime
 }
 
-func (i laneQoSInput) OnQoSStatus(udpLimited bool, udpDeliveredBps uint32, tcpLimited bool, tcpDeliveredBps uint32) {
+func (i laneQoSInput) OnQoSStatus(udpLimited bool, udpDeliveredBps uint32, tcpLimited bool, tcpDeliveredBps uint32, repairCount uint8) {
 	if i.lane == nil {
 		return
 	}
 	i.lane.leg.observeQoSStatus(udpLimited, udpDeliveredBps, tcpLimited, tcpDeliveredBps)
+	i.lane.setFEC(repairCount)
 	if debuglog.Enabled() {
 		primary := i.lane.primaryTransport()
 		shadow := i.lane.shadowTransport()

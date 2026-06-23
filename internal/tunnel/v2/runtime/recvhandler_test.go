@@ -290,13 +290,15 @@ found:
 	if qos == nil {
 		t.Fatal("missing QoS input")
 	}
+	rec := &recordingQoSInput{}
+	s.LaneManager().RegisterQoS(send.LaneKey{SessionID: sessionID, LaneID: 1}, rec)
 
 	frame := protocol.Frame{
 		Type:      protocol.TypeLinkStatus,
 		SessionID: sessionID,
 		LaneID:    1,
 		Body: protocol.LinkStatusBody{
-			Status:          protocol.LinkStatusStateLimited << 4,
+			Status:          0x54,
 			UDPDeliveredBps: 2_000_000,
 			TCPDeliveredBps: 8_000_000,
 		},
@@ -304,6 +306,42 @@ found:
 	if err := handler.OnQoS(context.Background(), transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp"}, frame); err != nil {
 		t.Fatalf("OnQoS: %v", err)
 	}
+	if !rec.called {
+		t.Fatal("QoS input was not called")
+	}
+	if !rec.udpLimited {
+		t.Fatal("UDP limited = false, want true")
+	}
+	if rec.tcpLimited {
+		t.Fatal("TCP limited = true, want false")
+	}
+	if rec.repairCount != 3 {
+		t.Fatalf("repair count = %d, want 3", rec.repairCount)
+	}
+	if rec.udpDeliveredBps != 2_000_000 {
+		t.Fatalf("UDP delivered bps = %d, want 2000000", rec.udpDeliveredBps)
+	}
+	if rec.tcpDeliveredBps != 8_000_000 {
+		t.Fatalf("TCP delivered bps = %d, want 8000000", rec.tcpDeliveredBps)
+	}
+}
+
+type recordingQoSInput struct {
+	called          bool
+	udpLimited      bool
+	udpDeliveredBps uint32
+	tcpLimited      bool
+	tcpDeliveredBps uint32
+	repairCount     uint8
+}
+
+func (r *recordingQoSInput) OnQoSStatus(udpLimited bool, udpDeliveredBps uint32, tcpLimited bool, tcpDeliveredBps uint32, repairCount uint8) {
+	r.called = true
+	r.udpLimited = udpLimited
+	r.udpDeliveredBps = udpDeliveredBps
+	r.tcpLimited = tcpLimited
+	r.tcpDeliveredBps = tcpDeliveredBps
+	r.repairCount = repairCount
 }
 
 // TestOnPingUnknownSessionRepliesClose verifies the peer-restart self-heal: a

@@ -26,7 +26,7 @@ type LaneKey struct {
 }
 
 type QoSInput interface {
-	OnQoSStatus(udpLimited bool, udpDeliveredBps uint32, tcpLimited bool, tcpDeliveredBps uint32)
+	OnQoSStatus(udpLimited bool, udpDeliveredBps uint32, tcpLimited bool, tcpDeliveredBps uint32, repairCount uint8)
 }
 
 // KeyForLeg builds a LegKey from a session/lane/leg triple.
