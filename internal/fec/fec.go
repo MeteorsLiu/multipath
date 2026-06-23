@@ -46,11 +46,6 @@ func (c *Codec) Encode(shards [][]byte, keys []uint16) error {
 	if c.repairShards == 1 {
 		return c.encodeSingle(shards, keys[0])
 	}
-	encoder, err := c.validatedEncoder(keys)
-	if err != nil {
-		debuglog.Printf("fec", "encode_keyset_err keys=%v err=%v", keys, err)
-		return err
-	}
 
 	repairLen := maxShardLen(shards[:c.dataShards])
 	if repairLen == 0 {
@@ -76,6 +71,10 @@ func (c *Codec) Encode(shards [][]byte, keys []uint16) error {
 		}
 		work[c.dataShards+i] = repair
 	}
+	encoder, err := c.encoder(keys)
+	if err != nil {
+		return err
+	}
 	if err := encoder.Encode(work); err != nil {
 		return err
 	}
@@ -99,11 +98,6 @@ func (c *Codec) Reconstruct(shards [][]byte, keys []uint16) error {
 	}
 	if c.repairShards == 1 {
 		return c.reconstructSingle(shards, keys[0])
-	}
-	encoder, err := c.validatedEncoder(keys)
-	if err != nil {
-		debuglog.Printf("fec", "reconstruct_keyset_err keys=%v err=%v", keys, err)
-		return err
 	}
 
 	shardLen := maxShardLen(shards)
@@ -135,6 +129,10 @@ func (c *Codec) Reconstruct(shards [][]byte, keys []uint16) error {
 	}
 	if missingData == 0 || missingData > c.repairShards {
 		return ErrUnrecoverable
+	}
+	encoder, err := c.encoder(keys)
+	if err != nil {
+		return err
 	}
 	if err := encoder.ReconstructData(work); err != nil {
 		debuglog.Printf("fec", "reconstruct_err keys=%v missing_count=%d err=%v", keys, missingData, err)
@@ -277,70 +275,6 @@ func (c *Codec) encoder(keys []uint16) (reedsolomon.Encoder, error) {
 		reedsolomon.WithCustomMatrix(matrix),
 		reedsolomon.WithMaxGoroutines(1),
 	)
-}
-
-func (c *Codec) validatedEncoder(keys []uint16) (reedsolomon.Encoder, error) {
-	encoder, err := c.encoder(keys)
-	if err != nil {
-		return nil, ErrInvalidShardConfig
-	}
-	if !c.canReconstructDataSubsets(encoder) {
-		return nil, ErrInvalidShardConfig
-	}
-	return encoder, nil
-}
-
-func (c *Codec) canReconstructDataSubsets(encoder reedsolomon.Encoder) bool {
-	maxMissing := c.repairShards
-	if maxMissing > c.dataShards {
-		maxMissing = c.dataShards
-	}
-	for missingCount := 1; missingCount <= maxMissing; missingCount++ {
-		if !c.canReconstructDataSubsetsOfSize(encoder, missingCount, 0, make([]int, 0, missingCount)) {
-			return false
-		}
-	}
-	return true
-}
-
-func (c *Codec) canReconstructDataSubsetsOfSize(encoder reedsolomon.Encoder, target, start int, missing []int) bool {
-	if len(missing) == target {
-		return c.canReconstructDataSubset(encoder, missing)
-	}
-	remaining := target - len(missing)
-	for i := start; i <= c.dataShards-remaining; i++ {
-		missing = append(missing, i)
-		if !c.canReconstructDataSubsetsOfSize(encoder, target, i+1, missing) {
-			return false
-		}
-		missing = missing[:len(missing)-1]
-	}
-	return true
-}
-
-func (c *Codec) canReconstructDataSubset(encoder reedsolomon.Encoder, missing []int) bool {
-	shards := make([][]byte, c.dataShards+c.repairShards)
-	for i := 0; i < c.dataShards; i++ {
-		shards[i] = []byte{byte(i + 1)}
-	}
-	for i := 0; i < c.repairShards; i++ {
-		shards[c.dataShards+i] = make([]byte, 1)
-	}
-	if err := encoder.Encode(shards); err != nil {
-		return false
-	}
-	for _, index := range missing {
-		shards[index] = nil
-	}
-	if err := encoder.ReconstructData(shards); err != nil {
-		return false
-	}
-	for _, index := range missing {
-		if len(shards[index]) != 1 || shards[index][0] != byte(index+1) {
-			return false
-		}
-	}
-	return true
 }
 
 func maxShardLen(shards [][]byte) int {
