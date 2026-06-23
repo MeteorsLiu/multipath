@@ -382,8 +382,10 @@ func (h *RecvHandler) OnQoS(ctx context.Context, leg transport.LegRef, frame pro
 	if !h.sessionKnown(frame.SessionID) {
 		return h.closeUnknownSession(ctx, leg, frame.SessionID)
 	}
-	udpLimited := body.Status>>4 == protocol.LinkStatusStateLimited
-	tcpLimited := body.Status&0x0f == protocol.LinkStatusStateLimited
+	udpLimited, tcpLimited, repairCount, ok := decodeLinkStatus(body.Status)
+	if !ok {
+		return protocol.ErrInvalidFrame
+	}
 	qos := h.lanes.LookupQoS(send.LaneKey{SessionID: frame.SessionID, LaneID: frame.LaneID})
 	if qos == nil {
 		debuglog.Printf("runtime", "link_status_drop no_qos session=%d lane=%d", frame.SessionID, frame.LaneID)
@@ -392,9 +394,28 @@ func (h *RecvHandler) OnQoS(ctx context.Context, leg transport.LegRef, frame pro
 			frame.SessionID, frame.LaneID, body.Status)
 		return nil
 	}
-	qos.OnQoSStatus(udpLimited, body.UDPDeliveredBps, tcpLimited, body.TCPDeliveredBps)
+	qos.OnQoSStatus(udpLimited, body.UDPDeliveredBps, tcpLimited, body.TCPDeliveredBps, repairCount)
 	debuglog.Printf("runtime", "link_status_apply session=%d lane=%d status=%#02x control_leg=%s udp_limited=%t udp_delivered_bps=%d tcp_limited=%t tcp_delivered_bps=%d",
 		frame.SessionID, frame.LaneID, body.Status, runtimeKindLabel(leg.Kind), udpLimited, body.UDPDeliveredBps, tcpLimited, body.TCPDeliveredBps)
 	recordLinkStatusEvent("apply", frame.SessionID, frame.LaneID, udpLimited, tcpLimited)
 	return nil
+}
+
+func decodeLinkStatus(status uint8) (bool, bool, uint8, bool) {
+	udpLimited, udpRepairCount, ok := decodeLinkStatusState(status >> 4)
+	if !ok {
+		return false, false, 0, false
+	}
+	tcpLimited, tcpRepairCount, ok := decodeLinkStatusState(status & 0x0f)
+	if !ok || tcpRepairCount != udpRepairCount {
+		return false, false, 0, false
+	}
+	return udpLimited, tcpLimited, udpRepairCount, true
+}
+
+func decodeLinkStatusState(state uint8) (bool, uint8, bool) {
+	if state > 7 {
+		return false, 0, false
+	}
+	return state&protocol.LinkStatusStateLimited != 0, (state >> 1) + 1, true
 }

@@ -86,7 +86,7 @@ func TestLaneQoSOverridesSelector(t *testing.T) {
 	l := newLaneRuntime(1, 100)
 	bindBoth(l)
 
-	laneQoSInput{lane: l}.OnQoSStatus(true, 2_000_000, false, 8_000_000)
+	laneQoSInput{lane: l}.OnQoSStatus(true, 2_000_000, false, 8_000_000, 1)
 
 	if got := l.primaryTransport(); got.Kind != transport.KindTCP {
 		t.Fatalf("primary kind = %v, want TCP after UDP QoS", got.Kind)
@@ -101,7 +101,7 @@ func TestLaneQoSSelectionWaitsForBandwidthGate(t *testing.T) {
 	bindBoth(l)
 
 	l.leg.setPreferTCP(true)
-	laneQoSInput{lane: l}.OnQoSStatus(false, 8_000_000, true, 2_000_000)
+	laneQoSInput{lane: l}.OnQoSStatus(false, 8_000_000, true, 2_000_000, 1)
 
 	if got := l.primaryTransportWithQoS(false); got.Kind != transport.KindTCP {
 		t.Fatalf("primary kind with QoS gated = %v, want TCP from BW PreferTCP", got.Kind)
@@ -115,7 +115,7 @@ func TestLaneQoSSeenDisablesBandwidthPreferTCP(t *testing.T) {
 	gated := newLaneRuntime(1, 100)
 	bindBoth(gated)
 	gated.leg.setPreferTCP(true)
-	laneQoSInput{lane: gated}.OnQoSStatus(false, 0, false, 0)
+	laneQoSInput{lane: gated}.OnQoSStatus(false, 0, false, 0, 1)
 	if got := gated.primaryTransportWithQoS(false); got.Kind != transport.KindTCP {
 		t.Fatalf("primary kind with QoS gated = %v, want TCP from BW PreferTCP", got.Kind)
 	}
@@ -123,9 +123,37 @@ func TestLaneQoSSeenDisablesBandwidthPreferTCP(t *testing.T) {
 	enabled := newLaneRuntime(1, 100)
 	bindBoth(enabled)
 	enabled.leg.setPreferTCP(true)
-	laneQoSInput{lane: enabled}.OnQoSStatus(false, 0, false, 0)
+	laneQoSInput{lane: enabled}.OnQoSStatus(false, 0, false, 0, 1)
 	if got := enabled.primaryTransportWithQoS(true); got.Kind != transport.KindUDP {
 		t.Fatalf("primary kind after QoS evidence = %v, want UDP with BW PreferTCP suppressed", got.Kind)
+	}
+}
+
+func TestLaneQoSInputUpdatesFECRepairCount(t *testing.T) {
+	l := newLaneRuntime(1, 100)
+	if got := l.currentFECRepairCount(); got != 1 {
+		t.Fatalf("initial repair count = %d, want 1", got)
+	}
+
+	laneQoSInput{lane: l}.OnQoSStatus(false, 0, false, 0, 3)
+
+	if got := l.currentFECRepairCount(); got != 3 {
+		t.Fatalf("repair count = %d, want 3", got)
+	}
+}
+
+func TestLaneSetFECRejectsInvalidRepairCount(t *testing.T) {
+	l := newLaneRuntime(1, 100)
+	l.setFEC(4)
+
+	l.setFEC(0)
+	if got := l.currentFECRepairCount(); got != 4 {
+		t.Fatalf("repair count after 0 = %d, want 4", got)
+	}
+
+	l.setFEC(5)
+	if got := l.currentFECRepairCount(); got != 4 {
+		t.Fatalf("repair count after 5 = %d, want 4", got)
 	}
 }
 
