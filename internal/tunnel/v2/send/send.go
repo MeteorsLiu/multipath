@@ -68,9 +68,8 @@ type Send struct {
 	bwReference uint64
 	bwSched     *bwScheduler
 
-	// FEC codecs (4+1 SLC)
-	fecCodec  *fec.Codec
-	fecCodecs [maxFECSourceSpan + 1]*fec.Codec
+	// FEC codecs indexed by source span and repair count.
+	fecCodecs [maxFECSourceSpan + 1][5]*fec.Codec
 
 	// Atomic state
 	activeSessionID  atomic.Uint64
@@ -193,11 +192,10 @@ func (s *Send) FECEnabled() bool {
 
 func (s *Send) EnableFEC() {
 	s.fecConfigured.Store(true)
-	// Create 4+1 SLC codec (hardcoded per spec)
-	codec, _ := fec.NewCodec(4, 1)
-	s.fecCodec = codec
 	for i := 1; i <= maxFECSourceSpan; i++ {
-		s.fecCodecs[i], _ = fec.NewCodec(i, 1)
+		for repairs := 1; repairs <= 4; repairs++ {
+			s.fecCodecs[i][repairs], _ = fec.NewCodec(i, repairs)
+		}
 	}
 	if sessionID, ok := s.activeSession(); ok {
 		s.enableSessionFEC(sessionID)
@@ -1030,7 +1028,7 @@ func estimateFrameSize(frame protocol.Frame) int {
 	}
 }
 
-// sendRepair sends a REPAIR frame (spec 7.2).
+// sendRepair sends REPAIR frames (spec 7.2).
 func (s *Send) sendRepair(ctx context.Context, sessionID uint64, lane *laneRuntime, group txRepairGroup) {
 	if len(group.packets) == 0 {
 		return
@@ -1044,10 +1042,15 @@ func (s *Send) sendRepair(ctx context.Context, sessionID uint64, lane *laneRunti
 		return
 	}
 
-	repairKey := uint16(state.nextRepairKey.Add(1) - 1)
+	repairCount := lane.currentFECRepairCount()
+	keys := make([]uint16, repairCount)
+	for i := range keys {
+		keys[i] = uint16(state.nextRepairKey.Add(1) - 1)
+	}
 
 	// Encode FEC
-	codec := s.fecCodecForSourceSpan(int(group.sourceSpan))
+	sourceSpan := int(group.sourceSpan)
+	codec := s.fecCodecFor(sourceSpan, repairCount)
 	if codec == nil {
 		for _, pkt := range group.packets {
 			pkt.Release()
@@ -1055,31 +1058,17 @@ func (s *Send) sendRepair(ctx context.Context, sessionID uint64, lane *laneRunti
 		return
 	}
 
-	shards := make([][]byte, int(group.sourceSpan)+1)
+	shards := make([][]byte, sourceSpan+int(repairCount))
 	for i, pkt := range group.packets {
 		shards[i] = pkt.Payload
 	}
 
-	if err := codec.Encode(shards, []uint16{repairKey}); err != nil {
+	if err := codec.Encode(shards, keys); err != nil {
 		debuglog.Printf("send/fec", "encode_err session=%d lane=%d err=%v", sessionID, lane.id, err)
 		for _, pkt := range group.packets {
 			pkt.Release()
 		}
 		return
-	}
-
-	// Build REPAIR frame
-	frame := protocol.Frame{
-		Version:   protocol.Version,
-		Type:      protocol.TypeREPAIR,
-		SessionID: sessionID,
-		LaneID:    lane.id,
-		Body: protocol.RepairBody{
-			BasePacketID: group.basePacketID,
-			Key:          repairKey,
-			SourceSpan:   group.sourceSpan,
-			Symbol:       shards[group.sourceSpan],
-		},
 	}
 
 	// Release DATA packets
@@ -1088,35 +1077,48 @@ func (s *Send) sendRepair(ctx context.Context, sessionID uint64, lane *laneRunti
 	}
 
 	// Send REPAIR on shadow transport
-	packet, err := s.encodeFrame(frame)
-	if err != nil {
-		return
-	}
-
 	qosEnabled := s.qosSelectionEnabled()
 	leg := lane.shadowTransportWithQoS(qosEnabled)
 	if leg.Kind == 0 {
-		packet.Release()
 		return
 	}
-	if debuglog.Enabled() {
-		primary := lane.primaryTransportWithQoS(qosEnabled)
-		debuglog.Printf("send", "schedule_select session=%d lane=%d primary={%s} shadow={%s} leg={%s} frame=type=REPAIR base_packet_id=%d key=%d source_span=%d symbol_len=%d",
-			sessionID, lane.id, debugLeg(primary), debugLeg(leg), debugLeg(leg),
-			group.basePacketID, repairKey, group.sourceSpan, len(shards[group.sourceSpan]))
-	}
 
-	_ = s.WriteTo(ctx, leg, packet)
+	for i, key := range keys {
+		symbol := shards[sourceSpan+i]
+		frame := protocol.Frame{
+			Version:   protocol.Version,
+			Type:      protocol.TypeREPAIR,
+			SessionID: sessionID,
+			LaneID:    lane.id,
+			Body: protocol.RepairBody{
+				BasePacketID: group.basePacketID,
+				Key:          key,
+				SourceSpan:   group.sourceSpan,
+				Symbol:       symbol,
+			},
+		}
+
+		packet, err := s.encodeFrame(frame)
+		if err != nil {
+			return
+		}
+
+		if debuglog.Enabled() {
+			primary := lane.primaryTransportWithQoS(qosEnabled)
+			debuglog.Printf("send", "schedule_select session=%d lane=%d primary={%s} shadow={%s} leg={%s} frame=type=REPAIR base_packet_id=%d key=%d source_span=%d symbol_len=%d",
+				sessionID, lane.id, debugLeg(primary), debugLeg(leg), debugLeg(leg),
+				group.basePacketID, key, group.sourceSpan, len(symbol))
+		}
+
+		_ = s.WriteTo(ctx, leg, packet)
+	}
 }
 
-func (s *Send) fecCodecForSourceSpan(sourceSpan int) *fec.Codec {
-	if sourceSpan <= 0 || sourceSpan > maxFECSourceSpan {
+func (s *Send) fecCodecFor(sourceSpan int, repairCount uint8) *fec.Codec {
+	if sourceSpan <= 0 || sourceSpan > maxFECSourceSpan || repairCount == 0 || repairCount > 4 {
 		return nil
 	}
-	if sourceSpan == maxFECSourceSpan && s.fecCodec != nil {
-		return s.fecCodec
-	}
-	return s.fecCodecs[sourceSpan]
+	return s.fecCodecs[sourceSpan][repairCount]
 }
 
 func (s *Send) armFECFlushTimer(sessionID uint64, lane *laneRuntime) {
