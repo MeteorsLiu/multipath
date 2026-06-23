@@ -14,6 +14,15 @@
 
 This plan implements one spec. It touches multiple packages, but the changes are one protocol/data-flow increment: multi-repair FEC and its lane-local feedback path. Do not add retransmission, new FEC frames, public Lane modules, public protocol helpers, or compatibility profiles.
 
+## Subagent Execution Rule
+
+All implementer and reviewer subagents for this plan must follow the minimum-implementation rule:
+
+- Do not add defensive validation, compatibility paths, fallback behavior, state, fields, abstractions, or tests for cases not required by the current approved spec.
+- Do not reject inputs based on guessed future failure modes. Validate only the shape constraints required by the protocol or local API contract.
+- Do not precompute or pre-prove behavior for hypothetical future packet-loss patterns. Execute the current operation and return the existing error when it fails.
+- When a reviewer flags a possible edge case, first ask whether the approved requirement actually needs a new check. Do not treat extra checks as automatically safer.
+
 ## File Structure
 
 - `internal/fec/fec.go`: shard-level codec, now `keys []uint16` and `repairShards` in `1..4`.
