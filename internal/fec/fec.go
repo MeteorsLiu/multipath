@@ -22,155 +22,167 @@ const (
 type Codec struct {
 	dataShards   int
 	repairShards int
-	low          reedsolomon.LowLevel
 }
 
 func NewCodec(dataShards, repairShards int) (*Codec, error) {
-	if dataShards <= 0 || repairShards != 1 {
+	if dataShards <= 0 || repairShards <= 0 || repairShards > 4 {
 		debuglog.Printf("fec", "new_codec_err data_shards=%d repair_shards=%d err=%v", dataShards, repairShards, ErrInvalidShardConfig)
 		return nil, ErrInvalidShardConfig
 	}
 	debuglog.Printf("fec", "new_codec data_shards=%d repair_shards=%d", dataShards, repairShards)
-	return &Codec{
-		dataShards:   dataShards,
-		repairShards: repairShards,
-	}, nil
+	return &Codec{dataShards: dataShards, repairShards: repairShards}, nil
 }
 
-func (c *Codec) Encode(shards [][]byte, key uint16) error {
+func (c *Codec) Encode(shards [][]byte, keys []uint16) error {
 	if debuglog.Enabled() {
 		dataShards, repairShards := debugCodecShape(c)
-		debuglog.Printf("fec", "encode_start key=%d data_shards=%d repair_shards=%d lens=%v", key, dataShards, repairShards, debugShardLens(shards))
+		debuglog.Printf("fec", "encode_start keys=%v data_shards=%d repair_shards=%d lens=%v", keys, dataShards, repairShards, debugShardLens(shards))
 	}
-	if err := c.validate(shards); err != nil {
-		debuglog.Printf("fec", "encode_validate_err key=%d err=%v", key, err)
+	if err := c.validate(shards, keys); err != nil {
+		debuglog.Printf("fec", "encode_validate_err keys=%v err=%v", keys, err)
 		return err
 	}
 
-	repairLen := 0
-	for i := 0; i < c.dataShards; i++ {
-		if len(shards[i]) > repairLen {
-			repairLen = len(shards[i])
-		}
-	}
+	repairLen := maxShardLen(shards[:c.dataShards])
 	if repairLen == 0 {
-		debuglog.Printf("fec", "encode_err key=%d err=%v reason=empty_repair", key, ErrInvalidShardConfig)
+		debuglog.Printf("fec", "encode_err keys=%v err=%v reason=empty_repair", keys, ErrInvalidShardConfig)
 		return ErrInvalidShardConfig
 	}
 
+	work := make([][]byte, c.dataShards+c.repairShards)
 	for i := 0; i < c.dataShards; i++ {
 		if shards[i] == nil {
-			debuglog.Printf("fec", "encode_err key=%d shard=%d err=%v reason=nil_data_shard", key, i, ErrInvalidShardConfig)
+			debuglog.Printf("fec", "encode_err keys=%v shard=%d err=%v reason=nil_data_shard", keys, i, ErrInvalidShardConfig)
 			return ErrInvalidShardConfig
 		}
+		work[i] = paddedShard(shards[i], repairLen)
 	}
-
-	repair := shards[c.dataShards]
-	if cap(repair) < repairLen {
-		repair = make([]byte, repairLen)
-	} else {
-		repair = repair[:repairLen]
+	for i := 0; i < c.repairShards; i++ {
+		repair := shards[c.dataShards+i]
+		if cap(repair) < repairLen {
+			repair = make([]byte, repairLen)
+		} else {
+			repair = repair[:repairLen]
+			clear(repair)
+		}
+		work[c.dataShards+i] = repair
 	}
-	clear(repair)
-
-	var coeffBuf [32]byte
-	var coeffs []byte
-	if c.dataShards > len(coeffBuf) {
-		coeffs = make([]byte, c.dataShards)
-	} else {
-		coeffs = coeffBuf[:c.dataShards]
+	encoder, err := c.encoder(keys)
+	if err != nil {
+		return err
 	}
-	fillCodingCoefficients(key, coeffs)
-	for i := 0; i < c.dataShards; i++ {
-		c.low.GalMulSliceXor(coeffs[i], shards[i], repair[:len(shards[i])])
+	if err := encoder.Encode(work); err != nil {
+		return err
 	}
-
-	shards[c.dataShards] = repair
+	for i := 0; i < c.repairShards; i++ {
+		shards[c.dataShards+i] = work[c.dataShards+i]
+	}
 	if debuglog.Enabled() {
-		debuglog.Printf("fec", "encode_done key=%d repair_len=%d", key, len(repair))
+		debuglog.Printf("fec", "encode_done keys=%v repair_len=%d", keys, repairLen)
 	}
 	return nil
 }
 
-func (c *Codec) Reconstruct(shards [][]byte, key uint16) error {
+func (c *Codec) Reconstruct(shards [][]byte, keys []uint16) error {
 	if debuglog.Enabled() {
 		dataShards, repairShards := debugCodecShape(c)
-		debuglog.Printf("fec", "reconstruct_start key=%d data_shards=%d repair_shards=%d lens=%v", key, dataShards, repairShards, debugShardLens(shards))
+		debuglog.Printf("fec", "reconstruct_start keys=%v data_shards=%d repair_shards=%d lens=%v", keys, dataShards, repairShards, debugShardLens(shards))
 	}
-	if err := c.validate(shards); err != nil {
-		debuglog.Printf("fec", "reconstruct_validate_err key=%d err=%v", key, err)
+	if err := c.validate(shards, keys); err != nil {
+		debuglog.Printf("fec", "reconstruct_validate_err keys=%v err=%v", keys, err)
 		return err
 	}
 
-	repair := shards[c.dataShards]
-	if len(repair) == 0 {
-		debuglog.Printf("fec", "reconstruct_err key=%d err=%v reason=empty_repair", key, ErrUnrecoverable)
+	shardLen := maxShardLen(shards)
+	if shardLen == 0 {
 		return ErrUnrecoverable
 	}
-	repairLen := len(repair)
-
-	missingIndex := -1
-	missingCount := 0
+	missingData := 0
+	work := make([][]byte, c.dataShards+c.repairShards)
 	for i := 0; i < c.dataShards; i++ {
 		if len(shards[i]) == 0 {
-			missingIndex = i
-			missingCount++
-		}
-	}
-	if missingCount != 1 {
-		debuglog.Printf("fec", "reconstruct_err key=%d missing_count=%d err=%v", key, missingCount, ErrUnrecoverable)
-		return ErrUnrecoverable
-	}
-
-	for i := 0; i < c.dataShards; i++ {
-		if i == missingIndex {
+			missingData++
 			continue
 		}
-		if len(shards[i]) > repairLen {
-			debuglog.Printf("fec", "reconstruct_err key=%d shard=%d shard_len=%d repair_len=%d err=%v", key, i, len(shards[i]), repairLen, ErrUnrecoverable)
+		if len(shards[i]) > shardLen {
 			return ErrUnrecoverable
 		}
+		work[i] = paddedShard(shards[i], shardLen)
 	}
-
-	var coeffBuf [32]byte
-	var coeffs []byte
-	if c.dataShards > len(coeffBuf) {
-		coeffs = make([]byte, c.dataShards)
-	} else {
-		coeffs = coeffBuf[:c.dataShards]
-	}
-	fillCodingCoefficients(key, coeffs)
-
-	recovered := shards[missingIndex]
-	if cap(recovered) < repairLen {
-		recovered = make([]byte, repairLen)
-	} else {
-		recovered = recovered[:repairLen]
-	}
-	copy(recovered, repair)
-	for i := 0; i < c.dataShards; i++ {
-		if i == missingIndex {
+	for i := 0; i < c.repairShards; i++ {
+		shard := shards[c.dataShards+i]
+		if len(shard) == 0 {
 			continue
 		}
-		c.low.GalMulSliceXor(coeffs[i], shards[i], recovered[:len(shards[i])])
+		if len(shard) != shardLen {
+			return ErrUnrecoverable
+		}
+		work[c.dataShards+i] = shard
 	}
-	c.low.GalMulSlice(reedsolomon.Inv(coeffs[missingIndex]), recovered, recovered)
-
-	shards[missingIndex] = recovered
+	if missingData == 0 || missingData > c.repairShards {
+		return ErrUnrecoverable
+	}
+	encoder, err := c.encoder(keys)
+	if err != nil {
+		return err
+	}
+	if err := encoder.ReconstructData(work); err != nil {
+		debuglog.Printf("fec", "reconstruct_err keys=%v missing_count=%d err=%v", keys, missingData, err)
+		return ErrUnrecoverable
+	}
+	for i := 0; i < c.dataShards; i++ {
+		if len(shards[i]) == 0 {
+			shards[i] = work[i]
+		}
+	}
 	if debuglog.Enabled() {
-		debuglog.Printf("fec", "reconstruct_done key=%d missing_index=%d recovered_len=%d", key, missingIndex, len(recovered))
+		debuglog.Printf("fec", "reconstruct_done keys=%v recovered_len=%d", keys, shardLen)
 	}
 	return nil
 }
 
-func (c *Codec) validate(shards [][]byte) error {
-	if c == nil || c.dataShards <= 0 || c.repairShards != 1 {
+func (c *Codec) validate(shards [][]byte, keys []uint16) error {
+	if c == nil || c.dataShards <= 0 || c.repairShards <= 0 || c.repairShards > 4 {
 		return ErrInvalidShardConfig
 	}
-	if len(shards) != c.dataShards+c.repairShards {
+	if len(shards) != c.dataShards+c.repairShards || len(keys) != c.repairShards {
 		return ErrInvalidShardConfig
 	}
 	return nil
+}
+
+func (c *Codec) encoder(keys []uint16) (reedsolomon.Encoder, error) {
+	matrix := make([][]byte, c.repairShards)
+	for i, key := range keys {
+		row := make([]byte, c.dataShards)
+		fillCodingCoefficients(key, row)
+		matrix[i] = row
+	}
+	return reedsolomon.New(
+		c.dataShards,
+		c.repairShards,
+		reedsolomon.WithCustomMatrix(matrix),
+		reedsolomon.WithMaxGoroutines(1),
+	)
+}
+
+func maxShardLen(shards [][]byte) int {
+	size := 0
+	for _, shard := range shards {
+		if len(shard) > size {
+			size = len(shard)
+		}
+	}
+	return size
+}
+
+func paddedShard(shard []byte, size int) []byte {
+	if len(shard) == size {
+		return shard
+	}
+	out := make([]byte, size)
+	copy(out, shard)
+	return out
 }
 
 func fillCodingCoefficients(key uint16, coeffs []byte) {
