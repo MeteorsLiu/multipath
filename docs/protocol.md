@@ -433,7 +433,7 @@ fec_profile = slc_variable_plus_1:
 For both SLC profiles:
 
 ```text
-repair count    = 1
+repair count    = 1..4
 field           = GF(2^8)
 ```
 
@@ -703,12 +703,24 @@ udp_delivered_bps uint32
 tcp_delivered_bps uint32
 ```
 
-State values:
+`status` is a complete lane snapshot:
 
 ```text
-0 = clear
-1 = limited
+status = UUUU TTTT
+
+high uint4 = UDP state
+low uint4  = TCP state
+
+each uint4:
+  bit0    = QoS limited state
+  bits1-3 = repairCount - 1
 ```
+
+The default repair count is `1`, so repair bits `000` mean one REPAIR packet
+per FEC group. Current valid per-transport state values are `0..7`.
+
+`repairCount` is lane-local. The sender writes the same repair-count bits into
+the UDP and TCP nibbles. The QoS bit remains transport-kind specific.
 
 Sender behavior:
 
@@ -720,23 +732,26 @@ Sender behavior:
    transport ref for the target lane. It does not delegate this frame to the
    lane's default control-transport policy.
 4. Set `status` as a complete lane snapshot. The high nibble carries UDP state
-   and the low nibble carries TCP state. A clear state clears the peer's
-   selector QoS state for that transport kind.
+   and the low nibble carries TCP state. Each nibble carries that transport
+   kind's QoS bit and the lane-local repair-count bits.
 5. Set `udp_delivered_bps` and `tcp_delivered_bps` to the receive-side rate
    estimates for each transport kind when available. Use `0` when the receiver
    has no estimate for that kind.
-6. Send LINK_STATUS when the lane QoS state changes between clear and limited.
-   A delivered-bps estimate is auxiliary data in that state snapshot and is not
-   a continuous telemetry stream. A delivered-bps-only change generally does not
-   require another LINK_STATUS frame, except when both UDP and TCP are currently
-   limited and the updated estimates change the QoS-preferred primary leg.
+6. Send LINK_STATUS when the lane QoS state changes between clear and limited,
+   or when the lane-local repair count changes. A delivered-bps estimate is
+   auxiliary data in that state snapshot and is not a continuous telemetry
+   stream. A delivered-bps-only change generally does not require another
+   LINK_STATUS frame, except when both UDP and TCP are currently limited and
+   the updated estimates change the QoS-preferred primary leg.
 
 Receiver behavior:
 
 1. Validate session, lane, and `status`.
-2. Apply the snapshot atomically to the matching lane selector quality.
-3. Keep the applied QoS state until a later LINK_STATUS snapshot changes it.
-4. Do not emit anything to TUN.
+2. Apply the QoS bits atomically to the matching lane selector quality.
+3. Apply the decoded repair count to the matching lane's future FEC emission.
+4. Keep the applied QoS and repair-count state until a later LINK_STATUS
+   snapshot changes it.
+5. Do not emit anything to TUN.
 
 ## Lane State Machine
 
@@ -853,13 +868,13 @@ primary DATA transport for the lane; the shadow transport is the opposite kind.
 The initial receiver-side primary is UDP, matching the sender's default
 selection. The receiver changes this primary only after the current role's QoS
 decision filter commits a clear/limited state; it must not infer a primary
-switch from an individual DATA arrival. In the current estimator, the rate and
-health paths use a short decision-sample filter before commit. Do not read this
-as a requirement for every path to wait for an additional wall-clock sustain
+switch from an individual DATA arrival. In the current estimator, rate decision
+paths use a short decision-sample filter before commit. Do not read this as a
+requirement for every path to wait for an additional wall-clock sustain
 duration. DATA or REPAIR observations that do not match the current
 primary/shadow pair are ignored by the QoS estimator. Each tick evaluates only
 the current role state. Non-current role state does not consume the tick,
-advance the decision filter, or emit LINK_STATUS state.
+advance the decision filter, or emit LINK_STATUS QoS state.
 
 Before changing the current primary DATA direction, the receiver resets the
 target primary/DATA state so stale actual or expected rate history cannot carry
@@ -871,8 +886,10 @@ used as a gate for another direction's QoS judgment.
 
 Duplicate DATA rejected by the session emit dedupe is dropped before FEC-window
 or QoS bookkeeping. Discarded DATA, late duplicate DATA, unrecovered DATA, and
-FEC-recovered DATA must not be converted into synthetic DATA bytes, recovered
-bytes, mature rate samples, or bandwidth-estimation inputs.
+FEC-recovered DATA must not be converted into DATA-leg actual bytes, synthetic
+DATA bytes, mature rate samples, or bandwidth-estimation inputs. Recovered IP
+lengths may be used only as expected source bytes for a completed or recovered
+FEC group.
 
 Unrecovered missing DATA may only contribute to FEC health observations:
 
@@ -880,9 +897,17 @@ Unrecovered missing DATA may only contribute to FEC health observations:
 DataArrived / DataExpected
 ```
 
-FEC health limited/clear decisions require new health observations to refresh
-the decision filter. Empty estimator ticks may decay rate EMAs, but they must
-not turn an old incomplete-group health sample into fresh health evidence.
+FEC health does not directly commit QoS limited or clear state. It drives only
+the lane-local adaptive repair count carried in LINK_STATUS. Empty estimator
+ticks may decay rate EMAs, but they must not turn an old incomplete-group
+health sample into fresh QoS evidence.
+
+Adaptive repair count is computed from group packet arrival ratio:
+
+```text
+lossRatio   = (sum(DataExpected) - sum(DataArrived)) / sum(DataExpected)
+repairCount = clamp(ceil(lossRatio * 4), 1, 4)
+```
 
 The receiver derives rate estimates from accepted DATA and REPAIR byte counters:
 
