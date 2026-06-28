@@ -2,6 +2,17 @@ package recv
 
 import "github.com/MeteorsLiu/multipath/internal/packetbuf"
 
+const (
+	defaultRxGroupWindowDataLimit   = 4096
+	defaultRxGroupWindowGroupLimit  = 1024
+	defaultRxGroupWindowClosedLimit = 4096
+)
+
+type rxGroupKey struct {
+	basePacketID uint32
+	sourceSpan   int
+}
+
 type rxGroupWindow struct {
 	recentData map[uint32]*packetbuf.Packet
 	groups     map[rxGroupKey]*rxGroup
@@ -17,9 +28,10 @@ type rxGroupWindow struct {
 }
 
 type rxGroup struct {
-	key     rxGroupKey
-	data    []*packetbuf.Packet
-	repairs []rxRepairShard
+	key       rxGroupKey
+	data      []*packetbuf.Packet
+	repairs   []rxRepairShard
+	recovered bool
 }
 
 type rxRepairShard struct {
@@ -50,10 +62,16 @@ func newRxGroupWindow() *rxGroupWindow {
 		recentData: make(map[uint32]*packetbuf.Packet),
 		groups:     make(map[rxGroupKey]*rxGroup),
 		closed:     make(map[rxGroupKey]struct{}),
-		maxData:    defaultRxSLCWindowDataLimit,
-		maxGroups:  defaultRxSLCWindowRepairLimit,
-		maxClosed:  defaultRxSLCWindowClosedLimit,
+		maxData:    defaultRxGroupWindowDataLimit,
+		maxGroups:  defaultRxGroupWindowGroupLimit,
+		maxClosed:  defaultRxGroupWindowClosedLimit,
 	}
+}
+
+func storePacket(b []byte) *packetbuf.Packet {
+	p := packetbuf.Acquire(len(b))
+	copy(p.Payload, b)
+	return p
 }
 
 func (w *rxGroupWindow) addData(packetID uint32, packet []byte) rxGroupWindowResult {
@@ -173,11 +191,8 @@ func (w *rxGroupWindow) finishRecovery(r rxGroupRecoverable) rxGroupWindowResult
 		return w.prune()
 	}
 
-	out := rxGroupWindowResult{done: []rxGroupDone{w.doneForGroup(group, true, false)}}
-	w.closeGroup(group.key)
-	w.dropGroup(group.key)
-	out.add(w.prune())
-	return out
+	group.recovered = true
+	return w.prune()
 }
 
 func (w *rxGroupWindow) expireGroup(key rxGroupKey) rxGroupWindowResult {
@@ -190,7 +205,7 @@ func (w *rxGroupWindow) expireGroup(key rxGroupKey) rxGroupWindowResult {
 		return w.prune()
 	}
 
-	out := rxGroupWindowResult{done: []rxGroupDone{w.doneForGroup(group, false, true)}}
+	out := rxGroupWindowResult{done: []rxGroupDone{w.doneForGroup(group, group.recovered, !group.recovered)}}
 	w.closeGroup(group.key)
 	w.dropGroup(group.key)
 	out.add(w.prune())
@@ -225,7 +240,7 @@ func (w *rxGroupWindow) prune() rxGroupWindowResult {
 			continue
 		}
 		w.eachGroupForPacket(packetID, func(group *rxGroup, index int) {
-			out.done = append(out.done, w.doneForGroup(group, false, true))
+			out.done = append(out.done, w.doneForGroup(group, group.recovered, !group.recovered))
 			w.closeGroup(group.key)
 			w.dropGroup(group.key)
 		})
@@ -239,7 +254,7 @@ func (w *rxGroupWindow) prune() rxGroupWindowResult {
 		if group == nil {
 			continue
 		}
-		out.done = append(out.done, w.doneForGroup(group, false, true))
+		out.done = append(out.done, w.doneForGroup(group, group.recovered, !group.recovered))
 		w.closeGroup(group.key)
 		w.dropGroup(group.key)
 	}
@@ -255,6 +270,9 @@ func (w *rxGroupWindow) prune() rxGroupWindowResult {
 
 func (w *rxGroupWindow) checkGroup(group *rxGroup) rxGroupWindowResult {
 	if group == nil {
+		return rxGroupWindowResult{}
+	}
+	if group.recovered {
 		return rxGroupWindowResult{}
 	}
 

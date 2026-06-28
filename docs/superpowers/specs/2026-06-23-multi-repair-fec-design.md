@@ -20,7 +20,7 @@ headers and feeds those bytes into the QoS estimator.
 
 - FEC remains opportunistic packet loss repair for a layer-3 tunnel.
 - FEC must not add tunnel-level retransmission or reliable transport semantics.
-- FEC health does not directly commit QoS limited or clear state.
+- FEC health is not a QoS detector input; it drives only adaptive repair count.
 - QoS rate estimation is based on DATA source bytes versus DATA-leg arrival,
   not on REPAIR arrival ratio alone.
 - Multi-repair FEC exists to make missing DATA packets recoverable often enough
@@ -290,7 +290,16 @@ one REPAIR frame for each equation. Each REPAIR frame carries the group's
 All emitted REPAIR frames for the group go through the lane shadow role. The
 selector chooses the concrete transport leg for that role.
 
-Partial groups created by the existing flush path use the same repair count.
+Partial groups created by the existing flush path scale the configured repair
+count to the actual source span:
+
+```text
+effectiveRepairCount = ceil(repairCount * source_span / 4)
+effectiveRepairCount = clamp(effectiveRepairCount, 1, source_span)
+```
+
+The `repairCount` carried in LINK_STATUS remains the full `4 DATA` group target.
+The sender applies the scaling only when emitting a partial FEC group.
 Their `source_span` is the number of protected DATA packets in that partial
 group.
 
@@ -358,7 +367,7 @@ The group data model is direct:
 ```go
 type rxGroupKey struct {
     basePacketID uint32
-    sourceSpan   uint8
+    sourceSpan   int
 }
 
 type rxGroup struct {
@@ -384,12 +393,12 @@ an internal Go module. The window exposes only the minimum facts other receive
 side code needs:
 
 ```go
-type rxWindowResult struct {
-    recoverable []rxRecoverable
+type rxGroupWindowResult struct {
+    recoverable []rxGroupRecoverable
     done        []rxGroupDone
 }
 
-type rxRecoverable struct {
+type rxGroupRecoverable struct {
     group       rxGroupKey
     missingMask uint8
 }
@@ -503,10 +512,9 @@ Multi-repair FEC changes the inputs:
    IP total lengths.
 4. Unrecoverable groups contribute adaptive FEC pressure only.
 
-FEC health no longer commits QoS limited state by itself. It can raise
-`fecRepairCount`, which improves future recovery probability. Once future groups
-become recoverable, recovered source bytes let the rate estimator make a
-rate-based QoS decision.
+FEC health does not feed the QoS detector. It can raise `fecRepairCount`, which
+improves future recovery probability. Once future groups become recoverable,
+recovered source bytes let the rate estimator make a rate-based QoS decision.
 
 This preserves the design goal that QoS is rate-based while still handling
 missing samples.
@@ -567,8 +575,8 @@ repairCount = ceil(1.00 * 4) = 4
 => 4+4
 ```
 
-This formula controls only adaptive FEC. It does not directly commit QoS
-limited or clear state.
+This formula controls only adaptive FEC. It does not feed QoS limited or clear
+state.
 
 The output of the adaptive policy is only:
 
@@ -608,6 +616,26 @@ receiver computes expected source bytes from actual IP packet lengths
 estimator gets rate-based expected-vs-actual observations
 ```
 
+### Primary Switch Reset
+
+When the QoS estimator commits a primary transport switch, Recv resets the
+lane-local adaptive FEC policy before writing `repairCount` into LINK_STATUS:
+
+```text
+primary switch committed
+-> rxFECPolicy reset: counters cleared, repairCount = 1
+-> LINK_STATUS carries repairCount = 1
+-> peer lane.setFEC(1)
+```
+
+The reset applies before any LINK_STATUS from the same receive batch is sent. If
+the same batch also contains FEC health that would otherwise raise repairCount,
+the switch reset wins.
+
+After the reset, adaptive FEC accepts health observations only for the current
+DATA leg. Late groups from the previous DATA leg may still recover packets, but
+their health does not raise the new primary leg's repair count.
+
 ### QoS and FEC Interaction
 
 ```text
@@ -618,7 +646,7 @@ QoS estimator -> limited/clear LINK_STATUS bits
 LINK_STATUS repair bits -> sender FEC count
 ```
 
-FEC health is upstream of adaptive FEC, not a direct QoS decision.
+FEC health is upstream of adaptive FEC, not the QoS detector.
 
 ## Module Boundaries
 
@@ -706,7 +734,7 @@ Estimator tests:
 
 - expected source bytes use actual and recovered IP total lengths.
 - `source_span * repair_symbol_size` is not used as source-byte input.
-- FEC health does not directly commit QoS limited state.
+- FEC health is not a QoS detector input.
 - unrecoverable groups affect adaptive repair count, not expected bps.
 
 Runtime tests:

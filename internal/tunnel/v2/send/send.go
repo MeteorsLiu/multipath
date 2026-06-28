@@ -100,6 +100,9 @@ type Send struct {
 
 	runnableCacheMu sync.Mutex
 	runnableCache   map[uint64]*runnableCache
+
+	dataSelectDebugMu sync.Mutex
+	dataSelectDebug   map[dataSelectDebugKey]dataSelectDebugStats
 }
 
 type laneKey struct {
@@ -113,6 +116,19 @@ type runnableCache struct {
 	generation uint64
 }
 
+type dataSelectDebugKey struct {
+	sessionID uint64
+	laneID    uint8
+}
+
+type dataSelectDebugStats struct {
+	second   int64
+	udpPkts  uint64
+	udpBytes uint64
+	tcpPkts  uint64
+	tcpBytes uint64
+}
+
 // sendState holds per-session send-side state.
 type sendState struct {
 	nextPacketID  atomic.Uint32
@@ -123,14 +139,15 @@ type sendState struct {
 // New creates a new Send instance.
 func New(configs ...Config) *Send {
 	s := &Send{
-		lanes:          make(map[laneKey]*laneRuntime),
-		strategies:     make(map[uint64]schedule.Strategy[*laneRuntime]),
-		sendStates:     make(map[uint64]*sendState),
-		runnableCache:  make(map[uint64]*runnableCache),
-		packets:        make(chan transport.Payload, 1024),
-		sessionManager: &sessionpkg.Manager{},
-		fecFlushMin:    defaultFECFlushMin,
-		fecFlushMax:    defaultFECFlushMax,
+		lanes:           make(map[laneKey]*laneRuntime),
+		strategies:      make(map[uint64]schedule.Strategy[*laneRuntime]),
+		sendStates:      make(map[uint64]*sendState),
+		runnableCache:   make(map[uint64]*runnableCache),
+		dataSelectDebug: make(map[dataSelectDebugKey]dataSelectDebugStats),
+		packets:         make(chan transport.Payload, 1024),
+		sessionManager:  &sessionpkg.Manager{},
+		fecFlushMin:     defaultFECFlushMin,
+		fecFlushMax:     defaultFECFlushMax,
 	}
 
 	for _, cfg := range configs {
@@ -883,6 +900,19 @@ func (s *Send) sendDataFrame(ctx context.Context, lane *laneRuntime, frame proto
 		packet.Release()
 		return nil
 	}
+	if debuglog.Enabled() {
+		if ack, ok := ackTracePayload(payload); ok {
+			debuglog.Printf("send/ack_trace", "send session=%d lane=%d packet_id=%d leg=%s time_ns=%d len=%d src_port=%d dst_port=%d seq=%d ack=%d",
+				frame.SessionID, lane.id, packetID, kindEventLabel(leg.Kind), time.Now().UnixNano(), len(payload),
+				ack.srcPort, ack.dstPort, ack.seq, ack.ack)
+		}
+		if data, ok := dataTracePayload(payload); ok {
+			debuglog.Printf("send/data_trace", "send session=%d lane=%d packet_id=%d leg=%s time_ns=%d len=%d src_port=%d dst_port=%d seq=%d ack=%d tcp_payload_len=%d",
+				frame.SessionID, lane.id, packetID, kindEventLabel(leg.Kind), time.Now().UnixNano(), len(payload),
+				data.srcPort, data.dstPort, data.seq, data.ack, data.payloadLen)
+		}
+		s.recordDataSelectDebug(frame.SessionID, lane.id, leg.Kind, len(payload))
+	}
 	s.recordQoSDataLegSelection(frame.SessionID, lane, leg.Kind, qosEnabled)
 	if debuglog.Enabled() {
 		udpQ, tcpQ := lane.leg.qualitySnapshot()
@@ -906,6 +936,33 @@ func (s *Send) sendDataFrame(ctx context.Context, lane *laneRuntime, frame proto
 	}
 
 	return s.WriteTo(ctx, leg, packet)
+}
+
+func (s *Send) recordDataSelectDebug(sessionID uint64, laneID uint8, kind transport.Kind, payloadLen int) {
+	if s == nil {
+		return
+	}
+	now := time.Now().Unix()
+	key := dataSelectDebugKey{sessionID: sessionID, laneID: laneID}
+	s.dataSelectDebugMu.Lock()
+	stats := s.dataSelectDebug[key]
+	if stats.second != 0 && stats.second != now {
+		debuglog.Printf("send/data_select", "tick session=%d lane=%d second=%d udp_pkts=%d udp_bytes=%d tcp_pkts=%d tcp_bytes=%d",
+			key.sessionID, key.laneID, stats.second,
+			stats.udpPkts, stats.udpBytes, stats.tcpPkts, stats.tcpBytes)
+		stats = dataSelectDebugStats{}
+	}
+	stats.second = now
+	switch kind {
+	case transport.KindUDP:
+		stats.udpPkts++
+		stats.udpBytes += uint64(payloadLen)
+	case transport.KindTCP:
+		stats.tcpPkts++
+		stats.tcpBytes += uint64(payloadLen)
+	}
+	s.dataSelectDebug[key] = stats
+	s.dataSelectDebugMu.Unlock()
 }
 
 func (s *Send) recordQoSDataLegSelection(sessionID uint64, lane *laneRuntime, kind transport.Kind, qosEnabled bool) {
@@ -1042,14 +1099,21 @@ func (s *Send) sendRepair(ctx context.Context, sessionID uint64, lane *laneRunti
 		return
 	}
 
-	repairCount := lane.currentFECRepairCount()
+	sourceSpan := int(group.sourceSpan)
+	configuredRepairCount := lane.currentFECRepairCount()
+	repairCount := scaledFECRepairCount(configuredRepairCount, sourceSpan)
+	if repairCount == 0 {
+		for _, pkt := range group.packets {
+			pkt.Release()
+		}
+		return
+	}
 	keys := make([]uint16, repairCount)
 	for i := range keys {
 		keys[i] = uint16(state.nextRepairKey.Add(1) - 1)
 	}
 
 	// Encode FEC
-	sourceSpan := int(group.sourceSpan)
 	codec := s.fecCodecFor(sourceSpan, repairCount)
 	if codec == nil {
 		for _, pkt := range group.packets {
@@ -1082,6 +1146,8 @@ func (s *Send) sendRepair(ctx context.Context, sessionID uint64, lane *laneRunti
 	if leg.Kind == 0 {
 		return
 	}
+	debuglog.Printf("send/fec", "repair_group session=%d lane=%d base_packet_id=%d source_span=%d packet_count=%d configured_repair_count=%d scaled_repair_count=%d leg={%s}",
+		sessionID, lane.id, group.basePacketID, group.sourceSpan, len(group.packets), configuredRepairCount, repairCount, debugLeg(leg))
 
 	for i, key := range keys {
 		symbol := shards[sourceSpan+i]
@@ -1112,6 +1178,26 @@ func (s *Send) sendRepair(ctx context.Context, sessionID uint64, lane *laneRunti
 
 		_ = s.WriteTo(ctx, leg, packet)
 	}
+}
+
+func scaledFECRepairCount(repairCount uint8, sourceSpan int) uint8 {
+	if sourceSpan <= 0 || sourceSpan > maxFECSourceSpan {
+		return 0
+	}
+	if repairCount == 0 {
+		repairCount = 1
+	}
+	if repairCount > maxFECSourceSpan {
+		repairCount = maxFECSourceSpan
+	}
+	scaled := (int(repairCount)*sourceSpan + maxFECSourceSpan - 1) / maxFECSourceSpan
+	if scaled < 1 {
+		return 1
+	}
+	if scaled > sourceSpan {
+		return uint8(sourceSpan)
+	}
+	return uint8(scaled)
 }
 
 func (s *Send) fecCodecFor(sourceSpan int, repairCount uint8) *fec.Codec {

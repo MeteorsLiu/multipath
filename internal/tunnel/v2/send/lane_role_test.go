@@ -354,3 +354,61 @@ func TestRepairCountEmitsMultipleRepairFrames(t *testing.T) {
 	default:
 	}
 }
+
+func TestRepairCountScalesForPartialGroup(t *testing.T) {
+	s := New()
+	s.EnableFEC()
+
+	const sessionID uint64 = 1002
+	s.sendStatesMu.Lock()
+	s.sendStates[sessionID] = &sendState{}
+	s.sendStatesMu.Unlock()
+
+	lane := newLaneRuntime(1, 100)
+	bindBoth(lane)
+	lane.setFEC(3)
+
+	packets := make([]*packetbuf.Packet, 2)
+	for i := range packets {
+		pkt := packetbuf.Acquire(24)
+		for j := range pkt.Payload {
+			pkt.Payload[j] = byte(i + j + 1)
+		}
+		packets[i] = pkt
+	}
+
+	group := txRepairGroup{
+		basePacketID: 88,
+		sourceSpan:   2,
+		packets:      packets,
+	}
+
+	s.sendRepair(context.Background(), sessionID, lane, group)
+
+	for i := 0; i < 2; i++ {
+		select {
+		case payload := <-s.Packets():
+			f, err := protocol.Decode(payload.Packet.Payload)
+			payload.Packet.Release()
+			if err != nil {
+				t.Fatalf("decode repair %d: %v", i, err)
+			}
+			if f.Type != protocol.TypeREPAIR {
+				t.Fatalf("frame %d type = %v, want REPAIR", i, f.Type)
+			}
+			body := f.Body.(protocol.RepairBody)
+			if body.SourceSpan != group.sourceSpan {
+				t.Fatalf("repair %d source_span = %d, want %d", i, body.SourceSpan, group.sourceSpan)
+			}
+		default:
+			t.Fatalf("got %d REPAIR frames, want 2", i)
+		}
+	}
+
+	select {
+	case payload := <-s.Packets():
+		payload.Packet.Release()
+		t.Fatal("got extra REPAIR frame, want exactly 2")
+	default:
+	}
+}

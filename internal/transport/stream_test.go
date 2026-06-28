@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -222,6 +224,36 @@ func TestStreamWritePayloadBatchWritesLengthPrefixedFrames(t *testing.T) {
 	}
 }
 
+func TestStreamStartsOneReadLoopPerConn(t *testing.T) {
+	conn := &blockingReadConn{
+		readStarted: make(chan struct{}, 2),
+		closed:      make(chan struct{}),
+	}
+	stream := NewStream(nil)
+	connID := stream.addConn(conn)
+	writer := eventChanWriter{events: make(chan Payload, 1)}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	stream.startReadLoop(ctx, connID, conn, writer)
+	stream.startReadLoop(ctx, connID, conn, writer)
+
+	select {
+	case <-conn.readStarted:
+	case <-time.After(time.Second):
+		t.Fatal("read loop did not start")
+	}
+
+	select {
+	case <-conn.readStarted:
+		t.Fatal("started duplicate read loop for same conn")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	_ = conn.Close()
+}
+
 func TestStreamWriteErrorClosesConn(t *testing.T) {
 	conn := &errorWriteConn{err: errors.New("write failed")}
 	stream := NewStream(nil)
@@ -253,6 +285,13 @@ type errorWriteConn struct {
 	closed bool
 }
 
+type blockingReadConn struct {
+	net.Conn
+	readStarted chan struct{}
+	closed      chan struct{}
+	closeOnce   sync.Once
+}
+
 type legFailureHandlerFunc func(context.Context, LegRef, error)
 
 func (f legFailureHandlerFunc) OnLegFailure(ctx context.Context, leg LegRef, err error) {
@@ -277,5 +316,21 @@ func (c *errorWriteConn) Write(payload []byte) (int, error) {
 
 func (c *errorWriteConn) Close() error {
 	c.closed = true
+	return nil
+}
+
+func (c *blockingReadConn) Read([]byte) (int, error) {
+	select {
+	case c.readStarted <- struct{}{}:
+	default:
+	}
+	<-c.closed
+	return 0, io.EOF
+}
+
+func (c *blockingReadConn) Close() error {
+	c.closeOnce.Do(func() {
+		close(c.closed)
+	})
 	return nil
 }

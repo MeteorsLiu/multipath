@@ -119,11 +119,17 @@ func (l *laneRuntime) bindTCP(ref Ref) {
 // touches it directly.
 func (l *laneRuntime) markActive(kind transport.Kind) {
 	l.leg.markActive(kind)
+	if debuglog.Enabled() {
+		debuglog.Printf("send/leg_state", "active lane=%d kind=%s", l.id, kindEventLabel(kind))
+	}
 }
 
 // markDown marks a transport inactive (spec 6.2: UDP ping超时 / TCP I/O error).
 func (l *laneRuntime) markDown(kind transport.Kind) {
 	l.leg.markDown(kind)
+	if debuglog.Enabled() {
+		debuglog.Printf("send/leg_state", "down lane=%d kind=%s", l.id, kindEventLabel(kind))
+	}
 }
 
 // setPrimary flips the leg's nominal primary orientation. Runtime DATA/REPAIR
@@ -162,14 +168,16 @@ func (i laneQoSInput) OnQoSStatus(udpLimited bool, udpDeliveredBps uint32, tcpLi
 	if i.lane == nil {
 		return
 	}
+	repairBefore := i.lane.currentFECRepairCount()
 	i.lane.leg.observeQoSStatus(udpLimited, udpDeliveredBps, tcpLimited, tcpDeliveredBps)
 	i.lane.setFEC(repairCount)
 	if debuglog.Enabled() {
+		repairAfter := i.lane.currentFECRepairCount()
 		primary := i.lane.primaryTransport()
 		shadow := i.lane.shadowTransport()
-		debuglog.Printf("send/qos", "apply session=%d lane=%d primary={%s} shadow={%s} udp_limited=%t udp_delivered_bps=%d tcp_limited=%t tcp_delivered_bps=%d",
+		debuglog.Printf("send/qos", "apply session=%d lane=%d primary={%s} shadow={%s} udp_limited=%t udp_delivered_bps=%d tcp_limited=%t tcp_delivered_bps=%d repair_count=%d repair_before=%d repair_after=%d",
 			i.sessionID, i.lane.id, debugLeg(primary), debugLeg(shadow),
-			udpLimited, udpDeliveredBps, tcpLimited, tcpDeliveredBps)
+			udpLimited, udpDeliveredBps, tcpLimited, tcpDeliveredBps, repairCount, repairBefore, repairAfter)
 	}
 }
 

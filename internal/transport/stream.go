@@ -30,6 +30,7 @@ type Stream struct {
 
 	mu      sync.RWMutex
 	conns   map[string]net.Conn
+	readers map[string]struct{}
 	writer  PacketWriter
 	failure LegFailureHandler
 	runCtx  context.Context
@@ -40,6 +41,7 @@ func NewStream(listener net.Listener) *Stream {
 	return &Stream{
 		listener: listener,
 		conns:    make(map[string]net.Conn),
+		readers:  make(map[string]struct{}),
 	}
 }
 
@@ -50,14 +52,26 @@ func (s *Stream) SetFailureHandler(handler LegFailureHandler) {
 }
 
 func (s *Stream) Run(ctx context.Context, writer PacketWriter) error {
+	type readStart struct {
+		connID string
+		conn   net.Conn
+	}
+	var starts []readStart
+
 	s.mu.Lock()
 	s.writer = writer
 	s.runCtx = ctx
 	for connID, conn := range s.conns {
-		debuglog.Printf("transport/tcp", "start existing read_loop conn=%s remote=%v", connID, debugRemoteAddr(conn))
-		go s.readLoop(ctx, connID, conn, writer)
+		if s.markReaderLocked(connID, conn) {
+			starts = append(starts, readStart{connID: connID, conn: conn})
+		}
 	}
 	s.mu.Unlock()
+
+	for _, start := range starts {
+		debuglog.Printf("transport/tcp", "start existing read_loop conn=%s remote=%v", start.connID, debugRemoteAddr(start.conn))
+		go s.readLoop(ctx, start.connID, start.conn, writer)
+	}
 	debuglog.Printf("transport/tcp", "run listener=%v", s.listener != nil)
 
 	errCh := make(chan error, 1)
@@ -100,9 +114,7 @@ func (s *Stream) Dial(ctx context.Context, remote string) (LegRef, error) {
 	connID := s.addConn(conn)
 	debuglog.Printf("transport/tcp", "dial ok remote=%s conn=%s local=%v", remote, connID, debugLocalAddr(conn))
 	writer, runCtx := s.currentRuntime()
-	if writer != nil {
-		go s.readLoop(runCtx, connID, conn, writer)
-	}
+	s.startReadLoop(runCtx, connID, conn, writer)
 
 	return LegRef{
 		Kind:   KindTCP,
@@ -230,6 +242,7 @@ func (s *Stream) Close(ctx context.Context, connID string) error {
 	s.mu.Lock()
 	conn := s.conns[connID]
 	delete(s.conns, connID)
+	delete(s.readers, connID)
 	s.mu.Unlock()
 	if conn == nil {
 		debuglog.Printf("transport/tcp", "close unknown conn=%s", connID)
@@ -277,7 +290,7 @@ func (s *Stream) acceptLoop(ctx context.Context, writer PacketWriter) error {
 
 		connID := s.addConn(conn)
 		debuglog.Printf("transport/tcp", "accept conn=%s remote=%v local=%v", connID, debugRemoteAddr(conn), debugLocalAddr(conn))
-		go s.readLoop(ctx, connID, conn, writer)
+		s.startReadLoop(ctx, connID, conn, writer)
 	}
 }
 
@@ -377,6 +390,30 @@ func (s *Stream) addConn(conn net.Conn) string {
 	return connID
 }
 
+func (s *Stream) startReadLoop(ctx context.Context, connID string, conn net.Conn, writer PacketWriter) {
+	if writer == nil {
+		return
+	}
+	s.mu.Lock()
+	start := s.markReaderLocked(connID, conn)
+	s.mu.Unlock()
+	if !start {
+		return
+	}
+	go s.readLoop(ctx, connID, conn, writer)
+}
+
+func (s *Stream) markReaderLocked(connID string, conn net.Conn) bool {
+	if connID == "" || conn == nil || s.conns[connID] != conn {
+		return false
+	}
+	if _, ok := s.readers[connID]; ok {
+		return false
+	}
+	s.readers[connID] = struct{}{}
+	return true
+}
+
 func (s *Stream) currentRuntime() (PacketWriter, context.Context) {
 	s.mu.RLock()
 	writer := s.writer
@@ -395,6 +432,7 @@ func (s *Stream) deleteConn(connID string, conn net.Conn) bool {
 		return false
 	}
 	delete(s.conns, connID)
+	delete(s.readers, connID)
 	return true
 }
 

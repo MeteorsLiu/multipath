@@ -88,6 +88,7 @@ PORT_LINK_STATUS_QOS_IPERF_JITTER=5033
 PORT_LINK_STATUS_QOS_IPERF_RTT200=5034
 PORT_TCP_FALLBACK_RATE_DYNAMIC=5035
 PORT_LINK_STATUS_QOS_JITTER_NO_QOS=5036
+PORT_FEC_ADAPTIVE_75=5037
 
 PATH1_C="10.201.1.1/24"
 PATH1_S="10.201.1.2/24"
@@ -1055,6 +1056,10 @@ clear_loss() {
   ip netns exec "${NS_S}" tc qdisc del dev "${VETHSN}" root >/dev/null 2>&1 || true
   ip netns exec "${NS_N}" tc qdisc del dev "${VETHNC}" root >/dev/null 2>&1 || true
   ip netns exec "${NS_N}" tc qdisc del dev "${VETHNS}" root >/dev/null 2>&1 || true
+  ip netns exec "${NS_C}" iptables -F OUTPUT >/dev/null 2>&1 || true
+  ip netns exec "${NS_C}" iptables -t mangle -F OUTPUT >/dev/null 2>&1 || true
+  ip netns exec "${NS_S}" iptables -t mangle -F OUTPUT >/dev/null 2>&1 || true
+  ip netns exec "${NS_N}" iptables -t mangle -F OUTPUT >/dev/null 2>&1 || true
   ip netns exec "${NS_S}" iptables -F INPUT >/dev/null 2>&1 || true
 }
 
@@ -1160,6 +1165,34 @@ add_port_filter() {
     match ip protocol "${proto_num}" 0xff \
     match ip "${field}" "${port}" 0xffff \
     flowid "1:${band}"
+}
+
+add_mark_filter() {
+  local ns="$1"
+  local dev="$2"
+  local prio="$3"
+  local mark="$4"
+  local band="$5"
+  ip netns exec "${ns}" tc filter replace dev "${dev}" protocol ip parent 1:0 prio "${prio}" handle "${mark}" fw flowid "1:${band}"
+}
+
+add_udp_output_mark() {
+  local ns="$1"
+  local dev="$2"
+  local field="$3"
+  local port="$4"
+  local mark="$5"
+
+  case "${field}" in
+  dport | sport)
+    ;;
+  *)
+    echo "unsupported udp mark field: ${field}"
+    exit 1
+    ;;
+  esac
+
+  ip netns exec "${ns}" iptables -t mangle -A OUTPUT -o "${dev}" -p udp "--${field}" "${port}" -j MARK --set-mark "${mark}"
 }
 
 add_udp_port_large_packet_filter() {
@@ -1298,6 +1331,25 @@ apply_udp_partial_loss_client_to_server_path() {
   add_port_filter "${NS_C}" "${client_dev}" 1 udp dport "${port}" 3
 }
 
+apply_udp_data_keep_one_of_four_client_to_server_path() {
+  local path="$1"
+  local port="$2"
+  local client_dev
+  client_dev="$(path_client_dev "${path}")"
+
+  setup_prio_qdisc "${NS_C}" "${client_dev}"
+  add_loss_band "${NS_C}" "${client_dev}" 3 30 100%
+  ip netns exec "${NS_C}" tc filter replace dev "${client_dev}" protocol ip parent 1:0 prio 1 handle 75 fw flowid 1:3
+
+  ip netns exec "${NS_C}" iptables -t mangle -A OUTPUT -o "${client_dev}" \
+    -p udp --dport "${port}" -m length --length 80:65535 \
+    -m statistic --mode nth --every 4 --packet 0 \
+    -j ACCEPT
+  ip netns exec "${NS_C}" iptables -t mangle -A OUTPUT -o "${client_dev}" \
+    -p udp --dport "${port}" -m length --length 80:65535 \
+    -j MARK --set-mark 75
+}
+
 apply_udp_partial_loss_server_to_client_path() {
   local path="$1"
   local port="$2"
@@ -1331,17 +1383,20 @@ apply_udp_tunnel_rate_path() {
   local path="$1"
   local port="$2"
   local rate="$3"
+  local mark="0x301"
   local client_dev server_dev
   client_dev="$(path_client_dev "${path}")"
   server_dev="$(path_server_dev "${path}")"
 
   setup_prio_qdisc "${NS_C}" "${client_dev}"
   add_rate_band "${NS_C}" "${client_dev}" 3 30 "${rate}"
-  add_port_filter "${NS_C}" "${client_dev}" 1 udp dport "${port}" 3
+  add_udp_output_mark "${NS_C}" "${client_dev}" dport "${port}" "${mark}"
+  add_mark_filter "${NS_C}" "${client_dev}" 1 "${mark}" 3
 
   setup_prio_qdisc "${NS_S}" "${server_dev}"
   add_rate_band "${NS_S}" "${server_dev}" 3 30 "${rate}"
-  add_port_filter "${NS_S}" "${server_dev}" 1 udp sport "${port}" 3
+  add_udp_output_mark "${NS_S}" "${server_dev}" sport "${port}" "${mark}"
+  add_mark_filter "${NS_S}" "${server_dev}" 1 "${mark}" 3
 }
 
 apply_udp_tunnel_rate_with_delay_jitter_path() {
@@ -1350,19 +1405,22 @@ apply_udp_tunnel_rate_with_delay_jitter_path() {
   local rate="$3"
   local delay="$4"
   local jitter="$5"
+  local mark="0x301"
   local client_dev server_dev
   client_dev="$(path_client_dev "${path}")"
   server_dev="$(path_server_dev "${path}")"
 
   setup_prio_qdisc "${NS_C}" "${client_dev}"
   add_delay_jitter_rate_band "${NS_C}" "${client_dev}" 3 30 "${delay}" "${jitter}" "${rate}"
-  add_port_filter "${NS_C}" "${client_dev}" 1 udp dport "${port}" 3
+  add_udp_output_mark "${NS_C}" "${client_dev}" dport "${port}" "${mark}"
+  add_mark_filter "${NS_C}" "${client_dev}" 1 "${mark}" 3
   add_delay_jitter_band "${NS_C}" "${client_dev}" 4 40 "${delay}" "${jitter}"
   add_port_filter "${NS_C}" "${client_dev}" 2 tcp dport "${port}" 4
 
   setup_prio_qdisc "${NS_S}" "${server_dev}"
   add_delay_jitter_rate_band "${NS_S}" "${server_dev}" 3 30 "${delay}" "${jitter}" "${rate}"
-  add_port_filter "${NS_S}" "${server_dev}" 1 udp sport "${port}" 3
+  add_udp_output_mark "${NS_S}" "${server_dev}" sport "${port}" "${mark}"
+  add_mark_filter "${NS_S}" "${server_dev}" 1 "${mark}" 3
   add_delay_jitter_band "${NS_S}" "${server_dev}" 4 40 "${delay}" "${jitter}"
   add_port_filter "${NS_S}" "${server_dev}" 2 tcp sport "${port}" 4
 }
@@ -2017,6 +2075,220 @@ assert_log_file_pattern_count_since_le() {
   fi
 }
 
+assert_fec_groups_scaled_tcp_repairs_since() {
+  local label="$1"
+  local log_file="$2"
+  local start_line="$3"
+  local full_repair_count="$4"
+  local output status
+
+  set +e
+  output="$(python3 - "${log_file}" "${start_line}" "${full_repair_count}" <<'PY'
+import re
+import sys
+
+path = sys.argv[1]
+start = int(sys.argv[2])
+full_repair_count = int(sys.argv[3])
+data = {}
+repairs = {}
+
+field_re = {}
+
+
+def field(line, name):
+    regex = field_re.get(name)
+    if regex is None:
+        regex = re.compile(r"\b" + re.escape(name) + r"=([0-9]+)")
+        field_re[name] = regex
+    match = regex.search(line)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def scaled_count(repair_count, source_span):
+    if repair_count <= 0:
+        repair_count = 1
+    if repair_count > 4:
+        repair_count = 4
+    count = (repair_count * source_span + 3) // 4
+    if count < 1:
+        return 1
+    if count > source_span:
+        return source_span
+    return count
+
+
+try:
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line_no, line in enumerate(f, 1):
+            if line_no <= start:
+                continue
+            if "recv: frame_in type=DATA " in line and "leg={udp " in line:
+                lane = field(line, "lane")
+                packet_id = field(line, "packet_id")
+                if lane is not None and packet_id is not None:
+                    data.setdefault(lane, set()).add(packet_id)
+                continue
+            if "recv: frame_in type=REPAIR " in line and "leg={tcp " in line:
+                lane = field(line, "lane")
+                base = field(line, "base_packet_id")
+                key = field(line, "key")
+                span = field(line, "source_span")
+                if None not in (lane, base, key, span):
+                    repairs.setdefault((lane, base, span), set()).add(key)
+except FileNotFoundError:
+    print(f"log file missing: {path}")
+    sys.exit(2)
+
+best = None
+match = None
+oversent = None
+for (lane, base, span), keys in sorted(repairs.items()):
+    udp_data = sum(1 for packet_id in data.get(lane, set()) if base <= packet_id < base + span)
+    got = len(keys)
+    want = scaled_count(full_repair_count, span)
+    candidate = (got, udp_data, lane, base, span, want)
+    if best is None or candidate > best:
+        best = candidate
+    if got > want:
+        oversent = candidate
+    elif got == want and udp_data < span and match is None:
+        match = candidate
+
+if oversent is not None:
+    got, udp_data, lane, base, span, want = oversent
+    print(f"oversent lane={lane} base_packet_id={base} source_span={span} udp_data={udp_data} tcp_repairs={got} want={want}")
+    sys.exit(1)
+
+if match is not None:
+    got, udp_data, lane, base, span, want = match
+    print(f"ok lane={lane} base_packet_id={base} source_span={span} udp_data={udp_data} tcp_repairs={got} want={want}")
+    sys.exit(0)
+
+if best is None:
+    print("no TCP REPAIR group found")
+else:
+    got, udp_data, lane, base, span, want = best
+    print(f"best lane={lane} base_packet_id={base} source_span={span} udp_data={udp_data} tcp_repairs={got} want={want}")
+sys.exit(1)
+PY
+)"
+  status=$?
+  set -e
+
+  if (( status == 0 )); then
+    pass "${label}" "server observed scaled TCP REPAIR count for an actually observed FEC group: ${output#ok }"
+  else
+    fail "${label}" "server did not observe a correctly scaled TCP REPAIR group: ${output}"
+  fi
+}
+
+assert_fec_span_two_scaled_tcp_repairs_since() {
+  local label="$1"
+  local log_file="$2"
+  local start_line="$3"
+  local full_repair_count="$4"
+  local output status
+
+  set +e
+  output="$(python3 - "${log_file}" "${start_line}" "${full_repair_count}" <<'PY'
+import re
+import sys
+
+path = sys.argv[1]
+start = int(sys.argv[2])
+full_repair_count = int(sys.argv[3])
+repairs = {}
+field_re = {}
+
+
+def field(line, name):
+    regex = field_re.get(name)
+    if regex is None:
+        regex = re.compile(r"\b" + re.escape(name) + r"=([0-9]+)")
+        field_re[name] = regex
+    match = regex.search(line)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def scaled_count(repair_count, source_span):
+    if repair_count <= 0:
+        repair_count = 1
+    if repair_count > 4:
+        repair_count = 4
+    count = (repair_count * source_span + 3) // 4
+    if count < 1:
+        return 1
+    if count > source_span:
+        return source_span
+    return count
+
+
+try:
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line_no, line in enumerate(f, 1):
+            if line_no <= start:
+                continue
+            if "recv: frame_in type=REPAIR " not in line or "leg={tcp " not in line:
+                continue
+            lane = field(line, "lane")
+            base = field(line, "base_packet_id")
+            key = field(line, "key")
+            span = field(line, "source_span")
+            if None not in (lane, base, key, span):
+                repairs.setdefault((lane, base, span), set()).add(key)
+except FileNotFoundError:
+    print(f"log file missing: {path}")
+    sys.exit(2)
+
+best = None
+match = None
+oversent = None
+for (lane, base, span), keys in sorted(repairs.items()):
+    if span != 2:
+        continue
+    got = len(keys)
+    want = scaled_count(full_repair_count, span)
+    candidate = (got, lane, base, span, want)
+    if best is None or candidate > best:
+        best = candidate
+    if got > want:
+        oversent = candidate
+    elif got == want and match is None:
+        match = candidate
+
+if oversent is not None:
+    got, lane, base, span, want = oversent
+    print(f"oversent lane={lane} base_packet_id={base} source_span={span} tcp_repairs={got} want={want}")
+    sys.exit(1)
+
+if match is not None:
+    got, lane, base, span, want = match
+    print(f"ok lane={lane} base_packet_id={base} source_span={span} tcp_repairs={got}")
+    sys.exit(0)
+
+if best is None:
+    print("no source_span=2 TCP REPAIR group found")
+else:
+    got, lane, base, span, want = best
+    print(f"best lane={lane} base_packet_id={base} source_span={span} tcp_repairs={got} want={want}")
+sys.exit(1)
+PY
+)"
+  status=$?
+  set -e
+
+  if (( status == 0 )); then
+    pass "${label}" "server observed scaled TCP REPAIR count for source_span=2 FEC group: ${output#ok }"
+  else
+    fail "${label}" "server did not observe scaled TCP REPAIR count for source_span=2 FEC group: ${output}"
+  fi
+}
+
 wait_bandwidth_probe_udp_rate_window() {
   local label="$1"
   local log_file="$2"
@@ -2433,6 +2705,80 @@ wait_log_file_pattern_while_ping_from() {
   return 1
 }
 
+wait_log_file_pattern_while_iperf_from() {
+  local label="$1"
+  local log_file="$2"
+  local pattern="$3"
+  local timeout="${4:-15}"
+  local message="$5"
+  local start_line="${6:-0}"
+  local server_ns="$7"
+  local server_bind="$8"
+  local client_ns="$9"
+  local client_remote="${10}"
+  if [[ -z "${log_file}" ]]; then
+    fail "${label}" "${message}: log file unset"
+    return 1
+  fi
+  if ! command -v iperf3 >/dev/null 2>&1; then
+    fail "${label}" "${message}: iperf3 not found"
+    return 1
+  fi
+  if ! command -v timeout >/dev/null 2>&1; then
+    fail "${label}" "${message}: timeout not found"
+    return 1
+  fi
+
+  local iperf_server_log="${WORKDIR}/${label}.wait-iperf-server.log"
+  local iperf_client_log="${WORKDIR}/${label}.wait-iperf-client.log"
+  echo "[${label}] drive iperf3 while waiting: ${client_ns}->${client_remote}, server=${server_ns}/${server_bind}"
+  ip netns exec "${server_ns}" iperf3 -s -1 -B "${server_bind}" >"${iperf_server_log}" 2>&1 &
+  local iperf_server=$!
+  sleep 1
+  timeout "$((timeout + 5))s" ip netns exec "${client_ns}" iperf3 -c "${client_remote}" -t "${timeout}" -i 1 >"${iperf_client_log}" 2>&1 &
+  local iperf_client=$!
+
+  local deadline=$((SECONDS + timeout))
+  while (( SECONDS < deadline )); do
+    if log_file_has_any_pattern_since "${log_file}" "${start_line}" "${pattern}"; then
+      kill "${iperf_client}" "${iperf_server}" >/dev/null 2>&1 || true
+      wait "${iperf_client}" >/dev/null 2>&1 || true
+      wait "${iperf_server}" >/dev/null 2>&1 || true
+      pass "${label}" "${message}"
+      return 0
+    fi
+    if ! check_multipath_alive "${label}"; then
+      kill "${iperf_client}" "${iperf_server}" >/dev/null 2>&1 || true
+      wait "${iperf_client}" >/dev/null 2>&1 || true
+      wait "${iperf_server}" >/dev/null 2>&1 || true
+      return 1
+    fi
+    if ! kill -0 "${iperf_client}" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 0.2
+  done
+  if log_file_has_any_pattern_since "${log_file}" "${start_line}" "${pattern}"; then
+    kill "${iperf_client}" "${iperf_server}" >/dev/null 2>&1 || true
+    wait "${iperf_client}" >/dev/null 2>&1 || true
+    wait "${iperf_server}" >/dev/null 2>&1 || true
+    pass "${label}" "${message}"
+    return 0
+  fi
+
+  kill "${iperf_client}" "${iperf_server}" >/dev/null 2>&1 || true
+  wait "${iperf_client}" >/dev/null 2>&1 || true
+  wait "${iperf_server}" >/dev/null 2>&1 || true
+  echo "[${label}] iperf3 client log: ${iperf_client_log}"
+  tail -n 12 "${iperf_client_log}" || true
+  echo "[${label}] iperf3 server log: ${iperf_server_log}"
+  tail -n 12 "${iperf_server_log}" || true
+  echo "[${label}] traffic probe debug: ns=${client_ns} remote=${client_remote}"
+  ip netns exec "${client_ns}" ip -4 route get "${client_remote}" || true
+  fail "${label}" "${message}: pattern not seen within ${timeout}s: ${pattern}"
+  return 1
+}
+
 run_fec_case() {
   local label="$1"
   local fec_flag="$2"
@@ -2620,6 +2966,59 @@ run_multipath_fec_case() {
   echo "==== ${name} e2e end ===="
 }
 
+run_fec_adaptive_75_case() {
+  local name="fec-adaptive-75"
+  echo "==== ${name} e2e start ===="
+  clear_loss
+  write_one_lane_config "${name}" "${PORT_FEC_ADAPTIVE_75}" false true 200 3000
+  start_multipath "${name}"
+
+  wait_ping_ok "${name} baseline" 12
+  wait_log_pattern "${name}" "send: hello_ack_active session=[0-9]+ lane=1 kind=2" 20 "TCP shadow leg reached HELLO_ACK"
+
+  local server_loss_line
+  local client_apply_line
+  server_loss_line="$(current_log_file_line_count "${CURRENT_SERVER_LOG}")"
+  client_apply_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
+
+  echo "[${name}] deterministically drop 3 of every 4 client-to-server UDP DATA frames; TCP REPAIR stays clean"
+  apply_udp_data_keep_one_of_four_client_to_server_path 1 "${PORT_FEC_ADAPTIVE_75}"
+  run_short_ping_load "${name}-warmup" 200 0.001
+  wait_log_file_pattern "${name}" "${CURRENT_CLIENT_LOG}" "runtime: link_status_apply session=[0-9]+ lane=1 status=0x44" 5 "client applied FEC repair count 3 before QoS selector switch"
+
+  local server_partial_line
+  server_partial_line="$(current_log_file_line_count "${CURRENT_SERVER_LOG}")"
+  run_short_ping_load "${name}-partial-group-check" 2 0.001
+  sleep 0.2
+  assert_fec_span_two_scaled_tcp_repairs_since "${name}" "${CURRENT_SERVER_LOG}" "${server_partial_line}" 3
+
+  local server_group_line
+  server_group_line="$(current_log_file_line_count "${CURRENT_SERVER_LOG}")"
+  run_short_ping_load "${name}-group-check" 400 0.001
+  sleep 0.2
+  assert_fec_groups_scaled_tcp_repairs_since "${name}" "${CURRENT_SERVER_LOG}" "${server_group_line}" 3
+
+  run_ping_sample "${name}-steady"
+
+  if awk -v loss="${PING_SAMPLE_LOSS}" 'BEGIN { exit !(loss < 1) }'; then
+    pass "${name}" "observed packet loss ${PING_SAMPLE_LOSS}% < 1% after adaptive FEC"
+  else
+    fail "${name}" "observed packet loss ${PING_SAMPLE_LOSS}% >= 1% after adaptive FEC"
+  fi
+
+  assert_log_file_pattern_count_since_le "${name}" "${CURRENT_SERVER_LOG}" "${server_loss_line}" "recv: recover_err" 0 "server observed no FEC recovery errors"
+
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_SERVER_LOG}" "runtime/qos: link_status_send session=[0-9]+ lane=1 status=0x10 .*udp_limited=true" "${LINK_STATUS_QOS_WAIT}" "server emitted UDP limited LINK_STATUS with reset repair count" "${server_loss_line}"
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "runtime: link_status_apply session=[0-9]+ lane=1 status=0x10 .*udp_limited=true" "${LINK_STATUS_QOS_WAIT}" "client applied UDP limited LINK_STATUS with reset repair count" "${client_apply_line}"
+  wait_log_file_pattern_while_ping_from "${name}" "${CURRENT_CLIENT_LOG}" "schedule_select.*lane=1 .*leg=\\{tcp .*frame=type=DATA" 20 "client sent DATA over TCP after reset-count QoS switch" "${client_apply_line}" "${NS_C}" "${TUN_C_REMOTE}"
+  assert_log_file_pattern_count_since_le "${name}" "${CURRENT_SERVER_LOG}" "${server_loss_line}" "runtime/qos: link_status_send session=[0-9]+ lane=1 status=0x54" 0 "server did not emit UDP limited LINK_STATUS with stale repair count 3"
+  assert_log_file_pattern_count_since_le "${name}" "${CURRENT_CLIENT_LOG}" "${client_apply_line}" "runtime: link_status_apply session=[0-9]+ lane=1 status=0x54" 0 "client did not apply UDP limited LINK_STATUS with stale repair count 3"
+
+  stop_multipath
+  clear_loss
+  echo "==== ${name} e2e end ===="
+}
+
 run_fec_disabled_negotiation_case() {
   local name="fec-disabled-negotiation"
   echo "==== ${name} e2e start ===="
@@ -2677,7 +3076,7 @@ run_link_status_qos_case() {
   clear_loss
   local client_return_line
   client_return_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
-  wait_log_file_pattern_while_ping_from "${name}" "${CURRENT_CLIENT_LOG}" "schedule_select.*lane=1 .*leg=\\{udp .*frame=type=DATA" 35 "client selector returned DATA to UDP after QoS clear" "${client_return_line}" "${NS_C}" "${TUN_C_REMOTE}"
+  wait_log_file_pattern_while_iperf_from "${name}" "${CURRENT_CLIENT_LOG}" "schedule_select.*lane=1 .*leg=\\{udp .*frame=type=DATA" 35 "client selector returned DATA to UDP after QoS clear" "${client_return_line}" "${NS_S}" "${TUN_S_LOCAL}" "${NS_C}" "${TUN_C_REMOTE}"
   wait_ping_ok "${name} post-qos-clear" 12
 
   stop_multipath
@@ -2722,7 +3121,7 @@ run_link_status_qos_reverse_case() {
   clear_loss
   local server_return_line
   server_return_line="$(current_log_file_line_count "${CURRENT_SERVER_LOG}")"
-  wait_log_file_pattern_while_ping_from "${name}" "${CURRENT_SERVER_LOG}" "schedule_select.*lane=1 .*leg=\\{udp .*frame=type=DATA" 35 "server selector returned DATA to UDP after QoS clear" "${server_return_line}" "${NS_S}" "${TUN_S_REMOTE}"
+  wait_log_file_pattern_while_iperf_from "${name}" "${CURRENT_SERVER_LOG}" "schedule_select.*lane=1 .*leg=\\{udp .*frame=type=DATA" 35 "server selector returned DATA to UDP after QoS clear" "${server_return_line}" "${NS_C}" "${TUN_C_LOCAL}" "${NS_S}" "${TUN_S_REMOTE}"
   wait_ping_ok "${name} post-qos-clear" 12
 
   stop_multipath
@@ -3302,6 +3701,7 @@ run_fec_comparison
 run_fec_disabled_negotiation_case
 run_fec_tcp_fallback_case
 run_multipath_fec_case
+run_fec_adaptive_75_case
 run_link_status_qos_case
 run_link_status_qos_reverse_case
 run_link_status_qos_jitter_no_qos_case
