@@ -52,8 +52,8 @@ func (w *QoSWriter) Write(ctx context.Context, status recv.QoSStatus) error {
 		return nil
 	}
 	linkStatus := linkStatusByte(status.UDPLimited, status.TCPLimited, status.RepairCount)
-	debuglog.Printf("runtime/qos", "link_status_send session=%d lane=%d status=%#02x control_leg=tcp udp_limited=%t udp_delivered_bps=%d tcp_limited=%t tcp_delivered_bps=%d",
-		status.SessionID, status.LaneID, linkStatus, status.UDPLimited, status.UDPDeliveredBps, status.TCPLimited, status.TCPDeliveredBps)
+	debuglog.Printf("runtime/qos", "link_status_send session=%d lane=%d status=%#02x control_leg=tcp udp_limited=%t udp_delivered_bps=%d tcp_limited=%t tcp_delivered_bps=%d repair_count=%d",
+		status.SessionID, status.LaneID, linkStatus, status.UDPLimited, status.UDPDeliveredBps, status.TCPLimited, status.TCPDeliveredBps, status.RepairCount)
 	err := w.send.WriteFrame(ctx, protocol.Frame{
 		Version:   protocol.Version,
 		Type:      protocol.TypeLinkStatus,

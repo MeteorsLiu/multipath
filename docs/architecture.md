@@ -304,9 +304,7 @@ QoS limited/clear decisions are made only by estimator ticks. DATA and REPAIR
 arrival paths only add bytes to pending counters and must not submit limited or
 clear state directly.
 FEC health observations such as incomplete-group `DataArrived/DataExpected`
-must be refreshed by new health samples before they can advance a limited or
-clear decision; an old health sample must not be re-used by empty ticks as
-fresh evidence.
+do not feed the QoS estimator. They drive only adaptive repair count.
 The estimator records the current primary transport direction for the lane. The
 shadow direction is the opposite transport kind and does not need separate
 storage. Rate EMAs, PID correction, limited state, and decision-filter state are
@@ -314,10 +312,9 @@ scoped to the DATA/REPAIR direction and role: primary/DATA role state is used to
 judge the current primary DATA leg, and shadow/REPAIR role state is used to
 observe the current shadow leg. Each tick evaluates only the state for the
 current role; non-current role state does not consume the tick, advance the
-decision filter, or emit LINK_STATUS state. The current rate and health
-estimator paths use a short decision-sample filter before committing
-clear/limited state; this should not be read as an additional wall-clock sustain
-duration on every path.
+decision filter, or emit LINK_STATUS state. The current rate estimator path uses
+a short decision-sample filter before committing clear/limited state; this
+should not be read as an additional wall-clock sustain duration on every path.
 Before changing the current primary direction, the estimator resets the target
 primary/DATA state that would otherwise carry stale `actual` or `expected` rate
 history into the new primary leg. It also resets the old primary's
@@ -338,8 +335,8 @@ Recv must not feed duplicate DATA into the FEC window or the QoS estimator after
 session emit dedupe rejects that packet id. QoS must not create synthetic DATA
 bytes, recovered bytes, mature rate samples, or bandwidth-estimation inputs from
 discarded DATA, late duplicate DATA, unrecovered DATA, or FEC-recovered DATA.
-Unrecovered missing DATA may only contribute to FEC health observations such as
-`DataArrived/DataExpected`.
+Unrecovered missing DATA may only contribute to adaptive FEC health observations
+such as `DataArrived/DataExpected`; it must not feed QoS estimator state.
 Recv must not import or call concrete Send.
 ```
 

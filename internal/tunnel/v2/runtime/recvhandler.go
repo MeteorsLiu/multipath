@@ -388,15 +388,15 @@ func (h *RecvHandler) OnQoS(ctx context.Context, leg transport.LegRef, frame pro
 	}
 	qos := h.lanes.LookupQoS(send.LaneKey{SessionID: frame.SessionID, LaneID: frame.LaneID})
 	if qos == nil {
-		debuglog.Printf("runtime", "link_status_drop no_qos session=%d lane=%d", frame.SessionID, frame.LaneID)
+		debuglog.Printf("runtime", "link_status_drop no_qos session=%d lane=%d repair_count=%d", frame.SessionID, frame.LaneID, repairCount)
 		recordLinkStatusEvent("apply_drop_no_qos", frame.SessionID, frame.LaneID, udpLimited, tcpLimited)
 		eventlog.Printf("link_status", "action=apply_drop_no_qos session=%d lane=%d status=%#02x",
 			frame.SessionID, frame.LaneID, body.Status)
 		return nil
 	}
 	qos.OnQoSStatus(udpLimited, body.UDPDeliveredBps, tcpLimited, body.TCPDeliveredBps, repairCount)
-	debuglog.Printf("runtime", "link_status_apply session=%d lane=%d status=%#02x control_leg=%s udp_limited=%t udp_delivered_bps=%d tcp_limited=%t tcp_delivered_bps=%d",
-		frame.SessionID, frame.LaneID, body.Status, runtimeKindLabel(leg.Kind), udpLimited, body.UDPDeliveredBps, tcpLimited, body.TCPDeliveredBps)
+	debuglog.Printf("runtime", "link_status_apply session=%d lane=%d status=%#02x control_leg=%s udp_limited=%t udp_delivered_bps=%d tcp_limited=%t tcp_delivered_bps=%d repair_count=%d",
+		frame.SessionID, frame.LaneID, body.Status, runtimeKindLabel(leg.Kind), udpLimited, body.UDPDeliveredBps, tcpLimited, body.TCPDeliveredBps, repairCount)
 	recordLinkStatusEvent("apply", frame.SessionID, frame.LaneID, udpLimited, tcpLimited)
 	return nil
 }

@@ -850,10 +850,10 @@ cross-leg evidence and must not produce a QoS decision.
 The QoS estimator is event-counter based:
 
 ```text
-non-duplicate DATA accepted -> pending DATA bytes += DATA payload length
-REPAIR accepted             -> pending REPAIR bytes += REPAIR payload length
-periodic tick               -> convert pending counters to rate observations
-                               and clear the pending counters
+first DATA-frame arrival -> pending DATA bytes += DATA payload length
+REPAIR accepted          -> pending REPAIR bytes += REPAIR payload length
+periodic tick            -> convert pending counters to rate observations
+                            and clear the pending counters
 ```
 
 For an already-observed DATA / REPAIR direction, an empty tick is still a
@@ -884,12 +884,14 @@ The receiver aggregates committed direction-local role state into the final
 per-transport LINK_STATUS snapshot; the aggregated UDP/TCP status must not be
 used as a gate for another direction's QoS judgment.
 
-Duplicate DATA rejected by the session emit dedupe is dropped before FEC-window
-or QoS bookkeeping. Discarded DATA, late duplicate DATA, unrecovered DATA, and
-FEC-recovered DATA must not be converted into DATA-leg actual bytes, synthetic
-DATA bytes, mature rate samples, or bandwidth-estimation inputs. Recovered IP
-lengths may be used only as expected source bytes for a completed or recovered
-FEC group.
+Duplicate DATA rejected by the session emit dedupe is dropped before TUN output
+and FEC-window bookkeeping. QoS DATA bytes use a separate DATA-arrival dedupe:
+a late original DATA frame may count once as DATA-leg arrival evidence even if a
+FEC-recovered copy was already written to TUN. The same DATA frame must not
+count twice, and FEC-recovered DATA must not be converted into DATA-leg actual
+bytes, synthetic DATA bytes, mature rate samples, or bandwidth-estimation
+inputs. Recovered IP lengths may be used only as expected source bytes for a
+completed or recovered FEC group.
 
 Unrecovered missing DATA may only contribute to FEC health observations:
 
@@ -897,10 +899,9 @@ Unrecovered missing DATA may only contribute to FEC health observations:
 DataArrived / DataExpected
 ```
 
-FEC health does not directly commit QoS limited or clear state. It drives only
-the lane-local adaptive repair count carried in LINK_STATUS. Empty estimator
-ticks may decay rate EMAs, but they must not turn an old incomplete-group
-health sample into fresh QoS evidence.
+FEC health is not a QoS detector input. It drives only the lane-local adaptive
+repair count carried in LINK_STATUS. Empty estimator ticks may decay rate EMAs,
+but they must not turn an old incomplete-group health sample into QoS evidence.
 
 Adaptive repair count is computed from group packet arrival ratio:
 
@@ -909,7 +910,8 @@ lossRatio   = (sum(DataExpected) - sum(DataArrived)) / sum(DataExpected)
 repairCount = clamp(ceil(lossRatio * 4), 1, 4)
 ```
 
-The receiver derives rate estimates from accepted DATA and REPAIR byte counters:
+The receiver derives rate estimates from counted DATA-frame and REPAIR byte
+counters:
 
 ```text
 actualRate           = accepted DATA bytes / tick duration

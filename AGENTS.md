@@ -37,19 +37,21 @@ QoS detection is based on FEC differential observations. Within one FEC group,
 the DATA leg and REPAIR leg carry differential observations of the same source
 data under the FEC rules. QoS detection may compare values derived from that
 same-group relationship, for example expected DATA bytes versus actual DATA
-bytes or unrecoverable group health. Do not treat primary and shadow legs as the
-same capacity reference across different transport protocols. Do not introduce
-cross-leg capacity heuristics such as using shadow throughput as primary
-capacity, `max(expectedBps, shadowBps)`, or a `CapacityGap`-style signal for
-primary-leg QoS decisions.
+bytes. FEC health is not a QoS detector input; it drives only adaptive repair
+count. Do not treat primary and shadow legs as the same capacity reference
+across different transport protocols. Do not introduce cross-leg capacity
+heuristics such as using shadow throughput as primary capacity,
+`max(expectedBps, shadowBps)`, or a `CapacityGap`-style signal for primary-leg
+QoS decisions.
 
 QoS detection must not use duplicate or discarded DATA packets as late
 bookkeeping inputs. Once `emitDedupe` rejects a DATA packet, it must be dropped
 without updating rx windows, rate samples, mature samples, or QoS estimator
-state. Unrecovered missing DATA may only contribute to FEC health observations
-such as `DataArrived/DataExpected`; do not convert unrecovered, discarded, or
-late duplicate packets into synthetic DATA bytes, recovered bytes, rate samples,
-or bandwidth-estimation inputs.
+state. Unrecovered missing DATA may only contribute to adaptive FEC health
+observations such as `DataArrived/DataExpected`; do not feed it into the QoS
+estimator or convert unrecovered, discarded, or late duplicate packets into
+synthetic DATA bytes, recovered bytes, rate samples, or bandwidth-estimation
+inputs.
 
 QoS estimator rate state, PID correction state, limited state, and
 decision-filter state must be scoped to the DATA/REPAIR direction, for example

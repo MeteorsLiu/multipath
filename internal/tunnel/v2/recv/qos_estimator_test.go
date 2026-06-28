@@ -1,6 +1,7 @@
 package recv
 
 import (
+	"reflect"
 	"testing"
 	"time"
 
@@ -35,14 +36,13 @@ func observeProfileRateTick(e *qosEstimator, at time.Time, dataKind, repairKind 
 	return out
 }
 
-func observeHealth(e *qosEstimator, at time.Time, dataKind, repairKind transport.Kind, arrived, expected uint64) {
-	e.ObserveHealth(qosHealthSample{
-		At:           at,
-		DataKind:     dataKind,
-		RepairKind:   repairKind,
-		DataArrived:  arrived,
-		DataExpected: expected,
-	})
+func TestQoSEstimatorDirectionStateHasNoRateEMA(t *testing.T) {
+	stateType := reflect.TypeOf(qosDirectionState{})
+	for _, name := range []string{"actual", "repair"} {
+		if _, ok := stateType.FieldByName(name); ok {
+			t.Fatalf("qosDirectionState still has %s EMA state", name)
+		}
+	}
 }
 
 func TestQoSEstimatorStaysSilentBelowSampleFloor(t *testing.T) {
@@ -89,25 +89,20 @@ func TestQoSEstimatorRateEventsUpdateStreams(t *testing.T) {
 		t.Fatal("first rate event should establish tick baseline only")
 	}
 	if !state.flush(now.Add(time.Second), time.Second) {
-		t.Fatal("tick should initialize EMA streams from pending events")
-	}
-
-	if !state.actual.initialized || !state.repair.initialized {
-		t.Fatal("actual and repair rate EMAs should be initialized")
+		t.Fatal("tick should publish raw rate state from pending events")
 	}
 	if state.lastActual != 4800 || state.lastRepair != 1200 {
 		t.Fatalf("last bytes = actual %d repair %d, want 4800/1200", state.lastActual, state.lastRepair)
 	}
-	if state.groupBytes.initialized || state.repairBytes.initialized {
-		t.Fatal("flush should not train DATA/REPAIR byte profiles directly")
+	if state.lastActualBps != 38400 || state.lastRepairBps != 9600 {
+		t.Fatalf("last bps = actual %d repair %d, want 38400/9600", state.lastActualBps, state.lastRepairBps)
 	}
-	state.observeProfile()
-	if !state.groupBytes.initialized || !state.repairBytes.initialized {
-		t.Fatal("paired tick should be able to initialize DATA and REPAIR byte profiles")
+	if state.lastProfileData != 0 || state.lastProfileRepair != 0 {
+		t.Fatalf("last profile bytes = data %d repair %d, want none without group profile", state.lastProfileData, state.lastProfileRepair)
 	}
 }
 
-func TestQoSEstimatorRateEventsDecayUnobservedStreams(t *testing.T) {
+func TestQoSEstimatorRateEventsUseCurrentTickOnly(t *testing.T) {
 	now := time.Unix(0, 0)
 	state := &qosDirectionState{dataKind: transport.KindUDP, repairKind: transport.KindTCP}
 
@@ -127,9 +122,8 @@ func TestQoSEstimatorRateEventsDecayUnobservedStreams(t *testing.T) {
 		RepairBytes: 1200,
 	}, now.Add(time.Second))
 	if !state.flush(now.Add(time.Second), time.Second) {
-		t.Fatal("second rate event should initialize EMA streams")
+		t.Fatal("second rate event should publish raw rate state")
 	}
-	repairBefore := state.repair.value
 
 	state.observeRate(qosRateSample{
 		At:         now.Add(2 * time.Second),
@@ -141,12 +135,15 @@ func TestQoSEstimatorRateEventsDecayUnobservedStreams(t *testing.T) {
 		t.Fatal("DATA-only event should update rate streams")
 	}
 
-	if state.repair.value >= repairBefore {
-		t.Fatalf("repair EMA = %.0f, want below %.0f after missing repair bytes", state.repair.value, repairBefore)
+	if state.lastActual != 4800 || state.lastRepair != 0 {
+		t.Fatalf("last bytes = actual %d repair %d, want 4800/0", state.lastActual, state.lastRepair)
+	}
+	if state.lastActualBps != 38400 || state.lastRepairBps != 0 {
+		t.Fatalf("last bps = actual %d repair %d, want 38400/0", state.lastActualBps, state.lastRepairBps)
 	}
 }
 
-func TestQoSEstimatorEmptyTicksDecayRateStreams(t *testing.T) {
+func TestQoSEstimatorEmptyTickClearsCurrentRateStreams(t *testing.T) {
 	now := time.Unix(0, 0)
 	state := &qosDirectionState{dataKind: transport.KindUDP, repairKind: transport.KindTCP}
 
@@ -159,40 +156,32 @@ func TestQoSEstimatorEmptyTicksDecayRateStreams(t *testing.T) {
 	}, now)
 	state.flush(now, time.Second)
 	if !state.flush(now.Add(time.Second), time.Second) {
-		t.Fatal("initial tick should initialize EMA streams")
+		t.Fatal("initial tick should publish raw rate state")
 	}
-	actualBefore := state.actual.value
-	repairBefore := state.repair.value
 
 	if !state.flush(now.Add(2*time.Second), time.Second) {
-		t.Fatal("empty tick should still update initialized EMA streams")
+		t.Fatal("empty tick should still publish raw zero rate state")
 	}
-	if state.actual.value >= actualBefore {
-		t.Fatalf("actual EMA = %.0f, want below %.0f after empty tick", state.actual.value, actualBefore)
+	if state.lastActual != 0 || state.lastRepair != 0 {
+		t.Fatalf("last bytes = actual %d repair %d, want 0/0 after empty tick", state.lastActual, state.lastRepair)
 	}
-	if state.repair.value >= repairBefore {
-		t.Fatalf("repair EMA = %.0f, want below %.0f after empty tick", state.repair.value, repairBefore)
+	if state.lastActualBps != 0 || state.lastRepairBps != 0 {
+		t.Fatalf("last bps = actual %d repair %d, want 0/0 after empty tick", state.lastActualBps, state.lastRepairBps)
 	}
 }
 
-func TestQoSEstimatorEmptyTicksCanSustainExistingRateGap(t *testing.T) {
+func TestQoSEstimatorEmptyTicksDoNotSustainStaleRateGap(t *testing.T) {
 	now := time.Unix(0, 0)
 	var got []qosStatus
 	e := newQoSEstimator(qosConfig{SampleFloor: 1, Sustain: time.Second, Tick: time.Second}, nil)
-	state := e.direction(transport.KindUDP, transport.KindTCP, qosRoleData)
-	state.groupBytes.observe(4800)
-	state.repairBytes.observe(1200)
 
-	got = append(got, observeRateTick(e, now, transport.KindUDP, transport.KindTCP, 1200, 1200)...)
+	got = append(got, observeProfileRateTick(e, now, transport.KindUDP, transport.KindTCP, 1200, 1200, 4800, 1200)...)
 	for i := 1; i < 5; i++ {
 		got = append(got, e.Tick(now.Add(time.Duration(i+1)*time.Second))...)
 	}
 
-	if len(got) != 1 {
-		t.Fatalf("statuses = %+v, want one sustained limited status from empty ticks", got)
-	}
-	if !got[0].UDPLimited || got[0].TCPLimited {
-		t.Fatalf("status = %+v, want UDP limited only", got[0])
+	if len(got) != 0 {
+		t.Fatalf("statuses = %+v, want no stale limited status from empty ticks", got)
 	}
 }
 
@@ -200,13 +189,10 @@ func TestQoSEstimatorMarksDataLegLimitedFromRateGap(t *testing.T) {
 	now := time.Unix(0, 0)
 	var got []qosStatus
 	e := newQoSEstimator(qosConfig{SampleFloor: 1, Sustain: time.Second, Tick: time.Second}, nil)
-	state := e.direction(transport.KindUDP, transport.KindTCP, qosRoleData)
-	state.groupBytes.observe(4800)
-	state.repairBytes.observe(1200)
 
 	for i := 0; i < 4; i++ {
 		at := now.Add(time.Duration(i) * time.Second)
-		got = append(got, observeRateTick(e, at, transport.KindUDP, transport.KindTCP, 1200, 1200)...)
+		got = append(got, observeProfileRateTick(e, at, transport.KindUDP, transport.KindTCP, 1200, 1200, 4800, 1200)...)
 	}
 
 	if len(got) != 1 {
@@ -218,6 +204,27 @@ func TestQoSEstimatorMarksDataLegLimitedFromRateGap(t *testing.T) {
 	if got[0].UDPDeliveredBps == 0 {
 		t.Fatalf("status = %+v, want UDP delivered bps populated", got[0])
 	}
+	if !got[0].primarySwitched {
+		t.Fatalf("status = %+v, want primary switch marker", got[0])
+	}
+}
+
+func TestQoSEstimatorHighGapCommitsAfterDecisionSamples(t *testing.T) {
+	now := time.Unix(0, 0)
+	e := newQoSEstimator(qosConfig{SampleFloor: 1, Sustain: 3 * time.Second, Tick: time.Second}, nil)
+	state := e.direction(transport.KindUDP, transport.KindTCP, qosRoleData)
+
+	for i := 0; i < qosDecisionSamples-1; i++ {
+		at := now.Add(time.Duration(i) * time.Second)
+		if status, ok := e.driveHighGapState(state, qosLimitStateDataRate, 0.20, 100, at); ok {
+			t.Fatalf("status at sample %d = %+v, want no commit before decision window is ready", i, status)
+		}
+	}
+
+	got, ok := e.driveHighGapState(state, qosLimitStateDataRate, 0.20, 100, now.Add((qosDecisionSamples-1)*time.Second))
+	if !ok || !got.UDPLimited || got.TCPLimited {
+		t.Fatalf("status = %+v ok=%t, want UDP limited after decision window is ready", got, ok)
+	}
 }
 
 func TestQoSEstimatorMarksDataLegLimitedWhenDataMissing(t *testing.T) {
@@ -227,11 +234,11 @@ func TestQoSEstimatorMarksDataLegLimitedWhenDataMissing(t *testing.T) {
 
 	for i := 0; i < 2; i++ {
 		at := now.Add(time.Duration(i) * time.Second)
-		got = append(got, observeRateTick(e, at, transport.KindUDP, transport.KindTCP, 4800, 1200)...)
+		got = append(got, observeProfileRateTick(e, at, transport.KindUDP, transport.KindTCP, 4800, 1200, 4800, 1200)...)
 	}
 	for i := 2; i < 8; i++ {
 		at := now.Add(time.Duration(i) * time.Second)
-		got = append(got, observeRateTick(e, at, transport.KindUDP, transport.KindTCP, 0, 1200)...)
+		got = append(got, observeProfileRateTick(e, at, transport.KindUDP, transport.KindTCP, 0, 1200, 4800, 1200)...)
 	}
 
 	if len(got) != 1 {
@@ -388,12 +395,9 @@ func TestQoSEstimatorIgnoresNonCurrentPrimarySamplesUntilCommittedState(t *testi
 	now := time.Unix(0, 0)
 	var got []qosStatus
 	e := newQoSEstimator(qosConfig{SampleFloor: 1, Sustain: 3 * time.Second, Tick: time.Second}, nil)
-	udpData := e.direction(transport.KindUDP, transport.KindTCP, qosRoleData)
 	tcpShadow := e.direction(transport.KindTCP, transport.KindUDP, qosRoleShadow)
-	udpData.groupBytes.observe(4800)
-	udpData.repairBytes.observe(1200)
 
-	got = append(got, observeRateTick(e, now, transport.KindUDP, transport.KindTCP, 1200, 1200)...)
+	got = append(got, observeProfileRateTick(e, now, transport.KindUDP, transport.KindTCP, 1200, 1200, 4800, 1200)...)
 	if len(got) != 0 {
 		t.Fatalf("statuses = %+v, want pending only", got)
 	}
@@ -411,8 +415,9 @@ func TestQoSEstimatorIgnoresNonCurrentPrimarySamplesUntilCommittedState(t *testi
 		t.Fatalf("TCP shadow samples = %d, want flight sample ignored before committed switch", tcpShadow.sampleTotal)
 	}
 
-	for i := 2; i <= 4; i++ {
-		got = append(got, e.Tick(now.Add(time.Duration(i)*time.Second))...)
+	for i := 1; i <= 4; i++ {
+		at := now.Add(time.Duration(i) * time.Second)
+		got = append(got, observeProfileRateTick(e, at, transport.KindUDP, transport.KindTCP, 1200, 1200, 4800, 1200)...)
 	}
 	if len(got) != 1 {
 		t.Fatalf("statuses = %+v, want UDP limited after pending sustain", got)
@@ -431,8 +436,6 @@ func TestQoSEstimatorShadowRoleAvoidsReverseDataLimitedFalsePositive(t *testing.
 	e := newQoSEstimator(qosConfig{SampleFloor: 1, Sustain: time.Hour, Tick: time.Second}, nil)
 	udpData := e.direction(transport.KindUDP, transport.KindTCP, qosRoleData)
 	tcpData := e.direction(transport.KindTCP, transport.KindUDP, qosRoleData)
-	tcpData.groupBytes.observe(4800)
-	tcpData.repairBytes.observe(1200)
 
 	e.currentPrimary = transport.KindUDP
 	if status, ok := e.driveLimitState(udpData, qosLimitStateDataRate, true, 100, now); ok {
@@ -459,14 +462,40 @@ func TestQoSEstimatorShadowRoleAvoidsReverseDataLimitedFalsePositive(t *testing.
 	}
 }
 
-func TestQoSEstimatorPrimarySwitchPreservesDirectionProfile(t *testing.T) {
+func TestQoSEstimatorShadowRoleDoesNotClearFromStaleRepairTick(t *testing.T) {
+	now := time.Unix(0, 0)
 	e := newQoSEstimator(qosConfig{SampleFloor: 1, Sustain: time.Second, Tick: time.Second}, nil)
 	udpData := e.direction(transport.KindUDP, transport.KindTCP, qosRoleData)
-	udpData.groupBytes.observe(4800)
-	udpData.repairBytes.observe(1200)
-	udpData.pidCorrection = 42
-	udpData.pidIntegral = 7
-	udpData.pidPrevError = 3
+
+	status, ok := e.commitLimitState(udpData, qosLimitStateDataRate, true, 100, now, now)
+	if !ok || !status.UDPLimited || status.TCPLimited {
+		t.Fatalf("initial status = %+v ok=%t, want UDP limited only", status, ok)
+	}
+	if e.currentPrimary != transport.KindTCP || e.currentRoleLocked() != qosRoleShadow {
+		t.Fatalf("primary=%v role=%v, want TCP shadow after UDP limited", e.currentPrimary, e.currentRoleLocked())
+	}
+
+	var got []qosStatus
+	got = append(got, observeProfileRateTick(e, now.Add(time.Second), transport.KindTCP, transport.KindUDP, 70_000_000, 17_500_000, 64_000_000, 16_000_000)...)
+	got = append(got, observeProfileRateTick(e, now.Add(2*time.Second), transport.KindTCP, transport.KindUDP, 31_000_000, 7_800_000, 31_000_000, 7_750_000)...)
+	got = append(got, observeProfileRateTick(e, now.Add(3*time.Second), transport.KindTCP, transport.KindUDP, 12_000_000, 1_200_000, 10_000_000, 2_500_000)...)
+
+	for _, status := range got {
+		if !status.UDPLimited {
+			t.Fatalf("statuses = %+v, want UDP to remain limited when current repair tick is too small", got)
+		}
+	}
+}
+
+func TestQoSEstimatorPrimarySwitchResetsDirectionTickState(t *testing.T) {
+	e := newQoSEstimator(qosConfig{SampleFloor: 1, Sustain: time.Second, Tick: time.Second}, nil)
+	udpData := e.direction(transport.KindUDP, transport.KindTCP, qosRoleData)
+	udpData.lastActual = 1200
+	udpData.lastRepair = 1200
+	udpData.lastProfileData = 4800
+	udpData.lastProfileRepair = 1200
+	udpData.lastActualBps = 1200
+	udpData.lastRepairBps = 1200
 
 	e.currentPrimary = transport.KindTCP
 	tcpData := e.direction(transport.KindTCP, transport.KindUDP, qosRoleData)
@@ -481,14 +510,9 @@ func TestQoSEstimatorPrimarySwitchPreservesDirectionProfile(t *testing.T) {
 		t.Fatalf("current primary = %v, want UDP after TCP limited is committed", e.currentPrimary)
 	}
 
-	if !udpData.groupBytes.initialized || !udpData.repairBytes.initialized {
-		t.Fatal("direction profile was cleared on primary switch")
-	}
-	if udpData.groupBytes.value != 4800 || udpData.repairBytes.value != 1200 {
-		t.Fatalf("direction profile = %.0f/%.0f, want 4800/1200", udpData.groupBytes.value, udpData.repairBytes.value)
-	}
-	if udpData.pidCorrection != 42 || udpData.pidIntegral != 7 || udpData.pidPrevError != 3 {
-		t.Fatalf("pid state = %.0f/%.0f/%.0f, want 42/7/3", udpData.pidCorrection, udpData.pidIntegral, udpData.pidPrevError)
+	if udpData.lastActual != 0 || udpData.lastRepair != 0 || udpData.lastProfileData != 0 || udpData.lastProfileRepair != 0 || udpData.lastActualBps != 0 || udpData.lastRepairBps != 0 {
+		t.Fatalf("direction tick state = actual %d repair %d profile %d/%d bps %d/%d, want reset",
+			udpData.lastActual, udpData.lastRepair, udpData.lastProfileData, udpData.lastProfileRepair, udpData.lastActualBps, udpData.lastRepairBps)
 	}
 }
 
@@ -498,10 +522,10 @@ func TestQoSEstimatorLateDataAfterLimitedDoesNotEraseCommittedState(t *testing.T
 	e.currentPrimary = transport.KindUDP
 	udpData := e.direction(transport.KindUDP, transport.KindTCP, qosRoleData)
 
-	if status, ok := e.driveLimitState(udpData, qosLimitStateHealth, true, 100, now); ok {
+	if status, ok := e.driveLimitState(udpData, qosLimitStateDataRate, true, 100, now); ok {
 		t.Fatalf("first limited state = %+v, want pending only", status)
 	}
-	status, ok := e.driveLimitState(udpData, qosLimitStateHealth, true, 100, now.Add(1100*time.Millisecond))
+	status, ok := e.driveLimitState(udpData, qosLimitStateDataRate, true, 100, now.Add(1100*time.Millisecond))
 	if !ok || !status.UDPLimited || status.TCPLimited {
 		t.Fatalf("limited status = %+v ok=%t, want UDP limited", status, ok)
 	}
@@ -546,191 +570,5 @@ func TestQoSEstimatorDoesNotMarkHealthyRateEvents(t *testing.T) {
 
 	if len(got) != 0 {
 		t.Fatalf("statuses = %+v, want none for healthy DATA/REPAIR events", got)
-	}
-}
-
-func TestQoSEstimatorDoesNotLearnProfileFromRateLimitedGap(t *testing.T) {
-	now := time.Unix(0, 0)
-	e := newQoSEstimator(qosConfig{SampleFloor: 1, Sustain: time.Second, Tick: time.Second}, nil)
-	state := e.direction(transport.KindUDP, transport.KindTCP, qosRoleData)
-	state.groupBytes.observe(4800)
-	state.repairBytes.observe(1200)
-
-	for i := 0; i < 5; i++ {
-		at := now.Add(time.Duration(i) * time.Second)
-		observeRateTick(e, at, transport.KindUDP, transport.KindTCP, 1200, 1200)
-	}
-
-	if state.groupBytes.value != 4800 || state.repairBytes.value != 1200 {
-		t.Fatalf("profile = %.0f/%.0f, want unchanged 4800/1200", state.groupBytes.value, state.repairBytes.value)
-	}
-}
-
-func TestQoSEstimatorHealthDoesNotCommitLimitedState(t *testing.T) {
-	now := time.Unix(0, 0)
-	var got []qosStatus
-	e := newQoSEstimator(qosConfig{SampleFloor: 1, Sustain: time.Second, Tick: time.Second}, nil)
-
-	for i := 0; i < 6; i++ {
-		at := now.Add(time.Duration(i) * time.Second)
-		observeHealth(e, at, transport.KindUDP, transport.KindTCP, 0, 4)
-		got = append(got, e.Tick(at.Add(time.Second))...)
-	}
-
-	if len(got) != 0 {
-		t.Fatalf("statuses = %+v, want none from health samples", got)
-	}
-	if status := e.snapshotStatus(); status.UDPLimited || status.TCPLimited {
-		t.Fatalf("snapshot = %+v, want clear limited state", status)
-	}
-	state := e.directionIfExists(transport.KindUDP, transport.KindTCP, qosRoleData)
-	if state == nil || state.health.sampleTotal == 0 {
-		t.Fatalf("health state = %+v, want stored health samples", state)
-	}
-}
-
-func TestQoSEstimatorShadowCleanResetsStalePendingState(t *testing.T) {
-	now := time.Unix(0, 0)
-	e := newQoSEstimator(qosConfig{SampleFloor: 1, Sustain: time.Second, Tick: time.Second}, nil)
-	dataDir := e.direction(transport.KindUDP, transport.KindTCP, qosRoleData)
-	shadowDir := e.direction(transport.KindTCP, transport.KindUDP, qosRoleShadow)
-
-	if status, ok := e.driveLimitState(dataDir, qosLimitStateDataRate, true, 100, now); ok {
-		t.Fatalf("first limited state = %+v, want pending only", status)
-	}
-	status, ok := e.driveLimitState(dataDir, qosLimitStateDataRate, true, 100, now.Add(1100*time.Millisecond))
-	if !ok || !status.UDPLimited || status.TCPLimited {
-		t.Fatalf("limited status = %+v ok=%t, want UDP limited", status, ok)
-	}
-
-	if status, ok = e.driveLimitState(dataDir, qosLimitStateHealth, true, 100, now.Add(1200*time.Millisecond)); ok {
-		t.Fatalf("health state = %+v, want stale pending only", status)
-	}
-	if status, ok = e.driveLimitState(shadowDir, qosLimitStateShadow, false, 100, now.Add(1300*time.Millisecond)); ok {
-		t.Fatalf("first shadow clean state = %+v, want pending only", status)
-	}
-	status, ok = e.driveLimitState(shadowDir, qosLimitStateShadow, false, 100, now.Add(2400*time.Millisecond))
-	if !ok || status.UDPLimited || status.TCPLimited {
-		t.Fatalf("clear status = %+v ok=%t, want both legs clear", status, ok)
-	}
-
-	if status, ok = e.driveLimitState(dataDir, qosLimitStateHealth, true, 100, now.Add(2500*time.Millisecond)); ok {
-		t.Fatalf("stale health state after shadow clean = %+v, want pending reset", status)
-	}
-}
-
-func TestQoSEstimatorHealthDoesNotOverrideHealthyRate(t *testing.T) {
-	now := time.Unix(0, 0)
-	e := newQoSEstimator(qosConfig{SampleFloor: 1, Sustain: time.Second, Tick: time.Second}, nil)
-
-	var got []qosStatus
-	for i := 0; i < 4; i++ {
-		at := now.Add(time.Duration(i) * 2 * time.Second)
-		observeHealth(e, at, transport.KindUDP, transport.KindTCP, 0, 4)
-		got = append(got, observeRateTick(e, at, transport.KindUDP, transport.KindTCP, 4800, 1200)...)
-	}
-
-	if len(got) != 0 {
-		t.Fatalf("statuses = %+v, want none from health samples with healthy rate estimate", got)
-	}
-}
-
-func TestQoSEstimatorHealthDoesNotSwitchPrimary(t *testing.T) {
-	now := time.Unix(0, 0)
-	e := newQoSEstimator(qosConfig{SampleFloor: 4, Sustain: time.Second}, nil)
-
-	observeHealth(e, now, transport.KindUDP, transport.KindTCP, 0, 4)
-	if statuses := e.Tick(now.Add(time.Second)); len(statuses) != 0 {
-		t.Fatalf("first health tick statuses = %+v, want pending only", statuses)
-	}
-	observeHealth(e, now.Add(2*time.Second), transport.KindUDP, transport.KindTCP, 0, 4)
-	statuses := e.Tick(now.Add(2 * time.Second))
-	if len(statuses) != 0 {
-		t.Fatalf("second health tick statuses = %+v, want pending only", statuses)
-	}
-	observeHealth(e, now.Add(3*time.Second), transport.KindUDP, transport.KindTCP, 0, 4)
-	statuses = e.Tick(now.Add(3 * time.Second))
-	if len(statuses) != 0 {
-		t.Fatalf("health statuses = %+v, want none", statuses)
-	}
-	if e.currentPrimary != transport.KindUDP || e.currentRoleLocked() != qosRoleData {
-		t.Fatalf("after health samples primary=%v role=%v, want UDP data role", e.currentPrimary, e.currentRoleLocked())
-	}
-}
-
-func TestQoSEstimatorOwnsMatureTimer(t *testing.T) {
-	group := rxGroupKey{basePacketID: 10, sourceSpan: 4}
-	matured := make(chan rxGroupKey, 1)
-	e := newQoSEstimator(qosConfig{
-		MatureAfter: 10 * time.Millisecond,
-		Mature: func(group rxGroupKey, at time.Time) rxWindowResult {
-			matured <- group
-			return rxWindowResult{}
-		},
-	}, nil)
-	defer e.Close()
-
-	e.ObserveResult(rxWindowResult{matureGroup: group, hasMatureGroup: true})
-
-	select {
-	case got := <-matured:
-		if got != group {
-			t.Fatalf("mature group = %+v, want %+v", got, group)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("mature timer did not fire")
-	}
-}
-
-func TestQoSEstimatorCancelsMatureTimerOnCompleteGroup(t *testing.T) {
-	group := rxGroupKey{basePacketID: 10, sourceSpan: 4}
-	matured := make(chan rxGroupKey, 1)
-	e := newQoSEstimator(qosConfig{
-		Sustain:     time.Second,
-		MatureAfter: 20 * time.Millisecond,
-		Mature: func(group rxGroupKey, at time.Time) rxWindowResult {
-			matured <- group
-			return rxWindowResult{}
-		},
-	}, nil)
-	defer e.Close()
-
-	e.ObserveResult(rxWindowResult{matureGroup: group, hasMatureGroup: true})
-	e.ObserveResult(rxWindowResult{completeGroup: group, hasComplete: true})
-
-	select {
-	case got := <-matured:
-		t.Fatalf("mature timer fired for completed group %+v", got)
-	case <-time.After(50 * time.Millisecond):
-	}
-}
-
-func TestQoSEstimatorCancelsMatureTimersOnCommittedPrimarySwitch(t *testing.T) {
-	group := rxGroupKey{basePacketID: 10, sourceSpan: 4}
-	matured := make(chan rxGroupKey, 1)
-	e := newQoSEstimator(qosConfig{
-		Sustain:     time.Second,
-		MatureAfter: 20 * time.Millisecond,
-		Mature: func(group rxGroupKey, at time.Time) rxWindowResult {
-			matured <- group
-			return rxWindowResult{}
-		},
-	}, nil)
-	defer e.Close()
-
-	e.ObserveResult(rxWindowResult{matureGroup: group, hasMatureGroup: true})
-	udpData := e.direction(transport.KindUDP, transport.KindTCP, qosRoleData)
-	if status, ok := e.driveLimitState(udpData, qosLimitStateDataRate, true, 100, time.Unix(0, 0)); ok {
-		t.Fatalf("first limited status = %+v, want pending only", status)
-	}
-	status, ok := e.driveLimitState(udpData, qosLimitStateDataRate, true, 100, time.Unix(1, 0))
-	if !ok || !status.UDPLimited || status.TCPLimited {
-		t.Fatalf("limited status = %+v ok=%t, want UDP limited", status, ok)
-	}
-
-	select {
-	case got := <-matured:
-		t.Fatalf("mature timer fired after primary switch for group %+v", got)
-	case <-time.After(50 * time.Millisecond):
 	}
 }
