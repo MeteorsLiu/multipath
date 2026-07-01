@@ -51,7 +51,12 @@ func (w *QoSWriter) Write(ctx context.Context, status recv.QoSStatus) error {
 		recordLinkStatusEvent("send_drop_not_enabled", status.SessionID, status.LaneID, status.UDPLimited, status.TCPLimited)
 		return nil
 	}
-	linkStatus := linkStatusByte(status.UDPLimited, status.TCPLimited, status.RepairCount)
+	linkStatus, ok := linkStatusByte(status.UDPLimited, status.TCPLimited, status.RepairCount)
+	if !ok {
+		debuglog.Printf("runtime/qos", "link_status_drop invalid_repair_count session=%d lane=%d repair_count=%d",
+			status.SessionID, status.LaneID, status.RepairCount)
+		return protocol.ErrInvalidFrame
+	}
 	debuglog.Printf("runtime/qos", "link_status_send session=%d lane=%d status=%#02x control_leg=tcp udp_limited=%t udp_delivered_bps=%d tcp_limited=%t tcp_delivered_bps=%d repair_count=%d",
 		status.SessionID, status.LaneID, linkStatus, status.UDPLimited, status.UDPDeliveredBps, status.TCPLimited, status.TCPDeliveredBps, status.RepairCount)
 	err := w.send.WriteFrame(ctx, protocol.Frame{
@@ -75,9 +80,9 @@ func (w *QoSWriter) Write(ctx context.Context, status recv.QoSStatus) error {
 	return nil
 }
 
-func linkStatusByte(udpLimited, tcpLimited bool, repairCount uint8) uint8 {
+func linkStatusByte(udpLimited, tcpLimited bool, repairCount uint8) (uint8, bool) {
 	if repairCount == 0 || repairCount > 4 {
-		repairCount = 1
+		return 0, false
 	}
 	state := (repairCount - 1) << 1
 	udpState := state
@@ -88,7 +93,7 @@ func linkStatusByte(udpLimited, tcpLimited bool, repairCount uint8) uint8 {
 	if tcpLimited {
 		tcpState |= protocol.LinkStatusStateLimited
 	}
-	return udpState<<4 | tcpState
+	return udpState<<4 | tcpState, true
 }
 
 func recordLinkStatusEvent(event string, sessionID uint64, laneID uint8, udpLimited, tcpLimited bool) {

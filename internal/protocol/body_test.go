@@ -52,7 +52,7 @@ func TestTypedFramesRoundTrip(t *testing.T) {
 			Type:      TypeREPAIR,
 			SessionID: 11,
 			LaneID:    1,
-			Body:      RepairBody{BasePacketID: 10, Key: 7, SourceSpan: 4, Symbol: []byte("repair")},
+			Body:      RepairBody{BasePacketID: 10, Key: 7, SourceSpan: 4, RepairCount: 1, Symbol: []byte("repair")},
 		},
 		{
 			Type:      TypeCLOSE,
@@ -96,6 +96,46 @@ func TestTypedFramesRoundTrip(t *testing.T) {
 	}
 }
 
+func TestRepairBodyPacksSourceSpanAndRepairCount(t *testing.T) {
+	body := RepairBody{BasePacketID: 10, Key: 7, SourceSpan: 4, Symbol: []byte("repair")}
+	setRepairCountForTest(t, &body, 3)
+	encoded, err := Encode(Frame{Type: TypeREPAIR, SessionID: 11, LaneID: 1, Body: body}, nil)
+	if err != nil {
+		t.Fatalf("Encode REPAIR failed: %v", err)
+	}
+	if got, want := encoded[headerSize+6], uint8(0x14); got != want {
+		t.Fatalf("packed source_span byte = %#x, want %#x", got, want)
+	}
+
+	got, err := Decode(encoded)
+	if err != nil {
+		t.Fatalf("Decode REPAIR failed: %v", err)
+	}
+	repair := got.Body.(RepairBody)
+	if repair.SourceSpan != 4 {
+		t.Fatalf("decoded source span = %d, want 4", repair.SourceSpan)
+	}
+	if got := repairCountForTest(t, repair); got != 3 {
+		t.Fatalf("decoded repair count = %d, want 3", got)
+	}
+}
+
+func TestRepairBodyRejectsReservedSourceSpanBits(t *testing.T) {
+	encoded, err := Encode(Frame{
+		Type:      TypeREPAIR,
+		SessionID: 11,
+		LaneID:    1,
+		Body:      RepairBody{BasePacketID: 10, Key: 7, SourceSpan: 4, Symbol: []byte("repair")},
+	}, nil)
+	if err != nil {
+		t.Fatalf("Encode REPAIR failed: %v", err)
+	}
+	encoded[headerSize+6] = 0x24
+	if _, err := Decode(encoded); !errors.Is(err, ErrInvalidFrame) {
+		t.Fatalf("Decode reserved repair source_span err = %v, want ErrInvalidFrame", err)
+	}
+}
+
 func TestBodyTooShort(t *testing.T) {
 	for _, frameType := range []FrameType{
 		TypeHELLO,
@@ -114,6 +154,24 @@ func TestBodyTooShort(t *testing.T) {
 			t.Fatalf("Decode type %d err = %v, want ErrBodyTooShort", frameType, err)
 		}
 	}
+}
+
+func setRepairCountForTest(t *testing.T, body *RepairBody, repairCount uint8) {
+	t.Helper()
+	field := reflect.ValueOf(body).Elem().FieldByName("RepairCount")
+	if !field.IsValid() {
+		t.Fatal("RepairBody missing RepairCount field")
+	}
+	field.SetUint(uint64(repairCount))
+}
+
+func repairCountForTest(t *testing.T, body RepairBody) uint8 {
+	t.Helper()
+	field := reflect.ValueOf(body).FieldByName("RepairCount")
+	if !field.IsValid() {
+		t.Fatal("RepairBody missing RepairCount field")
+	}
+	return uint8(field.Uint())
 }
 
 func TestBandwidthProbeRejectsInvalidTrainBudget(t *testing.T) {

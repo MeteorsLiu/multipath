@@ -127,6 +127,15 @@ func TestQoSWriterWritesLinkStatusFrame(t *testing.T) {
 	t.Fatal("missing LINK_STATUS output")
 }
 
+func TestLinkStatusByteRejectsInvalidRepairCount(t *testing.T) {
+	if _, ok := linkStatusByte(true, false, 0); ok {
+		t.Fatal("repairCount 0 encoded, want reject")
+	}
+	if _, ok := linkStatusByte(true, false, 5); ok {
+		t.Fatal("repairCount 5 encoded, want reject")
+	}
+}
+
 func TestQoSWriterDropsBeforeNegotiation(t *testing.T) {
 	s := send.New(send.Config{
 		BootstrapLanes: []send.BootstrapLane{{

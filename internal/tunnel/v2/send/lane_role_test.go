@@ -338,6 +338,9 @@ func TestRepairCountEmitsMultipleRepairFrames(t *testing.T) {
 			if body.SourceSpan != group.sourceSpan {
 				t.Fatalf("repair %d source_span = %d, want %d", i, body.SourceSpan, group.sourceSpan)
 			}
+			if body.RepairCount != 3 {
+				t.Fatalf("repair %d repair_count = %d, want 3", i, body.RepairCount)
+			}
 			if seenKeys[body.Key] {
 				t.Fatalf("repair %d repeated key %d", i, body.Key)
 			}
@@ -399,6 +402,9 @@ func TestRepairCountScalesForPartialGroup(t *testing.T) {
 			body := f.Body.(protocol.RepairBody)
 			if body.SourceSpan != group.sourceSpan {
 				t.Fatalf("repair %d source_span = %d, want %d", i, body.SourceSpan, group.sourceSpan)
+			}
+			if body.RepairCount != 2 {
+				t.Fatalf("repair %d repair_count = %d, want 2", i, body.RepairCount)
 			}
 		default:
 			t.Fatalf("got %d REPAIR frames, want 2", i)

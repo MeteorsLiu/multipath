@@ -67,6 +67,7 @@ type RepairBody struct {
 	BasePacketID uint32
 	Key          uint16
 	SourceSpan   uint8
+	RepairCount  uint8
 	Symbol       []byte
 }
 
@@ -133,7 +134,7 @@ func encodedBodySize(frame Frame) (int, error) {
 		if !ok {
 			return 0, ErrInvalidFrame
 		}
-		if repair.SourceSpan == 0 || repair.SourceSpan > 4 {
+		if !validRepairSourceSpan(repair.SourceSpan) || !validRepairCount(repair.RepairCount) {
 			return 0, ErrInvalidFrame
 		}
 		return 7 + len(repair.Symbol), nil
@@ -196,7 +197,7 @@ func encodeBodyInto(frame Frame, out []byte) error {
 		repair := frame.Body.(RepairBody)
 		binary.BigEndian.PutUint32(out[:4], repair.BasePacketID)
 		binary.BigEndian.PutUint16(out[4:6], repair.Key)
-		out[6] = repair.SourceSpan
+		out[6] = encodeRepairSpanCount(repair.SourceSpan, repair.RepairCount)
 		copy(out[7:], repair.Symbol)
 	case TypeCLOSE:
 		body := frame.Body.(CloseBody)
@@ -272,13 +273,15 @@ func decodeBody(frame *Frame, body []byte) error {
 		if len(body) < 7 {
 			return ErrBodyTooShort
 		}
-		if body[6] == 0 || body[6] > 4 {
+		sourceSpan, repairCount, ok := decodeRepairSpanCount(body[6])
+		if !ok {
 			return ErrInvalidFrame
 		}
 		frame.Body = RepairBody{
 			BasePacketID: binary.BigEndian.Uint32(body[:4]),
 			Key:          binary.BigEndian.Uint16(body[4:6]),
-			SourceSpan:   body[6],
+			SourceSpan:   sourceSpan,
+			RepairCount:  repairCount,
 			Symbol:       body[7:],
 		}
 	case TypeCLOSE:
@@ -341,6 +344,33 @@ func decodeBody(frame *Frame, body []byte) error {
 		return ErrInvalidFrame
 	}
 	return nil
+}
+
+func validRepairSourceSpan(sourceSpan uint8) bool {
+	return sourceSpan >= 1 && sourceSpan <= 4
+}
+
+func validRepairCount(repairCount uint8) bool {
+	return repairCount <= 4
+}
+
+func encodeRepairSpanCount(sourceSpan, repairCount uint8) uint8 {
+	if repairCount == 0 {
+		repairCount = 1
+	}
+	return sourceSpan | ((repairCount - 1) << 3)
+}
+
+func decodeRepairSpanCount(packed uint8) (uint8, uint8, bool) {
+	if packed&0xe0 != 0 {
+		return 0, 0, false
+	}
+	sourceSpan := packed & 0x07
+	repairCount := ((packed >> 3) & 0x03) + 1
+	if !validRepairSourceSpan(sourceSpan) {
+		return 0, 0, false
+	}
+	return sourceSpan, repairCount, true
 }
 
 func validLinkStatusStatus(status uint8) bool {

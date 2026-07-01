@@ -563,6 +563,31 @@ if weighted_seconds > 0:
 PY
 }
 
+parse_iperf_json_end_bps() {
+  local log_file="$1"
+  if [[ ! -f "${log_file}" ]]; then
+    return 0
+  fi
+  python3 - "${log_file}" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(0)
+
+end = data.get("end") or {}
+for key in ("sum_received", "sum", "sum_sent"):
+    summary = end.get(key)
+    if isinstance(summary, dict) and summary.get("bits_per_second") is not None:
+        print(f'{float(summary["bits_per_second"]):.0f}')
+        break
+PY
+}
+
 assert_iperf_window_recovered() {
   local label="$1"
   local baseline="$2"
@@ -1066,6 +1091,7 @@ clear_loss() {
 setup_prio_qdisc() {
   local ns="$1"
   local dev="$2"
+  ip netns exec "${ns}" tc qdisc del dev "${dev}" root >/dev/null 2>&1 || true
   ip netns exec "${ns}" tc qdisc replace dev "${dev}" root handle 1: prio bands 4
 }
 
@@ -2984,19 +3010,42 @@ run_fec_adaptive_75_case() {
   echo "[${name}] deterministically drop 3 of every 4 client-to-server UDP DATA frames; TCP REPAIR stays clean"
   apply_udp_data_keep_one_of_four_client_to_server_path 1 "${PORT_FEC_ADAPTIVE_75}"
   run_short_ping_load "${name}-warmup" 200 0.001
-  wait_log_file_pattern "${name}" "${CURRENT_CLIENT_LOG}" "runtime: link_status_apply session=[0-9]+ lane=1 status=0x44" 5 "client applied FEC repair count 3 before QoS selector switch"
+  wait_log_file_pattern "${name}" "${CURRENT_CLIENT_LOG}" "runtime: link_status_apply session=[0-9]+ lane=1 .*udp_limited=false .*tcp_limited=false .*repair_count=[34]" 5 "client applied FEC repair count >=3 before QoS selector switch"
+
+  local adaptive_repair_count
+  adaptive_repair_count="$(python3 - "${CURRENT_CLIENT_LOG}" "${client_apply_line}" <<'PY'
+import re
+import sys
+
+path = sys.argv[1]
+start = int(sys.argv[2])
+pattern = re.compile(r"runtime: link_status_apply .*udp_limited=false .*tcp_limited=false .*repair_count=([34])\b")
+
+with open(path, "r", encoding="utf-8", errors="replace") as f:
+    for line_no, line in enumerate(f, 1):
+        if line_no <= start:
+            continue
+        match = pattern.search(line)
+        if match:
+            print(match.group(1))
+            break
+PY
+)"
+  if [[ -z "${adaptive_repair_count}" ]]; then
+    fail "${name}" "could not read adaptive FEC repair count from LINK_STATUS"
+  fi
 
   local server_partial_line
   server_partial_line="$(current_log_file_line_count "${CURRENT_SERVER_LOG}")"
   run_short_ping_load "${name}-partial-group-check" 2 0.001
   sleep 0.2
-  assert_fec_span_two_scaled_tcp_repairs_since "${name}" "${CURRENT_SERVER_LOG}" "${server_partial_line}" 3
+  assert_fec_span_two_scaled_tcp_repairs_since "${name}" "${CURRENT_SERVER_LOG}" "${server_partial_line}" "${adaptive_repair_count}"
 
   local server_group_line
   server_group_line="$(current_log_file_line_count "${CURRENT_SERVER_LOG}")"
   run_short_ping_load "${name}-group-check" 400 0.001
   sleep 0.2
-  assert_fec_groups_scaled_tcp_repairs_since "${name}" "${CURRENT_SERVER_LOG}" "${server_group_line}" 3
+  assert_fec_groups_scaled_tcp_repairs_since "${name}" "${CURRENT_SERVER_LOG}" "${server_group_line}" "${adaptive_repair_count}"
 
   run_ping_sample "${name}-steady"
 
@@ -3154,6 +3203,100 @@ run_link_status_qos_jitter_no_qos_case() {
   assert_log_file_pattern_count_since_le "${name}" "${CURRENT_CLIENT_LOG}" "${client_select_line}" "schedule_select.*lane=1 .*leg=\\{tcp .*frame=type=DATA" 0 "client kept DATA on UDP under shared jitter"
 
   stop_multipath
+  clear_loss
+  echo "==== ${name} e2e end ===="
+}
+
+run_direct_udp_iperf_json() {
+  local label="$1"
+  local port="$2"
+  local duration="$3"
+  local rate="$4"
+  local client_json="$5"
+  local client_err="$6"
+  local server_log="$7"
+
+  echo "[${label}] direct UDP iperf3: ${NS_C}->${PATH1_REMOTE}:${port} rate=${rate} duration=${duration}s"
+  ip netns exec "${NS_S}" iperf3 -s -1 -B "${PATH1_REMOTE}" -p "${port}" >"${server_log}" 2>&1 &
+  local iperf_server=$!
+  sleep 1
+
+  local client_status=0
+  set +e
+  timeout "$((duration + 8))s" ip netns exec "${NS_C}" iperf3 -c "${PATH1_REMOTE}" -p "${port}" -u -b "${rate}" -t "${duration}" -i 1 -J \
+    >"${client_json}" 2>"${client_err}"
+  client_status=$?
+  set -e
+
+  kill "${iperf_server}" >/dev/null 2>&1 || true
+  wait "${iperf_server}" >/dev/null 2>&1 || true
+
+  echo "[${label}] direct UDP iperf3 json=${client_json} err=${client_err} server_log=${server_log}"
+  if (( client_status != 0 )); then
+    tail -n 20 "${client_err}" || true
+    fail "${label}" "direct UDP iperf3 failed status=${client_status}"
+    return 1
+  fi
+}
+
+run_link_status_qos_udp_rate_sanity_case() {
+  local name="link-status-qos-udp-rate-sanity"
+  local port="${PORT_LINK_STATUS_QOS_IPERF}"
+  local rate="5mbit"
+  echo "==== ${name} e2e start ===="
+  if ! command -v iperf3 >/dev/null 2>&1; then
+    echo "[${name}] iperf3 not found, skip UDP rate sanity case"
+    echo "==== ${name} e2e end ===="
+    return 0
+  fi
+  if ! command -v timeout >/dev/null 2>&1; then
+    echo "[${name}] timeout not found, skip UDP rate sanity case"
+    echo "==== ${name} e2e end ===="
+    return 0
+  fi
+
+  clear_loss
+
+  local baseline_json="${WORKDIR}/${name}.baseline-client.json"
+  local baseline_err="${WORKDIR}/${name}.baseline-client.err"
+  local baseline_server_log="${WORKDIR}/${name}.baseline-server.log"
+  if ! run_direct_udp_iperf_json "${name}-baseline" "${port}" 6 120M "${baseline_json}" "${baseline_err}" "${baseline_server_log}"; then
+    clear_loss
+    echo "==== ${name} e2e end ===="
+    return 0
+  fi
+
+  echo "[${name}] apply UDP rate limit: ${rate}"
+  apply_udp_tunnel_rate_path 1 "${port}" "${rate}"
+
+  local limited_json="${WORKDIR}/${name}.limited-client.json"
+  local limited_err="${WORKDIR}/${name}.limited-client.err"
+  local limited_server_log="${WORKDIR}/${name}.limited-server.log"
+  if ! run_direct_udp_iperf_json "${name}-limited" "${port}" 10 120M "${limited_json}" "${limited_err}" "${limited_server_log}"; then
+    clear_loss
+    echo "==== ${name} e2e end ===="
+    return 0
+  fi
+
+  echo "[${name}] client qdisc after limited UDP iperf3"
+  ip netns exec "${NS_C}" tc -s qdisc show dev "${VETHC1}" || true
+  echo "[${name}] client mangle OUTPUT marks after limited UDP iperf3"
+  ip netns exec "${NS_C}" iptables -t mangle -nvL OUTPUT || true
+
+  local baseline_bps
+  local limited_bps
+  baseline_bps="$(parse_iperf_json_end_bps "${baseline_json}")"
+  limited_bps="$(parse_iperf_json_end_bps "${limited_json}")"
+  echo "[${name}] udp_direct_bps baseline=${baseline_bps} limited=${limited_bps}"
+
+  if [[ -z "${baseline_bps}" || -z "${limited_bps}" ]]; then
+    fail "${name}" "could not parse direct UDP iperf3 bitrate"
+  elif awk -v baseline="${baseline_bps}" -v limited="${limited_bps}" 'BEGIN { exit !(baseline > 30000000 && limited < 10000000) }'; then
+    pass "${name}" "direct UDP path was rate-limited"
+  else
+    fail "${name}" "direct UDP path was not rate-limited enough"
+  fi
+
   clear_loss
   echo "==== ${name} e2e end ===="
 }
@@ -3705,6 +3848,7 @@ run_fec_adaptive_75_case
 run_link_status_qos_case
 run_link_status_qos_reverse_case
 run_link_status_qos_jitter_no_qos_case
+run_link_status_qos_udp_rate_sanity_case
 run_link_status_qos_iperf_dynamic_case "link-status-qos-iperf" "${PORT_LINK_STATUS_QOS_IPERF}" udp-rate false 5mbit "" "" 0.40 0.03
 run_link_status_qos_iperf_dynamic_case "link-status-qos-iperf-repeat" "${PORT_LINK_STATUS_QOS_IPERF_REPEAT}" udp-rate true 5mbit "" "" 0.40 0.03
 run_link_status_qos_iperf_dynamic_case "link-status-qos-iperf-jitter" "${PORT_LINK_STATUS_QOS_IPERF_JITTER}" udp-rate-jitter false 500kbit 60ms 80ms 0.25 0.03

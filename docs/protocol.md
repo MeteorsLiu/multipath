@@ -407,14 +407,22 @@ REPAIR carries one SLC repair symbol used to recover lost DATA symbols.
 Body:
 
 ```text
-base_packet_id uint32
-key            uint16
-source_span    uint8
-repair_symbol bytes[repair_symbol_size]
+base_packet_id                uint32
+key                           uint16
+source_span_and_repair_count  uint8
+repair_symbol                 bytes[repair_symbol_size]
 ```
 
-`source_span` is the number of contiguous DATA symbols protected by this REPAIR
-frame. It defines the protected range:
+`source_span_and_repair_count` is a packed byte:
+
+```text
+bits 0-2 = source_span
+bits 3-4 = repair_count - 1
+bits 5-7 = reserved, must be zero
+```
+
+`source_span` is the decoded number of contiguous DATA symbols protected by this
+REPAIR frame. It defines the protected range:
 
 ```text
 base_packet_id .. base_packet_id + source_span - 1
@@ -436,6 +444,10 @@ For both SLC profiles:
 repair count    = 1..4
 field           = GF(2^8)
 ```
+
+`repair_count` is the total number of REPAIR frames the sender generated for
+this FEC group. Every REPAIR frame for the same group must carry the same
+decoded `repair_count`.
 
 The protected source symbols are:
 
@@ -464,7 +476,7 @@ repair_symbol_size = max(len(P0), ..., len(P[source_span-1]))
 ```
 
 The `4` bytes are `base_packet_id`, the `2` bytes are `key`, and the `1` byte is
-`source_span`:
+`source_span_and_repair_count`:
 
 ```text
 repair_symbol_size = frame_body_len - 4 - 2 - 1
@@ -489,11 +501,12 @@ Sender behavior for `slc_4_plus_1`:
 
 1. After a DATA frame is written successfully, add its DATA symbol to that
    lane's SLC transmit window.
-2. After four contiguous successfully written DATA symbols, compute one
-   REPAIR.
+2. After four contiguous successfully written DATA symbols, compute the
+   configured number of REPAIR symbols for this group.
 3. Set `base_packet_id` to the first protected DATA symbol.
 4. Increment or otherwise vary `key` for each REPAIR.
-5. Set `source_span = 4`.
+5. Encode `source_span = 4` and the group `repair_count` in
+   `source_span_and_repair_count`.
 6. Set the repair symbol length to the largest IP packet length in this repair
    window.
 7. Compute the REPAIR symbol with coefficients derived from `key`.
@@ -510,17 +523,20 @@ Sender behavior for `slc_variable_plus_1`:
 2. Arm a flush timer when the pending SLC transmit window transitions from zero
    symbols to one symbol.
 3. If four contiguous successfully written DATA symbols become available before
-   the timer fires, cancel the timer and emit one full REPAIR with
-   `source_span = 4`.
+   the timer fires, cancel the timer and emit the configured number of full
+   REPAIR symbols with `source_span = 4`.
 4. If the timer fires with one to three contiguous DATA symbols pending, emit
-   one partial REPAIR with `source_span` set to the number of protected symbols.
+   the scaled number of partial REPAIR symbols with `source_span` set to the
+   number of protected symbols.
 5. Set `base_packet_id` to the first protected DATA symbol.
 6. Increment or otherwise vary `key` for each REPAIR.
-7. Set the repair symbol length to the largest IP packet length in this repair
+7. Encode the decoded `source_span` and group `repair_count` in
+   `source_span_and_repair_count`.
+8. Set the repair symbol length to the largest IP packet length in this repair
    window.
-8. Compute the REPAIR symbol with coefficients derived from `key`.
+9. Compute the REPAIR symbol with coefficients derived from `key`.
    Source bytes beyond the end of a shorter IP packet are treated as zero.
-9. Send REPAIR on the same lane's shadow transport role.
+10. Send REPAIR on the same lane's shadow transport role.
 
 For `slc_variable_plus_1`, the flush interval is derived from the sender's
 per-leg RTT estimator:
@@ -536,17 +552,22 @@ override the RTT-derived value for deterministic tests.
 Receiver behavior:
 
 1. Validate session and lane.
-2. Validate `source_span` for the negotiated `fec_profile`.
-3. Use `lane_id`, `base_packet_id`, and `source_span` to identify the protected
+2. Decode `source_span_and_repair_count`; reject frames with nonzero reserved
+   bits, invalid `source_span`, or invalid `repair_count`.
+3. Validate decoded `source_span` for the negotiated `fec_profile`.
+4. Use `lane_id`, `base_packet_id`, and decoded `source_span` to identify the protected
    DATA symbols in that lane's SLC receive window.
-4. Store the REPAIR symbol while the protected lane-local window is still alive.
-5. If all protected DATA symbols are already known, drop the REPAIR.
-6. If exactly one protected DATA symbol is missing, recover it using the REPAIR
+5. Store the REPAIR symbol and decoded `repair_count` while the protected
+   lane-local window is still alive. If REPAIR frames for the same group carry
+   inconsistent `repair_count`, FEC recovery may still use the received symbols
+   but that group is not trustworthy as a REPAIR-side QoS expectation sample.
+6. If all protected DATA symbols are already known, drop the REPAIR.
+7. If exactly one protected DATA symbol is missing, recover it using the REPAIR
    symbol and coefficients derived from `key`.
-7. If multiple protected DATA symbols are missing, keep the REPAIR until more
+8. If multiple protected DATA symbols are missing, keep the REPAIR until more
    DATA arrives or the window expires. A single SLC REPAIR cannot recover two
    missing DATA symbols.
-8. For each recovered DATA symbol, parse the IP header to obtain the packet
+9. For each recovered DATA symbol, parse the IP header to obtain the packet
    total length, truncate to that length, and write the recovered IP packet to
    TUN if it has not already been emitted.
 
@@ -721,6 +742,18 @@ per FEC group. Current valid per-transport state values are `0..7`.
 
 `repairCount` is lane-local. The sender writes the same repair-count bits into
 the UDP and TCP nibbles. The QoS bit remains transport-kind specific.
+The encoded repair-count bits must match the receive-side committed QoS state;
+the LINK_STATUS writer must not clamp, rewrite, or reset `repairCount` while
+encoding the frame.
+
+The `repairCount` bits are feedback to the peer sender for future FEC groups.
+REPAIR frames carry the per-group repair count that the sender actually used.
+The receiver must not assume that a newly sent LINK_STATUS repair count has
+already affected the current receive-side group; it should use the decoded
+REPAIR-frame repair count for that group. A receive group is recovered as soon
+as the received REPAIR symbols are sufficient for its missing DATA symbols; the
+receive window does not wait for every REPAIR symbol that the peer might have
+sent.
 
 Sender behavior:
 
@@ -847,51 +880,66 @@ REPAIR observations to compare the selected DATA leg with the shadow leg. When
 DATA and REPAIR arrive on the same transport kind, the observation is not
 cross-leg evidence and must not produce a QoS decision.
 
-The QoS estimator is event-counter based:
+The QoS estimator keeps only real receive-side sample classes:
 
 ```text
-first DATA-frame arrival -> pending DATA bytes += DATA payload length
-REPAIR accepted          -> pending REPAIR bytes += REPAIR payload length
-periodic tick            -> convert pending counters to rate observations
-                            and clear the pending counters
+originalDataBytes = DATA bytes received without REPAIR and without late arrivals
+expectedBytes     = source DATA bytes known from a completed or recovered FEC
+                    group and IP packet header length parsing
+repairBytes       = received REPAIR symbol bytes
+lateDataBytes     = original DATA bytes that arrive after the same packet id
+                    was recovered by FEC
+
+periodic tick     -> convert pending sample classes to rate observations
+                     and clear pending sample classes
 ```
 
 For an already-observed DATA / REPAIR direction, an empty tick is still a
-zero-byte rate observation. This lets the DATA and REPAIR rate EMAs decay over
-time without inventing DATA bytes, REPAIR bytes, or group samples.
+zero-byte rate observation. This lets rate state decay over time without
+inventing DATA bytes, REPAIR bytes, or group samples.
 
-Rate EMAs, PID correction, limited state, and decision-filter state are scoped
-to the DATA/REPAIR direction and role. For example, `DATA=UDP, REPAIR=TCP` is
-independent from `DATA=TCP, REPAIR=UDP`, and the primary/DATA role is
-independent from the shadow/REPAIR role. The receiver records the current
-primary DATA transport for the lane; the shadow transport is the opposite kind.
-The initial receiver-side primary is UDP, matching the sender's default
-selection. The receiver changes this primary only after the current role's QoS
-decision filter commits a clear/limited state; it must not infer a primary
-switch from an individual DATA arrival. In the current estimator, rate decision
-paths use a short decision-sample filter before commit. Do not read this as a
-requirement for every path to wait for an additional wall-clock sustain
-duration. DATA or REPAIR observations that do not match the current
-primary/shadow pair are ignored by the QoS estimator. Each tick evaluates only
-the current role state. Non-current role state does not consume the tick,
-advance the decision filter, or emit LINK_STATUS QoS state.
+Raw byte accounting is independent of FEC group lifetime. Accepted original
+DATA adds `originalDataBytes` when it arrives. Received REPAIR adds
+`repairBytes` when it arrives. Late DATA adds `lateDataBytes` when the
+estimator has already seen that packet id as recovered. Only `expectedBytes`
+is a FEC-group result; it is submitted when the group completes or recovers and
+the receiver knows the source DATA byte total. A closed or dropped FEC group
+must not decide whether raw DATA, REPAIR, or late-DATA bytes can be accounted.
+
+Rate EMAs, PID correction, limited state, and the three-sample gap window are
+scoped to the DATA/REPAIR direction and role. For example, `DATA=UDP,
+REPAIR=TCP` is independent from `DATA=TCP, REPAIR=UDP`, and the primary/DATA
+role is independent from the shadow/REPAIR role. The receiver records the
+current primary DATA transport for the lane; the shadow transport is the
+opposite kind. The initial receiver-side primary is UDP, matching the sender's
+default selection. The receiver changes this primary only after the current
+role's QoS tick commits a clear/limited state; it must not infer a primary
+switch from an individual DATA arrival. The receive-side QoS tick is one second.
+The estimator stores each tick's `rateGap`, averages three consecutive tick
+gaps, and compares that three-sample average with the QoS thresholds. Do not add
+a separate minimum group-count gate before evaluating QoS. DATA or REPAIR
+observations that do not match the current primary/shadow pair are ignored by
+the QoS estimator. Each tick evaluates only the current role state. Non-current
+role state does not consume the tick or emit LINK_STATUS QoS state.
 
 Before changing the current primary DATA direction, the receiver resets the
 target primary/DATA state so stale actual or expected rate history cannot carry
 into the new primary leg. It also resets the old primary's shadow/REPAIR state
-so stale repair or shadow-rate history cannot carry into shadow observation.
+so stale repair history cannot carry into shadow observation.
 The receiver aggregates committed direction-local role state into the final
 per-transport LINK_STATUS snapshot; the aggregated UDP/TCP status must not be
 used as a gate for another direction's QoS judgment.
 
 Duplicate DATA rejected by the session emit dedupe is dropped before TUN output
-and FEC-window bookkeeping. QoS DATA bytes use a separate DATA-arrival dedupe:
-a late original DATA frame may count once as DATA-leg arrival evidence even if a
-FEC-recovered copy was already written to TUN. The same DATA frame must not
-count twice, and FEC-recovered DATA must not be converted into DATA-leg actual
-bytes, synthetic DATA bytes, mature rate samples, or bandwidth-estimation
-inputs. Recovered IP lengths may be used only as expected source bytes for a
-completed or recovered FEC group.
+and must not contribute to `originalDataBytes`, FEC health, recovery, or emit
+state, and it must not be inserted into the receive FEC window. The receiver's
+QoS estimator may account that DATA once as `lateDataBytes` when its
+recovered-packet state has seen the packet id. Duplicate original DATA that was
+already emitted as original DATA is not late DATA. The same DATA frame must not
+count twice, and FEC-recovered DATA must not be
+converted into `originalDataBytes`, synthetic DATA bytes, mature rate samples,
+or bandwidth-estimation inputs. Recovered IP lengths may be used only as
+`expectedBytes` source bytes for a completed or recovered FEC group.
 
 Unrecovered missing DATA may only contribute to FEC health observations:
 
@@ -902,31 +950,95 @@ DataArrived / DataExpected
 FEC health is not a QoS detector input. It drives only the lane-local adaptive
 repair count carried in LINK_STATUS. Empty estimator ticks may decay rate EMAs,
 but they must not turn an old incomplete-group health sample into QoS evidence.
+FEC health has separate loss-health and late-health inputs. They must not be
+merged into one pressure value or one EMA. Estimator ticks may clear the
+FEC-health dirty flag after applying the current health state, but they must
+not reset the committed `repairCount`. The only committed `repairCount` reset
+is part of an actual primary protocol switch between UDP and TCP. That reset
+must happen before the LINK_STATUS snapshot is emitted so the sent repair-count
+bits and the receiver's local committed state remain identical.
 
-Adaptive repair count is computed from group packet arrival ratio:
+Loss health is computed from group packet arrival ratio and reacts quickly to
+rising loss:
 
 ```text
-lossRatio   = (sum(DataExpected) - sum(DataArrived)) / sum(DataExpected)
-repairCount = clamp(ceil(lossRatio * 4), 1, 4)
+groupLossRatio = (DataExpected - DataArrived) / DataExpected
+lossEMA        = EMA(lossEMA, groupLossRatio, 0.75 when rising, 0.05 when falling)
+lossRepairCount = clamp(ceil(lossEMA * 4), 1, 4)
 ```
 
-The receiver derives rate estimates from counted DATA-frame and REPAIR byte
-counters:
+Late health is computed only by estimator ticks from that tick's own pending
+byte counters. It is slower and more conservative than loss health:
 
 ```text
-actualRate           = accepted DATA bytes / tick duration
-repairRate           = accepted REPAIR bytes / tick duration
-shadowEquivalentRate = repairRate scaled by the observed DATA/REPAIR byte profile
+lateRatio   = lateDataBytes / expectedBytes
+lateEMA     = EMA(lateEMA, lateRatio, 0.20 when rising, 0.05 when falling)
+
+lateRepairCount = 1 when lateEMA <= 0.50
+lateRepairCount = 2 when lateEMA <= 0.75
+lateRepairCount = 3 when lateEMA <= 1.00
+lateRepairCount = 4 when lateEMA >  1.00
 ```
+
+If `expectedBytes` is zero for the tick, late health is not updated because the
+tick has no DATA-load denominator. The committed adaptive repair count is:
+
+```text
+repairCount = max(lossRepairCount, lateRepairCount)
+```
+
+The receiver derives rate estimates from the real sample classes:
+
+```text
+originalDataBps = originalDataBytes / tick duration
+expectedBps     = expectedBytes / tick duration
+repairBps       = repairBytes / tick duration
+lateDataBps     = lateDataBytes / tick duration
+```
+
+`expectedBps` is the DATA-side expectation from `expectedBytes`. It is not
+`originalDataBytes + repairBytes`. The estimator does not maintain a fifth
+pending byte class for derived repair expectations.
+
+`lateDataBps` is retained as a separate late-arrival observation for logs and
+late health. It must not be merged into `originalDataBytes` or directly mark a
+leg limited/clear.
 
 There are two limited-leg role paths:
 
-1. DATA-leg limited: when `actualRate` is materially below the FEC-derived
-   shadow-equivalent rate in the current primary/DATA role, mark the DATA leg
-   limited in the next LINK_STATUS snapshot.
-2. Shadow-leg limited or clear: when the current role is shadow/REPAIR,
-   compare the shadow-equivalent rate with the DATA leg's `actualRate` and
-   update the REPAIR shadow leg in the next LINK_STATUS snapshot.
+1. DATA-leg limited: when `originalDataBps + lateDataBps` is materially below
+   `expectedBps`, mark the DATA leg limited in the next LINK_STATUS snapshot.
+2. Shadow-leg limited or clear: when source data is expected for the tick,
+   compare `repairBps` with a REPAIR-specific expected rate. The expected rate
+   is derived from completed groups. For each group:
+
+   ```text
+   groupRepairScale = maxSourceBytes / expectedBytes * repairCount
+   ```
+
+   where `maxSourceBytes` is the largest source DATA packet in that FEC group,
+   `expectedBytes` is the complete source DATA byte total for that group, and
+   `repairCount` is the decoded per-group REPAIR-frame repair count. The
+   estimator updates a direction-local EMA with `groupRepairScale` when the
+   group is submitted. Each tick then computes:
+
+   ```text
+   expectedRepairBps = expectedBps * repairScaleEMA
+   deliveryGap       = rateGapRatio(expectedRepairBps, repairBps)
+   loadGap           = rateGapRatio(expectedBps, repairBps)
+   ```
+
+   The limited decision uses the three-sample average of `deliveryGap`. The
+   clear decision requires both three-sample averages to be below the clear
+   threshold:
+
+   ```text
+   deliveryGap <= 0.03
+   loadGap     <= 0.75
+   ```
+
+   REPAIR frames for the same group with inconsistent `repairCount` values make
+   that group unusable for repair-scale updates.
 
 This makes the feedback stable across a fallback transition:
 

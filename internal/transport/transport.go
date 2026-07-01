@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/MeteorsLiu/multipath/internal/debuglog"
 	"github.com/MeteorsLiu/multipath/internal/metrics"
@@ -35,9 +36,10 @@ type Payload struct {
 }
 
 const (
-	tcpLegWriterQueueSize = 64*1024*1024/1500 + 1
-	udpLegWriterQueueSize = 1024
-	tcpPayloadBatchSize   = 128
+	tcpLegWriterQueueSize  = 64*1024*1024/1500 + 1
+	udpLegWriterQueueSize  = 1024
+	tcpPayloadBatchSize    = 128
+	debugQueueWaitLogAfter = time.Millisecond
 )
 
 type PacketWriter interface {
@@ -140,8 +142,20 @@ func (d *legWriterDispatcher) dispatch(payload Payload) error {
 	}
 	d.mu.Unlock()
 
+	packetBytes := len(payload.Packet.Payload)
+	var start time.Time
+	if debuglog.Enabled() {
+		start = time.Now()
+	}
 	select {
 	case ch <- payload:
+		if !start.IsZero() {
+			wait := time.Since(start)
+			if wait >= debugQueueWaitLogAfter {
+				debuglog.Printf("transport", "leg_queue_wait leg={%s} wait_us=%d queue_len=%d queue_cap=%d bytes=%d",
+					debugLeg(payload.Leg), wait.Microseconds(), len(ch), cap(ch), packetBytes)
+			}
+		}
 		return nil
 	case <-d.ctx.Done():
 		payload.Packet.Release()
