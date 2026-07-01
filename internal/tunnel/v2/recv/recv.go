@@ -357,19 +357,6 @@ func (o *Recv) handleDATA(ctx context.Context, leg Ref, frame protocol.Frame, pa
 	if !ok {
 		return false, protocol.ErrInvalidFrame
 	}
-	if debuglog.Enabled() {
-		if ack, ok := ackTracePayload(body.Packet); ok {
-			debuglog.Printf("recv/ack_trace", "recv session=%d lane=%d packet_id=%d leg=%s time_ns=%d len=%d src_port=%d dst_port=%d seq=%d ack=%d",
-				frame.SessionID, frame.LaneID, body.PacketID, kindMetricLabel(leg.Kind), time.Now().UnixNano(), len(body.Packet),
-				ack.srcPort, ack.dstPort, ack.seq, ack.ack)
-		}
-		if data, ok := dataTracePayload(body.Packet); ok {
-			debuglog.Printf("recv/data_trace", "recv session=%d lane=%d packet_id=%d leg=%s time_ns=%d len=%d src_port=%d dst_port=%d seq=%d ack=%d tcp_payload_len=%d",
-				frame.SessionID, frame.LaneID, body.PacketID, kindMetricLabel(leg.Kind), time.Now().UnixNano(), len(body.Packet),
-				data.srcPort, data.dstPort, data.seq, data.ack, data.payloadLen)
-		}
-	}
-
 	state := o.recvState(frame.SessionID)
 	if state == nil {
 		return false, nil
@@ -581,11 +568,6 @@ func (o *Recv) recoverPackets(sessionID uint64, laneID uint8, state *recvState, 
 		)
 		debuglog.Printf("recv", "recover_emit session=%d lane=%d packet_id=%d base_packet_id=%d keys=%v source_span=%d bytes=%d",
 			sessionID, laneID, packetID, recoverable.group.basePacketID, repairKeys, recoverable.group.sourceSpan, len(payload))
-		if data, ok := dataTracePayload(payload); ok {
-			debuglog.Printf("recv/recover_data_trace", "emit session=%d lane=%d packet_id=%d leg=fec time_ns=%d len=%d src_port=%d dst_port=%d seq=%d ack=%d tcp_payload_len=%d",
-				sessionID, laneID, packetID, time.Now().UnixNano(), len(payload),
-				data.srcPort, data.dstPort, data.seq, data.ack, data.payloadLen)
-		}
 		packet := packetbuf.Acquire(len(payload))
 		copy(packet.Payload, payload)
 		packets = append(packets, packet)
