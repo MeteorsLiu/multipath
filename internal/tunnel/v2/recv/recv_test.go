@@ -94,18 +94,18 @@ func assertNoRecvPacket(t *testing.T, out *Recv) {
 	}
 }
 
-func qosPendingActualBytes(t *testing.T, q *qosEstimator, dataKind, repairKind transport.Kind) uint64 {
+func qosPendingBytesFor(t *testing.T, q *qosEstimator, dataKind, repairKind transport.Kind) qosPendingBytes {
 	t.Helper()
 	if q == nil {
 		t.Fatal("missing QoS estimator")
 	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	state := q.directionIfExists(dataKind, repairKind, q.currentRoleLocked())
+	state := q.directionLocked(dataKind, repairKind, q.currentRole)
 	if state == nil {
 		t.Fatalf("missing QoS direction for %v/%v", dataKind, repairKind)
 	}
-	return state.pendingActual
+	return state.pending
 }
 
 func udpLeg() Ref {
@@ -262,8 +262,11 @@ func TestRecvLateOriginalDATACountsQoSWithoutReemit(t *testing.T) {
 	first.Release()
 
 	q := state.qos[1]
-	if got := qosPendingActualBytes(t, q, transport.KindUDP, transport.KindTCP); got != uint64(len(shards[0])) {
-		t.Fatalf("pending actual after first DATA = %d, want %d", got, len(shards[0]))
+	if got := qosPendingBytesFor(t, q, transport.KindUDP, transport.KindTCP); got.originalDataBytes != uint64(len(shards[0])) ||
+		got.expectedBytes != 0 ||
+		got.repairBytes != 0 ||
+		got.lateDataBytes != 0 {
+		t.Fatalf("pending after first DATA = %+v, want original=%d only", got, len(shards[0]))
 	}
 
 	repair := protocol.Frame{
@@ -286,49 +289,106 @@ func TestRecvLateOriginalDATACountsQoSWithoutReemit(t *testing.T) {
 	}
 	recovered.Release()
 
-	if got := qosPendingActualBytes(t, q, transport.KindUDP, transport.KindTCP); got != uint64(len(shards[0])) {
-		t.Fatalf("pending actual after recovery = %d, want %d", got, len(shards[0]))
+	if got := qosPendingBytesFor(t, q, transport.KindUDP, transport.KindTCP); got.originalDataBytes != uint64(len(shards[0])) ||
+		got.expectedBytes != uint64(len(shards[0])+len(shards[1])) ||
+		got.repairBytes != uint64(len(shards[2])) ||
+		got.lateDataBytes != 0 {
+		t.Fatalf("pending after recovery = %+v, want original=%d expected=%d repair=%d late=0",
+			got, len(shards[0]), len(shards[0])+len(shards[1]), len(shards[2]))
 	}
 
 	sendDATA(101, shards[1])
 	assertNoRecvPacket(t, out)
-	if got := qosPendingActualBytes(t, q, transport.KindUDP, transport.KindTCP); got != uint64(len(shards[0])+len(shards[1])) {
-		t.Fatalf("pending actual after late original = %d, want %d", got, len(shards[0])+len(shards[1]))
+	if got := qosPendingBytesFor(t, q, transport.KindUDP, transport.KindTCP); got.originalDataBytes != uint64(len(shards[0])) ||
+		got.expectedBytes != uint64(len(shards[0])+len(shards[1])) ||
+		got.lateDataBytes != uint64(len(shards[1])) {
+		t.Fatalf("pending after late original = %+v, want original=%d expected=%d late=%d",
+			got, len(shards[0]), len(shards[0])+len(shards[1]), len(shards[1]))
 	}
 
 	sendDATA(101, shards[1])
 	assertNoRecvPacket(t, out)
-	if got := qosPendingActualBytes(t, q, transport.KindUDP, transport.KindTCP); got != uint64(len(shards[0])+len(shards[1])) {
-		t.Fatalf("pending actual after duplicate late original = %d, want %d", got, len(shards[0])+len(shards[1]))
+	if got := qosPendingBytesFor(t, q, transport.KindUDP, transport.KindTCP); got.originalDataBytes != uint64(len(shards[0])) ||
+		got.expectedBytes != uint64(len(shards[0])+len(shards[1])) ||
+		got.lateDataBytes != uint64(len(shards[1])) {
+		t.Fatalf("pending after duplicate late original = %+v, want original=%d expected=%d late=%d",
+			got, len(shards[0]), len(shards[0])+len(shards[1]), len(shards[1]))
 	}
 }
 
-func TestRecvDoesNotStoreFECBytesForUngroupedDATA(t *testing.T) {
+func TestRecvLateRepairAfterClosedGroupStillCountsQoSRepairBytes(t *testing.T) {
 	var manager session.Manager
-	if _, ok := manager.Create(17); !ok {
+	if _, ok := manager.Create(15); !ok {
 		t.Fatal("Create session failed")
 	}
 	out := New(Config{SessionManager: &manager})
-	frame := protocol.Frame{
-		Type:      protocol.TypeDATA,
-		SessionID: 17,
-		LaneID:    1,
-		Body: protocol.DataBody{
-			PacketID: 1,
-			Packet:   []byte("packet"),
-		},
-	}
-	if err := out.WriteTo(context.Background(), udpLeg(), encodedTestFrame(t, frame)); err != nil {
-		t.Fatalf("Write DATA: %v", err)
-	}
-	readRecvPacket(t, out).Release()
-
-	state := out.recvState(17)
+	state := out.recvState(15)
 	state.mu.Lock()
-	got := len(state.fecDataBytes)
+	state.qos[1] = newQoSEstimator(qosConfig{SessionID: 15, LaneID: 1, Tick: time.Hour}, nil)
 	state.mu.Unlock()
-	if got != 0 {
-		t.Fatalf("FEC data byte entries = %d, want none without a repair group", got)
+
+	codec, err := fecpkg.NewCodec(2, 2)
+	if err != nil {
+		t.Fatalf("NewCodec: %v", err)
+	}
+	shards := [][]byte{
+		ipv4Packet(12, 'a'),
+		ipv4Packet(16, 'b'),
+		nil,
+		nil,
+	}
+	keys := []uint16{7, 8}
+	if err := codec.Encode(shards, keys); err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+
+	ctx := context.Background()
+	for i := 0; i < 2; i++ {
+		frame := protocol.Frame{
+			Type:      protocol.TypeDATA,
+			SessionID: 15,
+			LaneID:    1,
+			Body: protocol.DataBody{
+				PacketID: uint32(100 + i),
+				Packet:   shards[i],
+			},
+		}
+		if err := out.WriteTo(ctx, udpLeg(), encodedTestFrame(t, frame)); err != nil {
+			t.Fatalf("Write DATA %d: %v", i, err)
+		}
+		readRecvPacket(t, out).Release()
+	}
+
+	writeRepair := func(key uint16, symbol []byte) {
+		t.Helper()
+		frame := protocol.Frame{
+			Type:      protocol.TypeREPAIR,
+			SessionID: 15,
+			LaneID:    1,
+			Body: protocol.RepairBody{
+				BasePacketID: 100,
+				Key:          key,
+				SourceSpan:   2,
+				RepairCount:  2,
+				Symbol:       symbol,
+			},
+		}
+		if err := out.WriteTo(ctx, tcpLeg(), encodedTestFrame(t, frame)); err != nil {
+			t.Fatalf("Write REPAIR %d: %v", key, err)
+		}
+	}
+
+	q := state.qos[1]
+	writeRepair(keys[0], shards[2])
+	firstRepairBytes := uint64(len(shards[2]))
+	if got := qosPendingBytesFor(t, q, transport.KindUDP, transport.KindTCP); got.repairBytes != firstRepairBytes {
+		t.Fatalf("pending after first repair = %+v, want repair=%d", got, firstRepairBytes)
+	}
+
+	writeRepair(keys[1], shards[3])
+	wantRepairBytes := firstRepairBytes + uint64(len(shards[3]))
+	if got := qosPendingBytesFor(t, q, transport.KindUDP, transport.KindTCP); got.repairBytes != wantRepairBytes {
+		t.Fatalf("pending after late repair = %+v, want repair=%d", got, wantRepairBytes)
 	}
 }
 
@@ -490,11 +550,7 @@ func TestRecvReportsQoSStatusThroughCallback(t *testing.T) {
 			return nil
 		},
 	})
-	state := out.recvState(10)
-	state.mu.Lock()
-	qosStatuses := []qosStatus{{UDPLimited: true}}
-	state.attachRepairCount(1, qosStatuses)
-	state.mu.Unlock()
+	qosStatuses := []qosStatus{{UDPLimited: true, RepairCount: 1}}
 	if err := out.reportQoS(ctx, 10, 1, qosStatuses); err != nil {
 		t.Fatalf("reportQoS: %v", err)
 	}
@@ -507,257 +563,119 @@ func TestRecvReportsQoSStatusThroughCallback(t *testing.T) {
 	}
 }
 
-func TestRecvAdaptiveRepairCountUsesTickSmoothedGroupLoss(t *testing.T) {
-	var manager session.Manager
-	if _, ok := manager.Create(11); !ok {
-		t.Fatal("Create session failed")
-	}
-	var statuses []QoSStatus
-	ctx := context.Background()
-	out := New(Config{
-		SessionManager: &manager,
-		OnQoSStatus: func(ctx context.Context, status QoSStatus) error {
-			statuses = append(statuses, status)
-			return nil
-		},
-	})
-
-	state := out.recvState(11)
-	now := time.Unix(100, 0)
-	var qosStatuses []qosStatus
-	for i, at := range []time.Time{now, now.Add(500 * time.Millisecond), now.Add(time.Second)} {
-		group := rxGroupKey{basePacketID: uint32(100 + i*4), sourceSpan: 4}
-		state.mu.Lock()
-		state.fecGroups[rxLaneGroupKey{laneID: 1, group: group}] = rxGroupObservation{
-			dataKind:   transport.KindUDP,
-			repairKind: transport.KindTCP,
-		}
-		qosStatuses = append(qosStatuses, out.observeGroupResult(state, 1, rxGroupWindowResult{done: []rxGroupDone{{
-			group:        group,
-			dataArrived:  0,
-			dataExpected: 4,
-			expired:      true,
-		}}}, at)...)
-		state.attachRepairCount(1, qosStatuses)
-		state.mu.Unlock()
-	}
-	if err := out.reportQoS(ctx, 11, 1, qosStatuses); err != nil {
-		t.Fatalf("reportQoS: %v", err)
-	}
-
-	if len(statuses) != 1 {
-		t.Fatalf("statuses = %+v, want one", statuses)
-	}
-	if statuses[0].RepairCount != 4 {
-		t.Fatalf("status = %+v, want repair count 4", statuses[0])
-	}
-	if statuses[0].UDPLimited || statuses[0].TCPLimited {
-		t.Fatalf("status = %+v, want repair-only QoS snapshot", statuses[0])
-	}
-}
-
-func TestRecvAdaptiveRepairCountSmoothsSmallInitialGroupLoss(t *testing.T) {
-	var manager session.Manager
-	if _, ok := manager.Create(12); !ok {
-		t.Fatal("Create session failed")
-	}
-	out := New(Config{SessionManager: &manager})
-	state := out.recvState(12)
-	now := time.Unix(200, 0)
-	samples := []struct {
-		at       time.Time
-		group    rxGroupKey
-		arrived  uint8
-		expected uint8
-	}{
-		{at: now, group: rxGroupKey{basePacketID: 100, sourceSpan: 2}, arrived: 1, expected: 2},
-		{at: now.Add(500 * time.Millisecond), group: rxGroupKey{basePacketID: 102, sourceSpan: 4}, arrived: 3, expected: 4},
-		{at: now.Add(time.Second), group: rxGroupKey{basePacketID: 106, sourceSpan: 4}, arrived: 4, expected: 4},
-	}
-
-	var statuses []qosStatus
-	for _, sample := range samples {
-		state.mu.Lock()
-		for i := 0; i < int(sample.arrived); i++ {
-			state.dataDedupe.mark(sample.group.basePacketID + uint32(i))
-		}
-		state.fecGroups[rxLaneGroupKey{laneID: 1, group: sample.group}] = rxGroupObservation{
-			dataKind:   transport.KindTCP,
-			repairKind: transport.KindUDP,
-		}
-		statuses = append(statuses, out.observeGroupResult(state, 1, rxGroupWindowResult{done: []rxGroupDone{{
-			group:        sample.group,
-			dataArrived:  sample.arrived,
-			dataExpected: sample.expected,
-			recovered:    true,
-		}}}, sample.at)...)
-		state.attachRepairCount(1, statuses)
-		state.mu.Unlock()
-	}
-
-	if len(statuses) != 0 {
-		t.Fatalf("statuses = %+v, want none for tick-smoothed small initial loss", statuses)
-	}
-	if got := state.fecPolicyFor(1).currentRepairCount(); got != 1 {
-		t.Fatalf("repair count = %d, want 1", got)
-	}
-}
-
-func TestRxFECPolicyRaisesRepairCountQuicklyOnSevereLoss(t *testing.T) {
-	now := time.Unix(250, 0)
-	policy := &rxFECPolicy{
-		lossInitialized: true,
-		lossRatio:       1.0 / 3.0,
-		lastTickAt:      now.Add(-time.Second),
-		repairCount:     2,
-		dataKind:        transport.KindUDP,
-		pendingArrived:  50,
-		pendingExpected: 199,
-	}
-
-	repairCount, changed := policy.tick(now)
-	if !changed {
-		t.Fatalf("changed = false, want severe-loss tick to raise repair count")
-	}
-	if repairCount != 3 {
-		t.Fatalf("repair count = %d loss_ratio=%.3f, want 3 for severe-loss tick after moderate loss", repairCount, policy.lossRatio)
-	}
-}
-
-func TestRxFECPolicyLowersRepairCountSlowlyAfterSevereLoss(t *testing.T) {
-	now := time.Unix(260, 0)
-	policy := &rxFECPolicy{
-		lossInitialized: true,
-		lossRatio:       0.5625,
-		lastTickAt:      now.Add(-time.Second),
-		repairCount:     3,
-		dataKind:        transport.KindUDP,
-	}
-
-	for i := 0; i < 2; i++ {
-		policy.pendingArrived = 4
-		policy.pendingExpected = 4
-		repairCount, _ := policy.tick(now.Add(time.Duration(i) * time.Second))
-		if repairCount != 3 {
-			t.Fatalf("repair count after healthy tick %d = %d loss_ratio=%.3f, want still 3", i+1, repairCount, policy.lossRatio)
-		}
-	}
-}
-
-func TestRecvAdaptiveRepairCountUsesOriginalDataSeen(t *testing.T) {
-	var manager session.Manager
-	if _, ok := manager.Create(15); !ok {
-		t.Fatal("Create session failed")
-	}
-	out := New(Config{SessionManager: &manager})
-	state := out.recvState(15)
-	now := time.Unix(300, 0)
-	group := rxGroupKey{basePacketID: 1000, sourceSpan: 1}
-
-	state.mu.Lock()
-	state.dataDedupe.mark(group.basePacketID)
-	policy := state.fecPolicyFor(1)
-	policy.lastTickAt = now.Add(-time.Second)
-	state.fecGroups[rxLaneGroupKey{laneID: 1, group: group}] = rxGroupObservation{
-		dataKind:   transport.KindTCP,
-		repairKind: transport.KindUDP,
-	}
-	statuses := out.observeGroupResult(state, 1, rxGroupWindowResult{done: []rxGroupDone{{
-		group:        group,
-		dataArrived:  0,
-		dataExpected: 1,
-		expired:      true,
-	}}}, now)
-	repairCount := state.fecPolicyFor(1).currentRepairCount()
-	state.mu.Unlock()
-
-	if len(statuses) != 0 {
-		t.Fatalf("statuses = %+v, want none when original DATA was observed", statuses)
-	}
-	if repairCount != 1 {
-		t.Fatalf("repair count = %d, want 1 because dataDedupe saw the DATA", repairCount)
-	}
-}
-
-func TestRxGroupWindowKeepsRecoveredGroupUntilMature(t *testing.T) {
+func TestRxGroupWindowFinishesRecoveredGroup(t *testing.T) {
 	w := newRxGroupWindow()
 	result := w.addRepair(100, 7, 1, ipv4Packet(20, 'r'))
 	if len(result.recoverable) != 1 {
 		t.Fatalf("recoverable = %+v, want one group", result.recoverable)
 	}
 
-	result = w.finishRecovery(result.recoverable[0])
-	if len(result.done) != 0 {
-		t.Fatalf("done after recovery = %+v, want none before mature timer", result.done)
-	}
-	if group := w.groups[rxGroupKey{basePacketID: 100, sourceSpan: 1}]; group == nil || !group.recovered {
-		t.Fatalf("group after recovery = %+v, want retained recovered group", group)
-	}
-
-	result = w.expireGroup(rxGroupKey{basePacketID: 100, sourceSpan: 1})
+	result = w.finishRecovery(result.recoverable[0], uint64(len(ipv4Packet(20, 'r'))), uint64(len(ipv4Packet(20, 'r'))))
 	if len(result.done) != 1 {
-		t.Fatalf("done after mature = %+v, want one done group", result.done)
+		t.Fatalf("done after recovery = %+v, want one done group", result.done)
 	}
 	if !result.done[0].recovered || result.done[0].expired {
-		t.Fatalf("done = %+v, want recovered mature result without expired", result.done[0])
+		t.Fatalf("done = %+v, want recovered result without expired", result.done[0])
+	}
+	if group := w.groups[rxGroupKey{basePacketID: 100, sourceSpan: 1}]; group != nil {
+		t.Fatalf("group after recovery = %+v, want dropped", group)
 	}
 }
 
-func TestRecvPrimarySwitchResetsAdaptiveRepairCount(t *testing.T) {
+func TestRxGroupWindowExpireCompletesGroupBeforeExpired(t *testing.T) {
+	w := newRxGroupWindow()
+	defer w.releaseAll()
+
+	w.addData(100, ipv4Packet(10, 'a'))
+	w.addData(101, ipv4Packet(12, 'b'))
+	key := rxGroupKey{basePacketID: 100, sourceSpan: 2}
+	w.groups[key] = &rxGroup{
+		key:  key,
+		data: []*packetbuf.Packet{w.recentData[100], w.recentData[101]},
+	}
+
+	result := w.expireGroup(key)
+	if len(result.done) != 1 {
+		t.Fatalf("done = %+v, want one completed group", result.done)
+	}
+	if result.done[0].expired || result.done[0].recovered {
+		t.Fatalf("done = %+v, want completed group without expired/recovered", result.done[0])
+	}
+	if group := w.groups[key]; group != nil {
+		t.Fatalf("group after complete expire = %+v, want dropped", group)
+	}
+}
+
+func TestRxGroupWindowExpireReturnsRecoverableGroup(t *testing.T) {
+	w := newRxGroupWindow()
+	defer w.releaseAll()
+
+	key := rxGroupKey{basePacketID: 100, sourceSpan: 1}
+	result := w.addRepair(100, 7, 1, ipv4Packet(20, 'r'))
+	if len(result.recoverable) != 1 {
+		t.Fatalf("recoverable after repair = %+v, want one group", result.recoverable)
+	}
+
+	result = w.expireGroup(key)
+	if len(result.recoverable) != 1 || len(result.done) != 0 {
+		t.Fatalf("expire result = %+v, want recoverable without done", result)
+	}
+	if group := w.groups[key]; group == nil {
+		t.Fatal("recoverable group was dropped before recovery")
+	}
+}
+
+func TestRecvExpireFECGroupRecoversRecoverableGroup(t *testing.T) {
 	var manager session.Manager
-	if _, ok := manager.Create(13); !ok {
+	sess, ok := manager.Create(16)
+	if !ok {
 		t.Fatal("Create session failed")
 	}
 	out := New(Config{SessionManager: &manager})
-	state := out.recvState(13)
-	group := rxGroupKey{basePacketID: 100, sourceSpan: 4}
+	defer out.closeRecvState(16, sess)
 
-	state.mu.Lock()
-	state.fecGroups[rxLaneGroupKey{laneID: 1, group: group}] = rxGroupObservation{
-		dataKind:   transport.KindUDP,
-		repairKind: transport.KindTCP,
+	codec, err := fecpkg.NewCodec(2, 1)
+	if err != nil {
+		t.Fatalf("NewCodec: %v", err)
 	}
-	statuses := []qosStatus{{UDPLimited: true, primarySwitched: true}}
-	statuses = append(statuses, out.observeGroupResult(state, 1, rxGroupWindowResult{done: []rxGroupDone{{
-		group:        group,
-		dataArrived:  1,
-		dataExpected: 4,
-		expired:      true,
-	}}}, time.Now())...)
-	state.resetFECPolicyOnPrimarySwitch(1, statuses)
-	state.attachRepairCount(1, statuses)
-	policyRepairCount := state.fecPolicyFor(1).currentRepairCount()
+	shards := [][]byte{
+		ipv4Packet(10, 'a'),
+		ipv4Packet(12, 'b'),
+		nil,
+	}
+	keys := []uint16{7}
+	if err := codec.Encode(shards, keys); err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+
+	state := out.recvState(16)
+	group := rxGroupKey{basePacketID: 100, sourceSpan: 2}
+	state.mu.Lock()
+	state.qos[1] = newQoSEstimator(qosConfig{SessionID: 16, LaneID: 1, Tick: time.Hour}, nil)
+	window := state.windowFor(1)
+	window.addData(100, shards[0])
+	window.groups[group] = &rxGroup{
+		key:  group,
+		data: []*packetbuf.Packet{window.recentData[100], nil},
+		repairs: []rxRepairShard{{
+			key:    keys[0],
+			symbol: storePacket(shards[2]),
+		}},
+	}
 	state.mu.Unlock()
 
-	if policyRepairCount != 1 {
-		t.Fatalf("policy repair count = %d, want reset to 1", policyRepairCount)
-	}
-	for i, status := range statuses {
-		if status.RepairCount != 1 {
-			t.Fatalf("status %d = %+v, want repair count 1 after primary switch reset", i, status)
-		}
+	out.expireFECGroup(state, 1, group)
+
+	recovered := readRecvPacket(t, out)
+	defer recovered.Release()
+	if !bytes.Equal(recovered.Payload, shards[1]) {
+		t.Fatalf("recovered packet = %v, want %v", recovered.Payload, shards[1])
 	}
 
-	lateGroup := rxGroupKey{basePacketID: 200, sourceSpan: 4}
 	state.mu.Lock()
-	state.fecGroups[rxLaneGroupKey{laneID: 1, group: lateGroup}] = rxGroupObservation{
-		dataKind:   transport.KindUDP,
-		repairKind: transport.KindTCP,
-	}
-	lateStatuses := out.observeGroupResult(state, 1, rxGroupWindowResult{done: []rxGroupDone{{
-		group:        lateGroup,
-		dataArrived:  0,
-		dataExpected: 4,
-		expired:      true,
-	}}}, time.Now())
-	lateRepairCount := state.fecPolicyFor(1).currentRepairCount()
-	state.mu.Unlock()
-
-	if lateRepairCount != 1 {
-		t.Fatalf("late old-direction group raised repair count to %d, want 1", lateRepairCount)
-	}
-	if len(lateStatuses) != 0 {
-		t.Fatalf("late statuses = %+v, want none for old data leg", lateStatuses)
+	defer state.mu.Unlock()
+	if got := state.rxWindows[1].groups[group]; got != nil {
+		t.Fatalf("group after expire recovery = %+v, want dropped", got)
 	}
 }
 

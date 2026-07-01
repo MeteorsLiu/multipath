@@ -36,29 +36,70 @@ with reliability machinery.
 QoS detection is based on FEC differential observations. Within one FEC group,
 the DATA leg and REPAIR leg carry differential observations of the same source
 data under the FEC rules. QoS detection may compare values derived from that
-same-group relationship, for example expected DATA bytes versus actual DATA
-bytes. FEC health is not a QoS detector input; it drives only adaptive repair
-count. Do not treat primary and shadow legs as the same capacity reference
-across different transport protocols. Do not introduce cross-leg capacity
-heuristics such as using shadow throughput as primary capacity,
-`max(expectedBps, shadowBps)`, or a `CapacityGap`-style signal for primary-leg
-QoS decisions.
+same-group relationship, for example expected source DATA bytes versus original
+DATA bytes that arrived without REPAIR. FEC health is not a QoS detector input;
+it drives only adaptive repair count. Do not treat primary and shadow legs as
+the same capacity reference across different transport protocols. Do not
+introduce cross-leg capacity heuristics such as using REPAIR-derived throughput
+as primary DATA capacity or a `CapacityGap`-style signal for primary-leg QoS
+decisions.
 
-QoS detection must not use duplicate or discarded DATA packets as late
-bookkeeping inputs. Once `emitDedupe` rejects a DATA packet, it must be dropped
-without updating rx windows, rate samples, mature samples, or QoS estimator
-state. Unrecovered missing DATA may only contribute to adaptive FEC health
-observations such as `DataArrived/DataExpected`; do not feed it into the QoS
-estimator or convert unrecovered, discarded, or late duplicate packets into
-synthetic DATA bytes, recovered bytes, rate samples, or bandwidth-estimation
-inputs.
+Receive-side QoS raw byte accounting is independent of FEC group lifetime.
+Accepted original DATA adds `originalDataBytes` when it arrives. Received
+REPAIR adds `repairBytes` when it arrives. Late DATA adds `lateDataBytes` when
+the estimator has already seen that packet id as recovered. Only
+`expectedBytes` is a FEC-group result; it is submitted when the group completes
+or recovers and the receiver knows the source DATA byte total. A closed or
+dropped FEC group must not decide whether raw DATA, REPAIR, or late-DATA bytes
+can be accounted.
 
-QoS estimator rate state, PID correction state, limited state, and
-decision-filter state must be scoped to the DATA/REPAIR direction, for example
+QoS detection must keep real sample classes separate: `originalDataBytes` are
+DATA bytes received without REPAIR and without late arrivals; `expectedBytes`
+are the source DATA bytes known from a completed or recovered FEC group and IP
+header length parsing; `repairBytes` are received REPAIR symbol bytes;
+`lateDataBytes` are original DATA bytes that arrive after the same packet id was
+recovered by FEC.
+Once `emitDedupe` rejects a DATA packet, it must not update
+`originalDataBytes`, FEC health, recovery, emit state, or the receive FEC
+window. The lane-local QoS estimator may account it once as `lateDataBytes`
+only when its estimator-owned recovered-packet state has seen the packet id.
+Duplicate original DATA that was already emitted as original DATA is not late
+DATA. `lateDataBytes` is retained as a separate late-arrival observation only;
+it must not be merged into
+`originalDataBytes` or directly mark a leg limited/clear. FEC-recovered DATA
+may contribute only to `expectedBytes`
+through its parsed IP packet length, not to `originalDataBytes`.
+Unrecovered missing DATA may
+only contribute to adaptive FEC health observations such as
+`DataArrived/DataExpected`; do not feed it into the QoS limited/clear detector
+or convert it into synthetic DATA bytes, recovered bytes, rate samples, or
+bandwidth-estimation inputs. The lane-local QoS estimator may own and update
+FEC-health state only for adaptive repair-count feedback.
+
+Derived QoS rates must preserve those names and meanings:
+`expectedBps = expectedBytes / deltaT`; it is not the sum of
+`originalDataBytes` and `repairBytes`. The estimator keeps only
+`originalDataBytes`, `expectedBytes`, `repairBytes`, and `lateDataBytes` as
+pending QoS byte classes, and a tick resets those pending counters after
+converting them to rates. DATA-leg `rateGap` compares `expectedBps` with
+`originalDataBps + lateDataBps`; `lateDataBytes` still remains a separate
+sample class and is not merged into `originalDataBytes`. The receive-side QoS
+tick is one second. The estimator stores each tick's `rateGap`, averages three
+consecutive tick gaps, and compares that three-sample average with the QoS
+thresholds. Do not add a separate minimum group-count gate before evaluating
+QoS.
+
+Do not add a `lossRepair` detector or use the receiver's newly requested repair
+count as proof that the sender already used that count for the current receive
+group. LINK_STATUS repair-count feedback affects future peer send groups after
+the peer applies it; receive-side QoS must not add a separate repair-count-based
+pending byte class.
+
+QoS estimator rate state, PID correction state, limited state, and three-sample
+gap window must be scoped to the DATA/REPAIR direction, for example
 `data=UDP, repair=TCP` is independent from `data=TCP, repair=UDP`. The final
 LINK_STATUS snapshot is aggregated per transport kind only after a direction's
-role-local decision filter commits clear/limited state. Do not interpret this
-as an additional wall-clock sustain wait on every estimator path. Do not use
+role-local tick commits clear/limited state. Do not use
 one transport kind's aggregated LINK_STATUS state as a gate for another
 direction's DATA-leg or REPAIR-leg QoS judgment. LINK_STATUS is state-change
 feedback; delivered-bps fields are auxiliary snapshot data and are not a
@@ -234,13 +275,29 @@ Typical workflow:
    service tooling, and the user's environment are loaded.
 3. In the remote checkout, fetch the target branch, reset or pull to the exact
    commit being tested, and build the real binary there.
-4. Restart the deployed service on the remote host. The current live setup has
+
+Prebuilt-binary workflow, when explicitly requested or when the remote checkout
+must not be changed:
+
+1. Confirm the remote CPU architecture with `uname -m`.
+2. Cross-build locally for the remote target, for example
+   `GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o /tmp/multipath-linux-amd64 .`.
+3. Upload the binary to a remote temporary directory and mark it executable.
+4. Run namespace E2E with the uploaded binary by setting
+   `MULTIPATH_REAL_E2E_BIN=<remote-bin>` and
+   `MULTIPATH_REAL_E2E_PREBUILT_BIN=1`.
+5. If a case subset is needed for debugging, run it from a temporary copy of
+   `scripts/e2e.sh`; do not edit the repository script just to select cases.
+
+For live deployed-service validation:
+
+1. Restart the deployed service on the remote host. The current live setup has
    used a systemd unit named `mp`; verify the unit name on the host before
    restarting it.
-5. Drive traffic through the real tunnel, not through localhost shortcuts.
+2. Drive traffic through the real tunnel, not through localhost shortcuts.
    For reverse-direction QoS, use reverse iperf over the TUN address, for
    example `iperf3 -c <peer-tun-ip> -R`.
-6. Observe the service logs with `journalctl` while traffic and shaping are
+3. Observe the service logs with `journalctl` while traffic and shaping are
    active. Do not rely only on a single command's exit status.
 
 Useful remote log signals:

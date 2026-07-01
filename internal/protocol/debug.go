@@ -46,7 +46,7 @@ func debugFrame(frame Frame) string {
 	case DataBody:
 		return fmt.Sprintf("%s packet_id=%d payload_len=%d", base, body.PacketID, len(body.Packet))
 	case RepairBody:
-		return fmt.Sprintf("%s base_packet_id=%d key=%d source_span=%d symbol_len=%d", base, body.BasePacketID, body.Key, body.SourceSpan, len(body.Symbol))
+		return fmt.Sprintf("%s base_packet_id=%d key=%d source_span=%d repair_count=%d symbol_len=%d", base, body.BasePacketID, body.Key, body.SourceSpan, body.RepairCount, len(body.Symbol))
 	case CloseBody:
 		return fmt.Sprintf("%s scope=%d reason=%d", base, body.Scope, body.Reason)
 	case BandwidthProbeBody:

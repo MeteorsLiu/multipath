@@ -13,6 +13,7 @@ import (
 )
 
 const defaultPacketBufferSize = 64 * 1024
+const udpSocketBufferSize = 32 * 1024 * 1024
 
 var (
 	ErrUnknownEndpoint = errors.New("transport: unknown packet endpoint")
@@ -59,6 +60,7 @@ func NewPacket(endpoints ...PacketEndpoint) (*Packet, error) {
 		if endpoint.ID == "" {
 			return nil, fmt.Errorf("%w: empty endpoint id", ErrUnknownEndpoint)
 		}
+		tunePacketConn(endpoint.ID, endpoint.Conn)
 		p.endpoints[endpoint.ID] = packetEndpointState{
 			conn:  endpoint.Conn,
 			batch: newPacketBatcher(endpoint.Conn),

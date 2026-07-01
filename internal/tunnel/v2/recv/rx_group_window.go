@@ -50,11 +50,13 @@ type rxGroupRecoverable struct {
 }
 
 type rxGroupDone struct {
-	group        rxGroupKey
-	dataArrived  uint8
-	dataExpected uint8
-	recovered    bool
-	expired      bool
+	group          rxGroupKey
+	dataArrived    uint8
+	dataExpected   uint8
+	expectedBytes  uint64
+	maxSourceBytes uint64
+	recovered      bool
+	expired        bool
 }
 
 func newRxGroupWindow() *rxGroupWindow {
@@ -75,10 +77,6 @@ func storePacket(b []byte) *packetbuf.Packet {
 }
 
 func (w *rxGroupWindow) addData(packetID uint32, packet []byte) rxGroupWindowResult {
-	if w == nil {
-		return rxGroupWindowResult{}
-	}
-
 	if old := w.recentData[packetID]; old != nil {
 		old.Release()
 	} else {
@@ -96,7 +94,7 @@ func (w *rxGroupWindow) addData(packetID uint32, packet []byte) rxGroupWindowRes
 }
 
 func (w *rxGroupWindow) addRepair(basePacketID uint32, key uint16, sourceSpan int, symbol []byte) rxGroupWindowResult {
-	if w == nil || sourceSpan <= 0 || sourceSpan > maxFECSourceSpan {
+	if sourceSpan <= 0 || sourceSpan > maxFECSourceSpan {
 		return rxGroupWindowResult{}
 	}
 
@@ -132,7 +130,7 @@ func (w *rxGroupWindow) addRepair(basePacketID uint32, key uint16, sourceSpan in
 }
 
 func (w *rxGroupWindow) buildShardsLocked(r rxGroupRecoverable, shards [][]byte, repairKeys []uint16) ([][]byte, []uint16, bool) {
-	if w == nil || r.missingMask == 0 {
+	if r.missingMask == 0 {
 		return nil, nil, false
 	}
 
@@ -142,7 +140,7 @@ func (w *rxGroupWindow) buildShardsLocked(r rxGroupRecoverable, shards [][]byte,
 	}
 
 	missing := countMissing(r.missingMask, r.group.sourceSpan)
-	if missing == 0 || len(group.repairs) < missing {
+	if len(group.repairs) < missing {
 		return nil, nil, false
 	}
 
@@ -172,40 +170,39 @@ func (w *rxGroupWindow) buildShardsLocked(r rxGroupRecoverable, shards [][]byte,
 	}
 	for i := 0; i < missing; i++ {
 		repair := group.repairs[i]
-		if repair.symbol == nil {
-			return nil, nil, false
-		}
 		shards[r.group.sourceSpan+i] = repair.symbol.Payload
 		repairKeys = append(repairKeys, repair.key)
 	}
 	return shards, repairKeys, true
 }
 
-func (w *rxGroupWindow) finishRecovery(r rxGroupRecoverable) rxGroupWindowResult {
-	if w == nil {
-		return rxGroupWindowResult{}
-	}
-
+func (w *rxGroupWindow) finishRecovery(r rxGroupRecoverable, recoveredBytes, recoveredMaxBytes uint64) rxGroupWindowResult {
 	group := w.groups[r.group]
 	if group == nil {
 		return w.prune()
 	}
 
 	group.recovered = true
-	return w.prune()
+	out := rxGroupWindowResult{done: []rxGroupDone{w.doneForGroup(group, true, false, recoveredBytes, recoveredMaxBytes)}}
+	w.closeGroup(group.key)
+	w.dropGroup(group.key)
+	out.add(w.prune())
+	return out
 }
 
 func (w *rxGroupWindow) expireGroup(key rxGroupKey) rxGroupWindowResult {
-	if w == nil {
-		return rxGroupWindowResult{}
-	}
-
 	group := w.groups[key]
 	if group == nil {
 		return w.prune()
 	}
 
-	out := rxGroupWindowResult{done: []rxGroupDone{w.doneForGroup(group, group.recovered, !group.recovered)}}
+	out := w.checkGroup(group)
+	if len(out.done) > 0 || len(out.recoverable) > 0 {
+		out.add(w.prune())
+		return out
+	}
+
+	out = rxGroupWindowResult{done: []rxGroupDone{w.doneForGroup(group, group.recovered, !group.recovered, 0, 0)}}
 	w.closeGroup(group.key)
 	w.dropGroup(group.key)
 	out.add(w.prune())
@@ -213,9 +210,6 @@ func (w *rxGroupWindow) expireGroup(key rxGroupKey) rxGroupWindowResult {
 }
 
 func (w *rxGroupWindow) releaseAll() {
-	if w == nil {
-		return
-	}
 	for packetID := range w.recentData {
 		w.dropData(packetID)
 	}
@@ -240,7 +234,7 @@ func (w *rxGroupWindow) prune() rxGroupWindowResult {
 			continue
 		}
 		w.eachGroupForPacket(packetID, func(group *rxGroup, index int) {
-			out.done = append(out.done, w.doneForGroup(group, group.recovered, !group.recovered))
+			out.done = append(out.done, w.doneForGroup(group, group.recovered, !group.recovered, 0, 0))
 			w.closeGroup(group.key)
 			w.dropGroup(group.key)
 		})
@@ -254,7 +248,7 @@ func (w *rxGroupWindow) prune() rxGroupWindowResult {
 		if group == nil {
 			continue
 		}
-		out.done = append(out.done, w.doneForGroup(group, group.recovered, !group.recovered))
+		out.done = append(out.done, w.doneForGroup(group, group.recovered, !group.recovered, 0, 0))
 		w.closeGroup(group.key)
 		w.dropGroup(group.key)
 	}
@@ -269,16 +263,13 @@ func (w *rxGroupWindow) prune() rxGroupWindowResult {
 }
 
 func (w *rxGroupWindow) checkGroup(group *rxGroup) rxGroupWindowResult {
-	if group == nil {
-		return rxGroupWindowResult{}
-	}
 	if group.recovered {
 		return rxGroupWindowResult{}
 	}
 
 	missingMask := group.missingMask()
 	if missingMask == 0 {
-		out := rxGroupWindowResult{done: []rxGroupDone{w.doneForGroup(group, false, false)}}
+		out := rxGroupWindowResult{done: []rxGroupDone{w.doneForGroup(group, false, false, 0, 0)}}
 		w.closeGroup(group.key)
 		w.dropGroup(group.key)
 		return out
@@ -332,21 +323,32 @@ func (w *rxGroupWindow) dropGroup(key rxGroupKey) {
 		return
 	}
 	for i := range group.repairs {
-		if group.repairs[i].symbol != nil {
-			group.repairs[i].symbol.Release()
-		}
+		group.repairs[i].symbol.Release()
 	}
 	delete(w.groups, key)
 }
 
-func (w *rxGroupWindow) doneForGroup(group *rxGroup, recovered, expired bool) rxGroupDone {
-	return rxGroupDone{
-		group:        group.key,
-		dataArrived:  uint8(group.dataArrived()),
-		dataExpected: uint8(len(group.data)),
-		recovered:    recovered,
-		expired:      expired,
+func (w *rxGroupWindow) doneForGroup(group *rxGroup, recovered, expired bool, recoveredBytes, recoveredMaxBytes uint64) rxGroupDone {
+	done := rxGroupDone{
+		group:          group.key,
+		dataExpected:   uint8(len(group.data)),
+		maxSourceBytes: recoveredMaxBytes,
+		recovered:      recovered,
+		expired:        expired,
 	}
+	expectedBytes := recoveredBytes
+	for _, data := range group.data {
+		if data != nil {
+			done.dataArrived++
+			dataBytes := uint64(len(data.Payload))
+			expectedBytes += dataBytes
+			if dataBytes > done.maxSourceBytes {
+				done.maxSourceBytes = dataBytes
+			}
+		}
+	}
+	done.expectedBytes = expectedBytes
+	return done
 }
 
 func (g *rxGroup) hasRepair(key uint16) bool {
@@ -356,16 +358,6 @@ func (g *rxGroup) hasRepair(key uint16) bool {
 		}
 	}
 	return false
-}
-
-func (g *rxGroup) dataArrived() int {
-	var count int
-	for _, data := range g.data {
-		if data != nil {
-			count++
-		}
-	}
-	return count
 }
 
 func (g *rxGroup) missingMask() uint8 {

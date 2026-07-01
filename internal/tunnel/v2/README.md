@@ -101,9 +101,9 @@ DATA/REPAIR observations from the receive FEC window. Same-leg DATA/REPAIR
 samples are ignored because they have no cross-leg evidence. Cross-leg samples
 estimate:
 
-- actual DATA delivery rate
-- FEC-derived expected DATA rate
-- REPAIR shadow equivalent rate
+- original DATA delivery rate
+- FEC-recovered expected DATA rate
+- expected REPAIR rate from the group maximum packet size and decoded repair count
 
 The estimator maintains UDP and TCP limited state for the lane. Runtime
 `QoSWriter` sends LINK_STATUS snapshots carrying both leg states and their

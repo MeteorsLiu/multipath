@@ -28,11 +28,12 @@ var (
 )
 
 const (
-	defaultMTUBytes    = 1500
-	drrBaseQuantum     = 4 * defaultMTUBytes
-	maxFECSourceSpan   = 4
-	defaultFECFlushMin = 5 * time.Millisecond
-	defaultFECFlushMax = 30 * time.Millisecond
+	defaultMTUBytes        = 1500
+	drrBaseQuantum         = 4 * defaultMTUBytes
+	maxFECSourceSpan       = 4
+	defaultFECFlushMin     = 5 * time.Millisecond
+	defaultFECFlushMax     = 30 * time.Millisecond
+	debugQueueWaitLogAfter = time.Millisecond
 )
 
 // Send owns the send-side runtime state per spec section 5.2.
@@ -795,8 +796,20 @@ func (s *Send) WriteTo(ctx context.Context, leg Ref, packet *packetbuf.Packet) e
 		return nil
 	}
 
+	packetBytes := len(packet.Payload)
+	var start time.Time
+	if debuglog.Enabled() {
+		start = time.Now()
+	}
 	select {
 	case s.packets <- transport.Payload{Leg: leg, Packet: packet}:
+		if !start.IsZero() {
+			wait := time.Since(start)
+			if wait >= debugQueueWaitLogAfter {
+				debuglog.Printf("send", "output_queue_wait leg={%s} wait_us=%d queue_len=%d queue_cap=%d bytes=%d",
+					debugLeg(leg), wait.Microseconds(), len(s.packets), cap(s.packets), packetBytes)
+			}
+		}
 		return nil
 	case <-ctx.Done():
 		packet.Release()
@@ -1160,6 +1173,7 @@ func (s *Send) sendRepair(ctx context.Context, sessionID uint64, lane *laneRunti
 				BasePacketID: group.basePacketID,
 				Key:          key,
 				SourceSpan:   group.sourceSpan,
+				RepairCount:  repairCount,
 				Symbol:       symbol,
 			},
 		}
