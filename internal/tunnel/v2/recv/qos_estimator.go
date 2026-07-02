@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/MeteorsLiu/multipath/internal/debuglog"
+	"github.com/MeteorsLiu/multipath/internal/eventlog"
 	"github.com/MeteorsLiu/multipath/internal/metrics"
 	"github.com/MeteorsLiu/multipath/internal/transport"
 )
@@ -409,6 +410,11 @@ func (e *qosEstimator) tick(now time.Time) []qosStatus {
 		return nil
 	}
 	after.primarySwitched = primarySwitched
+	if e.cfg.SessionID != 0 {
+		eventlog.Printf("qos_status", "action=emit session=%d lane=%d primary=%s role=%s udp_limited=%t tcp_limited=%t repair_count=%d primary_switched=%t repair_changed=%t",
+			e.cfg.SessionID, e.cfg.LaneID, kindMetricLabel(e.currentPrimary), qosRoleLabel(e.currentRole),
+			after.UDPLimited, after.TCPLimited, after.RepairCount, primarySwitched, repairChanged)
+	}
 	return []qosStatus{after}
 }
 
@@ -426,14 +432,14 @@ func (e *qosEstimator) evaluateRatesLocked(direction *qosDirection, rates qosRat
 		}
 		if avgGap >= qosRateGapLimited {
 			if !direction.dataLimited {
-				e.recordEvent("limited_active", direction.dataKind)
+				e.recordEvent("limited_active", direction.dataKind, direction)
 			}
 			direction.dataLimited = true
 			return
 		}
 		if avgGap <= qosRateGapClear {
 			if e.clearLimitedLocked(direction.dataKind) {
-				e.recordEvent("limited_clear", direction.dataKind)
+				e.recordEvent("limited_clear", direction.dataKind, direction)
 			}
 		}
 	case qosRoleRepair:
@@ -453,7 +459,7 @@ func (e *qosEstimator) evaluateRatesLocked(direction *qosDirection, rates qosRat
 		}
 		if avgDeliveryGap >= qosRateGapLimited {
 			if !direction.repairLimited {
-				e.recordEvent("limited_active", direction.repairKind)
+				e.recordEvent("limited_active", direction.repairKind, direction)
 			}
 			direction.repairLimited = true
 			return
@@ -461,7 +467,7 @@ func (e *qosEstimator) evaluateRatesLocked(direction *qosDirection, rates qosRat
 		if avgDeliveryGap <= qosRateGapClear &&
 			avgLoadGap <= qosRepairLoadGapClear &&
 			e.clearLimitedLocked(direction.repairKind) {
-			e.recordEvent("limited_clear", direction.repairKind)
+			e.recordEvent("limited_clear", direction.repairKind, direction)
 		}
 	}
 }
@@ -954,7 +960,7 @@ func (e *qosEstimator) recordRates(direction *qosDirection, rates qosRates) {
 	)
 }
 
-func (e *qosEstimator) recordEvent(event string, kind transport.Kind) {
+func (e *qosEstimator) recordEvent(event string, kind transport.Kind, direction *qosDirection) {
 	if e.cfg.SessionID != 0 {
 		metrics.IncCounter(metrics.QoSEventsTotal,
 			metrics.LStr("event", event),
@@ -962,5 +968,9 @@ func (e *qosEstimator) recordEvent(event string, kind transport.Kind) {
 			metrics.L("lane", e.cfg.LaneID),
 			metrics.LStr("leg", kindMetricLabel(kind)),
 		)
+		eventlog.Printf("qos_state", "event=%s session=%d lane=%d leg=%s primary=%s role=%s data=%s repair=%s",
+			event, e.cfg.SessionID, e.cfg.LaneID, kindMetricLabel(kind),
+			kindMetricLabel(e.currentPrimary), qosRoleLabel(e.currentRole),
+			kindMetricLabel(direction.dataKind), kindMetricLabel(direction.repairKind))
 	}
 }

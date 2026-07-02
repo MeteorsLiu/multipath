@@ -16,6 +16,7 @@ import (
 	"github.com/MeteorsLiu/multipath/internal/schedule/drr"
 	sessionpkg "github.com/MeteorsLiu/multipath/internal/session"
 	"github.com/MeteorsLiu/multipath/internal/transport"
+	"github.com/MeteorsLiu/multipath/internal/transport/selector"
 	"github.com/MeteorsLiu/multipath/internal/tunnel/v2/probe/bw"
 	"github.com/MeteorsLiu/multipath/internal/tunnel/v2/probe/ping"
 )
@@ -939,8 +940,45 @@ func (s *Send) recordQoSDataLegSelection(sessionID uint64, lane *laneRuntime, ki
 	if !changed {
 		return
 	}
-	eventlog.Printf("selector", "action=qos_data_leg session=%d lane=%d from=%s to=%s",
-		sessionID, lane.id, kindEventLabel(previousKind), kindEventLabel(kind))
+	eventlog.Printf("selector", "action=qos_data_leg session=%d lane=%d from=%s to=%s reason=%s udp_active=%t tcp_active=%t udp_qos_limited=%t udp_qos_bps=%d tcp_qos_limited=%t tcp_qos_bps=%d udp_prefer_tcp=%t",
+		sessionID, lane.id, kindEventLabel(previousKind), kindEventLabel(kind),
+		selectorEventReason(udpQ, tcpQ, kind),
+		udpQ.Active, tcpQ.Active,
+		udpQ.QoSActive, udpQ.QoSDeliveredBps,
+		tcpQ.QoSActive, tcpQ.QoSDeliveredBps,
+		udpQ.PreferTCP)
+}
+
+func selectorEventReason(udpQ, tcpQ selector.Quality, selected transport.Kind) string {
+	switch {
+	case udpQ.Active && !tcpQ.Active:
+		return "udp_only_active"
+	case !udpQ.Active && tcpQ.Active:
+		return "tcp_only_active"
+	case udpQ.QoSActive && !tcpQ.QoSActive:
+		if selected == transport.KindTCP {
+			return "qos_avoid_udp"
+		}
+		return "qos_udp_limited_selected"
+	case !udpQ.QoSActive && tcpQ.QoSActive:
+		if selected == transport.KindUDP {
+			return "qos_avoid_tcp"
+		}
+		return "qos_tcp_limited_selected"
+	case udpQ.QoSActive && tcpQ.QoSActive:
+		if selected == transport.KindTCP {
+			return "qos_bps_tcp"
+		}
+		return "qos_bps_udp"
+	case udpQ.PreferTCP && selected == transport.KindTCP:
+		return "prefer_tcp"
+	case selected == transport.KindUDP:
+		return "default_udp"
+	case selected == transport.KindTCP:
+		return "selected_tcp"
+	default:
+		return "unknown"
+	}
 }
 
 func (s *Send) logBandwidthProbeDecision(target bwTarget, sample bw.Sample, preferTCP bool) {

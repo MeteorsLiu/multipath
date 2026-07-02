@@ -8,6 +8,7 @@ import (
 	"github.com/MeteorsLiu/multipath/internal/protocol"
 	sessionpkg "github.com/MeteorsLiu/multipath/internal/session"
 	"github.com/MeteorsLiu/multipath/internal/transport"
+	"github.com/MeteorsLiu/multipath/internal/transport/selector"
 )
 
 func TestSendWrite(t *testing.T) {
@@ -61,6 +62,51 @@ func TestSendWrite(t *testing.T) {
 		payload.Packet.Release()
 	default:
 		t.Error("expected packet in output queue")
+	}
+}
+
+func TestSelectorEventReason(t *testing.T) {
+	tests := []struct {
+		name     string
+		udp      selector.Quality
+		tcp      selector.Quality
+		selected transport.Kind
+		want     string
+	}{
+		{
+			name:     "qos avoids udp",
+			udp:      selector.Quality{Active: true, QoSActive: true, QoSDeliveredBps: 10},
+			tcp:      selector.Quality{Active: true, QoSDeliveredBps: 100},
+			selected: transport.KindTCP,
+			want:     "qos_avoid_udp",
+		},
+		{
+			name:     "prefer tcp",
+			udp:      selector.Quality{Active: true, PreferTCP: true},
+			tcp:      selector.Quality{Active: true},
+			selected: transport.KindTCP,
+			want:     "prefer_tcp",
+		},
+		{
+			name:     "only tcp active",
+			udp:      selector.Quality{},
+			tcp:      selector.Quality{Active: true},
+			selected: transport.KindTCP,
+			want:     "tcp_only_active",
+		},
+		{
+			name:     "default udp",
+			udp:      selector.Quality{Active: true},
+			tcp:      selector.Quality{Active: true},
+			selected: transport.KindUDP,
+			want:     "default_udp",
+		},
+	}
+
+	for _, tt := range tests {
+		if got := selectorEventReason(tt.udp, tt.tcp, tt.selected); got != tt.want {
+			t.Fatalf("%s: reason = %q, want %q", tt.name, got, tt.want)
+		}
 	}
 }
 
