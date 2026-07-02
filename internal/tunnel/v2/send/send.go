@@ -1125,6 +1125,11 @@ func (s *Send) sendRepair(ctx context.Context, sessionID uint64, lane *laneRunti
 		if err != nil {
 			return
 		}
+		cost := uint32(len(packet.Payload))
+		if cost < defaultMTUBytes {
+			cost = defaultMTUBytes
+		}
+		_, _ = s.strategy(sessionID).Pick([]*laneRuntime{lane}, cost)
 
 		if debuglog.Enabled() {
 			primary := lane.primaryTransportWithQoS(qosEnabled)

@@ -358,6 +358,71 @@ func TestRepairCountEmitsMultipleRepairFrames(t *testing.T) {
 	}
 }
 
+func TestSendRepairChargesScheduler(t *testing.T) {
+	s := New()
+	s.EnableFEC()
+
+	const sessionID uint64 = 1003
+	s.sendStatesMu.Lock()
+	s.sendStates[sessionID] = &sendState{}
+	s.sendStatesMu.Unlock()
+
+	lane := newLaneRuntime(1, 100)
+	bindBoth(lane)
+	lane.setFEC(3)
+	otherLane := newLaneRuntime(2, 100)
+	bindBoth(otherLane)
+	s.lanesMu.Lock()
+	s.lanes[laneKey{sessionID: sessionID, laneID: lane.id}] = lane
+	s.lanes[laneKey{sessionID: sessionID, laneID: otherLane.id}] = otherLane
+	s.lanesMu.Unlock()
+
+	strategy := &recordingStrategy{lane: lane}
+	s.strategiesMu.Lock()
+	s.strategies[sessionID] = strategy
+	s.strategiesMu.Unlock()
+
+	packets := make([]*packetbuf.Packet, maxFECSourceSpan)
+	for i := range packets {
+		pkt := packetbuf.Acquire(24)
+		for j := range pkt.Payload {
+			pkt.Payload[j] = byte(i + j + 1)
+		}
+		packets[i] = pkt
+	}
+
+	group := txRepairGroup{
+		basePacketID: 144,
+		sourceSpan:   maxFECSourceSpan,
+		packets:      packets,
+	}
+
+	s.sendRepair(context.Background(), sessionID, lane, group)
+
+	if strategy.picks != 3 {
+		t.Fatalf("repair scheduler picks = %d, want 3", strategy.picks)
+	}
+	for i, cost := range strategy.costs {
+		if cost < defaultMTUBytes {
+			t.Fatalf("repair scheduler cost[%d] = %d, want at least MTU %d", i, cost, defaultMTUBytes)
+		}
+	}
+	for i, lanes := range strategy.candidates {
+		if len(lanes) != 1 || lanes[0] != lane {
+			t.Fatalf("repair scheduler candidates[%d] = %v, want only source lane %p", i, lanes, lane)
+		}
+	}
+
+	for {
+		select {
+		case payload := <-s.Packets():
+			payload.Packet.Release()
+		default:
+			return
+		}
+	}
+}
+
 func TestRepairCountScalesForPartialGroup(t *testing.T) {
 	s := New()
 	s.EnableFEC()
@@ -417,4 +482,18 @@ func TestRepairCountScalesForPartialGroup(t *testing.T) {
 		t.Fatal("got extra REPAIR frame, want exactly 2")
 	default:
 	}
+}
+
+type recordingStrategy struct {
+	lane       *laneRuntime
+	picks      int
+	costs      []uint32
+	candidates [][]*laneRuntime
+}
+
+func (s *recordingStrategy) Pick(lanes []*laneRuntime, cost uint32) (*laneRuntime, bool) {
+	s.picks++
+	s.costs = append(s.costs, cost)
+	s.candidates = append(s.candidates, append([]*laneRuntime(nil), lanes...))
+	return s.lane, true
 }
