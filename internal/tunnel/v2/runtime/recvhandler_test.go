@@ -86,7 +86,7 @@ func TestRecvHandlerBandwidthProbeEmitsPassivePrimaryHint(t *testing.T) {
 					Seq:                 seq,
 					Count:               2,
 					SendMS:              uint64(1000 + seq),
-					TrainBytesTotal:     uint64(payloadLen * 2),
+					TargetBps:           200_000_000,
 					TrainBytesRemaining: remaining,
 					Payload:             make([]byte, payloadLen),
 				},
@@ -108,6 +108,9 @@ func TestRecvHandlerBandwidthProbeEmitsPassivePrimaryHint(t *testing.T) {
 	}
 	if !observation.UDPLimited {
 		t.Fatalf("observation = %+v, want UDP limited", observation)
+	}
+	if observation.CapBps != 200_000_000 {
+		t.Fatalf("observation cap bps = %d, want 200000000", observation.CapBps)
 	}
 }
 

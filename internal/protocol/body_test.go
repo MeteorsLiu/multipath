@@ -70,7 +70,7 @@ func TestTypedFramesRoundTrip(t *testing.T) {
 				Seq:                 2,
 				Count:               4,
 				SendMS:              12347,
-				TrainBytesTotal:     1000,
+				TargetBps:           200_000_000,
 				TrainBytesRemaining: 250,
 				Payload:             []byte("probe"),
 			},
@@ -174,10 +174,10 @@ func repairCountForTest(t *testing.T, body RepairBody) uint8 {
 	return uint8(field.Uint())
 }
 
-func TestBandwidthProbeRejectsInvalidTrainBudget(t *testing.T) {
+func TestBandwidthProbeRejectsInvalidRoundShape(t *testing.T) {
 	tests := []BandwidthProbeBody{
-		{TrainID: 1, ProbeID: 1, Seq: 0, Count: 1, SendMS: 1, TrainBytesTotal: 0, TrainBytesRemaining: 0},
-		{TrainID: 1, ProbeID: 1, Seq: 0, Count: 1, SendMS: 1, TrainBytesTotal: 100, TrainBytesRemaining: 101},
+		{TrainID: 1, ProbeID: 1, Seq: 0, Count: 0, SendMS: 1, TargetBps: 200_000_000, TrainBytesRemaining: 0},
+		{TrainID: 1, ProbeID: 1, Seq: 64, Count: 64, SendMS: 1, TargetBps: 200_000_000, TrainBytesRemaining: 0},
 	}
 	for _, body := range tests {
 		_, err := Encode(Frame{Type: TypeBandwidthProbe, SessionID: 1, LaneID: 1, Body: body}, nil)
@@ -187,7 +187,7 @@ func TestBandwidthProbeRejectsInvalidTrainBudget(t *testing.T) {
 	}
 }
 
-func TestBandwidthProbeDecodeRejectsInvalidTrainBudget(t *testing.T) {
+func TestBandwidthProbeTargetBpsUsesFormerTotalField(t *testing.T) {
 	encoded, err := Encode(Frame{
 		Type:      TypeBandwidthProbe,
 		SessionID: 1,
@@ -198,16 +198,23 @@ func TestBandwidthProbeDecodeRejectsInvalidTrainBudget(t *testing.T) {
 			Seq:                 0,
 			Count:               1,
 			SendMS:              1,
-			TrainBytesTotal:     100,
-			TrainBytesRemaining: 100,
+			TargetBps:           123_456_789,
+			TrainBytesRemaining: 987,
 		},
 	}, nil)
 	if err != nil {
 		t.Fatalf("Encode valid probe failed: %v", err)
 	}
-	binary.BigEndian.PutUint64(encoded[10+36:10+44], 101)
-	if _, err := Decode(encoded); !errors.Is(err, ErrInvalidFrame) {
-		t.Fatalf("Decode invalid remaining err = %v, want ErrInvalidFrame", err)
+	if got := binary.BigEndian.Uint64(encoded[10+28 : 10+36]); got != 123_456_789 {
+		t.Fatalf("encoded target_bps = %d, want 123456789", got)
+	}
+	decoded, err := Decode(encoded)
+	if err != nil {
+		t.Fatalf("Decode probe failed: %v", err)
+	}
+	body := decoded.Body.(BandwidthProbeBody)
+	if body.TargetBps != 123_456_789 || body.TrainBytesRemaining != 987 {
+		t.Fatalf("decoded probe = %+v, want target_bps 123456789 remaining 987", body)
 	}
 }
 

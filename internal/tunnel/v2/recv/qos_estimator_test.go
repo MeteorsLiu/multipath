@@ -538,6 +538,76 @@ func TestQoSEstimatorRepairLegClearAllowsNearDataLoad(t *testing.T) {
 	}
 }
 
+func TestQoSEstimatorRepairLegClearRequiresCapLoad(t *testing.T) {
+	now := time.Unix(298, 0)
+	e := newQoSEstimator(qosConfig{Tick: time.Second}, nil)
+	e.observePrimaryHint(qosPrimaryHint{
+		primary:    transport.KindTCP,
+		udpLimited: true,
+		capBps:     200_000_000,
+		at:         now,
+	})
+
+	for i := 0; i < qosDecisionSamples; i++ {
+		at := now.Add(time.Duration(i) * time.Second)
+		group := rxGroupKey{basePacketID: uint32(1375 + i*10), sourceSpan: 1}
+		observeQoSRepairFrame(e, group, transport.KindUDP, 4000, 1, at)
+		e.observeGroupDone(rxGroupDone{
+			group:          group,
+			dataArrived:    1,
+			dataExpected:   1,
+			expectedBytes:  4000,
+			maxSourceBytes: 4000,
+		}, at)
+		e.tick(at.Add(time.Second))
+	}
+
+	status := e.snapshotStatus()
+	if !status.UDPLimited || status.TCPLimited {
+		t.Fatalf("status = %+v, want UDP still limited when repair load is below cap", status)
+	}
+	if e.currentPrimary != transport.KindTCP {
+		t.Fatalf("primary = %v, want TCP", e.currentPrimary)
+	}
+}
+
+func TestQoSEstimatorRepairLegClearAllowsEightyPercentCapLoad(t *testing.T) {
+	now := time.Unix(299, 0)
+	e := newQoSEstimator(qosConfig{Tick: time.Second}, nil)
+	e.observePrimaryHint(qosPrimaryHint{
+		primary:    transport.KindTCP,
+		udpLimited: true,
+		capBps:     200_000_000,
+		at:         now,
+	})
+
+	var statuses []qosStatus
+	for i := 0; i < qosDecisionSamples; i++ {
+		at := now.Add(time.Duration(i) * time.Second)
+		group := rxGroupKey{basePacketID: uint32(1390 + i*10), sourceSpan: 1}
+		observeQoSRepairFrame(e, group, transport.KindUDP, 20_100_000, 1, at)
+		e.observeGroupDone(rxGroupDone{
+			group:          group,
+			dataArrived:    1,
+			dataExpected:   1,
+			expectedBytes:  4000,
+			maxSourceBytes: 4000,
+		}, at)
+		statuses = append(statuses, e.tick(at.Add(time.Second))...)
+	}
+
+	if len(statuses) == 0 {
+		t.Fatal("missing clear status")
+	}
+	last := statuses[len(statuses)-1]
+	if last.UDPLimited || last.TCPLimited {
+		t.Fatalf("statuses = %+v, want clear state at 80%% cap repair load", statuses)
+	}
+	if !last.primarySwitched || e.currentPrimary != transport.KindUDP {
+		t.Fatalf("statuses = %+v primary=%v, want switch back to UDP", statuses, e.currentPrimary)
+	}
+}
+
 func TestQoSEstimatorLateDataStaysSeparateFromOriginalData(t *testing.T) {
 	now := time.Unix(300, 0)
 	e := newQoSEstimator(qosConfig{Tick: time.Second}, nil)

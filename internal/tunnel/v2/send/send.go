@@ -1460,7 +1460,7 @@ func (s *Send) startBwScheduler(ctx context.Context, sessionID uint64) {
 						Seq:                 p.Seq,
 						Count:               p.Count,
 						SendMS:              p.SendMS,
-						TrainBytesTotal:     p.Total,
+						TargetBps:           p.TargetBps,
 						TrainBytesRemaining: p.Remaining,
 						Payload:             make([]byte, p.Bytes),
 					},

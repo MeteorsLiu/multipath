@@ -86,7 +86,7 @@ type BandwidthProbeBody struct {
 	Seq                 uint16
 	Count               uint16
 	SendMS              uint64
-	TrainBytesTotal     uint64
+	TargetBps           uint64
 	TrainBytesRemaining uint64
 	Payload             []byte
 }
@@ -143,8 +143,7 @@ func encodedBodySize(frame Frame) (int, error) {
 		return 2, validBody(ok)
 	case TypeBandwidthProbe:
 		body, ok := frame.Body.(BandwidthProbeBody)
-		if !ok || body.Count == 0 || body.Count > 64 || body.Seq >= body.Count ||
-			body.TrainBytesTotal == 0 || body.TrainBytesRemaining > body.TrainBytesTotal {
+		if !ok || body.Count == 0 || body.Count > 64 || body.Seq >= body.Count {
 			return 0, ErrInvalidFrame
 		}
 		return 44 + len(body.Payload), nil
@@ -210,7 +209,7 @@ func encodeBodyInto(frame Frame, out []byte) error {
 		binary.BigEndian.PutUint16(out[16:18], body.Seq)
 		binary.BigEndian.PutUint16(out[18:20], body.Count)
 		binary.BigEndian.PutUint64(out[20:28], body.SendMS)
-		binary.BigEndian.PutUint64(out[28:36], body.TrainBytesTotal)
+		binary.BigEndian.PutUint64(out[28:36], body.TargetBps)
 		binary.BigEndian.PutUint64(out[36:44], body.TrainBytesRemaining)
 		copy(out[44:], body.Payload)
 	case TypeBandwidthProbeAck:
@@ -295,9 +294,9 @@ func decodeBody(frame *Frame, body []byte) error {
 		}
 		count := binary.BigEndian.Uint16(body[18:20])
 		seq := binary.BigEndian.Uint16(body[16:18])
-		total := binary.BigEndian.Uint64(body[28:36])
+		targetBps := binary.BigEndian.Uint64(body[28:36])
 		remaining := binary.BigEndian.Uint64(body[36:44])
-		if count == 0 || count > 64 || seq >= count || total == 0 || remaining > total {
+		if count == 0 || count > 64 || seq >= count {
 			return ErrInvalidFrame
 		}
 		frame.Body = BandwidthProbeBody{
@@ -306,7 +305,7 @@ func decodeBody(frame *Frame, body []byte) error {
 			Seq:                 seq,
 			Count:               count,
 			SendMS:              binary.BigEndian.Uint64(body[20:28]),
-			TrainBytesTotal:     total,
+			TargetBps:           targetBps,
 			TrainBytesRemaining: remaining,
 			Payload:             body[44:],
 		}

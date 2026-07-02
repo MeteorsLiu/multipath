@@ -622,15 +622,17 @@ probe_id              uint64
 seq                   uint16
 count                 uint16 // total frames in this probe round, 1..64
 send_ms               uint64
-train_bytes_total     uint64
+target_bps            uint64
 train_bytes_remaining uint64
 payload               bytes
 ```
 
-`train_bytes_total` is the byte budget for one train. It must be non-zero.
-`train_bytes_remaining` is the byte budget remaining after this frame and must
-not exceed `train_bytes_total`. A value of zero marks normal train completion.
-The same `train_id` must not change `train_bytes_total`.
+`target_bps` is the sender's effective target/cap rate for this train. When a
+configured cap is present, it carries that cap. When no configured cap is
+present, it may carry the measured or configured reference used as the effective
+cap for this train. A value of zero means no target was provided.
+`train_bytes_remaining` is the sender's local byte budget remaining after this
+frame. A value of zero marks normal train completion.
 
 Sender behavior:
 
@@ -658,8 +660,7 @@ Sender behavior:
 Receiver behavior:
 
 1. Validate session, lane, and body length.
-2. Drop frames with `count = 0`, `count > 64`, `seq >= count`, zero
-   `train_bytes_total`, or `train_bytes_remaining > train_bytes_total`.
+2. Drop frames with `count = 0`, `count > 64`, or `seq >= count`.
 3. Do not emit the payload to TUN.
 4. Maintain a per-leg cumulative receive bitmap for the current probe round.
 5. Reply with BW_PROBE_ACK on the same transport leg.

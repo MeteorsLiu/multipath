@@ -57,6 +57,7 @@ type BandwidthProbeObservation struct {
 	UDPLimited      bool
 	UDPDeliveredBps uint32
 	TCPDeliveredBps uint32
+	CapBps          uint32
 }
 
 type Config struct {
@@ -171,6 +172,7 @@ func (o *Recv) observeBandwidthProbe(ctx context.Context, sessionID uint64, lane
 		udpLimited:      observation.UDPLimited,
 		udpDeliveredBps: observation.UDPDeliveredBps,
 		tcpDeliveredBps: observation.TCPDeliveredBps,
+		capBps:          observation.CapBps,
 	})
 	if err := o.reportQoS(ctx, sessionID, laneID, statuses); err != nil {
 		debuglog.Printf("recv", "qos_report_error session=%d lane=%d err=%v", sessionID, laneID, err)

@@ -127,7 +127,7 @@ func TestRecvDispatchesControlFramesToHandler(t *testing.T) {
 		{Type: protocol.TypePING, SessionID: 1, LaneID: 1, Body: protocol.PingBody{PingID: 1}},
 		{Type: protocol.TypePONG, SessionID: 1, LaneID: 1, Body: protocol.PingBody{PingID: 1}},
 		{Type: protocol.TypeCLOSE, SessionID: 1, LaneID: 1, Body: protocol.CloseBody{Scope: protocol.CloseScopeLane}},
-		{Type: protocol.TypeBandwidthProbe, SessionID: 1, LaneID: 1, Body: protocol.BandwidthProbeBody{Count: 1, TrainBytesTotal: 1}},
+		{Type: protocol.TypeBandwidthProbe, SessionID: 1, LaneID: 1, Body: protocol.BandwidthProbeBody{Count: 1, TargetBps: 1}},
 		{Type: protocol.TypeBandwidthProbeAck, SessionID: 1, LaneID: 1, Body: protocol.BandwidthProbeAckBody{Count: 1}},
 		{Type: protocol.TypeLinkStatus, SessionID: 1, LaneID: 1, Body: protocol.LinkStatusBody{Status: 0x10, UDPDeliveredBps: 1}},
 	}
@@ -575,6 +575,7 @@ func TestRecvAppliesBandwidthProbeObservationFromHandler(t *testing.T) {
 			UDPLimited:      true,
 			UDPDeliveredBps: 20_000_000,
 			TCPDeliveredBps: 80_000_000,
+			CapBps:          200_000_000,
 		},
 	}
 	var statuses []QoSStatus
@@ -596,7 +597,7 @@ func TestRecvAppliesBandwidthProbeObservationFromHandler(t *testing.T) {
 			TrainID:             10,
 			ProbeID:             10,
 			Count:               1,
-			TrainBytesTotal:     1,
+			TargetBps:           200_000_000,
 			TrainBytesRemaining: 0,
 		},
 	}
@@ -613,6 +614,24 @@ func TestRecvAppliesBandwidthProbeObservationFromHandler(t *testing.T) {
 	}
 	if status.UDPDeliveredBps != 20_000_000 || status.TCPDeliveredBps != 80_000_000 {
 		t.Fatalf("status delivered bps udp=%d tcp=%d, want udp=20000000 tcp=80000000", status.UDPDeliveredBps, status.TCPDeliveredBps)
+	}
+
+	state := out.recvState(11)
+	if state == nil {
+		t.Fatal("missing recv state")
+	}
+	state.mu.Lock()
+	q := state.qos[2]
+	if q == nil {
+		state.mu.Unlock()
+		t.Fatal("missing QoS estimator")
+	}
+	q.mu.Lock()
+	capBps := q.tcpUDPRepair.repairLoadCapBps
+	q.mu.Unlock()
+	state.mu.Unlock()
+	if capBps != 200_000_000 {
+		t.Fatalf("repair load cap bps = %d, want 200000000", capBps)
 	}
 }
 

@@ -25,6 +25,7 @@ const (
 	qosRateGapLimited     = 0.10
 	qosRateGapClear       = 0.03
 	qosRepairLoadGapClear = 0.10
+	qosRepairCapGapClear  = 0.20
 )
 
 type qosConfig struct {
@@ -94,6 +95,7 @@ type qosDirection struct {
 
 	repairScale            float64
 	repairScaleInitialized bool
+	repairLoadCapBps       uint32
 }
 
 type qosPendingBytes struct {
@@ -144,6 +146,7 @@ type qosPrimaryHint struct {
 	udpLimited      bool
 	udpDeliveredBps uint32
 	tcpDeliveredBps uint32
+	capBps          uint32
 	at              time.Time
 }
 
@@ -207,6 +210,12 @@ func (e *qosEstimator) observePrimaryHint(hint qosPrimaryHint) []qosStatus {
 		e.tcpUDPData.dataDelivered = qosDelivered{bps: hint.tcpDeliveredBps, at: now}
 		after := e.snapshotLocked()
 		primarySwitched := e.switchPrimaryLocked(after)
+		if hint.capBps > 0 {
+			direction := e.directionLocked(transport.KindTCP, transport.KindUDP, qosRoleRepair)
+			if direction != nil {
+				direction.repairLoadCapBps = hint.capBps
+			}
+		}
 		if primarySwitched {
 			after = e.snapshotLocked()
 		}
@@ -451,7 +460,13 @@ func (e *qosEstimator) evaluateRatesLocked(direction *qosDirection, rates qosRat
 		}
 		expectedRepairBps := clampUint32(float64(rates.expectedBps) * direction.repairScale)
 		deliveryGap := rateGapRatio(expectedRepairBps, rates.repairBps)
-		loadGap := rateGapRatio(rates.expectedBps, rates.repairBps)
+		loadReferenceBps := rates.expectedBps
+		loadGapClear := qosRepairLoadGapClear
+		if direction.repairLoadCapBps > 0 {
+			loadReferenceBps = direction.repairLoadCapBps
+			loadGapClear = qosRepairCapGapClear
+		}
+		loadGap := rateGapRatio(loadReferenceBps, rates.repairBps)
 		avgDeliveryGap, deliveryReady := direction.repairDecision.add(deliveryGap)
 		avgLoadGap, loadReady := direction.repairLoad.add(loadGap)
 		if !deliveryReady || !loadReady {
@@ -465,7 +480,7 @@ func (e *qosEstimator) evaluateRatesLocked(direction *qosDirection, rates qosRat
 			return
 		}
 		if avgDeliveryGap <= qosRateGapClear &&
-			avgLoadGap <= qosRepairLoadGapClear &&
+			avgLoadGap <= loadGapClear &&
 			e.clearLimitedLocked(direction.repairKind) {
 			e.recordEvent("limited_clear", direction.repairKind, direction)
 		}
@@ -791,6 +806,7 @@ func (d *qosDirection) resetRateState() {
 	d.pending = qosPendingBytes{}
 	d.repairScale = 0
 	d.repairScaleInitialized = false
+	d.repairLoadCapBps = 0
 	d.clearDecisions()
 }
 

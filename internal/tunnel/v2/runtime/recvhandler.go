@@ -329,7 +329,7 @@ func (h *RecvHandler) OnBandwidthProbe(ctx context.Context, leg transport.LegRef
 		Seq:       body.Seq,
 		Count:     body.Count,
 		SendMS:    body.SendMS,
-		Total:     body.TrainBytesTotal,
+		TargetBps: body.TargetBps,
 		Remaining: body.TrainBytesRemaining,
 		Bytes:     len(body.Payload),
 	}
@@ -403,15 +403,23 @@ func (h *RecvHandler) onPassiveBWSample(trainID uint64, sample bw.Sample) {
 	}
 
 	tcpBps := h.passiveBWTCPRef[laneKey]
-	capBps := h.bwCapBps
-	referenceBps := h.bwReferenceBps
+	capBps := sample.TargetBps
+	if capBps == 0 {
+		capBps = h.bwCapBps
+	}
+	referenceBps := sample.TargetBps
 	if referenceBps == 0 {
-		if h.bwCapBps > 0 {
-			referenceBps = h.bwCapBps
-		} else {
-			referenceBps = tcpBps
-			capBps = tcpBps
+		referenceBps = h.bwReferenceBps
+		if referenceBps == 0 {
+			if capBps > 0 {
+				referenceBps = capBps
+			} else {
+				referenceBps = tcpBps
+				capBps = tcpBps
+			}
 		}
+	} else if capBps == 0 {
+		capBps = referenceBps
 	}
 	h.passiveBWMu.Unlock()
 
@@ -441,6 +449,7 @@ func (h *RecvHandler) onPassiveBWSample(trainID uint64, sample bw.Sample) {
 			UDPLimited:      preferTCP,
 			UDPDeliveredBps: uint32Bps(sample.BandwidthBps),
 			TCPDeliveredBps: uint32Bps(sample.ReferenceBps),
+			CapBps:          uint32Bps(capBps),
 		}
 		h.passiveBWMu.Unlock()
 	}
