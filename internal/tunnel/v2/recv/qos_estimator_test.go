@@ -504,6 +504,40 @@ func TestQoSEstimatorRepairLegClearRequiresNearDataLoad(t *testing.T) {
 	}
 }
 
+func TestQoSEstimatorRepairLegClearAllowsCurrentFullDataLoad(t *testing.T) {
+	now := time.Unix(296, 0)
+	e := newQoSEstimator(qosConfig{Tick: time.Second}, nil)
+	e.udpTCPData.dataLimited = true
+	e.currentPrimary = transport.KindTCP
+	e.currentRole = qosRoleRepair
+
+	var statuses []qosStatus
+	for i, repairBytes := range []int{1000, 1000, 4000} {
+		at := now.Add(time.Duration(i) * time.Second)
+		group := rxGroupKey{basePacketID: uint32(1325 + i*10), sourceSpan: 4}
+		observeQoSRepairFrame(e, group, transport.KindUDP, repairBytes, 1, at)
+		e.observeGroupDone(rxGroupDone{
+			group:          group,
+			dataArrived:    4,
+			dataExpected:   4,
+			expectedBytes:  4000,
+			maxSourceBytes: 1000,
+		}, at)
+		statuses = append(statuses, e.tick(at.Add(time.Second))...)
+	}
+
+	if len(statuses) == 0 {
+		t.Fatal("missing clear status")
+	}
+	last := statuses[len(statuses)-1]
+	if last.UDPLimited || last.TCPLimited {
+		t.Fatalf("statuses = %+v, want clear state after current full repair load", statuses)
+	}
+	if !last.primarySwitched || e.currentPrimary != transport.KindUDP {
+		t.Fatalf("statuses = %+v primary=%v, want switch back to UDP", statuses, e.currentPrimary)
+	}
+}
+
 func TestQoSEstimatorRepairLegClearAllowsNearDataLoad(t *testing.T) {
 	now := time.Unix(297, 0)
 	e := newQoSEstimator(qosConfig{Tick: time.Second}, nil)

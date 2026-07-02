@@ -1052,11 +1052,12 @@ There are two limited-leg role paths:
 
    The limited decision uses the three-sample average of `deliveryGap`. The
    clear decision requires both three-sample averages to be below the clear
-   threshold:
+   threshold, or the current non-cap tick to show full shadow recovery with
+   `repairBps >= expectedBps`:
 
    ```text
    deliveryGap <= 0.03
-   loadGap     <= 0.10
+   loadGap     <= 0.10 OR repairBps >= expectedBps
    ```
 
    `deliveryGap` proves the peer-sent REPAIR load is delivered. `loadGap`
@@ -1065,7 +1066,9 @@ There are two limited-leg role paths:
    least 90% of the DATA expectation. A low-rate shadow trickle must not clear
    DATA-primary capacity: with default 4+1 FEC, one REPAIR for four source
    packets carries about 25% of `expectedBps`, so successful delivery of that
-   default repair load is not enough recovery evidence.
+   default repair load is not enough recovery evidence. When a cap reference is
+   active, cap-based clear still uses the cap load threshold rather than the
+   `repairBps >= expectedBps` shortcut.
 
    REPAIR frames for the same group with inconsistent `repairCount` values make
    that group unusable for repair-scale updates.

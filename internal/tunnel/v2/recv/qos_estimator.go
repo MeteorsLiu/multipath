@@ -473,8 +473,12 @@ func (e *qosEstimator) evaluateRatesLocked(direction *qosDirection, rates qosRat
 			direction.repairLimited = true
 			return
 		}
+		loadRecovered := avgLoadGap <= loadGapClear
+		if direction.repairLoadCapBps == 0 && rates.repairBps >= rates.expectedBps {
+			loadRecovered = true
+		}
 		if avgDeliveryGap <= qosRateGapClear &&
-			avgLoadGap <= loadGapClear &&
+			loadRecovered &&
 			e.clearLimitedLocked(direction.repairKind) {
 			e.recordEvent("limited_clear", direction.repairKind, direction)
 		}

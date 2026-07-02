@@ -354,11 +354,12 @@ loadGap           = rateGapRatio(expectedBps, repairBps)
 The REPAIR-side limited decision uses the three-sample average of
 `deliveryGap`: if REPAIR is not delivering its own expected load, the repair
 transport kind is limited. The REPAIR-side clear decision requires both
-three-sample averages to be below the clear threshold:
+three-sample averages to be below the clear threshold, or the current non-cap
+tick to show full shadow recovery with `repairBps >= expectedBps`:
 
 ```text
 deliveryGap <= 0.03
-loadGap     <= 0.10
+loadGap     <= 0.10 OR repairBps >= expectedBps
 ```
 
 `deliveryGap` proves the REPAIR symbols are being delivered for the repair load
@@ -368,7 +369,9 @@ measurement slack, so the shadow leg must carry at least 90% of the DATA
 expectation. A low-rate REPAIR trickle must not clear a transport kind for DATA:
 with the default 4+1 FEC shape, one REPAIR for four source packets carries
 about 25% of `expectedBps`, so successful delivery of that default repair load
-is not recovery evidence for DATA-primary capacity.
+is not recovery evidence for DATA-primary capacity. When a cap reference is
+active, cap-based clear still uses the cap load threshold rather than the
+`repairBps >= expectedBps` shortcut.
 Inconsistent REPAIR-frame repair counts within one group make that group
 unusable for repair-scale updates.
 
