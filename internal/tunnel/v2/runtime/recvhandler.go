@@ -521,8 +521,6 @@ func (h *RecvHandler) OnQoS(ctx context.Context, leg transport.LegRef, frame pro
 	if qos == nil {
 		debuglog.Printf("runtime", "link_status_drop no_qos session=%d lane=%d repair_count=%d", frame.SessionID, frame.LaneID, repairCount)
 		recordLinkStatusEvent("apply_drop_no_qos", frame.SessionID, frame.LaneID, udpLimited, tcpLimited)
-		eventlog.Printf("link_status", "action=apply_drop_no_qos session=%d lane=%d status=%#02x",
-			frame.SessionID, frame.LaneID, body.Status)
 		return nil
 	}
 	qos.OnQoSStatus(udpLimited, body.UDPDeliveredBps, tcpLimited, body.TCPDeliveredBps, repairCount)

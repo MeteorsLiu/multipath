@@ -3,6 +3,9 @@ package send
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -927,6 +930,37 @@ func (s *Send) sendDataFrame(ctx context.Context, lane *laneRuntime, frame proto
 	return s.WriteTo(ctx, leg, packet)
 }
 
+func (s *Send) qosLaneSnapshot(sessionID uint64, qosEnabled bool) string {
+	s.lanesMu.RLock()
+	lanes := make([]*laneRuntime, 0)
+	for key, lane := range s.lanes {
+		if key.sessionID == sessionID && lane != nil {
+			lanes = append(lanes, lane)
+		}
+	}
+	s.lanesMu.RUnlock()
+
+	sort.Slice(lanes, func(i, j int) bool {
+		return lanes[i].id < lanes[j].id
+	})
+
+	parts := make([]string, 0, len(lanes))
+	for _, lane := range lanes {
+		primary := lane.primaryTransportWithQoS(qosEnabled)
+		shadow := lane.shadowTransportWithQoS(qosEnabled)
+		udpQ, tcpQ := lane.leg.qualitySnapshot()
+		reason := selectorEventReason(udpQ, tcpQ, primary.Kind)
+		parts = append(parts, fmt.Sprintf("%d:ready=%t,primary=%s,shadow=%s,reason=%s,repair=%d,udp_active=%t,udp_limited=%t,udp_bps=%d,udp_prefer_tcp=%t,tcp_active=%t,tcp_limited=%t,tcp_bps=%d,tcp_reconnect=%t",
+			lane.id, lane.ready(),
+			kindEventLabel(primary.Kind), kindEventLabel(shadow.Kind), reason,
+			lane.currentFECRepairCount(),
+			udpQ.Active, udpQ.QoSActive, udpQ.QoSDeliveredBps, udpQ.PreferTCP,
+			tcpQ.Active, tcpQ.QoSActive, tcpQ.QoSDeliveredBps,
+			lane.tcpReconnectPending.Load()))
+	}
+	return strings.Join(parts, ";")
+}
+
 func (s *Send) recordQoSDataLegSelection(sessionID uint64, lane *laneRuntime, kind transport.Kind, qosEnabled bool) {
 	if lane == nil || kind == 0 {
 		return
@@ -940,13 +974,10 @@ func (s *Send) recordQoSDataLegSelection(sessionID uint64, lane *laneRuntime, ki
 	if !changed {
 		return
 	}
-	eventlog.Printf("selector", "action=qos_data_leg session=%d lane=%d from=%s to=%s reason=%s udp_active=%t tcp_active=%t udp_qos_limited=%t udp_qos_bps=%d tcp_qos_limited=%t tcp_qos_bps=%d udp_prefer_tcp=%t",
+	eventlog.Printf("qos", "action=selector session=%d lane=%d from=%s to=%s reason=%s qos_enabled=%t lanes=%s",
 		sessionID, lane.id, kindEventLabel(previousKind), kindEventLabel(kind),
-		selectorEventReason(udpQ, tcpQ, kind),
-		udpQ.Active, tcpQ.Active,
-		udpQ.QoSActive, udpQ.QoSDeliveredBps,
-		tcpQ.QoSActive, tcpQ.QoSDeliveredBps,
-		udpQ.PreferTCP)
+		selectorEventReason(udpQ, tcpQ, kind), qosEnabled,
+		s.qosLaneSnapshot(sessionID, qosEnabled))
 }
 
 func selectorEventReason(udpQ, tcpQ selector.Quality, selected transport.Kind) string {

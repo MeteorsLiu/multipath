@@ -5,7 +5,6 @@ import (
 	"sync"
 
 	"github.com/MeteorsLiu/multipath/internal/debuglog"
-	"github.com/MeteorsLiu/multipath/internal/eventlog"
 	"github.com/MeteorsLiu/multipath/internal/metrics"
 	"github.com/MeteorsLiu/multipath/internal/protocol"
 	"github.com/MeteorsLiu/multipath/internal/transport"
@@ -72,8 +71,6 @@ func (w *QoSWriter) Write(ctx context.Context, status recv.QoSStatus) error {
 	}, transport.LegRef{Kind: transport.KindTCP})
 	if err != nil {
 		recordLinkStatusEvent("send_error", status.SessionID, status.LaneID, status.UDPLimited, status.TCPLimited)
-		eventlog.Printf("link_status", "action=send_error session=%d lane=%d status=%#02x err=%v",
-			status.SessionID, status.LaneID, linkStatus, err)
 		return err
 	}
 	recordLinkStatusEvent("send", status.SessionID, status.LaneID, status.UDPLimited, status.TCPLimited)
