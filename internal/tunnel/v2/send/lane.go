@@ -35,6 +35,11 @@ type laneRuntime struct {
 	// has no stream transport configured (UDP-only).
 	dialer *dialer
 
+	// tcpReconnectPending is only event-log state. It is set after a TCP leg
+	// failure asks the dialer to redial and consumed when the replacement TCP
+	// HELLO_ACK makes that leg active again.
+	tcpReconnectPending atomic.Bool
+
 	// Per-lane FEC transmit window (spec 9.1).
 	fecMu          sync.Mutex
 	txWindow       *txSLCWindow
@@ -130,6 +135,19 @@ func (l *laneRuntime) markDown(kind transport.Kind) {
 	if debuglog.Enabled() {
 		debuglog.Printf("send/leg_state", "down lane=%d kind=%s", l.id, kindEventLabel(kind))
 	}
+}
+
+func (l *laneRuntime) markTCPReconnectPending() {
+	if l != nil {
+		l.tcpReconnectPending.Store(true)
+	}
+}
+
+func (l *laneRuntime) consumeTCPReconnectPending() bool {
+	if l == nil {
+		return false
+	}
+	return l.tcpReconnectPending.Swap(false)
 }
 
 // setPrimary flips the leg's nominal primary orientation. Runtime DATA/REPAIR

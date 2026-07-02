@@ -519,6 +519,7 @@ func (s *Send) openLaneHello(ctx context.Context, session *sessionpkg.Session, s
 		lane.markDown(legRef.Kind)
 		s.abortBwTarget(sessionID, laneID, legRef)
 		if legRef.Kind == transport.KindTCP && lane.dialer != nil {
+			lane.markTCPReconnectPending()
 			lane.dialer.redial()
 		}
 	}
@@ -536,6 +537,10 @@ func (s *Send) openLaneHello(ctx context.Context, session *sessionpkg.Session, s
 			s.markRunnableLanesDirty(sessionID)
 			s.syncBwSchedulerAfterLegActive(ctx, sessionID)
 			debuglog.Printf("send", "hello_ack_active session=%d lane=%d kind=%d", sessionID, laneID, legRef.Kind)
+			if legRef.Kind == transport.KindTCP && lane.consumeTCPReconnectPending() {
+				eventlog.Printf("reconnect", "action=tcp_leg_reconnect_done session=%d lane=%d conn=%s",
+					sessionID, laneID, legRef.ConnID)
+			}
 		},
 	}
 	_ = session.Open(ctx, cfg, sender, onExpire)
@@ -934,13 +939,8 @@ func (s *Send) recordQoSDataLegSelection(sessionID uint64, lane *laneRuntime, ki
 	if !changed {
 		return
 	}
-	primary := lane.primaryTransportWithQoS(qosEnabled)
-	shadow := lane.shadowTransportWithQoS(qosEnabled)
-	eventlog.Printf("selector", "action=qos_data_leg session=%d lane=%d from=%s to=%s primary={%s} shadow={%s} udp_active=%t udp_qos=%t udp_qos_bps=%d udp_prefer_tcp=%t tcp_active=%t tcp_qos=%t tcp_qos_bps=%d",
-		sessionID, lane.id, kindEventLabel(previousKind), kindEventLabel(kind),
-		debugLeg(primary), debugLeg(shadow),
-		udpQ.Active, udpQ.QoSActive, udpQ.QoSDeliveredBps, udpQ.PreferTCP,
-		tcpQ.Active, tcpQ.QoSActive, tcpQ.QoSDeliveredBps)
+	eventlog.Printf("selector", "action=qos_data_leg session=%d lane=%d from=%s to=%s",
+		sessionID, lane.id, kindEventLabel(previousKind), kindEventLabel(kind))
 }
 
 func (s *Send) logBandwidthProbeDecision(target bwTarget, sample bw.Sample, preferTCP bool) {
@@ -1230,6 +1230,7 @@ func (s *Send) OnLegFailure(ctx context.Context, legRef transport.LegRef, err er
 		affected.lane.markDown(transport.KindTCP)
 		s.abortBwTarget(affected.sessionID, affected.lane.id, legRef)
 		if affected.lane.dialer != nil {
+			affected.lane.markTCPReconnectPending()
 			affected.lane.dialer.redial()
 		}
 		debuglog.Printf("send", "tcp_leg_failure conn=%s err=%v", legRef.ConnID, err)
@@ -1286,11 +1287,15 @@ func (s *Send) startLanePing(ctx context.Context, sessionID uint64, lane *laneRu
 		OnUp: func() {
 			lane.markActive(kind)
 			debuglog.Printf("send", "ping_up session=%d lane=%d kind=%d", sessionID, laneID, kind)
+			eventlog.Printf("ping", "action=up session=%d lane=%d leg=%s",
+				sessionID, laneID, kindEventLabel(kind))
 		},
 		OnDown: func() {
 			lane.markDown(kind)
 			s.abortBwTarget(sessionID, laneID, legRef)
 			debuglog.Printf("send", "ping_down session=%d lane=%d kind=%d", sessionID, laneID, kind)
+			eventlog.Printf("ping", "action=down session=%d lane=%d leg=%s",
+				sessionID, laneID, kindEventLabel(kind))
 		},
 		Observer: func(q ping.Quality) {
 			lane.leg.observeRTT(kind, q.SampleMS)

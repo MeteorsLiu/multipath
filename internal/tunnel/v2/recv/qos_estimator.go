@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/MeteorsLiu/multipath/internal/debuglog"
-	"github.com/MeteorsLiu/multipath/internal/eventlog"
 	"github.com/MeteorsLiu/multipath/internal/metrics"
 	"github.com/MeteorsLiu/multipath/internal/transport"
 )
@@ -964,6 +963,4 @@ func (e *qosEstimator) recordEvent(event string, kind transport.Kind) {
 			metrics.LStr("leg", kindMetricLabel(kind)),
 		)
 	}
-	eventlog.Printf("qos_state", "event=%s session=%d lane=%d leg=%s",
-		event, e.cfg.SessionID, e.cfg.LaneID, kindMetricLabel(kind))
 }
