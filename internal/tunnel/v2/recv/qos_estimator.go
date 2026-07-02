@@ -19,11 +19,12 @@ const (
 	defaultFECLateAlpha     = 0.20
 	defaultFECLateBeta      = 0.05
 	defaultRepairScaleAlpha = 0.25
+	defaultFECHighDwell     = 75 * time.Second
 	qosDecisionSamples      = 3
 
 	qosRateGapLimited     = 0.10
 	qosRateGapClear       = 0.03
-	qosRepairLoadGapClear = 0.75
+	qosRepairLoadGapClear = 0.10
 )
 
 type qosConfig struct {
@@ -121,6 +122,7 @@ type qosFECHealth struct {
 	lateInitialized bool
 	dirty           bool
 	repairCount     uint8
+	highRepairSince time.Time
 }
 
 type qosDecisionWindow struct {
@@ -135,6 +137,14 @@ type qosGroup struct {
 	repairCount      uint8
 	directionTrusted bool
 	repairTrusted    bool
+}
+
+type qosPrimaryHint struct {
+	primary         transport.Kind
+	udpLimited      bool
+	udpDeliveredBps uint32
+	tcpDeliveredBps uint32
+	at              time.Time
 }
 
 func newQoSEstimator(cfg qosConfig, emit func(qosStatus)) *qosEstimator {
@@ -176,6 +186,52 @@ func (e *qosEstimator) observeOriginalData(dataKind transport.Kind, dataBytes in
 	if direction := e.currentDirectionForLocked(dataKind, otherQoSTransport(dataKind)); direction != nil {
 		direction.addOriginal(uint64(dataBytes), normalizeQoSTime(at))
 	}
+}
+
+func (e *qosEstimator) observePrimaryHint(hint qosPrimaryHint) []qosStatus {
+	if !knownQoSTransport(hint.primary) {
+		return nil
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return nil
+	}
+
+	before := e.snapshotLocked()
+	now := normalizeQoSTime(hint.at)
+	if hint.udpLimited {
+		e.udpTCPData.dataLimited = true
+		e.udpTCPData.dataDelivered = qosDelivered{bps: hint.udpDeliveredBps, at: now}
+		e.tcpUDPData.dataDelivered = qosDelivered{bps: hint.tcpDeliveredBps, at: now}
+		after := e.snapshotLocked()
+		primarySwitched := e.switchPrimaryLocked(after)
+		if primarySwitched {
+			after = e.snapshotLocked()
+		}
+		if primarySwitched || shouldEmitQoSStatus(before, after, false) {
+			after.primarySwitched = primarySwitched
+			return []qosStatus{after}
+		}
+		return nil
+	}
+
+	if hint.primary == e.currentPrimary {
+		return nil
+	}
+
+	oldPrimary := e.currentPrimary
+	e.directionLocked(hint.primary, otherQoSTransport(hint.primary), qosRoleData).resetRateState()
+	e.currentPrimary = hint.primary
+	e.currentRole = qosRoleData
+	e.currentDirectionLocked().fecHealth = qosFECHealth{repairCount: 1}
+
+	if debuglog.Enabled() {
+		debuglog.Printf("recv/qos", "primary_hint session=%d lane=%d from=%s to=%s role=%s",
+			e.cfg.SessionID, e.cfg.LaneID, kindMetricLabel(oldPrimary), kindMetricLabel(hint.primary), qosRoleLabel(qosRoleData))
+	}
+	return nil
 }
 
 func newQoSDirection(dataKind, repairKind transport.Kind, role qosRole) qosDirection {
@@ -343,7 +399,7 @@ func (e *qosEstimator) tick(now time.Time) []qosStatus {
 	direction.addLateHealth(rates)
 	e.recordRates(direction, rates)
 	e.evaluateRatesLocked(direction, rates)
-	repairChanged := direction.updateFECHealth()
+	repairChanged := direction.updateFECHealth(now)
 
 	after := e.snapshotLocked()
 	primarySwitched := e.switchPrimaryLocked(after)
@@ -694,19 +750,33 @@ func (d *qosDirection) flush(now time.Time, tick time.Duration) (qosRates, bool)
 	return rates, true
 }
 
-func (d *qosDirection) updateFECHealth() bool {
+func (d *qosDirection) updateFECHealth(now time.Time) bool {
 	before := d.fecHealth.repairCount
-	if !d.fecHealth.dirty {
-		return false
+	if d.fecHealth.dirty {
+		d.fecHealth.dirty = false
+		lossRepairCount := repairCountForLossRatio(d.fecHealth.lossRatio)
+		lateRepairCount := repairCountForLateRatio(d.fecHealth.lateRatio)
+		if lateRepairCount > lossRepairCount {
+			d.fecHealth.repairCount = lateRepairCount
+		} else {
+			d.fecHealth.repairCount = lossRepairCount
+		}
 	}
-	d.fecHealth.dirty = false
-	lossRepairCount := repairCountForLossRatio(d.fecHealth.lossRatio)
-	lateRepairCount := repairCountForLateRatio(d.fecHealth.lateRatio)
-	if lateRepairCount > lossRepairCount {
-		d.fecHealth.repairCount = lateRepairCount
-	} else {
-		d.fecHealth.repairCount = lossRepairCount
+
+	if d.fecHealth.repairCount < maxFECSourceSpan {
+		d.fecHealth.highRepairSince = time.Time{}
+		return d.fecHealth.repairCount != before
 	}
+
+	now = normalizeQoSTime(now)
+	if d.fecHealth.highRepairSince.IsZero() {
+		d.fecHealth.highRepairSince = now
+		return d.fecHealth.repairCount != before
+	}
+	if now.Sub(d.fecHealth.highRepairSince) >= defaultFECHighDwell {
+		d.fecHealth = qosFECHealth{repairCount: 1}
+	}
+
 	return d.fecHealth.repairCount != before
 }
 

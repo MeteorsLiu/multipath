@@ -14,7 +14,8 @@ import (
 )
 
 type recordingHandler struct {
-	calls []string
+	calls                     []string
+	bandwidthProbeObservation BandwidthProbeObservation
 }
 
 func (h *recordingHandler) OnHello(ctx context.Context, leg Ref, frame protocol.Frame) error {
@@ -37,9 +38,9 @@ func (h *recordingHandler) OnClose(ctx context.Context, leg Ref, frame protocol.
 	h.calls = append(h.calls, "OnClose")
 	return nil
 }
-func (h *recordingHandler) OnBandwidthProbe(ctx context.Context, leg Ref, frame protocol.Frame) error {
+func (h *recordingHandler) OnBandwidthProbe(ctx context.Context, leg Ref, frame protocol.Frame) (BandwidthProbeObservation, error) {
 	h.calls = append(h.calls, "OnBandwidthProbe")
-	return nil
+	return h.bandwidthProbeObservation, nil
 }
 func (h *recordingHandler) OnBandwidthProbeAck(ctx context.Context, leg Ref, frame protocol.Frame) error {
 	h.calls = append(h.calls, "OnBandwidthProbeAck")
@@ -560,6 +561,58 @@ func TestRecvReportsQoSStatusThroughCallback(t *testing.T) {
 	}
 	if statuses[0].SessionID != 10 || statuses[0].LaneID != 1 || !statuses[0].UDPLimited || statuses[0].TCPLimited || statuses[0].RepairCount != 1 {
 		t.Fatalf("status = %+v, want UDP limited for session 10 lane 1 with repair count 1", statuses[0])
+	}
+}
+
+func TestRecvAppliesBandwidthProbeObservationFromHandler(t *testing.T) {
+	var manager session.Manager
+	if _, ok := manager.Create(11); !ok {
+		t.Fatal("Create session failed")
+	}
+	handler := &recordingHandler{
+		bandwidthProbeObservation: BandwidthProbeObservation{
+			Primary:         transport.KindTCP,
+			UDPLimited:      true,
+			UDPDeliveredBps: 20_000_000,
+			TCPDeliveredBps: 80_000_000,
+		},
+	}
+	var statuses []QoSStatus
+	out := New(Config{
+		Handler:        handler,
+		SessionManager: &manager,
+		OnQoSStatus: func(ctx context.Context, status QoSStatus) error {
+			statuses = append(statuses, status)
+			return nil
+		},
+	})
+
+	frame := protocol.Frame{
+		Version:   protocol.Version,
+		Type:      protocol.TypeBandwidthProbe,
+		SessionID: 11,
+		LaneID:    2,
+		Body: protocol.BandwidthProbeBody{
+			TrainID:             10,
+			ProbeID:             10,
+			Count:               1,
+			TrainBytesTotal:     1,
+			TrainBytesRemaining: 0,
+		},
+	}
+	if err := out.WriteTo(context.Background(), udpLeg(), encodedTestFrame(t, frame)); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+
+	if len(statuses) != 1 {
+		t.Fatalf("statuses = %+v, want one", statuses)
+	}
+	status := statuses[0]
+	if status.SessionID != 11 || status.LaneID != 2 || !status.UDPLimited || status.TCPLimited {
+		t.Fatalf("status = %+v, want UDP limited for session 11 lane 2", status)
+	}
+	if status.UDPDeliveredBps != 20_000_000 || status.TCPDeliveredBps != 80_000_000 {
+		t.Fatalf("status delivered bps udp=%d tcp=%d, want udp=20000000 tcp=80000000", status.UDPDeliveredBps, status.TCPDeliveredBps)
 	}
 }
 

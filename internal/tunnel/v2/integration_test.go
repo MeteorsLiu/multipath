@@ -333,7 +333,7 @@ func TestInboundBandwidthProbeSendsAck(t *testing.T) {
 				Payload:             make([]byte, 1200),
 			},
 		}
-		if err := handler.OnBandwidthProbe(ctx, leg, frame); err != nil {
+		if _, err := handler.OnBandwidthProbe(ctx, leg, frame); err != nil {
 			t.Fatalf("OnBandwidthProbe seq=%d failed: %v", seq, err)
 		}
 	}

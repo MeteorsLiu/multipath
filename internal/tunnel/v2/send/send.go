@@ -968,7 +968,7 @@ func (s *Send) logBandwidthProbeDecision(target bwTarget, sample bw.Sample, pref
 		selected = "tcp"
 	}
 	tcpBetter := referenceBps > sample.BandwidthBps
-	eventlog.Printf("bandwidth_probe_decision", "session=%d lane=%d udp_active=%t tcp_active=%t udp_bps=%d udp_loss=%.3f tcp_bps=%d reference_bps=%d cap_bps=%d udp_qos_limited=%t tcp_better=%t prefer_tcp=%t selected_leg=%s",
+	eventlog.Printf("bandwidth_probe_decision", "side=send session=%d lane=%d udp_active=%t tcp_active=%t udp_bps=%d udp_loss=%.3f tcp_bps=%d reference_bps=%d cap_bps=%d udp_qos_limited=%t tcp_better=%t prefer_tcp=%t selected_leg=%s",
 		target.key.SessionID, target.laneID,
 		udpQ.Active, tcpQ.Active,
 		sample.BandwidthBps, sample.Loss,

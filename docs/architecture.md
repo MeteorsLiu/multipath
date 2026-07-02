@@ -358,13 +358,19 @@ three-sample averages to be below the clear threshold:
 
 ```text
 deliveryGap <= 0.03
-loadGap     <= 0.75
+loadGap     <= 0.10
 ```
 
-`deliveryGap` proves the REPAIR symbols are being delivered. `loadGap` prevents
-low-rate shadow trickle from clearing a transport kind for DATA. Inconsistent
-REPAIR-frame repair counts within one group make that group unusable for
-repair-scale updates.
+`deliveryGap` proves the REPAIR symbols are being delivered for the repair load
+the peer actually sent. `loadGap` proves that the shadow leg is carrying a load
+close to the current DATA expectation. The clear threshold allows up to 10%
+measurement slack, so the shadow leg must carry at least 90% of the DATA
+expectation. A low-rate REPAIR trickle must not clear a transport kind for DATA:
+with the default 4+1 FEC shape, one REPAIR for four source packets carries
+about 25% of `expectedBps`, so successful delivery of that default repair load
+is not recovery evidence for DATA-primary capacity.
+Inconsistent REPAIR-frame repair counts within one group make that group
+unusable for repair-scale updates.
 
 QoS limited/clear decisions are made only by estimator ticks. DATA and REPAIR
 arrival paths submit raw byte facts to the estimator immediately; group
@@ -375,9 +381,25 @@ state. Only `expectedBytes` is a FEC-group result: it is submitted when the
 group completes or recovers and the receiver knows the source DATA byte total.
 None of these paths may submit limited or clear state directly.
 FEC health observations such as incomplete-group `DataArrived/DataExpected`
-do not feed the QoS limited/clear detector. They are submitted to the same
-lane-local QoS estimator as FEC-health facts, and they drive only adaptive
-repair count. FEC health has two separate inputs:
+do not directly feed the QoS limited/clear detector. They are submitted to the
+same lane-local QoS estimator as FEC-health facts and drive adaptive
+repair count. That adaptive repair count has two purposes:
+
+1. When the current DATA primary is losing heavily, QoS rate detection may lack
+   enough accepted DATA/group evidence. Raising repair count lets the shadow
+   REPAIR leg recover more source packets sooner, restoring tunnel throughput
+   and keeping receive-side group facts flowing.
+2. When the current DATA primary is backpressured and many originals arrive
+   late, raising repair count lets the shadow REPAIR leg recover those packets
+   before the delayed originals arrive, reducing upper-layer wait time.
+
+The higher shadow REPAIR load created by adaptive repair count also supplies
+the only valid shadow-capacity evidence for clearing a previously limited
+transport kind. A clear requires the shadow leg to deliver REPAIR under load
+within 10% of the current DATA expectation; FEC health itself is not a separate
+QoS limited/clear signal.
+
+FEC health has two separate inputs:
 
 - loss health from FEC group completeness
 - late health from original DATA that arrived after the same packet id was
@@ -455,13 +477,24 @@ shadow observation. The unrelated side of each transport's role state is left
 intact.
 Adaptive `repairCount` is FEC-health state, not a pending sample counter. Tick
 flushes may clear the FEC-health dirty flag after applying the current loss
-EMA, but they must not reset `repairCount`. The only valid `repairCount` reset
-is part of an actual primary protocol switch between UDP and TCP; ordinary
-estimator ticks, empty ticks, clear/limited decisions that do not switch
-protocol, LINK_STATUS send/drop/failure paths, and Recv glue must preserve the
-current value. When a primary protocol switch resets `repairCount`, the reset
-must happen before the committed LINK_STATUS snapshot is emitted so the sent
-repair-count bits and the estimator's local committed state are identical.
+EMA, but they must not reset `repairCount` except through the explicit reset
+paths below:
+
+- an actual primary protocol switch between UDP and TCP
+- a direction-local high-repair dwell reset after computed `repairCount=4`
+  persists for 75 seconds
+
+The dwell timer starts when the computed adaptive repair count first reaches
+`4`, clears when the computed count falls below `4`, and is reset by primary
+protocol switches. When the dwell expires, only the direction-local FEC-health
+state is reset to `repairCount=1`; QoS limited/clear state, rate windows, and
+delivered-bps snapshots are preserved. Subsequent loss or late samples may raise
+repair count again and start a new dwell interval. Ordinary estimator ticks,
+empty ticks, clear/limited decisions that do not switch protocol, LINK_STATUS
+send/drop/failure paths, and Recv glue must otherwise preserve the current
+value. When a reset changes `repairCount`, the reset must happen before the
+committed LINK_STATUS snapshot is emitted so the sent repair-count bits and the
+estimator's local committed state are identical.
 The final LINK_STATUS snapshot is a projection computed from committed
 direction-local role state. It may expose UDP and TCP fields because the
 protocol encodes the snapshot that way, but the estimator must not maintain a

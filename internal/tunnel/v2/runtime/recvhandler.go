@@ -18,6 +18,7 @@ package runtime
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/MeteorsLiu/multipath/internal/debuglog"
@@ -49,6 +50,11 @@ type RecvHandler struct {
 	// recv glue writes the returned Ack as a BW_PROBE_ACK frame. Active probing
 	// (BwLoop) lives in send and is reached via the shared LaneManager.
 	receive *bw.Receive
+
+	passiveBWMu     sync.Mutex
+	passiveBWTrains map[uint64]send.LegKey
+	passiveBWTCPRef map[send.LaneKey]uint64
+	passiveBWObs    map[uint64]recv.BandwidthProbeObservation
 }
 
 // Config holds optional probe tuning for the runtime glue.
@@ -63,11 +69,16 @@ type Config struct {
 // probe instances.
 func NewRecvHandler(s *send.Send, sessions *sessionpkg.Manager, configs ...Config) *RecvHandler {
 	h := &RecvHandler{
-		send:     s,
-		sessions: sessions,
-		lanes:    s.LaneManager(),
-		receive:  bw.NewReceive(bw.ReceiveConfig{}),
+		send:            s,
+		sessions:        sessions,
+		lanes:           s.LaneManager(),
+		passiveBWTrains: make(map[uint64]send.LegKey),
+		passiveBWTCPRef: make(map[send.LaneKey]uint64),
+		passiveBWObs:    make(map[uint64]recv.BandwidthProbeObservation),
 	}
+	h.receive = bw.NewReceive(bw.ReceiveConfig{
+		OnSample: h.onPassiveBWSample,
+	})
 	for _, cfg := range configs {
 		if cfg.BWReferenceBps > 0 {
 			h.bwReferenceBps = cfg.BWReferenceBps
@@ -298,20 +309,22 @@ func (h *RecvHandler) OnClose(ctx context.Context, leg transport.LegRef, frame p
 // BW_PROBE frames arm the passive-side bwScheduler through LaneManager; when the
 // peer's train is done (TrainBytesRemaining==0), RemoteComplete releases the
 // scheduler's remote phase.
-func (h *RecvHandler) OnBandwidthProbe(ctx context.Context, leg transport.LegRef, frame protocol.Frame) error {
+func (h *RecvHandler) OnBandwidthProbe(ctx context.Context, leg transport.LegRef, frame protocol.Frame) (recv.BandwidthProbeObservation, error) {
 	body, ok := frame.Body.(protocol.BandwidthProbeBody)
 	if !ok {
-		return protocol.ErrInvalidFrame
+		return recv.BandwidthProbeObservation{}, protocol.ErrInvalidFrame
 	}
 
 	if !h.sessionKnown(frame.SessionID) {
-		return h.closeUnknownSession(ctx, leg, frame.SessionID)
+		return recv.BandwidthProbeObservation{}, h.closeUnknownSession(ctx, leg, frame.SessionID)
 	}
 
 	key := send.KeyForLeg(frame.SessionID, frame.LaneID, leg)
+	h.rememberPassiveBWTrain(body.TrainID, key)
 	h.lanes.RemoteProbe(key)
 
 	probe := bw.Probe{
+		TrainID:   body.TrainID,
 		ID:        body.ProbeID,
 		Seq:       body.Seq,
 		Count:     body.Count,
@@ -321,6 +334,7 @@ func (h *RecvHandler) OnBandwidthProbe(ctx context.Context, leg transport.LegRef
 		Bytes:     len(body.Payload),
 	}
 	ack, shouldAck := h.receive.Probe(probe)
+	observation := h.takePassiveBWObservation(body.TrainID)
 
 	// Peer's train finished: release the gate's remote phase (spec 7.5).
 	if body.TrainBytesRemaining == 0 {
@@ -328,7 +342,7 @@ func (h *RecvHandler) OnBandwidthProbe(ctx context.Context, leg transport.LegRef
 	}
 
 	if !shouldAck {
-		return nil
+		return observation, nil
 	}
 	ackFrame := protocol.Frame{
 		Version:   protocol.Version,
@@ -343,7 +357,115 @@ func (h *RecvHandler) OnBandwidthProbe(ctx context.Context, leg transport.LegRef
 			LastRXMS:  ack.LastRXMS,
 		},
 	}
-	return h.send.WriteFrame(ctx, ackFrame, leg)
+	return observation, h.send.WriteFrame(ctx, ackFrame, leg)
+}
+
+func (h *RecvHandler) rememberPassiveBWTrain(trainID uint64, key send.LegKey) {
+	if trainID == 0 {
+		return
+	}
+	h.passiveBWMu.Lock()
+	h.passiveBWTrains[trainID] = key
+	h.passiveBWMu.Unlock()
+}
+
+func (h *RecvHandler) takePassiveBWObservation(trainID uint64) recv.BandwidthProbeObservation {
+	if trainID == 0 {
+		return recv.BandwidthProbeObservation{}
+	}
+	h.passiveBWMu.Lock()
+	defer h.passiveBWMu.Unlock()
+	observation := h.passiveBWObs[trainID]
+	delete(h.passiveBWObs, trainID)
+	return observation
+}
+
+func (h *RecvHandler) onPassiveBWSample(trainID uint64, sample bw.Sample) {
+	h.passiveBWMu.Lock()
+	key, ok := h.passiveBWTrains[trainID]
+	if ok {
+		delete(h.passiveBWTrains, trainID)
+	}
+	if !ok {
+		h.passiveBWMu.Unlock()
+		return
+	}
+
+	laneKey := send.LaneKey{SessionID: key.SessionID, LaneID: key.LaneID}
+	if key.Kind == transport.KindTCP {
+		if sample.BandwidthBps > 0 {
+			h.passiveBWTCPRef[laneKey] = sample.BandwidthBps
+		}
+		h.passiveBWMu.Unlock()
+		debuglog.Printf("runtime", "bw_passive_sample session=%d lane=%d kind=%s bps=%d loss=%.3f",
+			key.SessionID, key.LaneID, runtimeKindLabel(key.Kind), sample.BandwidthBps, sample.Loss)
+		return
+	}
+
+	tcpBps := h.passiveBWTCPRef[laneKey]
+	capBps := h.bwCapBps
+	referenceBps := h.bwReferenceBps
+	if referenceBps == 0 {
+		if h.bwCapBps > 0 {
+			referenceBps = h.bwCapBps
+		} else {
+			referenceBps = tcpBps
+			capBps = tcpBps
+		}
+	}
+	h.passiveBWMu.Unlock()
+
+	if key.Kind != transport.KindUDP {
+		return
+	}
+	sample.ReferenceBps = referenceBps
+	preferTCP := passiveBWPreferTCP(sample)
+	primary := transport.KindUDP
+	if preferTCP {
+		primary = transport.KindTCP
+	}
+	debuglog.Printf("runtime", "bw_passive_sample session=%d lane=%d kind=%s bps=%d loss=%.3f reference_bps=%d prefer_tcp=%t primary=%s",
+		key.SessionID, key.LaneID, runtimeKindLabel(key.Kind), sample.BandwidthBps, sample.Loss, sample.ReferenceBps, preferTCP, runtimeKindLabel(primary))
+	eventlog.Printf("bw", "action=passive_sample session=%d lane=%d leg=%s bps=%d loss=%.3f reference_bps=%d prefer_tcp=%t selected_primary=%s",
+		key.SessionID, key.LaneID, runtimeKindLabel(key.Kind), sample.BandwidthBps, sample.Loss, sample.ReferenceBps, preferTCP, runtimeKindLabel(primary))
+	tcpBetter := sample.ReferenceBps > sample.BandwidthBps
+	eventlog.Printf("bandwidth_probe_decision", "side=recv session=%d lane=%d udp_bps=%d udp_loss=%.3f tcp_bps=%d reference_bps=%d cap_bps=%d tcp_better=%t prefer_tcp=%t selected_leg=%s",
+		key.SessionID, key.LaneID,
+		sample.BandwidthBps, sample.Loss,
+		tcpBps, sample.ReferenceBps, capBps,
+		tcpBetter, preferTCP, runtimeKindLabel(primary))
+	if trainID != 0 {
+		h.passiveBWMu.Lock()
+		h.passiveBWObs[trainID] = recv.BandwidthProbeObservation{
+			Primary:         primary,
+			UDPLimited:      preferTCP,
+			UDPDeliveredBps: uint32Bps(sample.BandwidthBps),
+			TCPDeliveredBps: uint32Bps(sample.ReferenceBps),
+		}
+		h.passiveBWMu.Unlock()
+	}
+}
+
+func uint32Bps(v uint64) uint32 {
+	if v > uint64(^uint32(0)) {
+		return ^uint32(0)
+	}
+	return uint32(v)
+}
+
+const (
+	passiveBWLossThreshold  = 0.01
+	passiveBWTCPPreferRatio = 3.0 / 2.0
+)
+
+func passiveBWPreferTCP(sample bw.Sample) bool {
+	if sample.Loss >= passiveBWLossThreshold {
+		return true
+	}
+	if sample.ReferenceBps > 0 && float64(sample.BandwidthBps)*passiveBWTCPPreferRatio <= float64(sample.ReferenceBps) {
+		return true
+	}
+	return false
 }
 
 // OnBandwidthProbeAck handles incoming BW_PROBE_ACK frames (spec 7.5). It routes

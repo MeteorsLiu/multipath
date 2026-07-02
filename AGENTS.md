@@ -33,79 +33,10 @@ upper-layer ARQ delay is paid; it must not turn the tunnel into a fully reliable
 transport, add tunnel-level retransmission semantics, or chase unrecoverable loss
 with reliability machinery.
 
-QoS detection is based on FEC differential observations. Within one FEC group,
-the DATA leg and REPAIR leg carry differential observations of the same source
-data under the FEC rules. QoS detection may compare values derived from that
-same-group relationship, for example expected source DATA bytes versus original
-DATA bytes that arrived without REPAIR. FEC health is not a QoS detector input;
-it drives only adaptive repair count. Do not treat primary and shadow legs as
-the same capacity reference across different transport protocols. Do not
-introduce cross-leg capacity heuristics such as using REPAIR-derived throughput
-as primary DATA capacity or a `CapacityGap`-style signal for primary-leg QoS
-decisions.
-
-Receive-side QoS raw byte accounting is independent of FEC group lifetime.
-Accepted original DATA adds `originalDataBytes` when it arrives. Received
-REPAIR adds `repairBytes` when it arrives. Late DATA adds `lateDataBytes` when
-the estimator has already seen that packet id as recovered. Only
-`expectedBytes` is a FEC-group result; it is submitted when the group completes
-or recovers and the receiver knows the source DATA byte total. A closed or
-dropped FEC group must not decide whether raw DATA, REPAIR, or late-DATA bytes
-can be accounted.
-
-QoS detection must keep real sample classes separate: `originalDataBytes` are
-DATA bytes received without REPAIR and without late arrivals; `expectedBytes`
-are the source DATA bytes known from a completed or recovered FEC group and IP
-header length parsing; `repairBytes` are received REPAIR symbol bytes;
-`lateDataBytes` are original DATA bytes that arrive after the same packet id was
-recovered by FEC.
-Once `emitDedupe` rejects a DATA packet, it must not update
-`originalDataBytes`, FEC health, recovery, emit state, or the receive FEC
-window. The lane-local QoS estimator may account it once as `lateDataBytes`
-only when its estimator-owned recovered-packet state has seen the packet id.
-Duplicate original DATA that was already emitted as original DATA is not late
-DATA. `lateDataBytes` is retained as a separate late-arrival observation only;
-it must not be merged into
-`originalDataBytes` or directly mark a leg limited/clear. FEC-recovered DATA
-may contribute only to `expectedBytes`
-through its parsed IP packet length, not to `originalDataBytes`.
-Unrecovered missing DATA may
-only contribute to adaptive FEC health observations such as
-`DataArrived/DataExpected`; do not feed it into the QoS limited/clear detector
-or convert it into synthetic DATA bytes, recovered bytes, rate samples, or
-bandwidth-estimation inputs. The lane-local QoS estimator may own and update
-FEC-health state only for adaptive repair-count feedback.
-
-Derived QoS rates must preserve those names and meanings:
-`expectedBps = expectedBytes / deltaT`; it is not the sum of
-`originalDataBytes` and `repairBytes`. The estimator keeps only
-`originalDataBytes`, `expectedBytes`, `repairBytes`, and `lateDataBytes` as
-pending QoS byte classes, and a tick resets those pending counters after
-converting them to rates. DATA-leg `rateGap` compares `expectedBps` with
-`originalDataBps + lateDataBps`; `lateDataBytes` still remains a separate
-sample class and is not merged into `originalDataBytes`. The receive-side QoS
-tick is one second. The estimator stores each tick's `rateGap`, averages three
-consecutive tick gaps, and compares that three-sample average with the QoS
-thresholds. Do not add a separate minimum group-count gate before evaluating
-QoS.
-
-Do not add a `lossRepair` detector or use the receiver's newly requested repair
-count as proof that the sender already used that count for the current receive
-group. LINK_STATUS repair-count feedback affects future peer send groups after
-the peer applies it; receive-side QoS must not add a separate repair-count-based
-pending byte class.
-
-QoS estimator rate state, PID correction state, limited state, and three-sample
-gap window must be scoped to the DATA/REPAIR direction, for example
-`data=UDP, repair=TCP` is independent from `data=TCP, repair=UDP`. The final
-LINK_STATUS snapshot is aggregated per transport kind only after a direction's
-role-local tick commits clear/limited state. Do not use
-one transport kind's aggregated LINK_STATUS state as a gate for another
-direction's DATA-leg or REPAIR-leg QoS judgment. LINK_STATUS is state-change
-feedback; delivered-bps fields are auxiliary snapshot data and are not a
-continuous telemetry stream. A delivered-bps-only update may emit a fresh
-LINK_STATUS only when both UDP and TCP are already limited and the updated
-relative bps changes the QoS-preferred primary leg.
+Detailed QoS, FEC-health, adaptive repair-count, LINK_STATUS, bandwidth-probe,
+and receive-side accounting semantics live in `docs/protocol.md` and
+`docs/architecture.md`. Keep this file as guidance for agents, not as a second
+copy of protocol or architecture rules.
 
 Do not reduce this project to a single-path transport with a global UDP/TCP
 fallback. Multiple lanes may be active at the same time, and the scheduler

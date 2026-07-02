@@ -947,16 +947,37 @@ Unrecovered missing DATA may only contribute to FEC health observations:
 DataArrived / DataExpected
 ```
 
-FEC health is not a QoS detector input. It drives only the lane-local adaptive
-repair count carried in LINK_STATUS. Empty estimator ticks may decay rate EMAs,
-but they must not turn an old incomplete-group health sample into QoS evidence.
-FEC health has separate loss-health and late-health inputs. They must not be
-merged into one pressure value or one EMA. Estimator ticks may clear the
-FEC-health dirty flag after applying the current health state, but they must
-not reset the committed `repairCount`. The only committed `repairCount` reset
-is part of an actual primary protocol switch between UDP and TCP. That reset
-must happen before the LINK_STATUS snapshot is emitted so the sent repair-count
-bits and the receiver's local committed state remain identical.
+FEC health is not a direct QoS limited/clear detector input. It drives the
+lane-local adaptive repair count carried in LINK_STATUS. That repair count has
+two jobs:
+
+1. When the current DATA primary is losing heavily, QoS rate detection may lack
+   enough accepted DATA/group evidence. Higher repair count lets the shadow
+   REPAIR leg recover more source packets sooner, restoring tunnel throughput
+   and preserving receive-side group facts.
+2. When the current DATA primary is backpressured and many originals arrive
+   late, higher repair count lets the shadow REPAIR leg recover those packets
+   before the delayed originals arrive, reducing upper-layer wait time.
+
+The increased shadow REPAIR load is also the only valid shadow-capacity evidence
+for clearing a previously limited transport kind. The receiver must not treat
+the FEC-health value itself as a separate QoS clear signal.
+
+Empty estimator ticks may decay rate EMAs, but they must not turn an old
+incomplete-group health sample into QoS evidence. FEC health has separate
+loss-health and late-health inputs. They must not be merged into one pressure
+value or one EMA. Estimator ticks may clear the FEC-health dirty flag after
+applying the current health state, but they must not reset the committed
+`repairCount` except through explicit reset paths. A reset is allowed when the
+primary protocol switches between UDP and TCP. A reset is also allowed when the
+direction-local computed adaptive repair count remains at `4` for 75 seconds:
+the receiver resets only that direction's FEC-health state to `repairCount=1`,
+preserves QoS limited/clear state and rate windows, and lets subsequent loss or
+late samples raise repair count again. The high-repair dwell timer starts when
+the computed count reaches `4`, clears when it falls below `4`, and is reset by
+primary switches. Any reset must happen before the LINK_STATUS snapshot is
+emitted so the sent repair-count bits and the receiver's local committed state
+remain identical.
 
 Loss health is computed from group packet arrival ratio and reacts quickly to
 rising loss:
@@ -1034,8 +1055,16 @@ There are two limited-leg role paths:
 
    ```text
    deliveryGap <= 0.03
-   loadGap     <= 0.75
+   loadGap     <= 0.10
    ```
+
+   `deliveryGap` proves the peer-sent REPAIR load is delivered. `loadGap`
+   proves that this REPAIR load is close to the DATA expectation. The clear
+   threshold allows up to 10% measurement slack, so the shadow leg must carry at
+   least 90% of the DATA expectation. A low-rate shadow trickle must not clear
+   DATA-primary capacity: with default 4+1 FEC, one REPAIR for four source
+   packets carries about 25% of `expectedBps`, so successful delivery of that
+   default repair load is not enough recovery evidence.
 
    REPAIR frames for the same group with inconsistent `repairCount` values make
    that group unusable for repair-scale updates.
@@ -1052,9 +1081,14 @@ Initial:
 After selector switches DATA to TCP:
   DATA = TCP
   REPAIR = UDP
-  TCP DATA is clean
-  UDP shadow remains weak
+  TCP DATA is clean enough that adaptive repair count stays low
+  UDP carries only low-rate default REPAIR
   -> receiver sends LINK_STATUS(status=UDP limited, TCP clear)
+
+If TCP later loses heavily or backpressures DATA, FEC health raises the lane
+repair count. Future groups then put higher REPAIR load on UDP. Only after UDP
+delivers that higher REPAIR load within 10% of `expectedBps` may the receiver
+send a clear LINK_STATUS for UDP and allow DATA to switch back.
 ```
 
 Without the shadow-leg path, the UDP limited state would lose fresh state as

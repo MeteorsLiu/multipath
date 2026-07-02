@@ -16,6 +16,7 @@ FEC_PING_INTERVAL=0.02
 FEC_HIGH_RTT_DELAY=50ms
 LINK_STATUS_QOS_LOSS=50%
 LINK_STATUS_QOS_WAIT=35
+LINK_STATUS_QOS_CLEAR_WAIT=120
 
 require_command() {
   local cmd="$1"
@@ -89,6 +90,7 @@ PORT_LINK_STATUS_QOS_IPERF_RTT200=5034
 PORT_TCP_FALLBACK_RATE_DYNAMIC=5035
 PORT_LINK_STATUS_QOS_JITTER_NO_QOS=5036
 PORT_FEC_ADAPTIVE_75=5037
+PORT_BW_PROBE_UDP_RESTORE=5038
 
 PATH1_C="10.201.1.1/24"
 PATH1_S="10.201.1.2/24"
@@ -644,6 +646,32 @@ assert_iperf_window_limited_drop() {
     pass "${label}" "limited window dropped as expected"
   else
     fail "${label}" "limited window did not drop enough: baseline=${baseline} limited=${limited}"
+    return 1
+  fi
+}
+
+assert_iperf_window_not_degraded() {
+  local label="$1"
+  local before="$2"
+  local after="$3"
+  local min_after_vs_before="$4"
+
+  echo "[${label}] iperf_window_bps before=${before} after=${after}"
+  if [[ -z "${before}" || -z "${after}" ]]; then
+    fail "${label}" "could not parse staged iperf stability windows"
+    return 1
+  fi
+  if awk \
+      -v before="${before}" \
+      -v after="${after}" \
+      -v min_ab="${min_after_vs_before}" '
+        BEGIN {
+          ok = before > 0 && after >= before * min_ab
+          exit !ok
+        }'; then
+    pass "${label}" "iperf throughput did not materially drop after UDP restore"
+  else
+    fail "${label}" "iperf throughput dropped after UDP restore: before=${before} after=${after}"
     return 1
   fi
 }
@@ -1911,7 +1939,150 @@ run_bandwidth_probe_tcp_reference_case() {
   assert_no_bandwidth_probe_remote_timeout_since "${name}" "${CURRENT_SERVER_LOG}" "${server_start_line}" "server BW gate did not rely on remote timeout"
   wait_bandwidth_probe_udp_rate_window "${name}" "${CURRENT_CLIENT_LOG}" "${client_start_line}" 40 "client UDP probe measured veth throughput" 10000000 60000000 200000000
   wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "send/bw: sample session=[0-9]+ lane=1 kind=1" 35 "client measured UDP bandwidth after TCP reference" "${client_start_line}"
-  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "bandwidth_probe_decision .*prefer_tcp=true selected_leg=tcp" 10 "client classified UDP below TCP reference and selected TCP" "${client_start_line}"
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "bandwidth_probe_decision side=send .*prefer_tcp=true selected_leg=tcp" 10 "client classified UDP below TCP reference and selected TCP" "${client_start_line}"
+
+  stop_multipath
+  clear_loss
+  echo "==== ${name} e2e end ===="
+}
+
+run_bandwidth_probe_udp_restore_iperf_case() {
+  local name="bandwidth-probe-udp-restore-iperf"
+  local port="${PORT_BW_PROBE_UDP_RESTORE}"
+  local rate="20mbit"
+  local duration=56
+  local clear_at=28
+
+  echo "==== ${name} e2e start ===="
+  if ! command -v iperf3 >/dev/null 2>&1; then
+    echo "[${name}] iperf3 not found, skip bandwidth-probe UDP restore case"
+    echo "==== ${name} e2e end ===="
+    return 0
+  fi
+  if ! command -v timeout >/dev/null 2>&1; then
+    echo "[${name}] timeout not found, skip bandwidth-probe UDP restore case"
+    echo "==== ${name} e2e end ===="
+    return 0
+  fi
+
+  clear_loss
+  write_one_lane_config "${name}" "${port}" false true 200 3000 -1
+  echo "[${name}] apply ${rate} UDP tunnel bottleneck before startup; bandwidth probe should prefer TCP"
+  apply_udp_tunnel_rate_path 1 "${port}" "${rate}"
+
+  local client_start_line
+  local server_start_line
+  local client_log_file="${WORKDIR}/${name}.client.log"
+  local server_log_file="${WORKDIR}/${name}.server.log"
+  client_start_line="$(current_log_file_line_count "${client_log_file}")"
+  server_start_line="$(current_log_file_line_count "${server_log_file}")"
+  start_multipath "${name}"
+
+  wait_ping_ok "${name} baseline-under-rate-limit" 12
+  wait_bandwidth_probe_train_budget "${name}" "${CURRENT_CLIENT_LOG}" "${client_start_line}" 25 "client TCP BW_PROBE used train-level budget" 20000000 32768 32768
+  wait_client_tcp_reference_probe "${name}" "${client_start_line}"
+  assert_no_bandwidth_probe_remote_timeout_since "${name}" "${CURRENT_CLIENT_LOG}" "${client_start_line}" "client BW gate did not rely on remote timeout"
+  assert_no_bandwidth_probe_remote_timeout_since "${name}" "${CURRENT_SERVER_LOG}" "${server_start_line}" "server BW gate did not rely on remote timeout"
+  wait_bandwidth_probe_udp_rate_window "${name}" "${CURRENT_CLIENT_LOG}" "${client_start_line}" 40 "client UDP probe recorded the startup bottleneck" 10000000 120000000 200000000
+  wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "bandwidth_probe_decision side=send .*prefer_tcp=true selected_leg=tcp" 10 "client classified UDP below TCP reference and selected TCP" "${client_start_line}"
+
+  local client_tcp_line
+  client_tcp_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
+  wait_log_file_pattern_while_ping_from "${name}" "${CURRENT_CLIENT_LOG}" "schedule_select.*lane=1 .*leg=\\{tcp .*frame=type=DATA" 20 "client sent DATA over TCP after bandwidth probe preference" "${client_tcp_line}" "${NS_C}" "${TUN_C_REMOTE}"
+
+  local iperf_server_log="${WORKDIR}/${name}.iperf-server.log"
+  local iperf_client_json="${WORKDIR}/${name}.iperf-client.json"
+  local iperf_client_err="${WORKDIR}/${name}.iperf-client.err"
+  echo "[${name}] start iperf3 over TCP-selected TUN path: duration=${duration}s"
+  ip netns exec "${NS_S}" iperf3 -s -1 -B "${TUN_S_LOCAL}" >"${iperf_server_log}" 2>&1 &
+  local iperf_server=$!
+  sleep 1
+  local iperf_start
+  iperf_start="${SECONDS}"
+  timeout "$((duration + 8))s" ip netns exec "${NS_C}" iperf3 -c "${TUN_C_REMOTE}" -t "${duration}" -i 1 -J \
+    >"${iperf_client_json}" 2>"${iperf_client_err}" &
+  local iperf_client=$!
+
+  if ! wait_log_file_pattern_while_ping "${name}" "${CURRENT_SERVER_LOG}" "bandwidth_probe_decision side=recv .*prefer_tcp=true selected_leg=tcp" 10 "server receive-side bandwidth decision classified client UDP below TCP reference" "${server_start_line}"; then
+    kill "${iperf_client}" "${iperf_server}" >/dev/null 2>&1 || true
+    wait "${iperf_client}" >/dev/null 2>&1 || true
+    wait "${iperf_server}" >/dev/null 2>&1 || true
+    stop_multipath
+    clear_loss
+    echo "==== ${name} e2e end ===="
+    return 0
+  fi
+  if ! wait_log_file_pattern_while_ping "${name}" "${CURRENT_CLIENT_LOG}" "bandwidth_probe_decision side=recv .*prefer_tcp=true selected_leg=tcp" 10 "client receive-side bandwidth decision classified server UDP below TCP reference" "${client_start_line}"; then
+    kill "${iperf_client}" "${iperf_server}" >/dev/null 2>&1 || true
+    wait "${iperf_client}" >/dev/null 2>&1 || true
+    wait "${iperf_server}" >/dev/null 2>&1 || true
+    stop_multipath
+    clear_loss
+    echo "==== ${name} e2e end ===="
+    return 0
+  fi
+
+  while (( SECONDS < iperf_start + clear_at - 3 )); do
+    sleep 1
+  done
+  local before_clear_line
+  before_clear_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
+  if ! wait_log_file_pattern_while_ping_from "${name}" "${CURRENT_CLIENT_LOG}" "schedule_select.*lane=1 .*leg=\\{tcp .*frame=type=DATA" 3 "client kept sending DATA over TCP before UDP restore" "${before_clear_line}" "${NS_C}" "${TUN_C_REMOTE}"; then
+    kill "${iperf_client}" "${iperf_server}" >/dev/null 2>&1 || true
+    wait "${iperf_client}" >/dev/null 2>&1 || true
+    wait "${iperf_server}" >/dev/null 2>&1 || true
+    stop_multipath
+    clear_loss
+    echo "==== ${name} e2e end ===="
+    return 0
+  fi
+
+  while (( SECONDS < iperf_start + clear_at )); do
+    sleep 1
+  done
+  echo "[${name}] clear UDP rate limit at iperf_elapsed=${clear_at}s while iperf3 is still running"
+  clear_loss
+  local after_clear_line
+  after_clear_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
+
+  local client_status=0
+  set +e
+  wait "${iperf_client}"
+  client_status=$?
+  set -e
+  kill "${iperf_server}" >/dev/null 2>&1 || true
+  wait "${iperf_server}" >/dev/null 2>&1 || true
+
+  echo "[${name}] iperf3 client json: ${iperf_client_json}"
+  echo "[${name}] iperf3 client err: ${iperf_client_err}"
+  echo "[${name}] iperf3 server log: ${iperf_server_log}"
+  if (( client_status != 0 )); then
+    fail "${name}" "iperf3 client failed status=${client_status}"
+  fi
+
+  local tcp_selected_bps
+  local udp_restored_bps
+  tcp_selected_bps="$(parse_iperf_json_window_avg_bps "${iperf_client_json}" 5 20)"
+  udp_restored_bps="$(parse_iperf_json_window_avg_bps "${iperf_client_json}" 38 52)"
+  if ! assert_iperf_window_not_degraded "${name}" "${tcp_selected_bps}" "${udp_restored_bps}" 0.75; then
+    stop_multipath
+    clear_loss
+    echo "==== ${name} e2e end ===="
+    return 0
+  fi
+
+  if ! wait_log_file_pattern_while_ping_from "${name}" "${CURRENT_CLIENT_LOG}" "schedule_select.*lane=1 .*leg=\\{udp .*frame=type=DATA" 20 "client sent DATA over UDP after UDP restore" "${after_clear_line}" "${NS_C}" "${TUN_C_REMOTE}"; then
+    stop_multipath
+    clear_loss
+    echo "==== ${name} e2e end ===="
+    return 0
+  fi
+  if ! wait_ping_ok "${name} post-udp-restore" 12; then
+    stop_multipath
+    clear_loss
+    echo "==== ${name} e2e end ===="
+    return 0
+  fi
 
   stop_multipath
   clear_loss
@@ -2664,6 +2835,10 @@ wait_log_file_any_pattern_while_ping_from() {
   echo "[${label}] traffic probe debug: ns=${ping_ns} remote=${ping_remote}"
   ip netns exec "${ping_ns}" ip -4 route get "${ping_remote}" || true
   ip netns exec "${ping_ns}" ping -c 1 -W 1 "${ping_remote}" || true
+  if log_file_has_any_pattern_since "${log_file}" "${start_line}" "$@"; then
+    pass "${label}" "${message}"
+    return 0
+  fi
   fail "${label}" "${message}: patterns not seen within ${timeout}s: $*"
   return 1
 }
@@ -2727,6 +2902,10 @@ wait_log_file_pattern_while_ping_from() {
   echo "[${label}] traffic probe debug: ns=${ping_ns} remote=${ping_remote}"
   ip netns exec "${ping_ns}" ip -4 route get "${ping_remote}" || true
   ip netns exec "${ping_ns}" ping -c 1 -W 1 "${ping_remote}" || true
+  if [[ -f "${log_file}" ]] && grep_cmd; then
+    pass "${label}" "${message}"
+    return 0
+  fi
   fail "${label}" "${message}: pattern not seen within ${timeout}s: ${pattern}"
   return 1
 }
@@ -3125,7 +3304,7 @@ run_link_status_qos_case() {
   clear_loss
   local client_return_line
   client_return_line="$(current_log_file_line_count "${CURRENT_CLIENT_LOG}")"
-  wait_log_file_pattern_while_iperf_from "${name}" "${CURRENT_CLIENT_LOG}" "schedule_select.*lane=1 .*leg=\\{udp .*frame=type=DATA" 35 "client selector returned DATA to UDP after QoS clear" "${client_return_line}" "${NS_S}" "${TUN_S_LOCAL}" "${NS_C}" "${TUN_C_REMOTE}"
+  wait_log_file_pattern_while_iperf_from "${name}" "${CURRENT_CLIENT_LOG}" "schedule_select.*lane=1 .*leg=\\{udp .*frame=type=DATA" "${LINK_STATUS_QOS_CLEAR_WAIT}" "client selector returned DATA to UDP after QoS clear" "${client_return_line}" "${NS_S}" "${TUN_S_LOCAL}" "${NS_C}" "${TUN_C_REMOTE}"
   wait_ping_ok "${name} post-qos-clear" 12
 
   stop_multipath
@@ -3170,7 +3349,7 @@ run_link_status_qos_reverse_case() {
   clear_loss
   local server_return_line
   server_return_line="$(current_log_file_line_count "${CURRENT_SERVER_LOG}")"
-  wait_log_file_pattern_while_iperf_from "${name}" "${CURRENT_SERVER_LOG}" "schedule_select.*lane=1 .*leg=\\{udp .*frame=type=DATA" 35 "server selector returned DATA to UDP after QoS clear" "${server_return_line}" "${NS_C}" "${TUN_C_LOCAL}" "${NS_S}" "${TUN_S_REMOTE}"
+  wait_log_file_pattern_while_iperf_from "${name}" "${CURRENT_SERVER_LOG}" "schedule_select.*lane=1 .*leg=\\{udp .*frame=type=DATA" "${LINK_STATUS_QOS_CLEAR_WAIT}" "server selector returned DATA to UDP after QoS clear" "${server_return_line}" "${NS_C}" "${TUN_C_LOCAL}" "${NS_S}" "${TUN_S_REMOTE}"
   wait_ping_ok "${name} post-qos-clear" 12
 
   stop_multipath
@@ -3836,6 +4015,7 @@ run_tcp_correctness_case
 run_udp_correctness_case
 run_bandwidth_probe_convergence_case
 run_bandwidth_probe_tcp_reference_case
+run_bandwidth_probe_udp_restore_iperf_case
 run_bandwidth_probe_default_cap_case
 run_bandwidth_probe_disabled_case
 run_nat_case

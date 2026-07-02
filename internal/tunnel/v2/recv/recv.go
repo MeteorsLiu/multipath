@@ -18,6 +18,7 @@ import (
 	"github.com/MeteorsLiu/multipath/internal/packetbuf"
 	"github.com/MeteorsLiu/multipath/internal/protocol"
 	sessionpkg "github.com/MeteorsLiu/multipath/internal/session"
+	"github.com/MeteorsLiu/multipath/internal/transport"
 )
 
 const (
@@ -34,7 +35,7 @@ type Handler interface {
 	OnPing(ctx context.Context, from Ref, frame protocol.Frame) error
 	OnPong(ctx context.Context, from Ref, frame protocol.Frame) error
 	OnClose(ctx context.Context, from Ref, frame protocol.Frame) error
-	OnBandwidthProbe(ctx context.Context, from Ref, frame protocol.Frame) error
+	OnBandwidthProbe(ctx context.Context, from Ref, frame protocol.Frame) (BandwidthProbeObservation, error)
 	OnBandwidthProbeAck(ctx context.Context, from Ref, frame protocol.Frame) error
 	OnQoS(ctx context.Context, from Ref, frame protocol.Frame) error
 }
@@ -50,6 +51,13 @@ type QoSStatus struct {
 }
 
 type QoSCallback func(ctx context.Context, status QoSStatus) error
+
+type BandwidthProbeObservation struct {
+	Primary         transport.Kind
+	UDPLimited      bool
+	UDPDeliveredBps uint32
+	TCPDeliveredBps uint32
+}
 
 type Config struct {
 	Handler        Handler
@@ -141,6 +149,32 @@ func (o *Recv) qosFor(state *recvState, laneID uint8) *qosEstimator {
 		state.qos[laneID] = q
 	}
 	return q
+}
+
+func (o *Recv) observeBandwidthProbe(ctx context.Context, sessionID uint64, laneID uint8, observation BandwidthProbeObservation) {
+	if !knownQoSTransport(observation.Primary) {
+		return
+	}
+	state := o.recvState(sessionID)
+	if state == nil {
+		return
+	}
+	state.mu.Lock()
+	if state.closed {
+		state.mu.Unlock()
+		return
+	}
+	q := o.qosFor(state, laneID)
+	state.mu.Unlock()
+	statuses := q.observePrimaryHint(qosPrimaryHint{
+		primary:         observation.Primary,
+		udpLimited:      observation.UDPLimited,
+		udpDeliveredBps: observation.UDPDeliveredBps,
+		tcpDeliveredBps: observation.TCPDeliveredBps,
+	})
+	if err := o.reportQoS(ctx, sessionID, laneID, statuses); err != nil {
+		debuglog.Printf("recv", "qos_report_error session=%d lane=%d err=%v", sessionID, laneID, err)
+	}
 }
 
 func (o *Recv) trackRepairGroup(state *recvState, laneID uint8, group rxGroupKey) {
@@ -314,7 +348,12 @@ func (o *Recv) handleControl(ctx context.Context, leg Ref, frame protocol.Frame)
 	case protocol.TypePONG:
 		return o.handler.OnPong(ctx, leg, frame)
 	case protocol.TypeBandwidthProbe:
-		return o.handler.OnBandwidthProbe(ctx, leg, frame)
+		observation, err := o.handler.OnBandwidthProbe(ctx, leg, frame)
+		if err != nil {
+			return err
+		}
+		o.observeBandwidthProbe(ctx, frame.SessionID, frame.LaneID, observation)
+		return nil
 	case protocol.TypeBandwidthProbeAck:
 		return o.handler.OnBandwidthProbeAck(ctx, leg, frame)
 	case protocol.TypeLinkStatus:

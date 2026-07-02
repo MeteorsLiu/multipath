@@ -892,14 +892,17 @@ func aggregateLoss(sentFrames, ackedFrames uint64) float64 {
 // It does not import send or protocol packages (零身份).
 type Receive struct {
 	ackEvery uint16
+	onSample func(uint64, Sample)
 
 	mu     sync.Mutex
 	rounds map[uint64]*passiveRound
+	trains map[uint64]*passiveTrain
 }
 
 // ReceiveConfig tunes the passive side.
 type ReceiveConfig struct {
 	AckEvery uint16 // send an ack every N received frames (default 16)
+	OnSample func(trainID uint64, sample Sample)
 }
 
 const defaultAckEvery = 16
@@ -912,7 +915,9 @@ func NewReceive(cfg ReceiveConfig) *Receive {
 	}
 	return &Receive{
 		ackEvery: ackEvery,
+		onSample: cfg.OnSample,
 		rounds:   make(map[uint64]*passiveRound),
+		trains:   make(map[uint64]*passiveTrain),
 	}
 }
 
@@ -933,10 +938,16 @@ func (r *Receive) Probe(p Probe) (Ack, bool) {
 	r.pruneLocked(now)
 	round := r.rounds[p.ID]
 	if round == nil || round.count != p.Count {
-		round = &passiveRound{count: p.Count, received: bitset.New(uint(p.Count)), firstRXMS: nowMS}
+		round = &passiveRound{
+			count:     p.Count,
+			received:  bitset.New(uint(p.Count)),
+			firstRXMS: nowMS,
+			bytes:     make([]int, p.Count),
+		}
 		r.rounds[p.ID] = round
 	}
 	round.received.Set(uint(p.Seq))
+	round.bytes[p.Seq] = p.Bytes
 	if round.firstRXMS == 0 || nowMS < round.firstRXMS {
 		round.firstRXMS = nowMS
 	}
@@ -958,8 +969,28 @@ func (r *Receive) Probe(p Probe) (Ack, bool) {
 		FirstRXMS: round.firstRXMS,
 		LastRXMS:  round.lastRXMS,
 	}
+	var sample Sample
+	var emitSample bool
+	if p.TrainID != 0 {
+		train := r.trains[p.TrainID]
+		if train == nil {
+			train = &passiveTrain{rounds: make(map[uint64]*passiveRound)}
+			r.trains[p.TrainID] = train
+		}
+		train.rounds[p.ID] = round
+		if p.Remaining == 0 && !train.complete {
+			train.complete = true
+			train.completedAt = now
+			sample = train.sample()
+			emitSample = true
+		}
+	}
+	onSample := r.onSample
 	r.mu.Unlock()
 
+	if emitSample && onSample != nil {
+		onSample(p.TrainID, sample)
+	}
 	return ack, shouldAck
 }
 
@@ -969,6 +1000,11 @@ func (r *Receive) pruneLocked(now time.Time) {
 			delete(r.rounds, id)
 		}
 	}
+	for id, train := range r.trains {
+		if train != nil && train.complete && now.Sub(train.completedAt) > receiveRoundKeepalive {
+			delete(r.trains, id)
+		}
+	}
 }
 
 type passiveRound struct {
@@ -976,8 +1012,44 @@ type passiveRound struct {
 	received    *bitset.BitSet
 	firstRXMS   uint64
 	lastRXMS    uint64
+	bytes       []int
 	complete    bool
 	completedAt time.Time
+}
+
+type passiveTrain struct {
+	rounds      map[uint64]*passiveRound
+	complete    bool
+	completedAt time.Time
+}
+
+func (t *passiveTrain) sample() Sample {
+	var bestBps uint64
+	var expectedFrames uint64
+	var receivedFrames uint64
+	for _, round := range t.rounds {
+		if round == nil || round.count == 0 {
+			continue
+		}
+		expectedFrames += uint64(round.count)
+		if round.received != nil {
+			receivedFrames += uint64(round.received.Count())
+		}
+		var receivedBytes uint64
+		for seq, bytes := range round.bytes {
+			if bytes <= 0 || round.received == nil || !round.received.Test(uint(seq)) {
+				continue
+			}
+			receivedBytes += uint64(bytes)
+		}
+		if bps := bandwidthBps(receivedBytes, round.firstRXMS, round.lastRXMS); bps > bestBps {
+			bestBps = bps
+		}
+	}
+	return Sample{
+		BandwidthBps: bestBps,
+		Loss:         aggregateLoss(expectedFrames, receivedFrames),
+	}
 }
 
 func bitsetMask(set *bitset.BitSet) uint64 {

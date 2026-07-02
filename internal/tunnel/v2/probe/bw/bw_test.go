@@ -71,6 +71,52 @@ func TestBWStartActiveSendsProbes(t *testing.T) {
 	}
 }
 
+func TestReceiveEmitsSampleWhenTrainCompletes(t *testing.T) {
+	var gotTrainID uint64
+	var gotSample Sample
+	samples := 0
+	r := NewReceive(ReceiveConfig{
+		OnSample: func(trainID uint64, sample Sample) {
+			gotTrainID = trainID
+			gotSample = sample
+			samples++
+		},
+	})
+
+	r.Probe(Probe{
+		TrainID:   10,
+		ID:        100,
+		Seq:       0,
+		Count:     2,
+		Total:     2400,
+		Remaining: 1200,
+		Bytes:     1200,
+	})
+	time.Sleep(2 * time.Millisecond)
+	r.Probe(Probe{
+		TrainID:   10,
+		ID:        100,
+		Seq:       1,
+		Count:     2,
+		Total:     2400,
+		Remaining: 0,
+		Bytes:     1200,
+	})
+
+	if samples != 1 {
+		t.Fatalf("samples = %d, want 1", samples)
+	}
+	if gotTrainID != 10 {
+		t.Fatalf("trainID = %d, want 10", gotTrainID)
+	}
+	if gotSample.BandwidthBps == 0 {
+		t.Fatalf("sample bandwidth = %d, want non-zero", gotSample.BandwidthBps)
+	}
+	if gotSample.Loss != 0 {
+		t.Fatalf("sample loss = %f, want 0", gotSample.Loss)
+	}
+}
+
 func TestBwLoopUsesTrainBudgetForRemaining(t *testing.T) {
 	const referenceBps = uint64(200_000_000)
 	withTrainWindow(t, 50*time.Millisecond)
