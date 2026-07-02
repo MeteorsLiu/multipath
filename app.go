@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"syscall"
 
 	"github.com/MeteorsLiu/multipath/internal/metrics"
 	"github.com/MeteorsLiu/multipath/internal/session"
@@ -221,6 +222,9 @@ func newMetricsServer(cfg Config) (*metrics.Server, error) {
 		metrics.L("paths", len(cfg.Client.RemotePaths)),
 	)
 	server, err := metrics.NewServer(cfg.PromListenAddr)
+	if err != nil && cfg.promListenAddrDefaulted && errors.Is(err, syscall.EADDRINUSE) {
+		server, err = metrics.NewServer(defaultPromFallbackListen)
+	}
 	if err != nil {
 		return nil, err
 	}

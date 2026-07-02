@@ -125,7 +125,7 @@ FEC fixed flush   0, disabled
 probe interval   200 ms
 probe timeout    600 ms
 path weight      1
-promListenAddr    127.0.0.1:0
+promListenAddr    0.0.0.0:2131
 ```
 
 When FEC negotiates the variable-span SLC profile, the sender arms a flush timer
@@ -151,10 +151,11 @@ Set `"fec": false` explicitly to disable FEC.
 
 When `tun.name` is omitted, the OS chooses an available TUN device name and the
 runtime configures that actual device name. When `promListenAddr` is omitted,
-the default uses port `0` so the metrics listener binds an available local port
-instead of failing on a fixed occupied port. Set `promListenAddr` to a concrete
-address such as `"127.0.0.1:9100"` when Prometheus should scrape a stable port.
-Set it to `"off"` to disable the listener.
+the metrics listener defaults to `0.0.0.0:2131`. If that default port is already
+in use, the listener falls back to `0.0.0.0:0` and binds an available port. Set
+`promListenAddr` to a concrete address such as `"127.0.0.1:9100"` when
+Prometheus should scrape a stable port. Set it to `"off"` to disable the
+listener.
 
 The process prints the resolved metrics listen address at startup. Metrics are
 served at `/metrics` in Prometheus text format. Current counters cover TUN

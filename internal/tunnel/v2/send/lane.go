@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/MeteorsLiu/multipath/internal/debuglog"
-	"github.com/MeteorsLiu/multipath/internal/eventlog"
+	"github.com/MeteorsLiu/multipath/internal/metrics"
 	"github.com/MeteorsLiu/multipath/internal/packetbuf"
 	"github.com/MeteorsLiu/multipath/internal/transport"
 	"github.com/MeteorsLiu/multipath/internal/transport/selector"
@@ -191,18 +191,9 @@ func (i laneQoSInput) OnQoSStatus(udpLimited bool, udpDeliveredBps uint32, tcpLi
 	i.lane.leg.observeQoSStatus(udpLimited, udpDeliveredBps, tcpLimited, tcpDeliveredBps)
 	i.lane.setFEC(repairCount)
 	repairAfter := i.lane.currentFECRepairCount()
-	if repairBefore != repairAfter {
-		direction := "up"
-		if repairAfter < repairBefore {
-			direction = "down"
-		}
-		primary := i.lane.primaryTransport()
-		shadow := i.lane.shadowTransport()
-		eventlog.Printf("qos", "action=repair_count session=%d lane=%d from=%d to=%d direction=%s primary=%s shadow=%s udp_limited=%t udp_bps=%d tcp_limited=%t tcp_bps=%d",
-			i.sessionID, i.lane.id, repairBefore, repairAfter, direction,
-			kindEventLabel(primary.Kind), kindEventLabel(shadow.Kind),
-			udpLimited, udpDeliveredBps, tcpLimited, tcpDeliveredBps)
-	}
+	metrics.SetGauge(metrics.QoSRepairCount, float64(repairAfter),
+		metrics.LU64("session", i.sessionID),
+		metrics.LU8("lane", i.lane.id))
 	if debuglog.Enabled() {
 		primary := i.lane.primaryTransport()
 		shadow := i.lane.shadowTransport()

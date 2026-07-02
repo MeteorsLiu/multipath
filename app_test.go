@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/MeteorsLiu/multipath/internal/tun"
@@ -32,8 +34,8 @@ func TestParseConfigDefaults(t *testing.T) {
 	if cfg.Tun.Name != "" {
 		t.Fatalf("tun name = %q, want empty for OS auto-selection", cfg.Tun.Name)
 	}
-	if cfg.PromListenAddr != defaultPromListen {
-		t.Fatalf("prom listen = %q, want %q", cfg.PromListenAddr, defaultPromListen)
+	if cfg.PromListenAddr != "0.0.0.0:2131" {
+		t.Fatalf("prom listen = %q, want 0.0.0.0:2131", cfg.PromListenAddr)
 	}
 	if cfg.ProbeIntervalMS != 200 || cfg.ProbeTimeoutMS != 1000 {
 		t.Fatalf("probe defaults = %d/%d, want 200/1000", cfg.ProbeIntervalMS, cfg.ProbeTimeoutMS)
@@ -276,6 +278,36 @@ func TestBuildRuntimeMetricsServer(t *testing.T) {
 	cancel()
 	if err := <-errCh; !errors.Is(err, context.Canceled) {
 		t.Fatalf("metrics Run err = %v, want context.Canceled", err)
+	}
+}
+
+func TestDefaultMetricsServerFallsBackWhenDefaultPortIsInUse(t *testing.T) {
+	listener, err := net.Listen("tcp4", "0.0.0.0:2131")
+	if err != nil && !errors.Is(err, syscall.EADDRINUSE) {
+		t.Skipf("cannot reserve default metrics port: %v", err)
+	}
+	if listener != nil {
+		defer listener.Close()
+	}
+
+	cfg := Config{}
+	cfg.setDefaults()
+
+	server, err := newMetricsServer(cfg)
+	if err != nil {
+		t.Fatalf("newMetricsServer failed: %v", err)
+	}
+	defer server.Close()
+
+	host, port, err := net.SplitHostPort(server.Addr())
+	if err != nil {
+		t.Fatalf("SplitHostPort(%q): %v", server.Addr(), err)
+	}
+	if host != "0.0.0.0" {
+		t.Fatalf("metrics host = %q, want 0.0.0.0", host)
+	}
+	if port == "2131" {
+		t.Fatalf("metrics port = %q, want fallback random port", port)
 	}
 }
 

@@ -7,10 +7,11 @@ import (
 )
 
 const (
-	defaultTunMTU        = 1440
-	defaultPromListen    = "127.0.0.1:0"
-	defaultProbeInterval = 200 * time.Millisecond
-	defaultProbeTimeout  = 1000 * time.Millisecond
+	defaultTunMTU             = 1440
+	defaultPromListen         = "0.0.0.0:2131"
+	defaultPromFallbackListen = "0.0.0.0:0"
+	defaultProbeInterval      = 200 * time.Millisecond
+	defaultProbeTimeout       = 1000 * time.Millisecond
 )
 
 type PathConfig struct {
@@ -50,6 +51,8 @@ type Config struct {
 	ProbeIntervalMS      int          `json:"probeIntervalMS"`
 	ProbeTimeoutMS       int          `json:"probeTimeoutMS"`
 	BandwidthProbeCapBps int64        `json:"bandwidthProbeCapBps"`
+
+	promListenAddrDefaulted bool
 }
 
 func ParseConfig(path string) (Config, error) {
@@ -73,6 +76,7 @@ func (c *Config) setDefaults() {
 	}
 	if c.PromListenAddr == "" {
 		c.PromListenAddr = defaultPromListen
+		c.promListenAddrDefaulted = true
 	}
 	if c.ProbeIntervalMS == 0 {
 		c.ProbeIntervalMS = int(defaultProbeInterval / time.Millisecond)

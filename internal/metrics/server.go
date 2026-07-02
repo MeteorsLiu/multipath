@@ -21,7 +21,7 @@ func NewServer(listenAddr string) (*Server, error) {
 		return nil, nil
 	}
 
-	listener, err := net.Listen("tcp", listenAddr)
+	listener, err := listenTCP(listenAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -43,6 +43,15 @@ func NewServer(listenAddr string) (*Server, error) {
 			Handler: mux,
 		},
 	}, nil
+}
+
+func listenTCP(listenAddr string) (net.Listener, error) {
+	network := "tcp"
+	host, _, err := net.SplitHostPort(listenAddr)
+	if err == nil && net.ParseIP(host).To4() != nil {
+		network = "tcp4"
+	}
+	return net.Listen(network, listenAddr)
 }
 
 func (s *Server) Addr() string {
