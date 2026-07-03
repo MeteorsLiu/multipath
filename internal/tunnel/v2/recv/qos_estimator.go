@@ -14,7 +14,7 @@ const (
 	defaultQoSTick          = time.Second
 	defaultQoSGroupMature   = 1500 * time.Millisecond
 	defaultFECLossAlpha     = 0.75
-	defaultFECLossBeta      = 0.05
+	defaultFECLossBeta      = 0.01
 	defaultFECLateAlpha     = 0.20
 	defaultFECLateBeta      = 0.05
 	defaultRepairScaleAlpha = 0.25

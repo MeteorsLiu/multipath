@@ -414,12 +414,13 @@ is submitted:
 
 ```text
 groupLossRatio = (DataExpected - DataArrived) / DataExpected
-lossEMA        = EMA(lossEMA, groupLossRatio, 0.75 when rising, 0.05 when falling)
+lossEMA        = EMA(lossEMA, groupLossRatio, 0.75 when rising, 0.01 when falling)
 lossRepairCount = clamp(ceil(lossEMA * 4), 1, 4)
 ```
 
-Loss health must react quickly to rising loss. Its upward EMA parameter and
-repair-count thresholds are therefore more aggressive than late health.
+Loss health must react quickly to rising loss and decay slowly after loss clears,
+so short healthy bursts do not immediately reduce repair traffic and reintroduce
+oscillation.
 
 The estimator updates the late-health EMA only from the estimator tick's own
 pending byte counters:

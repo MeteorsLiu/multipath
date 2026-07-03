@@ -222,6 +222,38 @@ func TestQoSEstimatorFECHealthUpdatesLossEMAOnGroupArrival(t *testing.T) {
 	}
 }
 
+func TestQoSEstimatorFECHealthLossFallsSlowly(t *testing.T) {
+	now := time.Unix(235, 0)
+	var d qosDirection
+	d.fecHealth = qosFECHealth{repairCount: 1}
+
+	d.addLossHealth(0, 4, now)
+	if !d.updateFECHealth(now) {
+		t.Fatal("missing initial repair-count change")
+	}
+	if got := d.fecHealth.repairCount; got != 4 {
+		t.Fatalf("initial repair count = %d, want 4", got)
+	}
+
+	for i := 0; i < 10; i++ {
+		at := now.Add(time.Duration(i+1) * time.Second)
+		d.addLossHealth(4, 4, at)
+		d.updateFECHealth(at)
+	}
+	if got := d.fecHealth.repairCount; got != 4 {
+		t.Fatalf("repair count after 10 healthy groups = %d, want 4", got)
+	}
+
+	for i := 0; i < 20; i++ {
+		at := now.Add(time.Duration(i+11) * time.Second)
+		d.addLossHealth(4, 4, at)
+		d.updateFECHealth(at)
+	}
+	if got := d.fecHealth.repairCount; got != 3 {
+		t.Fatalf("repair count after 30 healthy groups = %d, want 3", got)
+	}
+}
+
 func TestQoSEstimatorFECHealthKeepsLateSeparateFromLoss(t *testing.T) {
 	now := time.Unix(240, 0)
 	e := newQoSEstimator(qosConfig{Tick: time.Second}, nil)

@@ -985,7 +985,7 @@ rising loss:
 
 ```text
 groupLossRatio = (DataExpected - DataArrived) / DataExpected
-lossEMA        = EMA(lossEMA, groupLossRatio, 0.75 when rising, 0.05 when falling)
+lossEMA        = EMA(lossEMA, groupLossRatio, 0.75 when rising, 0.01 when falling)
 lossRepairCount = clamp(ceil(lossEMA * 4), 1, 4)
 ```
 
