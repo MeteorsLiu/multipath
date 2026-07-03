@@ -604,6 +604,50 @@ func TestQoSEstimatorRepairLegClearAllowsNearDataLoad(t *testing.T) {
 	}
 }
 
+func TestQoSEstimatorMaxRepairLateTCPDataMarksTCPLimited(t *testing.T) {
+	now := time.Unix(297, 500)
+	e := newQoSEstimator(qosConfig{Tick: time.Second}, nil)
+	e.udpTCPData.dataLimited = true
+	e.currentPrimary = transport.KindTCP
+	e.currentRole = qosRoleRepair
+	e.tcpUDPRepair.fecHealth = qosFECHealth{
+		lossInitialized: true,
+		lossRatio:       1,
+		repairCount:     maxFECSourceSpan,
+	}
+
+	var statuses []qosStatus
+	for i := 0; i < qosDecisionSamples; i++ {
+		at := now.Add(time.Duration(i) * time.Second)
+		packetID := uint32(1450 + i)
+		group := rxGroupKey{basePacketID: uint32(1450 + i*10), sourceSpan: 4}
+
+		e.observeOriginalData(transport.KindTCP, 50_000, at)
+		observeQoSRepairFrame(e, group, transport.KindUDP, 100_000, maxFECSourceSpan, at)
+		e.observeRecoveredData(packetID)
+		e.observeLateData(packetID, transport.KindTCP, 50_000, at)
+		e.observeGroupDone(rxGroupDone{
+			group:          group,
+			dataArrived:    4,
+			dataExpected:   4,
+			expectedBytes:  100_000,
+			maxSourceBytes: 25_000,
+		}, at)
+		statuses = append(statuses, e.tick(at.Add(time.Second))...)
+	}
+
+	if len(statuses) == 0 {
+		t.Fatal("missing TCP limited status")
+	}
+	last := statuses[len(statuses)-1]
+	if last.UDPLimited || !last.TCPLimited {
+		t.Fatalf("statuses = %+v, want TCP limited only", statuses)
+	}
+	if !last.primarySwitched || e.currentPrimary != transport.KindUDP {
+		t.Fatalf("statuses = %+v primary=%v, want switch back to UDP", statuses, e.currentPrimary)
+	}
+}
+
 func TestQoSEstimatorRepairLegClearRequiresCapLoad(t *testing.T) {
 	now := time.Unix(298, 0)
 	e := newQoSEstimator(qosConfig{Tick: time.Second}, nil)
