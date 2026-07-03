@@ -281,6 +281,50 @@ func TestBuildRuntimeMetricsServer(t *testing.T) {
 	}
 }
 
+func TestBuildRuntimeMetricsServerExposesPprof(t *testing.T) {
+	cfg := Config{
+		Client: ClientConfig{
+			RemotePaths: []PathConfig{
+				{RemoteAddr: "127.0.0.1:9000", Weight: 1},
+			},
+		},
+		PromListenAddr: "127.0.0.1:0",
+	}
+	cfg.setDefaults()
+
+	device := tun.NewDevice(&appMemoryTun{}, cfg.Tun.MTU)
+	runtime, closers, err := buildClientRuntime(cfg, device)
+	if err != nil {
+		t.Fatalf("buildClientRuntime failed: %v", err)
+	}
+	defer closeAll(closers)
+	if runtime.metricsServer == nil {
+		t.Fatal("metricsServer is nil")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- runtime.metricsServer.Run(ctx)
+	}()
+
+	resp, err := http.Get("http://" + runtime.metricsServer.Addr() + "/debug/pprof/")
+	if err != nil {
+		cancel()
+		t.Fatalf("GET /debug/pprof/: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		cancel()
+		t.Fatalf("GET /debug/pprof/ status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	cancel()
+	if err := <-errCh; !errors.Is(err, context.Canceled) {
+		t.Fatalf("metrics Run err = %v, want context.Canceled", err)
+	}
+}
+
 func TestDefaultMetricsServerFallsBackWhenDefaultPortIsInUse(t *testing.T) {
 	listener, err := net.Listen("tcp4", "0.0.0.0:2131")
 	if err != nil && !errors.Is(err, syscall.EADDRINUSE) {

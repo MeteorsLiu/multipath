@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -14,6 +15,8 @@ type Server struct {
 	listener net.Listener
 	server   *http.Server
 }
+
+var defaultMuxOnce sync.Once
 
 func NewServer(listenAddr string) (*Server, error) {
 	listenAddr = strings.TrimSpace(listenAddr)
@@ -26,9 +29,19 @@ func NewServer(listenAddr string) (*Server, error) {
 		return nil, err
 	}
 
-	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.HandlerFor(Default.Gatherer(), promhttp.HandlerOpts{}))
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	defaultMuxOnce.Do(registerDefaultMuxHandlers)
+
+	return &Server{
+		listener: listener,
+		server: &http.Server{
+			Handler: http.DefaultServeMux,
+		},
+	}, nil
+}
+
+func registerDefaultMuxHandlers() {
+	http.DefaultServeMux.Handle("/metrics", promhttp.HandlerFor(Default.Gatherer(), promhttp.HandlerOpts{}))
+	http.DefaultServeMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
 			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 			_, _ = w.Write([]byte("multipath metrics: GET /metrics\n"))
@@ -36,13 +49,6 @@ func NewServer(listenAddr string) (*Server, error) {
 		}
 		http.NotFound(w, r)
 	})
-
-	return &Server{
-		listener: listener,
-		server: &http.Server{
-			Handler: mux,
-		},
-	}, nil
 }
 
 func listenTCP(listenAddr string) (net.Listener, error) {
