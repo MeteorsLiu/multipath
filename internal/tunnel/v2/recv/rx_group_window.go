@@ -1,11 +1,16 @@
 package recv
 
-import "github.com/MeteorsLiu/multipath/internal/packetbuf"
+import (
+	"github.com/MeteorsLiu/multipath/internal/packetbuf"
+	"github.com/emirpasic/gods/v2/trees/redblacktree"
+)
 
 const (
-	defaultRxGroupWindowDataLimit   = 4096
-	defaultRxGroupWindowGroupLimit  = 1024
-	defaultRxGroupWindowClosedLimit = 4096
+	// At 1440 bytes per packet, this covers about 1.9 seconds at 200 Mbit/s.
+	defaultRxWindowPacketLimit      = 32 * 1024
+	defaultRxGroupWindowDataLimit   = defaultRxWindowPacketLimit
+	defaultRxGroupWindowGroupLimit  = defaultRxWindowPacketLimit / maxFECSourceSpan
+	defaultRxGroupWindowClosedLimit = defaultRxWindowPacketLimit
 )
 
 type rxGroupKey struct {
@@ -13,13 +18,28 @@ type rxGroupKey struct {
 	sourceSpan   int
 }
 
+func compareRxGroupKey(a, b rxGroupKey) int {
+	if a.basePacketID < b.basePacketID {
+		return -1
+	}
+	if a.basePacketID > b.basePacketID {
+		return 1
+	}
+	if a.sourceSpan < b.sourceSpan {
+		return -1
+	}
+	if a.sourceSpan > b.sourceSpan {
+		return 1
+	}
+	return 0
+}
+
 type rxGroupWindow struct {
 	recentData map[uint32]*packetbuf.Packet
-	groups     map[rxGroupKey]*rxGroup
+	groups     *redblacktree.Tree[rxGroupKey, *rxGroup]
 	closed     map[rxGroupKey]struct{}
 
 	dataOrder   []uint32
-	groupOrder  []rxGroupKey
 	closedOrder []rxGroupKey
 
 	maxData   int
@@ -62,7 +82,7 @@ type rxGroupDone struct {
 func newRxGroupWindow() *rxGroupWindow {
 	return &rxGroupWindow{
 		recentData: make(map[uint32]*packetbuf.Packet),
-		groups:     make(map[rxGroupKey]*rxGroup),
+		groups:     redblacktree.NewWith[rxGroupKey, *rxGroup](compareRxGroupKey),
 		closed:     make(map[rxGroupKey]struct{}),
 		maxData:    defaultRxGroupWindowDataLimit,
 		maxGroups:  defaultRxGroupWindowGroupLimit,
@@ -103,7 +123,7 @@ func (w *rxGroupWindow) addRepair(basePacketID uint32, key uint16, sourceSpan in
 		return rxGroupWindowResult{}
 	}
 
-	group := w.groups[groupKey]
+	group, _ := w.groups.Get(groupKey)
 	if group == nil {
 		group = &rxGroup{
 			key:  groupKey,
@@ -112,8 +132,7 @@ func (w *rxGroupWindow) addRepair(basePacketID uint32, key uint16, sourceSpan in
 		for i := range group.data {
 			group.data[i] = w.recentData[basePacketID+uint32(i)]
 		}
-		w.groups[groupKey] = group
-		w.groupOrder = append(w.groupOrder, groupKey)
+		w.groups.Put(groupKey, group)
 	}
 
 	if group.hasRepair(key) {
@@ -134,7 +153,7 @@ func (w *rxGroupWindow) buildShardsLocked(r rxGroupRecoverable, shards [][]byte,
 		return nil, nil, false
 	}
 
-	group := w.groups[r.group]
+	group, _ := w.groups.Get(r.group)
 	if group == nil {
 		return nil, nil, false
 	}
@@ -177,7 +196,7 @@ func (w *rxGroupWindow) buildShardsLocked(r rxGroupRecoverable, shards [][]byte,
 }
 
 func (w *rxGroupWindow) finishRecovery(r rxGroupRecoverable, recoveredBytes, recoveredMaxBytes uint64) rxGroupWindowResult {
-	group := w.groups[r.group]
+	group, _ := w.groups.Get(r.group)
 	if group == nil {
 		return w.prune()
 	}
@@ -191,7 +210,7 @@ func (w *rxGroupWindow) finishRecovery(r rxGroupRecoverable, recoveredBytes, rec
 }
 
 func (w *rxGroupWindow) expireGroup(key rxGroupKey) rxGroupWindowResult {
-	group := w.groups[key]
+	group, _ := w.groups.Get(key)
 	if group == nil {
 		return w.prune()
 	}
@@ -213,14 +232,13 @@ func (w *rxGroupWindow) releaseAll() {
 	for packetID := range w.recentData {
 		w.dropData(packetID)
 	}
-	for key := range w.groups {
-		w.dropGroup(key)
+	for !w.groups.Empty() {
+		w.dropGroup(w.groups.Left().Key)
 	}
 	for key := range w.closed {
 		delete(w.closed, key)
 	}
 	w.dataOrder = w.dataOrder[:0]
-	w.groupOrder = w.groupOrder[:0]
 	w.closedOrder = w.closedOrder[:0]
 }
 
@@ -241,13 +259,8 @@ func (w *rxGroupWindow) prune() rxGroupWindowResult {
 		w.dropData(packetID)
 	}
 
-	for w.maxGroups > 0 && len(w.groups) > w.maxGroups && len(w.groupOrder) > 0 {
-		key := w.groupOrder[0]
-		w.groupOrder = w.groupOrder[1:]
-		group := w.groups[key]
-		if group == nil {
-			continue
-		}
+	for w.maxGroups > 0 && w.groups.Size() > w.maxGroups {
+		group := w.groups.Left().Value
 		out.done = append(out.done, w.doneForGroup(group, group.recovered, !group.recovered, 0, 0))
 		w.closeGroup(group.key)
 		w.dropGroup(group.key)
@@ -289,10 +302,10 @@ func (w *rxGroupWindow) eachGroupForPacket(packetID uint32, fn func(*rxGroup, in
 	for offset := 0; offset < maxFECSourceSpan; offset++ {
 		basePacketID := packetID - uint32(offset)
 		for sourceSpan := offset + 1; sourceSpan <= maxFECSourceSpan; sourceSpan++ {
-			group := w.groups[rxGroupKey{
+			group, _ := w.groups.Get(rxGroupKey{
 				basePacketID: basePacketID,
 				sourceSpan:   sourceSpan,
-			}]
+			})
 			if group != nil {
 				fn(group, offset)
 			}
@@ -318,14 +331,14 @@ func (w *rxGroupWindow) dropData(packetID uint32) {
 }
 
 func (w *rxGroupWindow) dropGroup(key rxGroupKey) {
-	group := w.groups[key]
+	group, _ := w.groups.Get(key)
 	if group == nil {
 		return
 	}
 	for i := range group.repairs {
 		group.repairs[i].symbol.Release()
 	}
-	delete(w.groups, key)
+	w.groups.Remove(key)
 }
 
 func (w *rxGroupWindow) doneForGroup(group *rxGroup, recovered, expired bool, recoveredBytes, recoveredMaxBytes uint64) rxGroupDone {

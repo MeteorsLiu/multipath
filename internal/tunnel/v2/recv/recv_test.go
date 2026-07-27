@@ -446,7 +446,7 @@ func TestRecvRepairCreatesGroupWindowEntry(t *testing.T) {
 	st := out.recvState(6)
 	st.mu.Lock()
 	window := st.rxWindows[1]
-	group := window.groups[rxGroupKey{basePacketID: 10, sourceSpan: 2}]
+	group, _ := window.groups.Get(rxGroupKey{basePacketID: 10, sourceSpan: 2})
 	st.mu.Unlock()
 	if group == nil {
 		t.Fatal("missing repair group")
@@ -649,7 +649,7 @@ func TestRxGroupWindowFinishesRecoveredGroup(t *testing.T) {
 	if !result.done[0].recovered || result.done[0].expired {
 		t.Fatalf("done = %+v, want recovered result without expired", result.done[0])
 	}
-	if group := w.groups[rxGroupKey{basePacketID: 100, sourceSpan: 1}]; group != nil {
+	if group, _ := w.groups.Get(rxGroupKey{basePacketID: 100, sourceSpan: 1}); group != nil {
 		t.Fatalf("group after recovery = %+v, want dropped", group)
 	}
 }
@@ -661,10 +661,10 @@ func TestRxGroupWindowExpireCompletesGroupBeforeExpired(t *testing.T) {
 	w.addData(100, ipv4Packet(10, 'a'))
 	w.addData(101, ipv4Packet(12, 'b'))
 	key := rxGroupKey{basePacketID: 100, sourceSpan: 2}
-	w.groups[key] = &rxGroup{
+	w.groups.Put(key, &rxGroup{
 		key:  key,
 		data: []*packetbuf.Packet{w.recentData[100], w.recentData[101]},
-	}
+	})
 
 	result := w.expireGroup(key)
 	if len(result.done) != 1 {
@@ -673,7 +673,7 @@ func TestRxGroupWindowExpireCompletesGroupBeforeExpired(t *testing.T) {
 	if result.done[0].expired || result.done[0].recovered {
 		t.Fatalf("done = %+v, want completed group without expired/recovered", result.done[0])
 	}
-	if group := w.groups[key]; group != nil {
+	if group, _ := w.groups.Get(key); group != nil {
 		t.Fatalf("group after complete expire = %+v, want dropped", group)
 	}
 }
@@ -692,7 +692,7 @@ func TestRxGroupWindowExpireReturnsRecoverableGroup(t *testing.T) {
 	if len(result.recoverable) != 1 || len(result.done) != 0 {
 		t.Fatalf("expire result = %+v, want recoverable without done", result)
 	}
-	if group := w.groups[key]; group == nil {
+	if group, _ := w.groups.Get(key); group == nil {
 		t.Fatal("recoverable group was dropped before recovery")
 	}
 }
@@ -726,14 +726,14 @@ func TestRecvExpireFECGroupRecoversRecoverableGroup(t *testing.T) {
 	state.qos[1] = newQoSEstimator(qosConfig{SessionID: 16, LaneID: 1, Tick: time.Hour}, nil)
 	window := state.windowFor(1)
 	window.addData(100, shards[0])
-	window.groups[group] = &rxGroup{
+	window.groups.Put(group, &rxGroup{
 		key:  group,
 		data: []*packetbuf.Packet{window.recentData[100], nil},
 		repairs: []rxRepairShard{{
 			key:    keys[0],
 			symbol: storePacket(shards[2]),
 		}},
-	}
+	})
 	state.mu.Unlock()
 
 	out.expireFECGroup(state, 1, group)
@@ -746,7 +746,7 @@ func TestRecvExpireFECGroupRecoversRecoverableGroup(t *testing.T) {
 
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	if got := state.rxWindows[1].groups[group]; got != nil {
+	if got, _ := state.rxWindows[1].groups.Get(group); got != nil {
 		t.Fatalf("group after expire recovery = %+v, want dropped", got)
 	}
 }
