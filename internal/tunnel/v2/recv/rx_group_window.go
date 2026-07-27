@@ -37,10 +37,9 @@ func compareRxGroupKey(a, b rxGroupKey) int {
 type rxGroupWindow struct {
 	recentData map[uint32]*packetbuf.Packet
 	groups     *redblacktree.Tree[rxGroupKey, *rxGroup]
-	closed     map[rxGroupKey]struct{}
+	closed     *redblacktree.Tree[rxGroupKey, struct{}]
 
-	dataOrder   []uint32
-	closedOrder []rxGroupKey
+	dataOrder []uint32
 
 	maxData   int
 	maxGroups int
@@ -83,7 +82,7 @@ func newRxGroupWindow() *rxGroupWindow {
 	return &rxGroupWindow{
 		recentData: make(map[uint32]*packetbuf.Packet),
 		groups:     redblacktree.NewWith[rxGroupKey, *rxGroup](compareRxGroupKey),
-		closed:     make(map[rxGroupKey]struct{}),
+		closed:     redblacktree.NewWith[rxGroupKey, struct{}](compareRxGroupKey),
 		maxData:    defaultRxGroupWindowDataLimit,
 		maxGroups:  defaultRxGroupWindowGroupLimit,
 		maxClosed:  defaultRxGroupWindowClosedLimit,
@@ -119,7 +118,7 @@ func (w *rxGroupWindow) addRepair(basePacketID uint32, key uint16, sourceSpan in
 	}
 
 	groupKey := rxGroupKey{basePacketID: basePacketID, sourceSpan: sourceSpan}
-	if _, ok := w.closed[groupKey]; ok {
+	if _, ok := w.closed.Get(groupKey); ok {
 		return rxGroupWindowResult{}
 	}
 
@@ -235,11 +234,8 @@ func (w *rxGroupWindow) releaseAll() {
 	for !w.groups.Empty() {
 		w.dropGroup(w.groups.Left().Key)
 	}
-	for key := range w.closed {
-		delete(w.closed, key)
-	}
+	w.closed.Clear()
 	w.dataOrder = w.dataOrder[:0]
-	w.closedOrder = w.closedOrder[:0]
 }
 
 func (w *rxGroupWindow) prune() rxGroupWindowResult {
@@ -266,10 +262,8 @@ func (w *rxGroupWindow) prune() rxGroupWindowResult {
 		w.dropGroup(group.key)
 	}
 
-	for w.maxClosed > 0 && len(w.closed) > w.maxClosed && len(w.closedOrder) > 0 {
-		key := w.closedOrder[0]
-		w.closedOrder = w.closedOrder[1:]
-		delete(w.closed, key)
+	for w.maxClosed > 0 && w.closed.Size() > w.maxClosed {
+		w.closed.Remove(w.closed.Left().Key)
 	}
 
 	return out
@@ -314,11 +308,10 @@ func (w *rxGroupWindow) eachGroupForPacket(packetID uint32, fn func(*rxGroup, in
 }
 
 func (w *rxGroupWindow) closeGroup(key rxGroupKey) {
-	if _, ok := w.closed[key]; ok {
+	if _, ok := w.closed.Get(key); ok {
 		return
 	}
-	w.closed[key] = struct{}{}
-	w.closedOrder = append(w.closedOrder, key)
+	w.closed.Put(key, struct{}{})
 }
 
 func (w *rxGroupWindow) dropData(packetID uint32) {

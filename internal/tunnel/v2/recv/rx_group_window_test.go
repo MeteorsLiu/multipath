@@ -42,3 +42,26 @@ func TestRxGroupWindowPrunesLowestGroupKey(t *testing.T) {
 		t.Fatalf("eviction result = %+v, want expired group 10", result.done)
 	}
 }
+
+func TestRxGroupWindowPrunesLowestClosedKey(t *testing.T) {
+	w := newRxGroupWindow()
+	defer w.releaseAll()
+	w.maxClosed = 2
+
+	w.closeGroup(rxGroupKey{basePacketID: 30, sourceSpan: 4})
+	w.closeGroup(rxGroupKey{basePacketID: 10, sourceSpan: 4})
+	w.closeGroup(rxGroupKey{basePacketID: 20, sourceSpan: 4})
+	w.prune()
+
+	if size := w.closed.Size(); size != 2 {
+		t.Fatalf("closed groups = %d, want 2", size)
+	}
+	if _, ok := w.closed.Get(rxGroupKey{basePacketID: 10, sourceSpan: 4}); ok {
+		t.Fatal("lowest closed group was not evicted")
+	}
+	for _, packetID := range []uint32{20, 30} {
+		if _, ok := w.closed.Get(rxGroupKey{basePacketID: packetID, sourceSpan: 4}); !ok {
+			t.Fatalf("closed group %d was unexpectedly evicted", packetID)
+		}
+	}
+}

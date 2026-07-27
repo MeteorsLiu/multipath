@@ -461,7 +461,7 @@ func (o *Recv) handleREPAIR(ctx context.Context, leg Ref, frame protocol.Frame) 
 	window := state.windowFor(frame.LaneID)
 	now := time.Now()
 	group := rxGroupKey{basePacketID: body.BasePacketID, sourceSpan: int(body.SourceSpan)}
-	_, closed := window.closed[group]
+	_, closed := window.closed.Get(group)
 	q := o.qosFor(state, frame.LaneID)
 	q.observeRepairBytes(leg.Kind, len(body.Symbol), now)
 	if !closed {
