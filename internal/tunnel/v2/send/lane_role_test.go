@@ -309,9 +309,9 @@ func TestRepairCountEmitsMultipleRepairFrames(t *testing.T) {
 	}
 
 	group := txRepairGroup{
-		basePacketID: 44,
-		sourceSpan:   maxFECSourceSpan,
-		packets:      packets,
+		groupID:    44,
+		sourceSpan: maxFECSourceSpan,
+		packets:    packets,
 	}
 
 	s.sendRepair(context.Background(), sessionID, lane, group)
@@ -332,8 +332,8 @@ func TestRepairCountEmitsMultipleRepairFrames(t *testing.T) {
 				t.Fatalf("frame %d type = %v, want REPAIR", i, f.Type)
 			}
 			body := f.Body.(protocol.RepairBody)
-			if body.BasePacketID != group.basePacketID {
-				t.Fatalf("repair %d base_packet_id = %d, want %d", i, body.BasePacketID, group.basePacketID)
+			if body.GroupID != group.groupID {
+				t.Fatalf("repair %d group_id = %d, want %d", i, body.GroupID, group.groupID)
 			}
 			if body.SourceSpan != group.sourceSpan {
 				t.Fatalf("repair %d source_span = %d, want %d", i, body.SourceSpan, group.sourceSpan)
@@ -389,9 +389,9 @@ func TestSendRepairDoesNotCallScheduler(t *testing.T) {
 	}
 
 	group := txRepairGroup{
-		basePacketID: 144,
-		sourceSpan:   maxFECSourceSpan,
-		packets:      packets,
+		groupID:    144,
+		sourceSpan: maxFECSourceSpan,
+		packets:    packets,
 	}
 
 	s.sendRepair(context.Background(), sessionID, lane, group)
@@ -433,9 +433,9 @@ func TestRepairCountScalesForPartialGroup(t *testing.T) {
 	}
 
 	group := txRepairGroup{
-		basePacketID: 88,
-		sourceSpan:   2,
-		packets:      packets,
+		groupID:    88,
+		sourceSpan: 2,
+		packets:    packets,
 	}
 
 	s.sendRepair(context.Background(), sessionID, lane, group)

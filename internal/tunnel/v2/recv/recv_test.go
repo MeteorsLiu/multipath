@@ -156,11 +156,11 @@ func TestRecvKeepsDATAAndREPAIROutOfHandler(t *testing.T) {
 	handler := &recordingHandler{}
 	out := New(Config{Handler: handler, SessionManager: &manager})
 
-	data := protocol.Frame{Type: protocol.TypeDATA, SessionID: 99, LaneID: 1, Body: protocol.DataBody{PacketID: 1, Packet: []byte("p")}}
+	data := protocol.Frame{Type: protocol.TypeDATA, SessionID: 99, LaneID: 1, Body: protocol.DataBody{GroupID: 1, Packet: []byte("p")}}
 	if err := out.WriteTo(context.Background(), udpLeg(), encodedTestFrame(t, data)); err != nil {
 		t.Fatalf("Write DATA: %v", err)
 	}
-	repair := protocol.Frame{Type: protocol.TypeREPAIR, SessionID: 99, LaneID: 1, Body: protocol.RepairBody{Key: 1, SourceSpan: 4, Symbol: []byte("r")}}
+	repair := protocol.Frame{Type: protocol.TypeREPAIR, SessionID: 99, LaneID: 1, Body: protocol.RepairBody{GroupID: 1, Key: 1, SourceSpan: 4, Symbol: []byte("r")}}
 	if err := out.WriteTo(context.Background(), tcpLeg(), encodedTestFrame(t, repair)); err != nil {
 		t.Fatalf("Write REPAIR: %v", err)
 	}
@@ -180,7 +180,7 @@ func TestRecvDuplicateDATAIsNotEmittedOrInsertedIntoWindow(t *testing.T) {
 	mk := func() *packetbuf.Packet {
 		return encodedTestFrame(t, protocol.Frame{
 			Type: protocol.TypeDATA, SessionID: 7, LaneID: 1,
-			Body: protocol.DataBody{PacketID: 42, Packet: []byte("packet")},
+			Body: protocol.DataBody{GroupID: 42, SourceIndex: 1, Packet: []byte("packet")},
 		})
 	}
 
@@ -205,7 +205,13 @@ func TestRecvDuplicateDATAIsNotEmittedOrInsertedIntoWindow(t *testing.T) {
 	window := st.rxWindows[1]
 	var dataCount int
 	if window != nil {
-		dataCount = len(window.recentData)
+		if group, _ := window.groups.Get(42); group != nil {
+			for _, packet := range group.data {
+				if packet != nil {
+					dataCount++
+				}
+			}
+		}
 	}
 	st.mu.Unlock()
 	if dataCount != 1 {
@@ -239,23 +245,24 @@ func TestRecvLateOriginalDATACountsQoSWithoutReemit(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	sendDATA := func(packetID uint32, packet []byte) {
+	sendDATA := func(sourceIndex uint8, packet []byte) {
 		t.Helper()
 		frame := protocol.Frame{
 			Type:      protocol.TypeDATA,
 			SessionID: 14,
 			LaneID:    1,
 			Body: protocol.DataBody{
-				PacketID: packetID,
-				Packet:   packet,
+				GroupID:     100,
+				SourceIndex: sourceIndex,
+				Packet:      packet,
 			},
 		}
 		if err := out.WriteTo(ctx, udpLeg(), encodedTestFrame(t, frame)); err != nil {
-			t.Fatalf("Write DATA %d: %v", packetID, err)
+			t.Fatalf("Write DATA index %d: %v", sourceIndex, err)
 		}
 	}
 
-	sendDATA(100, shards[0])
+	sendDATA(0, shards[0])
 	first := readRecvPacket(t, out)
 	if !bytes.Equal(first.Payload, shards[0]) {
 		t.Fatalf("first packet = %v, want %v", first.Payload, shards[0])
@@ -275,10 +282,10 @@ func TestRecvLateOriginalDATACountsQoSWithoutReemit(t *testing.T) {
 		SessionID: 14,
 		LaneID:    1,
 		Body: protocol.RepairBody{
-			BasePacketID: 100,
-			Key:          keys[0],
-			SourceSpan:   2,
-			Symbol:       shards[2],
+			GroupID:    100,
+			Key:        keys[0],
+			SourceSpan: 2,
+			Symbol:     shards[2],
 		},
 	}
 	if err := out.WriteTo(ctx, tcpLeg(), encodedTestFrame(t, repair)); err != nil {
@@ -298,7 +305,7 @@ func TestRecvLateOriginalDATACountsQoSWithoutReemit(t *testing.T) {
 			got, len(shards[0]), len(shards[0])+len(shards[1]), len(shards[2]))
 	}
 
-	sendDATA(101, shards[1])
+	sendDATA(1, shards[1])
 	assertNoRecvPacket(t, out)
 	if got := qosPendingBytesFor(t, q, transport.KindUDP, transport.KindTCP); got.originalDataBytes != uint64(len(shards[0])) ||
 		got.expectedBytes != uint64(len(shards[0])+len(shards[1])) ||
@@ -307,7 +314,7 @@ func TestRecvLateOriginalDATACountsQoSWithoutReemit(t *testing.T) {
 			got, len(shards[0]), len(shards[0])+len(shards[1]), len(shards[1]))
 	}
 
-	sendDATA(101, shards[1])
+	sendDATA(1, shards[1])
 	assertNoRecvPacket(t, out)
 	if got := qosPendingBytesFor(t, q, transport.KindUDP, transport.KindTCP); got.originalDataBytes != uint64(len(shards[0])) ||
 		got.expectedBytes != uint64(len(shards[0])+len(shards[1])) ||
@@ -350,8 +357,9 @@ func TestRecvLateRepairAfterClosedGroupStillCountsQoSRepairBytes(t *testing.T) {
 			SessionID: 15,
 			LaneID:    1,
 			Body: protocol.DataBody{
-				PacketID: uint32(100 + i),
-				Packet:   shards[i],
+				GroupID:     100,
+				SourceIndex: uint8(i),
+				Packet:      shards[i],
 			},
 		}
 		if err := out.WriteTo(ctx, udpLeg(), encodedTestFrame(t, frame)); err != nil {
@@ -367,11 +375,11 @@ func TestRecvLateRepairAfterClosedGroupStillCountsQoSRepairBytes(t *testing.T) {
 			SessionID: 15,
 			LaneID:    1,
 			Body: protocol.RepairBody{
-				BasePacketID: 100,
-				Key:          key,
-				SourceSpan:   2,
-				RepairCount:  2,
-				Symbol:       symbol,
+				GroupID:     100,
+				Key:         key,
+				SourceSpan:  2,
+				RepairCount: 2,
+				Symbol:      symbol,
 			},
 		}
 		if err := out.WriteTo(ctx, tcpLeg(), encodedTestFrame(t, frame)); err != nil {
@@ -401,7 +409,7 @@ func TestRecvPerLaneWindowIsolation(t *testing.T) {
 	out := New(Config{SessionManager: &manager})
 
 	// DATA on lane 1, REPAIR on lane 2: different windows, no cross recovery.
-	data := protocol.Frame{Type: protocol.TypeDATA, SessionID: 5, LaneID: 1, Body: protocol.DataBody{PacketID: 10, Packet: []byte("packetdata")}}
+	data := protocol.Frame{Type: protocol.TypeDATA, SessionID: 5, LaneID: 1, Body: protocol.DataBody{GroupID: 10, Packet: []byte("packetdata")}}
 	if err := out.WriteTo(context.Background(), udpLeg(), encodedTestFrame(t, data)); err != nil {
 		t.Fatalf("Write DATA: %v", err)
 	}
@@ -421,6 +429,37 @@ func TestRecvPerLaneWindowIsolation(t *testing.T) {
 	}
 }
 
+func TestRecvDedupeIsLaneLocal(t *testing.T) {
+	var manager session.Manager
+	sess, ok := manager.Create(19)
+	if !ok {
+		t.Fatal("Create session failed")
+	}
+	out := New(Config{SessionManager: &manager})
+	defer out.closeRecvState(19, sess)
+
+	for laneID := uint8(1); laneID <= 2; laneID++ {
+		frame := protocol.Frame{
+			Type:      protocol.TypeDATA,
+			SessionID: 19,
+			LaneID:    laneID,
+			Body: protocol.DataBody{
+				GroupID:     7,
+				SourceIndex: 0,
+				Packet:      []byte{laneID},
+			},
+		}
+		if err := out.WriteTo(context.Background(), udpLeg(), encodedTestFrame(t, frame)); err != nil {
+			t.Fatalf("Write DATA lane %d: %v", laneID, err)
+		}
+		packet := readRecvPacket(t, out)
+		if len(packet.Payload) != 1 || packet.Payload[0] != laneID {
+			t.Fatalf("lane %d packet = %v", laneID, packet.Payload)
+		}
+		packet.Release()
+	}
+}
+
 func TestRecvRepairCreatesGroupWindowEntry(t *testing.T) {
 	var manager session.Manager
 	if _, ok := manager.Create(6); !ok {
@@ -433,10 +472,10 @@ func TestRecvRepairCreatesGroupWindowEntry(t *testing.T) {
 		SessionID: 6,
 		LaneID:    1,
 		Body: protocol.RepairBody{
-			BasePacketID: 10,
-			Key:          3,
-			SourceSpan:   2,
-			Symbol:       []byte("repair"),
+			GroupID:    10,
+			Key:        3,
+			SourceSpan: 2,
+			Symbol:     []byte("repair"),
 		},
 	}
 	if err := out.WriteTo(context.Background(), tcpLeg(), encodedTestFrame(t, repair)); err != nil {
@@ -446,7 +485,7 @@ func TestRecvRepairCreatesGroupWindowEntry(t *testing.T) {
 	st := out.recvState(6)
 	st.mu.Lock()
 	window := st.rxWindows[1]
-	group, _ := window.groups.Get(rxGroupKey{basePacketID: 10, sourceSpan: 2})
+	group, _ := window.groups.Get(10)
 	st.mu.Unlock()
 	if group == nil {
 		t.Fatal("missing repair group")
@@ -481,28 +520,29 @@ func TestRecvRecoversTwoMissingPacketsWithTwoRepairs(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	sendData := func(packetID uint32, packet []byte) {
+	sendData := func(sourceIndex uint8, packet []byte) {
 		t.Helper()
 		frame := protocol.Frame{
 			Type:      protocol.TypeDATA,
 			SessionID: 8,
 			LaneID:    1,
 			Body: protocol.DataBody{
-				PacketID: packetID,
-				Packet:   packet,
+				GroupID:     100,
+				SourceIndex: sourceIndex,
+				Packet:      packet,
 			},
 		}
 		if err := out.WriteTo(ctx, udpLeg(), encodedTestFrame(t, frame)); err != nil {
-			t.Fatalf("Write DATA %d: %v", packetID, err)
+			t.Fatalf("Write DATA index %d: %v", sourceIndex, err)
 		}
 		got := readRecvPacket(t, out)
 		defer got.Release()
 		if !bytes.Equal(got.Payload, packet) {
-			t.Fatalf("DATA %d payload len/content mismatch", packetID)
+			t.Fatalf("DATA index %d payload len/content mismatch", sourceIndex)
 		}
 	}
-	sendData(100, shards[0])
-	sendData(102, shards[2])
+	sendData(0, shards[0])
+	sendData(2, shards[2])
 
 	for i, key := range keys {
 		repair := protocol.Frame{
@@ -510,10 +550,10 @@ func TestRecvRecoversTwoMissingPacketsWithTwoRepairs(t *testing.T) {
 			SessionID: 8,
 			LaneID:    1,
 			Body: protocol.RepairBody{
-				BasePacketID: 100,
-				Key:          key,
-				SourceSpan:   4,
-				Symbol:       shards[4+i],
+				GroupID:    100,
+				Key:        key,
+				SourceSpan: 4,
+				Symbol:     shards[4+i],
 			},
 		}
 		if err := out.WriteTo(ctx, tcpLeg(), encodedTestFrame(t, repair)); err != nil {
@@ -637,7 +677,7 @@ func TestRecvAppliesBandwidthProbeObservationFromHandler(t *testing.T) {
 
 func TestRxGroupWindowFinishesRecoveredGroup(t *testing.T) {
 	w := newRxGroupWindow()
-	result := w.addRepair(100, 7, 1, ipv4Packet(20, 'r'))
+	result, _ := w.addRepair(100, 7, 1, ipv4Packet(20, 'r'))
 	if len(result.recoverable) != 1 {
 		t.Fatalf("recoverable = %+v, want one group", result.recoverable)
 	}
@@ -649,7 +689,7 @@ func TestRxGroupWindowFinishesRecoveredGroup(t *testing.T) {
 	if !result.done[0].recovered || result.done[0].expired {
 		t.Fatalf("done = %+v, want recovered result without expired", result.done[0])
 	}
-	if group, _ := w.groups.Get(rxGroupKey{basePacketID: 100, sourceSpan: 1}); group != nil {
+	if group, _ := w.groups.Get(100); group != nil {
 		t.Fatalf("group after recovery = %+v, want dropped", group)
 	}
 }
@@ -658,22 +698,20 @@ func TestRxGroupWindowExpireCompletesGroupBeforeExpired(t *testing.T) {
 	w := newRxGroupWindow()
 	defer w.releaseAll()
 
-	w.addData(100, ipv4Packet(10, 'a'))
-	w.addData(101, ipv4Packet(12, 'b'))
-	key := rxGroupKey{basePacketID: 100, sourceSpan: 2}
-	w.groups.Put(key, &rxGroup{
-		key:  key,
-		data: []*packetbuf.Packet{w.recentData[100], w.recentData[101]},
-	})
+	w.addData(100, 0, ipv4Packet(10, 'a'))
+	w.addData(100, 1, ipv4Packet(12, 'b'))
+	key := rxGroupKey{groupID: 100, sourceSpan: 2}
+	group, _ := w.groups.Get(100)
+	group.key = key
 
-	result := w.expireGroup(key)
+	result := w.expireGroup(100)
 	if len(result.done) != 1 {
 		t.Fatalf("done = %+v, want one completed group", result.done)
 	}
 	if result.done[0].expired || result.done[0].recovered {
 		t.Fatalf("done = %+v, want completed group without expired/recovered", result.done[0])
 	}
-	if group, _ := w.groups.Get(key); group != nil {
+	if group, _ := w.groups.Get(100); group != nil {
 		t.Fatalf("group after complete expire = %+v, want dropped", group)
 	}
 }
@@ -682,17 +720,16 @@ func TestRxGroupWindowExpireReturnsRecoverableGroup(t *testing.T) {
 	w := newRxGroupWindow()
 	defer w.releaseAll()
 
-	key := rxGroupKey{basePacketID: 100, sourceSpan: 1}
-	result := w.addRepair(100, 7, 1, ipv4Packet(20, 'r'))
+	result, _ := w.addRepair(100, 7, 1, ipv4Packet(20, 'r'))
 	if len(result.recoverable) != 1 {
 		t.Fatalf("recoverable after repair = %+v, want one group", result.recoverable)
 	}
 
-	result = w.expireGroup(key)
+	result = w.expireGroup(100)
 	if len(result.recoverable) != 1 || len(result.done) != 0 {
 		t.Fatalf("expire result = %+v, want recoverable without done", result)
 	}
-	if group, _ := w.groups.Get(key); group == nil {
+	if group, _ := w.groups.Get(100); group == nil {
 		t.Fatal("recoverable group was dropped before recovery")
 	}
 }
@@ -721,22 +758,15 @@ func TestRecvExpireFECGroupRecoversRecoverableGroup(t *testing.T) {
 	}
 
 	state := out.recvState(16)
-	group := rxGroupKey{basePacketID: 100, sourceSpan: 2}
+	group := rxGroupKey{groupID: 100, sourceSpan: 2}
 	state.mu.Lock()
 	state.qos[1] = newQoSEstimator(qosConfig{SessionID: 16, LaneID: 1, Tick: time.Hour}, nil)
 	window := state.windowFor(1)
-	window.addData(100, shards[0])
-	window.groups.Put(group, &rxGroup{
-		key:  group,
-		data: []*packetbuf.Packet{window.recentData[100], nil},
-		repairs: []rxRepairShard{{
-			key:    keys[0],
-			symbol: storePacket(shards[2]),
-		}},
-	})
+	window.addData(100, 0, shards[0])
+	window.addRepair(100, keys[0], 2, shards[2])
 	state.mu.Unlock()
 
-	out.expireFECGroup(state, 1, group)
+	out.expireFECGroup(state, 1, group.groupID, nil)
 
 	recovered := readRecvPacket(t, out)
 	defer recovered.Release()
@@ -746,8 +776,130 @@ func TestRecvExpireFECGroupRecoversRecoverableGroup(t *testing.T) {
 
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	if got, _ := state.rxWindows[1].groups.Get(group); got != nil {
+	if got, _ := state.rxWindows[1].groups.Get(group.groupID); got != nil {
 		t.Fatalf("group after expire recovery = %+v, want dropped", got)
+	}
+}
+
+func TestRecvOldFECTimerCannotExpireReplacementGroupTimer(t *testing.T) {
+	var manager session.Manager
+	sess, ok := manager.Create(17)
+	if !ok {
+		t.Fatal("Create session failed")
+	}
+	out := New(Config{SessionManager: &manager})
+	defer out.closeRecvState(17, sess)
+
+	state := out.recvState(17)
+	key := rxLaneGroupKey{laneID: 1, groupID: 100}
+	oldTimer := time.NewTimer(time.Hour)
+	newTimer := time.NewTimer(time.Hour)
+	defer oldTimer.Stop()
+	defer newTimer.Stop()
+
+	state.mu.Lock()
+	state.windowFor(1).addData(100, 0, []byte("data"))
+	state.fecTimers[key] = newTimer
+	state.mu.Unlock()
+
+	out.expireFECGroup(state, 1, 100, oldTimer)
+
+	state.mu.Lock()
+	group, _ := state.rxWindows[1].groups.Get(100)
+	tracked := state.fecTimers[key]
+	state.mu.Unlock()
+	if group == nil {
+		t.Fatal("old timer expired the replacement group")
+	}
+	if tracked != newTimer {
+		t.Fatal("old timer removed the replacement timer")
+	}
+
+	out.expireFECGroup(state, 1, 100, newTimer)
+	state.mu.Lock()
+	group, _ = state.rxWindows[1].groups.Get(100)
+	_, trackedAfterExpire := state.fecTimers[key]
+	state.mu.Unlock()
+	if group != nil || trackedAfterExpire {
+		t.Fatalf("replacement timer expiration left group=%+v tracked=%t", group, trackedAfterExpire)
+	}
+}
+
+func TestRecvFECGroupTimerResetsInPlace(t *testing.T) {
+	var manager session.Manager
+	sess, ok := manager.Create(22)
+	if !ok {
+		t.Fatal("Create session failed")
+	}
+	out := New(Config{SessionManager: &manager})
+	defer out.closeRecvState(22, sess)
+
+	state := out.recvState(22)
+	key := rxLaneGroupKey{laneID: 1, groupID: 100}
+	state.mu.Lock()
+	out.trackFECGroup(state, 1, 100)
+	first := state.fecTimers[key]
+	out.trackFECGroup(state, 1, 100)
+	second := state.fecTimers[key]
+	state.mu.Unlock()
+
+	if first == nil || second != first {
+		t.Fatalf("group timer first=%p second=%p, want one reset timer", first, second)
+	}
+}
+
+func TestRecvConflictingRepairSpanDoesNotCreateQoSGroup(t *testing.T) {
+	var manager session.Manager
+	sess, ok := manager.Create(18)
+	if !ok {
+		t.Fatal("Create session failed")
+	}
+	out := New(Config{SessionManager: &manager})
+	defer out.closeRecvState(18, sess)
+
+	writeRepair := func(key uint16, sourceSpan uint8) {
+		t.Helper()
+		frame := protocol.Frame{
+			Type:      protocol.TypeREPAIR,
+			SessionID: 18,
+			LaneID:    1,
+			Body: protocol.RepairBody{
+				GroupID:     100,
+				Key:         key,
+				SourceSpan:  sourceSpan,
+				RepairCount: 1,
+				Symbol:      []byte("repair"),
+			},
+		}
+		if err := out.WriteTo(context.Background(), tcpLeg(), encodedTestFrame(t, frame)); err != nil {
+			t.Fatalf("Write REPAIR span=%d: %v", sourceSpan, err)
+		}
+	}
+
+	writeRepair(7, 2)
+	state := out.recvState(18)
+	timerKey := rxLaneGroupKey{laneID: 1, groupID: 100}
+	state.mu.Lock()
+	firstTimer := state.fecTimers[timerKey]
+	state.mu.Unlock()
+
+	writeRepair(8, 4)
+
+	state.mu.Lock()
+	q := state.qos[1]
+	trackedTimer := state.fecTimers[timerKey]
+	state.mu.Unlock()
+	q.mu.Lock()
+	_, canonical := q.groups[rxGroupKey{groupID: 100, sourceSpan: 2}]
+	_, conflicting := q.groups[rxGroupKey{groupID: 100, sourceSpan: 4}]
+	groupCount := len(q.groups)
+	q.mu.Unlock()
+
+	if !canonical || conflicting || groupCount != 1 {
+		t.Fatalf("QoS groups canonical=%t conflicting=%t count=%d, want true false 1", canonical, conflicting, groupCount)
+	}
+	if trackedTimer != firstTimer {
+		t.Fatal("conflicting REPAIR reset the accepted group's timer")
 	}
 }
 
@@ -792,7 +944,7 @@ func TestRecvDropsDataForUnknownSession(t *testing.T) {
 	out := New()
 	packet := encodedTestFrame(t, protocol.Frame{
 		Type: protocol.TypeDATA, SessionID: 99, LaneID: 1,
-		Body: protocol.DataBody{PacketID: 1, Packet: []byte("packet")},
+		Body: protocol.DataBody{GroupID: 1, Packet: []byte("packet")},
 	})
 	if err := out.WriteTo(context.Background(), udpLeg(), packet); err != nil {
 		t.Fatalf("Write DATA: %v", err)

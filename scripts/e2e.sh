@@ -2324,17 +2324,18 @@ try:
                 continue
             if "recv: frame_in type=DATA " in line and "leg={udp " in line:
                 lane = field(line, "lane")
-                packet_id = field(line, "packet_id")
-                if lane is not None and packet_id is not None:
-                    data.setdefault(lane, set()).add(packet_id)
+                group_id = field(line, "group_id")
+                source_index = field(line, "source_index")
+                if None not in (lane, group_id, source_index):
+                    data.setdefault(lane, set()).add((group_id, source_index))
                 continue
             if "recv: frame_in type=REPAIR " in line and "leg={tcp " in line:
                 lane = field(line, "lane")
-                base = field(line, "base_packet_id")
+                group_id = field(line, "group_id")
                 key = field(line, "key")
                 span = field(line, "source_span")
-                if None not in (lane, base, key, span):
-                    repairs.setdefault((lane, base, span), set()).add(key)
+                if None not in (lane, group_id, key, span):
+                    repairs.setdefault((lane, group_id, span), set()).add(key)
 except FileNotFoundError:
     print(f"log file missing: {path}")
     sys.exit(2)
@@ -2342,11 +2343,11 @@ except FileNotFoundError:
 best = None
 match = None
 oversent = None
-for (lane, base, span), keys in sorted(repairs.items()):
-    udp_data = sum(1 for packet_id in data.get(lane, set()) if base <= packet_id < base + span)
+for (lane, group_id, span), keys in sorted(repairs.items()):
+    udp_data = sum(1 for source_index in range(span) if (group_id, source_index) in data.get(lane, set()))
     got = len(keys)
     want = scaled_count(full_repair_count, span)
-    candidate = (got, udp_data, lane, base, span, want)
+    candidate = (got, udp_data, lane, group_id, span, want)
     if best is None or candidate > best:
         best = candidate
     if got > want:
@@ -2355,20 +2356,20 @@ for (lane, base, span), keys in sorted(repairs.items()):
         match = candidate
 
 if oversent is not None:
-    got, udp_data, lane, base, span, want = oversent
-    print(f"oversent lane={lane} base_packet_id={base} source_span={span} udp_data={udp_data} tcp_repairs={got} want={want}")
+    got, udp_data, lane, group_id, span, want = oversent
+    print(f"oversent lane={lane} group_id={group_id} source_span={span} udp_data={udp_data} tcp_repairs={got} want={want}")
     sys.exit(1)
 
 if match is not None:
-    got, udp_data, lane, base, span, want = match
-    print(f"ok lane={lane} base_packet_id={base} source_span={span} udp_data={udp_data} tcp_repairs={got} want={want}")
+    got, udp_data, lane, group_id, span, want = match
+    print(f"ok lane={lane} group_id={group_id} source_span={span} udp_data={udp_data} tcp_repairs={got} want={want}")
     sys.exit(0)
 
 if best is None:
     print("no TCP REPAIR group found")
 else:
-    got, udp_data, lane, base, span, want = best
-    print(f"best lane={lane} base_packet_id={base} source_span={span} udp_data={udp_data} tcp_repairs={got} want={want}")
+    got, udp_data, lane, group_id, span, want = best
+    print(f"best lane={lane} group_id={group_id} source_span={span} udp_data={udp_data} tcp_repairs={got} want={want}")
 sys.exit(1)
 PY
 )"
@@ -2433,11 +2434,11 @@ try:
             if "recv: frame_in type=REPAIR " not in line or "leg={tcp " not in line:
                 continue
             lane = field(line, "lane")
-            base = field(line, "base_packet_id")
+            group_id = field(line, "group_id")
             key = field(line, "key")
             span = field(line, "source_span")
-            if None not in (lane, base, key, span):
-                repairs.setdefault((lane, base, span), set()).add(key)
+            if None not in (lane, group_id, key, span):
+                repairs.setdefault((lane, group_id, span), set()).add(key)
 except FileNotFoundError:
     print(f"log file missing: {path}")
     sys.exit(2)
@@ -2445,12 +2446,12 @@ except FileNotFoundError:
 best = None
 match = None
 oversent = None
-for (lane, base, span), keys in sorted(repairs.items()):
+for (lane, group_id, span), keys in sorted(repairs.items()):
     if span != 2:
         continue
     got = len(keys)
     want = scaled_count(full_repair_count, span)
-    candidate = (got, lane, base, span, want)
+    candidate = (got, lane, group_id, span, want)
     if best is None or candidate > best:
         best = candidate
     if got > want:
@@ -2459,20 +2460,20 @@ for (lane, base, span), keys in sorted(repairs.items()):
         match = candidate
 
 if oversent is not None:
-    got, lane, base, span, want = oversent
-    print(f"oversent lane={lane} base_packet_id={base} source_span={span} tcp_repairs={got} want={want}")
+    got, lane, group_id, span, want = oversent
+    print(f"oversent lane={lane} group_id={group_id} source_span={span} tcp_repairs={got} want={want}")
     sys.exit(1)
 
 if match is not None:
-    got, lane, base, span, want = match
-    print(f"ok lane={lane} base_packet_id={base} source_span={span} tcp_repairs={got}")
+    got, lane, group_id, span, want = match
+    print(f"ok lane={lane} group_id={group_id} source_span={span} tcp_repairs={got}")
     sys.exit(0)
 
 if best is None:
     print("no source_span=2 TCP REPAIR group found")
 else:
-    got, lane, base, span, want = best
-    print(f"best lane={lane} base_packet_id={base} source_span={span} tcp_repairs={got} want={want}")
+    got, lane, group_id, span, want = best
+    print(f"best lane={lane} group_id={group_id} source_span={span} tcp_repairs={got} want={want}")
 sys.exit(1)
 PY
 )"

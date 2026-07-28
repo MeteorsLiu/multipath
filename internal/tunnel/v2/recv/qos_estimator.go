@@ -62,8 +62,8 @@ type qosEstimator struct {
 	tcpUDPRepair qosDirection
 
 	groups        map[rxGroupKey]qosGroup
-	lateSeen      *packetIDDedupe
-	recoveredSeen *packetIDDedupe
+	lateSeen      *dataIDDedupe
+	recoveredSeen *dataIDDedupe
 
 	done     chan struct{}
 	stopOnce sync.Once
@@ -165,8 +165,8 @@ func newQoSEstimator(cfg qosConfig, emit func(qosStatus)) *qosEstimator {
 		currentPrimary: transport.KindUDP,
 		currentRole:    qosRoleData,
 		groups:         make(map[rxGroupKey]qosGroup),
-		lateSeen:       newPacketIDDedupe(0),
-		recoveredSeen:  newPacketIDDedupe(0),
+		lateSeen:       newDataIDDedupe(0),
+		recoveredSeen:  newDataIDDedupe(0),
 		done:           make(chan struct{}),
 	}
 	e.udpTCPData = newQoSDirection(transport.KindUDP, transport.KindTCP, qosRoleData)
@@ -279,7 +279,7 @@ func (e *qosEstimator) run() {
 	}
 }
 
-func (e *qosEstimator) observeLateData(packetID uint32, dataKind transport.Kind, dataBytes int, at time.Time) {
+func (e *qosEstimator) observeLateData(dataID uint32, dataKind transport.Kind, dataBytes int, at time.Time) {
 	if dataBytes <= 0 || !knownQoSTransport(dataKind) {
 		return
 	}
@@ -289,7 +289,7 @@ func (e *qosEstimator) observeLateData(packetID uint32, dataKind transport.Kind,
 	if e.closed {
 		return
 	}
-	if !e.recoveredSeen.seen(packetID) || !e.lateSeen.mark(packetID) {
+	if !e.recoveredSeen.seen(dataID) || !e.lateSeen.mark(dataID) {
 		return
 	}
 	if direction := e.currentDirectionForLocked(dataKind, otherQoSTransport(dataKind)); direction != nil {
@@ -348,13 +348,13 @@ func (e *qosEstimator) observeRepairGroup(group rxGroupKey, repairKind transport
 	e.groups[group] = g
 }
 
-func (e *qosEstimator) observeRecoveredData(packetID uint32) {
+func (e *qosEstimator) observeRecoveredData(dataID uint32) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.closed {
 		return
 	}
-	e.recoveredSeen.mark(packetID)
+	e.recoveredSeen.mark(dataID)
 }
 
 func (e *qosEstimator) observeGroupDone(done rxGroupDone, at time.Time) {

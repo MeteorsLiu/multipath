@@ -114,7 +114,7 @@ Important constraints:
   concrete `Body`, and `Frame.Type` selects which body type is valid. Do not add
   public per-type body helper functions.
 - FEC exposes shard-level `Encode` and `Reconstruct`; it does not know
-  `session_id`, `lane_id`, `packet_id`, or protocol frames.
+  `session_id`, `lane_id`, `group_id`, or protocol frames.
 - FEC core erasure coding should use a maintained library. Local code should
   only adapt project shard/window semantics unless a different design is
   discussed first.

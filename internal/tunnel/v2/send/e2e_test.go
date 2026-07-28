@@ -1696,7 +1696,7 @@ func TestCloseSessionClearsState(t *testing.T) {
 	}
 	lane.bindTCP(e2eTCP("tcp-close"))
 	lane.markActive(transport.KindTCP)
-	lane.commitPacket(1, []byte("pending-fec"))
+	lane.commitPacket([]byte("pending-fec"), true)
 	if s.LaneManager().LookupPing(KeyForLeg(id, 1, e2eUDP())) == nil {
 		t.Fatal("ping missing before close")
 	}

@@ -11,7 +11,7 @@ func TestCodecRoundTrip(t *testing.T) {
 		Type:      TypeDATA,
 		SessionID: 0x0102030405060708,
 		LaneID:    7,
-		Body:      DataBody{PacketID: 9, Packet: []byte("packet")},
+		Body:      DataBody{GroupID: 9, SourceIndex: 2, Packet: []byte("packet")},
 	}
 
 	encoded, err := Encode(frame, []byte{0xaa})
@@ -43,8 +43,8 @@ func TestCodecRoundTrip(t *testing.T) {
 		t.Fatalf("body type = %T, want DataBody", got.Body)
 	}
 	wantBody := frame.Body.(DataBody)
-	if gotBody.PacketID != wantBody.PacketID {
-		t.Fatalf("PacketID = %d, want %d", gotBody.PacketID, wantBody.PacketID)
+	if gotBody.GroupID != wantBody.GroupID || gotBody.SourceIndex != wantBody.SourceIndex {
+		t.Fatalf("DATA id = group:%d index:%d, want group:%d index:%d", gotBody.GroupID, gotBody.SourceIndex, wantBody.GroupID, wantBody.SourceIndex)
 	}
 	if !bytes.Equal(gotBody.Packet, wantBody.Packet) {
 		t.Fatalf("Packet = %q, want %q", gotBody.Packet, wantBody.Packet)

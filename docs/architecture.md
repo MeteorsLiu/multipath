@@ -290,7 +290,10 @@ Recv passes HELLO, HELLO_ACK, PING, PONG, CLOSE, BW_PROBE, BW_PROBE_ACK, and LIN
 Recv does not pass DATA or REPAIR to Handler.
 Recv only accepts DATA or REPAIR for sessions admitted by the shared Session Manager.
 Unknown-session DATA or REPAIR is dropped.
-Recv owns per-lane receive-side FEC windows and a session-scoped emit dedupe.
+Recv owns per-lane receive-side FEC group windows and per-lane emit dedupe.
+Each receive group is keyed by the protocol `group_id` and directly owns its
+retained DATA and REPAIR buffers; Recv does not keep a separate recent-DATA
+window beside the group tree.
 Recv keeps a per-lane QoS estimator beside the receive FEC window. Recv is
 only glue for QoS and FEC-health events: it extracts facts from DATA, REPAIR,
 and FEC-window results, then immediately submits those facts to the estimator.
@@ -511,7 +514,7 @@ a new LINK_STATUS frame. The exception is the both-limited case: if updated
 delivered-bps estimates change the QoS-preferred primary leg, the receiver
 sends a fresh LINK_STATUS snapshot so the sender selector is not held to stale
 relative bps.
-Recv must not feed DATA rejected by session emit dedupe into
+Recv must not feed DATA rejected by lane-local emit dedupe into
 `originalDataBytes`, loss health, recovery, emit state, or the receive FEC
 window. Recv forwards the late-DATA fact to the lane-local QoS estimator. The
 estimator may account it once as `lateDataBytes` only when its recovered-packet
@@ -796,6 +799,9 @@ Protocol does not know Schedule Strategy.
 Protocol behavior is only Encode and Decode.
 Frame carries one concrete Body, and Frame.Type selects which body type is valid.
 Do not add public per-type body helper functions.
+Protocol owns the DATA `group_id`/`source_index` bit packing and the REPAIR
+30-bit `group_id` validation. Send and Recv consume decoded body fields and do
+not duplicate the wire bit layout.
 Current v2 negotiates CapLinkStatus with FEC. LINK_STATUS is a control frame for
 receive-side lane QoS snapshots; protocol only encodes and decodes it.
 ```

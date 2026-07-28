@@ -46,13 +46,13 @@ func TestTypedFramesRoundTrip(t *testing.T) {
 			Type:      TypeDATA,
 			SessionID: 11,
 			LaneID:    1,
-			Body:      DataBody{PacketID: 0x01020304, Packet: []byte("packet")},
+			Body:      DataBody{GroupID: 0x01020304, SourceIndex: 3, Packet: []byte("packet")},
 		},
 		{
 			Type:      TypeREPAIR,
 			SessionID: 11,
 			LaneID:    1,
-			Body:      RepairBody{BasePacketID: 10, Key: 7, SourceSpan: 4, RepairCount: 1, Symbol: []byte("repair")},
+			Body:      RepairBody{GroupID: 10, Key: 7, SourceSpan: 4, RepairCount: 1, Symbol: []byte("repair")},
 		},
 		{
 			Type:      TypeCLOSE,
@@ -96,8 +96,50 @@ func TestTypedFramesRoundTrip(t *testing.T) {
 	}
 }
 
+func TestDataBodyPacksGroupIDAndSourceIndex(t *testing.T) {
+	body := DataBody{GroupID: 25, SourceIndex: 3, Packet: []byte("packet")}
+	encoded, err := Encode(Frame{Type: TypeDATA, SessionID: 11, LaneID: 1, Body: body}, nil)
+	if err != nil {
+		t.Fatalf("Encode DATA failed: %v", err)
+	}
+	if got, want := binary.BigEndian.Uint32(encoded[headerSize:headerSize+4]), uint32(103); got != want {
+		t.Fatalf("packed DATA id = %d, want %d", got, want)
+	}
+
+	decoded, err := Decode(encoded)
+	if err != nil {
+		t.Fatalf("Decode DATA failed: %v", err)
+	}
+	got := decoded.Body.(DataBody)
+	if got.GroupID != body.GroupID || got.SourceIndex != body.SourceIndex {
+		t.Fatalf("decoded DATA id = group:%d index:%d, want group:%d index:%d", got.GroupID, got.SourceIndex, body.GroupID, body.SourceIndex)
+	}
+}
+
+func TestGroupIDValidation(t *testing.T) {
+	tests := []Frame{
+		{Type: TypeDATA, Body: DataBody{GroupID: maxGroupID + 1}},
+		{Type: TypeDATA, Body: DataBody{SourceIndex: 4}},
+		{Type: TypeREPAIR, Body: RepairBody{GroupID: maxGroupID + 1, SourceSpan: 4}},
+	}
+	for _, frame := range tests {
+		if _, err := Encode(frame, nil); !errors.Is(err, ErrInvalidFrame) {
+			t.Fatalf("Encode(%+v) err = %v, want ErrInvalidFrame", frame.Body, err)
+		}
+	}
+
+	encoded, err := Encode(Frame{Type: TypeREPAIR, Body: RepairBody{GroupID: 1, SourceSpan: 4}}, nil)
+	if err != nil {
+		t.Fatalf("Encode REPAIR failed: %v", err)
+	}
+	encoded[headerSize] |= 0x40
+	if _, err := Decode(encoded); !errors.Is(err, ErrInvalidFrame) {
+		t.Fatalf("Decode reserved REPAIR group bits err = %v, want ErrInvalidFrame", err)
+	}
+}
+
 func TestRepairBodyPacksSourceSpanAndRepairCount(t *testing.T) {
-	body := RepairBody{BasePacketID: 10, Key: 7, SourceSpan: 4, Symbol: []byte("repair")}
+	body := RepairBody{GroupID: 10, Key: 7, SourceSpan: 4, Symbol: []byte("repair")}
 	setRepairCountForTest(t, &body, 3)
 	encoded, err := Encode(Frame{Type: TypeREPAIR, SessionID: 11, LaneID: 1, Body: body}, nil)
 	if err != nil {
@@ -125,7 +167,7 @@ func TestRepairBodyRejectsReservedSourceSpanBits(t *testing.T) {
 		Type:      TypeREPAIR,
 		SessionID: 11,
 		LaneID:    1,
-		Body:      RepairBody{BasePacketID: 10, Key: 7, SourceSpan: 4, Symbol: []byte("repair")},
+		Body:      RepairBody{GroupID: 10, Key: 7, SourceSpan: 4, Symbol: []byte("repair")},
 	}, nil)
 	if err != nil {
 		t.Fatalf("Encode REPAIR failed: %v", err)
