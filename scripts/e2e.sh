@@ -2576,14 +2576,10 @@ wait_bandwidth_probe_train_budget() {
       -v max_payload="${max_payload}" '
         NR <= start { next }
         /protocol: encode type=BW_PROBE/ {
-          train_total = -1
           train_remaining = -1
           payload_len = -1
           for (i = 1; i <= NF; i++) {
-            if ($i ~ /^train_total=/) {
-              split($i, parts, "=")
-              train_total = parts[2] + 0
-            } else if ($i ~ /^train_remaining=/) {
+            if ($i ~ /^train_remaining=/) {
               split($i, parts, "=")
               train_remaining = parts[2] + 0
             } else if ($i ~ /^payload_len=/) {
@@ -2594,19 +2590,20 @@ wait_bandwidth_probe_train_budget() {
           if (payload_len < min_payload || payload_len > max_payload) {
             next
           }
-          if (train_total < min_total) {
-            message = sprintf("bad-train-budget train_total=%d train_remaining=%d payload_len=%d min_total=%d", train_total, train_remaining, payload_len, min_total)
+          train_budget = train_remaining + payload_len
+          if (train_budget < min_total) {
+            message = sprintf("bad-train-budget train_budget=%d train_remaining=%d payload_len=%d min_total=%d", train_budget, train_remaining, payload_len, min_total)
             status = 1
             done = 1
             exit
           }
-          if (train_remaining <= 0 || train_remaining >= train_total) {
-            message = sprintf("bad-train-remaining train_total=%d train_remaining=%d payload_len=%d", train_total, train_remaining, payload_len)
+          if (train_remaining <= 0) {
+            message = sprintf("bad-train-remaining train_budget=%d train_remaining=%d payload_len=%d", train_budget, train_remaining, payload_len)
             status = 1
             done = 1
             exit
           }
-          message = sprintf("ok train_total=%d train_remaining=%d payload_len=%d", train_total, train_remaining, payload_len)
+          message = sprintf("ok train_budget=%d train_remaining=%d payload_len=%d", train_budget, train_remaining, payload_len)
           status = 0
           done = 1
           exit
