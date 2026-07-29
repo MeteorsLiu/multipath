@@ -2,486 +2,965 @@ package recv
 
 import (
 	"math"
+	"sync"
 	"time"
 
-	"github.com/MeteorsLiu/multipath/internal/eventlog"
+	"github.com/MeteorsLiu/multipath/internal/debuglog"
 	"github.com/MeteorsLiu/multipath/internal/metrics"
-	"github.com/MeteorsLiu/multipath/internal/protocol"
 	"github.com/MeteorsLiu/multipath/internal/transport"
 )
 
 const (
-	defaultQoSSustain     = 3 * time.Second
-	defaultQoSSampleFloor = 4
-	defaultQoSRefresh     = time.Second
-	defaultQoSAlpha       = 0.10
+	defaultQoSTick          = time.Second
+	defaultQoSGroupMature   = 1500 * time.Millisecond
+	defaultFECLossAlpha     = 0.75
+	defaultFECLossBeta      = 0.01
+	defaultFECLateAlpha     = 0.20
+	defaultFECLateBeta      = 0.05
+	defaultRepairScaleAlpha = 0.25
+	defaultFECHighDwell     = 75 * time.Second
+	qosDecisionSamples      = 3
 
-	qosRateGapEnter = 0.10
-	qosRateGapExit  = 0.03
+	qosRateGapLimited     = 0.10
+	qosRateGapClear       = 0.03
+	qosRepairLoadGapClear = 0.10
+	qosRepairCapGapClear  = 0.20
 
-	qosShadowAdvantageEnter = 1.10
-	qosShadowAdvantageExit  = 1.05
-
-	qosShadowPIDGate = 0.05
-	qosShadowPIDKp   = 0.90
-	qosShadowPIDKi   = 0.02
-	qosShadowPIDKd   = 0.05
-	qosShadowPIDLeak = 0.985
-
-	qosShadowPIDWarmupSamples = 20
+	qosTCPLateGapLimited        = 0.50
+	qosTCPLateGapMinExpectedBps = 500_000
+	qosTCPLateGapMinRepairRatio = 0.80
 )
 
 type qosConfig struct {
-	Sustain     time.Duration
-	SampleFloor uint64
-	Refresh     time.Duration
-	SessionID   uint64
-	LaneID      uint8
+	SessionID uint64
+	LaneID    uint8
+	Tick      time.Duration
+	AutoStart bool
 }
 
 type qosStatus struct {
-	Kind         transport.Kind
-	Reason       uint8
-	DeliveredBps uint32
+	UDPLimited      bool
+	TCPLimited      bool
+	RepairCount     uint8
+	UDPDeliveredBps uint32
+	TCPDeliveredBps uint32
+	primarySwitched bool
 }
 
-type qosSample struct {
-	At             time.Time
-	Duration       time.Duration
-	DataKind       transport.Kind
-	DataArrived    uint64
-	DataExpected   uint64
-	DataBytes      uint64
-	RecoveredBytes uint64
-	RepairKind     transport.Kind
-	RepairBytes    uint64
-}
-
+// qosEstimator owns all lane-local QoS and adaptive-FEC state. Recv submits
+// packet and group facts; tick is the only path that commits LINK_STATUS state.
 type qosEstimator struct {
-	cfg  qosConfig
-	emit func(qosStatus)
+	mu             sync.Mutex
+	cfg            qosConfig
+	emit           func(qosStatus)
+	currentPrimary transport.Kind
+	currentRole    qosRole
 
-	limitedSince map[transport.Kind]time.Time
-	lastEmit     map[transport.Kind]map[uint8]time.Time
-	ema          map[qosDirectionKey]*qosEMAState
-	active       map[transport.Kind]map[uint8]qosActiveEvidence
+	udpTCPData   qosDirection
+	udpTCPRepair qosDirection
+	tcpUDPData   qosDirection
+	tcpUDPRepair qosDirection
+
+	groups        map[rxGroupKey]qosGroup
+	lateSeen      *dataIDDedupe
+	recoveredSeen *dataIDDedupe
+
+	done     chan struct{}
+	stopOnce sync.Once
+	closed   bool
 }
 
-type qosDirectionKey struct {
+type qosRole uint8
+
+const (
+	qosRoleData qosRole = iota + 1
+	qosRoleRepair
+)
+
+type qosDirection struct {
 	dataKind   transport.Kind
 	repairKind transport.Kind
+	role       qosRole
+
+	started    bool
+	lastTickAt time.Time
+	pending    qosPendingBytes
+
+	dataLimited   bool
+	repairLimited bool
+
+	dataDelivered   qosDelivered
+	repairDelivered qosDelivered
+	dataDecision    qosDecisionWindow
+	repairDecision  qosDecisionWindow
+	repairLoad      qosDecisionWindow
+	tcpLateData     qosDecisionWindow
+	fecHealth       qosFECHealth
+
+	repairScale            float64
+	repairScaleInitialized bool
+	repairLoadCapBps       uint32
 }
 
-type qosEstimate struct {
-	At           time.Time
-	DataKind     transport.Kind
-	RepairKind   transport.Kind
-	SampleTotal  uint64
-	RateGapRatio float64
-	ActualBps    uint32
-	ExpectedBps  uint32
-	ShadowBps    uint32
-	DeliveredBps uint32
+type qosPendingBytes struct {
+	originalDataBytes uint64
+	expectedBytes     uint64
+	repairBytes       uint64
+	lateDataBytes     uint64
 }
 
-type qosEMAState struct {
+type qosRates struct {
+	originalDataBps uint32
+	expectedBps     uint32
+	repairBps       uint32
+	lateDataBps     uint32
+}
+
+type qosDelivered struct {
+	bps uint32
+	at  time.Time
+}
+
+type qosFECHealth struct {
+	lossRatio       float64
+	lossInitialized bool
+	lateRatio       float64
+	lateInitialized bool
+	dirty           bool
+	repairCount     uint8
+	highRepairSince time.Time
+}
+
+type qosDecisionWindow struct {
+	values [qosDecisionSamples]float64
+	count  int
+	next   int
+}
+
+type qosGroup struct {
 	dataKind         transport.Kind
 	repairKind       transport.Kind
-	initialized      bool
-	sampleCount      uint64
-	sampleTotal      uint64
-	actualBpsEMA     float64
-	expectedBpsEMA   float64
-	repairBpsEMA     float64
-	profileDataEMA   float64
-	profileRepairEMA float64
-	pidCorrection    float64
-	pidIntegral      float64
-	pidPrevError     float64
+	repairCount      uint8
+	directionTrusted bool
+	repairTrusted    bool
 }
 
-type qosActiveEvidence struct {
-	lastEvidence time.Time
-	status       qosStatus
+type qosPrimaryHint struct {
+	primary         transport.Kind
+	udpLimited      bool
+	udpDeliveredBps uint32
+	tcpDeliveredBps uint32
+	capBps          uint32
+	at              time.Time
 }
 
 func newQoSEstimator(cfg qosConfig, emit func(qosStatus)) *qosEstimator {
-	if cfg.Sustain <= 0 {
-		cfg.Sustain = defaultQoSSustain
+	if cfg.Tick <= 0 {
+		cfg.Tick = defaultQoSTick
 	}
-	if cfg.SampleFloor == 0 {
-		cfg.SampleFloor = defaultQoSSampleFloor
+
+	e := &qosEstimator{
+		cfg:            cfg,
+		emit:           emit,
+		currentPrimary: transport.KindUDP,
+		currentRole:    qosRoleData,
+		groups:         make(map[rxGroupKey]qosGroup),
+		lateSeen:       newDataIDDedupe(0),
+		recoveredSeen:  newDataIDDedupe(0),
+		done:           make(chan struct{}),
 	}
-	if cfg.Refresh <= 0 {
-		cfg.Refresh = defaultQoSRefresh
+	e.udpTCPData = newQoSDirection(transport.KindUDP, transport.KindTCP, qosRoleData)
+	e.udpTCPRepair = newQoSDirection(transport.KindUDP, transport.KindTCP, qosRoleRepair)
+	e.tcpUDPData = newQoSDirection(transport.KindTCP, transport.KindUDP, qosRoleData)
+	e.tcpUDPRepair = newQoSDirection(transport.KindTCP, transport.KindUDP, qosRoleRepair)
+
+	if cfg.AutoStart {
+		go e.run()
 	}
-	return &qosEstimator{
-		cfg:          cfg,
-		emit:         emit,
-		limitedSince: make(map[transport.Kind]time.Time),
-		lastEmit:     make(map[transport.Kind]map[uint8]time.Time),
-		ema:          make(map[qosDirectionKey]*qosEMAState),
-		active:       make(map[transport.Kind]map[uint8]qosActiveEvidence),
+	return e
+}
+
+func (e *qosEstimator) observeOriginalData(dataKind transport.Kind, dataBytes int, at time.Time) {
+	if dataBytes <= 0 || !knownQoSTransport(dataKind) {
+		return
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return
+	}
+	if direction := e.currentDirectionForLocked(dataKind, otherQoSTransport(dataKind)); direction != nil {
+		direction.addOriginal(uint64(dataBytes), normalizeQoSTime(at))
 	}
 }
 
-func (e *qosEstimator) Observe(sample qosSample) {
-	if !qosKnownKind(sample.DataKind) {
+func (e *qosEstimator) observePrimaryHint(hint qosPrimaryHint) []qosStatus {
+	if !knownQoSTransport(hint.primary) {
+		return nil
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return nil
+	}
+
+	before := e.snapshotLocked()
+	now := normalizeQoSTime(hint.at)
+	if hint.udpLimited {
+		e.udpTCPData.dataLimited = true
+		e.udpTCPData.dataDelivered = qosDelivered{bps: hint.udpDeliveredBps, at: now}
+		e.tcpUDPData.dataDelivered = qosDelivered{bps: hint.tcpDeliveredBps, at: now}
+		after := e.snapshotLocked()
+		primarySwitched := e.switchPrimaryLocked(after)
+		if hint.capBps > 0 {
+			direction := e.directionLocked(transport.KindTCP, transport.KindUDP, qosRoleRepair)
+			if direction != nil {
+				direction.repairLoadCapBps = hint.capBps
+			}
+		}
+		if primarySwitched {
+			after = e.snapshotLocked()
+		}
+		if primarySwitched || shouldEmitQoSStatus(before, after, false) {
+			after.primarySwitched = primarySwitched
+			return []qosStatus{after}
+		}
+		return nil
+	}
+
+	if hint.primary == e.currentPrimary {
+		return nil
+	}
+
+	oldPrimary := e.currentPrimary
+	e.directionLocked(hint.primary, otherQoSTransport(hint.primary), qosRoleData).resetRateState()
+	e.currentPrimary = hint.primary
+	e.currentRole = qosRoleData
+	e.currentDirectionLocked().fecHealth = qosFECHealth{repairCount: 1}
+
+	if debuglog.Enabled() {
+		debuglog.Printf("recv/qos", "primary_hint session=%d lane=%d from=%s to=%s role=%s",
+			e.cfg.SessionID, e.cfg.LaneID, kindMetricLabel(oldPrimary), kindMetricLabel(hint.primary), qosRoleLabel(qosRoleData))
+	}
+	return nil
+}
+
+func newQoSDirection(dataKind, repairKind transport.Kind, role qosRole) qosDirection {
+	return qosDirection{
+		dataKind:   dataKind,
+		repairKind: repairKind,
+		role:       role,
+		fecHealth:  qosFECHealth{repairCount: 1},
+	}
+}
+
+func (e *qosEstimator) close() {
+	e.stopOnce.Do(func() {
+		close(e.done)
+		e.mu.Lock()
+		e.closed = true
+		e.mu.Unlock()
+	})
+}
+
+func (e *qosEstimator) run() {
+	ticker := time.NewTicker(e.cfg.Tick)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case now := <-ticker.C:
+			e.emitStatuses(e.tick(now))
+		case <-e.done:
+			return
+		}
+	}
+}
+
+func (e *qosEstimator) observeLateData(dataID uint32, dataKind transport.Kind, dataBytes int, at time.Time) {
+	if dataBytes <= 0 || !knownQoSTransport(dataKind) {
 		return
 	}
-	if !qosKnownKind(sample.RepairKind) || sample.DataKind == sample.RepairKind {
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
 		return
 	}
-	estimate, ok := e.updateEstimate(sample)
+	if !e.recoveredSeen.seen(dataID) || !e.lateSeen.mark(dataID) {
+		return
+	}
+	if direction := e.currentDirectionForLocked(dataKind, otherQoSTransport(dataKind)); direction != nil {
+		direction.addLate(uint64(dataBytes), normalizeQoSTime(at))
+	}
+}
+
+func (e *qosEstimator) observeRepairBytes(repairKind transport.Kind, repairBytes int, at time.Time) {
+	if repairBytes <= 0 || !knownQoSTransport(repairKind) {
+		return
+	}
+
+	dataKind := otherQoSTransport(repairKind)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return
+	}
+	if direction := e.currentDirectionForLocked(dataKind, repairKind); direction != nil {
+		direction.addRepair(uint64(repairBytes), normalizeQoSTime(at))
+	}
+}
+
+func (e *qosEstimator) observeRepairGroup(group rxGroupKey, repairKind transport.Kind, repairCount uint8) {
+	if !knownQoSTransport(repairKind) {
+		return
+	}
+	if repairCount == 0 {
+		repairCount = 1
+	}
+
+	dataKind := otherQoSTransport(repairKind)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return
+	}
+
+	g := e.groups[group]
+	if g.dataKind == 0 && g.repairKind == 0 {
+		g = qosGroup{
+			dataKind:         dataKind,
+			repairKind:       repairKind,
+			repairCount:      repairCount,
+			directionTrusted: true,
+			repairTrusted:    true,
+		}
+	} else {
+		if g.dataKind != dataKind || g.repairKind != repairKind {
+			g.directionTrusted = false
+		}
+		if g.repairCount != repairCount {
+			g.repairTrusted = false
+		}
+	}
+	e.groups[group] = g
+}
+
+func (e *qosEstimator) observeRecoveredData(dataID uint32) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return
+	}
+	e.recoveredSeen.mark(dataID)
+}
+
+func (e *qosEstimator) observeGroupDone(done rxGroupDone, at time.Time) {
+	if done.dataExpected == 0 {
+		return
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return
+	}
+	e.finishGroupLocked(done, normalizeQoSTime(at))
+}
+
+func (e *qosEstimator) finishGroupLocked(done rxGroupDone, at time.Time) {
+	group := e.groups[done.group]
+	delete(e.groups, done.group)
+
+	if !group.directionTrusted {
+		return
+	}
+	direction := e.currentDirectionForLocked(group.dataKind, group.repairKind)
+	if direction == nil {
+		return
+	}
+
+	direction.addLossHealth(done.dataArrived, done.dataExpected, at)
+	if done.expired {
+		return
+	}
+	if repairScale, ok := group.repairScale(done); ok {
+		direction.updateRepairScale(repairScale)
+	}
+	direction.addExpected(done.expectedBytes, at)
+}
+
+func (e *qosEstimator) tick(now time.Time) []qosStatus {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return nil
+	}
+
+	direction := e.currentDirectionLocked()
+	now = normalizeQoSTime(now)
+	rates, ok := direction.flush(now, e.cfg.Tick)
 	if !ok {
-		return
+		return nil
 	}
-	for _, status := range e.evaluate(estimate) {
-		if e.emit != nil {
-			e.emit(status)
+
+	before := e.snapshotLocked()
+	direction.dataDelivered = qosDelivered{bps: rates.originalDataBps, at: now}
+	direction.repairDelivered = qosDelivered{bps: rates.repairBps, at: now}
+	direction.addLateHealth(rates)
+	e.recordRates(direction, rates)
+	e.evaluateRatesLocked(direction, rates)
+	repairChanged := direction.updateFECHealth(now)
+
+	after := e.snapshotLocked()
+	primarySwitched := e.switchPrimaryLocked(after)
+	if primarySwitched {
+		after = e.snapshotLocked()
+	}
+	if !primarySwitched && !shouldEmitQoSStatus(before, after, repairChanged) {
+		return nil
+	}
+	after.primarySwitched = primarySwitched
+	return []qosStatus{after}
+}
+
+func (e *qosEstimator) evaluateRatesLocked(direction *qosDirection, rates qosRates) {
+	switch direction.role {
+	case qosRoleData:
+		if rates.expectedBps == 0 {
+			return
+		}
+		actualDataBps := clampUint32(float64(rates.originalDataBps) + float64(rates.lateDataBps))
+		gap := rateGapRatio(rates.expectedBps, actualDataBps)
+		avgGap, ready := direction.dataDecision.add(gap)
+		if !ready {
+			return
+		}
+		if avgGap >= qosRateGapLimited {
+			if !direction.dataLimited {
+				e.recordEvent("limited_active", direction.dataKind, direction)
+			}
+			direction.dataLimited = true
+			return
+		}
+		if avgGap <= qosRateGapClear {
+			if e.clearLimitedLocked(direction.dataKind) {
+				e.recordEvent("limited_clear", direction.dataKind, direction)
+			}
+		}
+	case qosRoleRepair:
+		if rates.expectedBps == 0 {
+			return
+		}
+		if e.evaluateTCPHighPressureLocked(direction, rates) {
+			return
+		}
+		if !direction.repairScaleInitialized {
+			return
+		}
+		expectedRepairBps := clampUint32(float64(rates.expectedBps) * direction.repairScale)
+		deliveryGap := rateGapRatio(expectedRepairBps, rates.repairBps)
+		loadReferenceBps := rates.expectedBps
+		loadGapClear := qosRepairLoadGapClear
+		if direction.repairLoadCapBps > 0 {
+			loadReferenceBps = direction.repairLoadCapBps
+			loadGapClear = qosRepairCapGapClear
+		}
+		loadGap := rateGapRatio(loadReferenceBps, rates.repairBps)
+		avgDeliveryGap, deliveryReady := direction.repairDecision.add(deliveryGap)
+		avgLoadGap, loadReady := direction.repairLoad.add(loadGap)
+		if !deliveryReady || !loadReady {
+			return
+		}
+		if avgDeliveryGap >= qosRateGapLimited {
+			if !direction.repairLimited {
+				e.recordEvent("limited_active", direction.repairKind, direction)
+			}
+			direction.repairLimited = true
+			return
+		}
+		loadRecovered := avgLoadGap <= loadGapClear
+		if direction.repairLoadCapBps == 0 && rates.repairBps >= rates.expectedBps {
+			loadRecovered = true
+		}
+		if avgDeliveryGap <= qosRateGapClear &&
+			loadRecovered &&
+			e.clearLimitedLocked(direction.repairKind) {
+			e.recordEvent("limited_clear", direction.repairKind, direction)
 		}
 	}
 }
 
-func (e *qosEstimator) updateEstimate(sample qosSample) (qosEstimate, bool) {
-	now := sample.At
-	if now.IsZero() {
-		now = time.Now()
-		sample.At = now
-	}
-	key := qosDirectionKey{dataKind: sample.DataKind, repairKind: sample.RepairKind}
-	state := e.ema[key]
-	if state == nil {
-		state = &qosEMAState{dataKind: sample.DataKind, repairKind: sample.RepairKind}
-		e.ema[key] = state
-	}
-	state.observe(sample)
-	if state.sampleTotal < e.cfg.SampleFloor {
-		e.recordEvent("below_floor", sample.DataKind, 0)
-		return qosEstimate{}, false
-	}
-	estimate := state.estimate(now)
-	e.recordSampleMetrics(estimate)
-	return estimate, true
-}
-
-func (e *qosEstimator) evaluate(sample qosEstimate) []qosStatus {
-	var out []qosStatus
-	now := sample.At
-	if now.IsZero() {
-		now = time.Now()
-	}
-	if status, ok := e.evaluateLimited(sample, now); ok {
-		if e.shouldEmit(status.Kind, status.Reason, now) {
-			e.recordEvent("limited_active", status.Kind, status.Reason)
-			out = append(out, status)
-		}
-	}
-	if status, ok := e.evaluateShadowLimited(sample, now); ok {
-		if e.shouldEmit(status.Kind, status.Reason, now) {
-			e.recordEvent("limited_active", status.Kind, status.Reason)
-			out = append(out, status)
-		}
-	}
-	out = append(out, e.refreshActive(now)...)
-	return out
-}
-
-func (e *qosEstimator) evaluateLimited(sample qosEstimate, now time.Time) (qosStatus, bool) {
-	if sample.SampleTotal == 0 {
-		delete(e.limitedSince, sample.DataKind)
-		return qosStatus{}, false
-	}
-	if sample.RateGapRatio < qosRateGapExit || !sample.hasShadowAdvantage(qosShadowAdvantageExit) {
-		_, pending := e.limitedSince[sample.DataKind]
-		delete(e.limitedSince, sample.DataKind)
-		cleared := e.clearActive(sample.DataKind, protocol.LinkStatusReasonLimited)
-		if pending || cleared {
-			e.recordEvent("limited_clear", sample.DataKind, protocol.LinkStatusReasonLimited)
-		}
-		return qosStatus{}, false
-	}
-	if sample.RateGapRatio <= qosRateGapEnter {
-		delete(e.limitedSince, sample.DataKind)
-		return qosStatus{}, false
-	}
-	if !sample.hasShadowAdvantage(qosShadowAdvantageEnter) {
-		delete(e.limitedSince, sample.DataKind)
-		return qosStatus{}, false
-	}
-	ready, first := e.sustained(e.limitedSince, sample.DataKind, now)
-	if !ready {
-		if first {
-			e.recordEvent("limited_pending", sample.DataKind, protocol.LinkStatusReasonLimited)
-		}
-		return qosStatus{}, false
-	}
-	status := qosStatus{
-		Kind:         sample.DataKind,
-		Reason:       protocol.LinkStatusReasonLimited,
-		DeliveredBps: sample.DeliveredBps,
-	}
-	e.setActive(status, now)
-	return status, true
-}
-
-func (e *qosEstimator) evaluateShadowLimited(sample qosEstimate, now time.Time) (qosStatus, bool) {
-	if sample.SampleTotal == 0 || sample.RateGapRatio >= qosRateGapExit || sample.ShadowBps == 0 {
-		delete(e.limitedSince, sample.RepairKind)
-		return qosStatus{}, false
-	}
-	if sample.shadowDeficitRatio() <= qosRateGapEnter {
-		delete(e.limitedSince, sample.RepairKind)
-		return qosStatus{}, false
-	}
-	ready, first := e.sustained(e.limitedSince, sample.RepairKind, now)
-	if !ready {
-		if first {
-			e.recordEvent("limited_pending", sample.RepairKind, protocol.LinkStatusReasonLimited)
-		}
-		return qosStatus{}, false
-	}
-	status := qosStatus{
-		Kind:         sample.RepairKind,
-		Reason:       protocol.LinkStatusReasonLimited,
-		DeliveredBps: sample.ShadowBps,
-	}
-	e.setActive(status, now)
-	return status, true
-}
-
-func (e *qosEstimator) setActive(status qosStatus, now time.Time) {
-	byReason := e.active[status.Kind]
-	if byReason == nil {
-		byReason = make(map[uint8]qosActiveEvidence)
-		e.active[status.Kind] = byReason
-	}
-	byReason[status.Reason] = qosActiveEvidence{lastEvidence: now, status: status}
-}
-
-func (e *qosEstimator) clearActive(kind transport.Kind, reason uint8) bool {
-	byReason := e.active[kind]
-	if byReason == nil {
+func (e *qosEstimator) evaluateTCPHighPressureLocked(direction *qosDirection, rates qosRates) bool {
+	if direction.dataKind != transport.KindTCP || direction.repairKind != transport.KindUDP {
 		return false
 	}
-	_, existed := byReason[reason]
-	delete(byReason, reason)
-	if len(byReason) == 0 {
-		delete(e.active, kind)
-	}
-	return existed
-}
 
-func (e *qosEstimator) refreshActive(now time.Time) []qosStatus {
-	var out []qosStatus
-	for kind, byReason := range e.active {
-		for reason, evidence := range byReason {
-			if now.Sub(evidence.lastEvidence) > e.cfg.Sustain {
-				delete(byReason, reason)
-				continue
-			}
-			if !e.shouldEmit(kind, reason, now) {
-				continue
-			}
-			e.recordEvent(activeEventName(reason), kind, reason)
-			out = append(out, evidence.status)
-		}
-		if len(byReason) == 0 {
-			delete(e.active, kind)
-		}
+	lateGap := 0.0
+	if direction.fecHealth.repairCount >= maxFECSourceSpan &&
+		rates.expectedBps >= qosTCPLateGapMinExpectedBps &&
+		float64(rates.repairBps) >= float64(rates.expectedBps)*qosTCPLateGapMinRepairRatio {
+		lateGap = float64(rates.lateDataBps) / float64(rates.expectedBps)
 	}
-	return out
-}
-
-func activeEventName(reason uint8) string {
-	return "limited_active"
-}
-
-func (e *qosEstimator) shouldEmit(kind transport.Kind, reason uint8, now time.Time) bool {
-	byReason := e.lastEmit[kind]
-	if byReason == nil {
-		byReason = make(map[uint8]time.Time)
-		e.lastEmit[kind] = byReason
-	}
-	last := byReason[reason]
-	if !last.IsZero() && now.Sub(last) < e.cfg.Refresh {
+	avgLateGap, ready := direction.tcpLateData.add(lateGap)
+	if !ready || avgLateGap < qosTCPLateGapLimited {
 		return false
 	}
-	byReason[reason] = now
+
+	if !direction.dataLimited {
+		e.recordEvent("limited_active", direction.dataKind, direction)
+	}
+	direction.dataLimited = true
+	if e.clearLimitedLocked(direction.repairKind) {
+		e.recordEvent("limited_clear", direction.repairKind, direction)
+	}
 	return true
 }
 
-func (e *qosEstimator) sustained(m map[transport.Kind]time.Time, kind transport.Kind, now time.Time) (ready bool, first bool) {
-	since, ok := m[kind]
-	if !ok {
-		m[kind] = now
-		return false, true
+func (e *qosEstimator) clearLimitedLocked(kind transport.Kind) bool {
+	if kind == transport.KindUDP {
+		return e.clearUDPLimitedLocked()
 	}
-	return now.Sub(since) >= e.cfg.Sustain, false
+	return e.clearTCPLimitedLocked()
 }
 
-func deliveredBps(bytes uint64, duration time.Duration) uint32 {
-	if duration <= 0 {
-		return 0
+func (e *qosEstimator) clearUDPLimitedLocked() bool {
+	changed := false
+	if e.udpTCPData.dataLimited {
+		e.udpTCPData.dataLimited = false
+		changed = true
 	}
-	bps := bytes * 8 * uint64(time.Second) / uint64(duration)
-	if bps > math.MaxUint32 {
-		return math.MaxUint32
+	if e.udpTCPRepair.dataLimited {
+		e.udpTCPRepair.dataLimited = false
+		changed = true
 	}
-	return uint32(bps)
+	if e.tcpUDPData.repairLimited {
+		e.tcpUDPData.repairLimited = false
+		changed = true
+	}
+	if e.tcpUDPRepair.repairLimited {
+		e.tcpUDPRepair.repairLimited = false
+		changed = true
+	}
+	return changed
 }
 
-func (e *qosEstimator) resetTransientState() {
-	clear(e.limitedSince)
-	clear(e.ema)
-	clear(e.active)
+func (e *qosEstimator) clearTCPLimitedLocked() bool {
+	changed := false
+	if e.udpTCPData.repairLimited {
+		e.udpTCPData.repairLimited = false
+		changed = true
+	}
+	if e.udpTCPRepair.repairLimited {
+		e.udpTCPRepair.repairLimited = false
+		changed = true
+	}
+	if e.tcpUDPData.dataLimited {
+		e.tcpUDPData.dataLimited = false
+		changed = true
+	}
+	if e.tcpUDPRepair.dataLimited {
+		e.tcpUDPRepair.dataLimited = false
+		changed = true
+	}
+	return changed
 }
 
-func (e *qosEstimator) hasPendingState() bool {
-	return len(e.limitedSince) > 0
+func (e *qosEstimator) switchPrimaryLocked(status qosStatus) bool {
+	nextPrimary := preferredPrimaryFromQoS(status)
+	if nextPrimary == e.currentPrimary {
+		return false
+	}
+
+	oldPrimary := e.currentPrimary
+	nextRole := qosRoleData
+	if e.limitedLocked(oldPrimary) {
+		nextRole = qosRoleRepair
+	}
+
+	e.directionLocked(nextPrimary, oldPrimary, qosRoleData).resetRateState()
+	if nextRole == qosRoleRepair {
+		e.directionLocked(nextPrimary, oldPrimary, qosRoleRepair).resetRateState()
+	}
+
+	e.currentPrimary = nextPrimary
+	e.currentRole = nextRole
+	e.currentDirectionLocked().fecHealth = qosFECHealth{repairCount: 1}
+
+	if debuglog.Enabled() {
+		debuglog.Printf("recv/qos", "primary_switch session=%d lane=%d from=%s to=%s role=%s",
+			e.cfg.SessionID, e.cfg.LaneID, kindMetricLabel(oldPrimary), kindMetricLabel(nextPrimary), qosRoleLabel(nextRole))
+	}
+	return true
 }
 
-func qosKnownKind(kind transport.Kind) bool {
+func (e *qosEstimator) currentDirectionForLocked(dataKind, repairKind transport.Kind) *qosDirection {
+	if dataKind != e.currentPrimary || repairKind != otherQoSTransport(e.currentPrimary) {
+		return nil
+	}
+	return e.currentDirectionLocked()
+}
+
+func (e *qosEstimator) currentDirectionLocked() *qosDirection {
+	if e.currentPrimary == transport.KindUDP {
+		if e.currentRole == qosRoleRepair {
+			return &e.udpTCPRepair
+		}
+		return &e.udpTCPData
+	}
+	if e.currentRole == qosRoleRepair {
+		return &e.tcpUDPRepair
+	}
+	return &e.tcpUDPData
+}
+
+func (e *qosEstimator) directionLocked(dataKind, repairKind transport.Kind, role qosRole) *qosDirection {
+	switch {
+	case dataKind == transport.KindUDP && repairKind == transport.KindTCP && role == qosRoleData:
+		return &e.udpTCPData
+	case dataKind == transport.KindUDP && repairKind == transport.KindTCP && role == qosRoleRepair:
+		return &e.udpTCPRepair
+	case dataKind == transport.KindTCP && repairKind == transport.KindUDP && role == qosRoleData:
+		return &e.tcpUDPData
+	case dataKind == transport.KindTCP && repairKind == transport.KindUDP && role == qosRoleRepair:
+		return &e.tcpUDPRepair
+	default:
+		return nil
+	}
+}
+
+func (e *qosEstimator) limitedLocked(kind transport.Kind) bool {
+	if kind == transport.KindUDP {
+		return e.udpLimitedLocked()
+	}
+	return e.tcpLimitedLocked()
+}
+
+func (e *qosEstimator) udpLimitedLocked() bool {
+	return e.udpTCPData.dataLimited ||
+		e.udpTCPRepair.dataLimited ||
+		e.tcpUDPData.repairLimited ||
+		e.tcpUDPRepair.repairLimited
+}
+
+func (e *qosEstimator) tcpLimitedLocked() bool {
+	return e.udpTCPData.repairLimited ||
+		e.udpTCPRepair.repairLimited ||
+		e.tcpUDPData.dataLimited ||
+		e.tcpUDPRepair.dataLimited
+}
+
+func (e *qosEstimator) snapshotStatus() qosStatus {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.snapshotLocked()
+}
+
+func (e *qosEstimator) snapshotLocked() qosStatus {
+	return qosStatus{
+		UDPLimited:      e.udpLimitedLocked(),
+		TCPLimited:      e.tcpLimitedLocked(),
+		RepairCount:     e.currentDirectionLocked().fecHealth.repairCount,
+		UDPDeliveredBps: e.udpDeliveredBpsLocked(),
+		TCPDeliveredBps: e.tcpDeliveredBpsLocked(),
+	}
+}
+
+func (e *qosEstimator) udpDeliveredBpsLocked() uint32 {
+	latest := qosDelivered{}
+	latest = newerDelivered(latest, e.udpTCPData.dataDelivered)
+	latest = newerDelivered(latest, e.udpTCPRepair.dataDelivered)
+	latest = newerDelivered(latest, e.tcpUDPData.repairDelivered)
+	latest = newerDelivered(latest, e.tcpUDPRepair.repairDelivered)
+	return latest.bps
+}
+
+func (e *qosEstimator) tcpDeliveredBpsLocked() uint32 {
+	latest := qosDelivered{}
+	latest = newerDelivered(latest, e.udpTCPData.repairDelivered)
+	latest = newerDelivered(latest, e.udpTCPRepair.repairDelivered)
+	latest = newerDelivered(latest, e.tcpUDPData.dataDelivered)
+	latest = newerDelivered(latest, e.tcpUDPRepair.dataDelivered)
+	return latest.bps
+}
+
+func (e *qosEstimator) emitStatuses(statuses []qosStatus) {
+	if e.emit == nil {
+		return
+	}
+	for _, status := range statuses {
+		e.emit(status)
+	}
+}
+
+func (d *qosDirection) addOriginal(bytes uint64, at time.Time) {
+	d.start(at)
+	d.pending.originalDataBytes += bytes
+}
+
+func (d *qosDirection) addExpected(bytes uint64, at time.Time) {
+	if bytes == 0 {
+		return
+	}
+	d.start(at)
+	d.pending.expectedBytes += bytes
+}
+
+func (d *qosDirection) addRepair(bytes uint64, at time.Time) {
+	d.start(at)
+	d.pending.repairBytes += bytes
+}
+
+func (d *qosDirection) updateRepairScale(scale float64) {
+	if scale <= 0 {
+		return
+	}
+	if !d.repairScaleInitialized {
+		d.repairScale = scale
+		d.repairScaleInitialized = true
+		return
+	}
+	d.repairScale = emaUpdate(d.repairScale, scale, defaultRepairScaleAlpha)
+}
+
+func (d *qosDirection) addLate(bytes uint64, at time.Time) {
+	d.start(at)
+	d.pending.lateDataBytes += bytes
+}
+
+func (d *qosDirection) addLossHealth(arrived, expected uint8, at time.Time) {
+	d.start(at)
+	if expected == 0 {
+		return
+	}
+	lossRatio := 0.0
+	if arrived < expected {
+		lossRatio = float64(expected-arrived) / float64(expected)
+	}
+	if !d.fecHealth.lossInitialized {
+		d.fecHealth.lossInitialized = true
+		d.fecHealth.lossRatio = lossRatio
+	} else if lossRatio > d.fecHealth.lossRatio {
+		d.fecHealth.lossRatio = emaUpdate(d.fecHealth.lossRatio, lossRatio, defaultFECLossAlpha)
+	} else {
+		d.fecHealth.lossRatio = emaUpdate(d.fecHealth.lossRatio, lossRatio, defaultFECLossBeta)
+	}
+	d.fecHealth.dirty = true
+}
+
+func (d *qosDirection) addLateHealth(rates qosRates) {
+	if rates.expectedBps == 0 {
+		return
+	}
+	lateRatio := float64(rates.lateDataBps) / float64(rates.expectedBps)
+	if !d.fecHealth.lateInitialized {
+		d.fecHealth.lateInitialized = true
+		d.fecHealth.lateRatio = lateRatio
+	} else if lateRatio > d.fecHealth.lateRatio {
+		d.fecHealth.lateRatio = emaUpdate(d.fecHealth.lateRatio, lateRatio, defaultFECLateAlpha)
+	} else {
+		d.fecHealth.lateRatio = emaUpdate(d.fecHealth.lateRatio, lateRatio, defaultFECLateBeta)
+	}
+	d.fecHealth.dirty = true
+}
+
+func (d *qosDirection) start(at time.Time) {
+	if d.started {
+		return
+	}
+	d.started = true
+	d.lastTickAt = normalizeQoSTime(at)
+}
+
+func (d *qosDirection) flush(now time.Time, tick time.Duration) (qosRates, bool) {
+	if !d.started {
+		return qosRates{}, false
+	}
+	if now.Sub(d.lastTickAt) < tick {
+		return qosRates{}, false
+	}
+
+	duration := now.Sub(d.lastTickAt)
+	rates := qosRates{
+		originalDataBps: bytesPerSecond(d.pending.originalDataBytes, duration),
+		expectedBps:     bytesPerSecond(d.pending.expectedBytes, duration),
+		repairBps:       bytesPerSecond(d.pending.repairBytes, duration),
+		lateDataBps:     bytesPerSecond(d.pending.lateDataBytes, duration),
+	}
+	if debuglog.Enabled() {
+		debuglog.Printf("recv/qos_rate", "tick role=%s data=%s repair=%s duration_ms=%d original_data=%d expected=%d repair=%d late_data=%d original_data_bps=%d expected_bps=%d repair_bps=%d late_data_bps=%d",
+			qosRoleLabel(d.role), kindMetricLabel(d.dataKind), kindMetricLabel(d.repairKind),
+			duration.Milliseconds(),
+			d.pending.originalDataBytes, d.pending.expectedBytes, d.pending.repairBytes, d.pending.lateDataBytes,
+			rates.originalDataBps, rates.expectedBps, rates.repairBps, rates.lateDataBps)
+	}
+
+	d.lastTickAt = now
+	d.pending = qosPendingBytes{}
+	return rates, true
+}
+
+func (d *qosDirection) updateFECHealth(now time.Time) bool {
+	before := d.fecHealth.repairCount
+	if d.fecHealth.dirty {
+		d.fecHealth.dirty = false
+		lossRepairCount := repairCountForLossRatio(d.fecHealth.lossRatio)
+		lateRepairCount := repairCountForLateRatio(d.fecHealth.lateRatio)
+		if lateRepairCount > lossRepairCount {
+			d.fecHealth.repairCount = lateRepairCount
+		} else {
+			d.fecHealth.repairCount = lossRepairCount
+		}
+	}
+
+	if d.fecHealth.repairCount < maxFECSourceSpan {
+		d.fecHealth.highRepairSince = time.Time{}
+		return d.fecHealth.repairCount != before
+	}
+
+	now = normalizeQoSTime(now)
+	if d.fecHealth.highRepairSince.IsZero() {
+		d.fecHealth.highRepairSince = now
+		return d.fecHealth.repairCount != before
+	}
+	if now.Sub(d.fecHealth.highRepairSince) >= defaultFECHighDwell {
+		d.fecHealth = qosFECHealth{repairCount: 1}
+	}
+
+	return d.fecHealth.repairCount != before
+}
+
+func (d *qosDirection) resetRateState() {
+	d.started = false
+	d.lastTickAt = time.Time{}
+	d.pending = qosPendingBytes{}
+	d.repairScale = 0
+	d.repairScaleInitialized = false
+	d.repairLoadCapBps = 0
+	d.clearDecisions()
+}
+
+func (d *qosDirection) clearDecisions() {
+	d.dataDecision = qosDecisionWindow{}
+	d.repairDecision = qosDecisionWindow{}
+	d.repairLoad = qosDecisionWindow{}
+	d.tcpLateData = qosDecisionWindow{}
+}
+
+func (w *qosDecisionWindow) add(value float64) (float64, bool) {
+	w.values[w.next] = value
+	w.next = (w.next + 1) % qosDecisionSamples
+	if w.count < qosDecisionSamples {
+		w.count++
+	}
+	if w.count < qosDecisionSamples {
+		return 0, false
+	}
+
+	var sum float64
+	for i := 0; i < w.count; i++ {
+		sum += w.values[i]
+	}
+	return sum / float64(w.count), true
+}
+
+func newerDelivered(a, b qosDelivered) qosDelivered {
+	if !b.at.IsZero() && (a.at.IsZero() || b.at.After(a.at)) {
+		return b
+	}
+	return a
+}
+
+func preferredPrimaryFromQoS(status qosStatus) transport.Kind {
+	switch {
+	case status.UDPLimited && !status.TCPLimited:
+		return transport.KindTCP
+	case !status.UDPLimited && status.TCPLimited:
+		return transport.KindUDP
+	case status.UDPLimited && status.TCPLimited:
+		if status.TCPDeliveredBps > status.UDPDeliveredBps {
+			return transport.KindTCP
+		}
+		return transport.KindUDP
+	default:
+		return transport.KindUDP
+	}
+}
+
+func knownQoSTransport(kind transport.Kind) bool {
 	return kind == transport.KindUDP || kind == transport.KindTCP
 }
 
-func otherTransportKind(kind transport.Kind) transport.Kind {
+func otherQoSTransport(kind transport.Kind) transport.Kind {
 	if kind == transport.KindUDP {
 		return transport.KindTCP
 	}
 	return transport.KindUDP
 }
 
-func (s *qosEMAState) observe(sample qosSample) {
-	groupBytes := sample.DataBytes + sample.RecoveredBytes
-	s.sampleTotal += sample.DataExpected
-	s.sampleCount++
-	actualBps := float64(deliveredBps(sample.DataBytes, sample.Duration))
-	expectedBps := float64(deliveredBps(groupBytes, sample.Duration))
-	repairBps := float64(deliveredBps(sample.RepairBytes, sample.Duration))
-	profileData := float64(groupBytes)
-	profileFEC := float64(sample.RepairBytes)
-	if !s.initialized {
-		s.actualBpsEMA = actualBps
-		s.expectedBpsEMA = expectedBps
-		s.repairBpsEMA = repairBps
-		s.profileDataEMA = profileData
-		s.profileRepairEMA = profileFEC
-		s.initialized = true
-		s.trainPID()
-		return
+func normalizeQoSTime(t time.Time) time.Time {
+	if t.IsZero() {
+		return time.Now()
 	}
-	s.actualBpsEMA = emaUpdate(s.actualBpsEMA, actualBps, defaultQoSAlpha)
-	s.expectedBpsEMA = emaUpdate(s.expectedBpsEMA, expectedBps, defaultQoSAlpha)
-	s.repairBpsEMA = emaUpdate(s.repairBpsEMA, repairBps, defaultQoSAlpha)
-	s.profileDataEMA = emaUpdate(s.profileDataEMA, profileData, defaultQoSAlpha)
-	s.profileRepairEMA = emaUpdate(s.profileRepairEMA, profileFEC, defaultQoSAlpha)
-	s.trainPID()
+	return t
 }
 
-func (s *qosEMAState) estimate(at time.Time) qosEstimate {
-	actual := clampUint32Float(s.actualBpsEMA)
-	expected := clampUint32Float(s.expectedBpsEMA)
-	shadow := clampUint32Float(s.shadowBpsEstimate())
-	delivered := actual
-	return qosEstimate{
-		At:           at,
-		DataKind:     s.dataKind,
-		RepairKind:   s.repairKind,
-		SampleTotal:  s.sampleTotal,
-		RateGapRatio: rateGapRatio(s.expectedBpsEMA, s.actualBpsEMA),
-		ActualBps:    actual,
-		ExpectedBps:  expected,
-		ShadowBps:    shadow,
-		DeliveredBps: delivered,
-	}
-}
-
-func (s *qosEMAState) trainPID() {
-	referenceBps := s.expectedBpsEMA
-	if referenceBps <= 0 || s.shadowBaseBps() <= 0 {
-		return
-	}
-	if rateGapRatio(s.expectedBpsEMA, s.actualBpsEMA) > qosRateGapExit {
-		return
-	}
-	estimate := s.shadowBpsEstimate()
-	if s.sampleCount > qosShadowPIDWarmupSamples {
-		if shadowDeficitRatio(referenceBps, estimate) > qosShadowPIDGate {
-			return
-		}
-	}
-	err := referenceBps - estimate
-	s.pidIntegral = qosShadowPIDLeak*s.pidIntegral + err
-	derivative := err - s.pidPrevError
-	s.pidPrevError = err
-	s.pidCorrection = qosShadowPIDLeak*s.pidCorrection +
-		qosShadowPIDKp*err +
-		qosShadowPIDKi*s.pidIntegral +
-		qosShadowPIDKd*derivative
-}
-
-func (s *qosEMAState) shadowBaseBps() float64 {
-	if s.repairBpsEMA <= 0 || s.profileRepairEMA <= 0 {
+func bytesPerSecond(bytes uint64, duration time.Duration) uint32 {
+	if bytes == 0 || duration <= 0 {
 		return 0
 	}
-	return s.repairBpsEMA * s.profileDataEMA / s.profileRepairEMA
+	return clampUint32(float64(bytes) * 8 * float64(time.Second) / float64(duration))
 }
 
-func (s *qosEMAState) shadowBpsEstimate() float64 {
-	base := s.shadowBaseBps()
-	if base <= 0 {
+func rateGapRatio(expected, actual uint32) float64 {
+	if expected == 0 || actual >= expected {
 		return 0
 	}
-	shadow := base + s.pidCorrection
-	if shadow < 0 {
-		return 0
-	}
-	limit := 4 * s.repairBpsEMA
-	if limit > 0 && shadow > limit {
-		return limit
-	}
-	return shadow
+	return float64(expected-actual) / float64(expected)
 }
 
-func (s qosEstimate) hasShadowAdvantage(ratio float64) bool {
-	if s.ShadowBps == 0 {
-		return false
+func (g qosGroup) repairScale(done rxGroupDone) (float64, bool) {
+	if !g.repairTrusted || g.repairCount == 0 || done.expectedBytes == 0 || done.maxSourceBytes == 0 {
+		return 0, false
 	}
-	if s.ActualBps == 0 {
-		return true
-	}
-	return float64(s.ShadowBps) > float64(s.ActualBps)*ratio
-}
-
-func (s qosEstimate) shadowDeficitRatio() float64 {
-	reference := s.ExpectedBps
-	if reference == 0 {
-		reference = s.ActualBps
-	}
-	return shadowDeficitRatio(float64(reference), float64(s.ShadowBps))
-}
-
-func shadowDeficitRatio(actual, shadow float64) float64 {
-	if actual <= 0 || shadow >= actual {
-		return 0
-	}
-	return (actual - shadow) / actual
-}
-
-func rateGapRatio(expected, actual float64) float64 {
-	if expected <= 0 || actual >= expected {
-		return 0
-	}
-	return (expected - actual) / expected
+	return float64(done.maxSourceBytes) / float64(done.expectedBytes) * float64(g.repairCount), true
 }
 
 func emaUpdate(current, sample, alpha float64) float64 {
-	return current + alpha*(sample-current)
+	return current*(1-alpha) + sample*alpha
 }
 
-func clampUint32Float(v float64) uint32 {
-	if v < 0 {
+func repairCountForLossRatio(lossRatio float64) uint8 {
+	if lossRatio <= 0 {
+		return 1
+	}
+	repairCount := int(math.Ceil(lossRatio * maxFECSourceSpan))
+	if repairCount < 1 {
+		return 1
+	}
+	if repairCount > maxFECSourceSpan {
+		return maxFECSourceSpan
+	}
+	return uint8(repairCount)
+}
+
+func repairCountForLateRatio(lateRatio float64) uint8 {
+	switch {
+	case lateRatio <= 0.50:
+		return 1
+	case lateRatio <= 0.75:
+		return 2
+	case lateRatio <= 1:
+		return 3
+	default:
+		return maxFECSourceSpan
+	}
+}
+
+func clampUint32(v float64) uint32 {
+	if v <= 0 {
 		return 0
 	}
 	if v > math.MaxUint32 {
@@ -490,33 +969,53 @@ func clampUint32Float(v float64) uint32 {
 	return uint32(v)
 }
 
-func (e *qosEstimator) recordSampleMetrics(sample qosEstimate) {
-	if e == nil || e.cfg.SessionID == 0 {
-		return
+func shouldEmitQoSStatus(before, after qosStatus, repairChanged bool) bool {
+	if before.UDPLimited != after.UDPLimited || before.TCPLimited != after.TCPLimited {
+		return true
 	}
-	leg := kindMetricLabel(sample.DataKind)
-	labels := []metrics.Label{
-		metrics.LU64("session", e.cfg.SessionID),
-		metrics.LU8("lane", e.cfg.LaneID),
-		metrics.LStr("leg", leg),
+	if repairChanged || before.RepairCount != after.RepairCount {
+		return true
 	}
-	metrics.SetGauge(metrics.QoSDeliveredBps, float64(sample.DeliveredBps), labels...)
+	if before.UDPLimited && before.TCPLimited && preferredPrimaryFromQoS(before) != preferredPrimaryFromQoS(after) {
+		return true
+	}
+	return false
 }
 
-func (e *qosEstimator) recordEvent(event string, kind transport.Kind, reason uint8) {
-	if e == nil || e.cfg.SessionID == 0 {
+func qosRoleLabel(role qosRole) string {
+	switch role {
+	case qosRoleData:
+		return "data"
+	case qosRoleRepair:
+		return "repair"
+	default:
+		return "unknown"
+	}
+}
+
+func (e *qosEstimator) recordRates(direction *qosDirection, rates qosRates) {
+	if e.cfg.SessionID == 0 {
 		return
 	}
-	metrics.IncCounter(metrics.QoSEventsTotal,
-		metrics.LStr("event", event),
-		metrics.LU64("session", e.cfg.SessionID),
-		metrics.LU8("lane", e.cfg.LaneID),
-		metrics.LStr("leg", kindMetricLabel(kind)),
-		metrics.LU8("reason", reason),
+	metrics.SetGauge(metrics.QoSDeliveredBps, float64(rates.originalDataBps),
+		metrics.L("session", e.cfg.SessionID),
+		metrics.L("lane", e.cfg.LaneID),
+		metrics.LStr("leg", kindMetricLabel(direction.dataKind)),
 	)
-	switch event {
-	case "limited_active", "limited_clear":
-		eventlog.Printf("qos_state", "event=%s session=%d lane=%d leg=%s reason=%d",
-			event, e.cfg.SessionID, e.cfg.LaneID, kindMetricLabel(kind), reason)
+	metrics.SetGauge(metrics.QoSDeliveredBps, float64(rates.repairBps),
+		metrics.L("session", e.cfg.SessionID),
+		metrics.L("lane", e.cfg.LaneID),
+		metrics.LStr("leg", kindMetricLabel(direction.repairKind)),
+	)
+}
+
+func (e *qosEstimator) recordEvent(event string, kind transport.Kind, direction *qosDirection) {
+	if e.cfg.SessionID != 0 {
+		metrics.IncCounter(metrics.QoSEventsTotal,
+			metrics.LStr("event", event),
+			metrics.L("session", e.cfg.SessionID),
+			metrics.L("lane", e.cfg.LaneID),
+			metrics.LStr("leg", kindMetricLabel(kind)),
+		)
 	}
 }

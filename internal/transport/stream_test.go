@@ -5,9 +5,13 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/MeteorsLiu/multipath/internal/packetbuf"
 )
 
 func TestStreamLengthPrefixedReadWrite(t *testing.T) {
@@ -194,6 +198,62 @@ func TestStreamWriteCompletesPartialConnWrites(t *testing.T) {
 	}
 }
 
+func TestStreamWritePayloadBatchWritesLengthPrefixedFrames(t *testing.T) {
+	conn := &partialWriteConn{maxChunk: 3}
+	stream := NewStream(nil)
+	connID := stream.addConn(conn)
+
+	first := packetbufFromString("one")
+	second := packetbufFromString("two")
+	payloads := []Payload{
+		{Leg: LegRef{Kind: KindTCP, ConnID: connID}, Packet: first},
+		{Leg: LegRef{Kind: KindTCP, ConnID: connID}, Packet: second},
+	}
+
+	if err := stream.writePayloadBatch(context.Background(), connID, payloads); err != nil {
+		t.Fatalf("writePayloadBatch failed: %v", err)
+	}
+	if first.Payload != nil || second.Payload != nil {
+		t.Fatal("batch packets were not released")
+	}
+
+	got := conn.buf.Bytes()
+	want := []byte{0, 3, 'o', 'n', 'e', 0, 3, 't', 'w', 'o'}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("written bytes = %v, want %v", got, want)
+	}
+}
+
+func TestStreamStartsOneReadLoopPerConn(t *testing.T) {
+	conn := &blockingReadConn{
+		readStarted: make(chan struct{}, 2),
+		closed:      make(chan struct{}),
+	}
+	stream := NewStream(nil)
+	connID := stream.addConn(conn)
+	writer := eventChanWriter{events: make(chan Payload, 1)}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	stream.startReadLoop(ctx, connID, conn, writer)
+	stream.startReadLoop(ctx, connID, conn, writer)
+
+	select {
+	case <-conn.readStarted:
+	case <-time.After(time.Second):
+		t.Fatal("read loop did not start")
+	}
+
+	select {
+	case <-conn.readStarted:
+		t.Fatal("started duplicate read loop for same conn")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	_ = conn.Close()
+}
+
 func TestStreamWriteErrorClosesConn(t *testing.T) {
 	conn := &errorWriteConn{err: errors.New("write failed")}
 	stream := NewStream(nil)
@@ -207,6 +267,12 @@ func TestStreamWriteErrorClosesConn(t *testing.T) {
 	}
 }
 
+func packetbufFromString(value string) *packetbuf.Packet {
+	packet := packetbuf.Acquire(len(value))
+	copy(packet.Payload, value)
+	return packet
+}
+
 type partialWriteConn struct {
 	net.Conn
 	buf      bytes.Buffer
@@ -217,6 +283,13 @@ type errorWriteConn struct {
 	net.Conn
 	err    error
 	closed bool
+}
+
+type blockingReadConn struct {
+	net.Conn
+	readStarted chan struct{}
+	closed      chan struct{}
+	closeOnce   sync.Once
 }
 
 type legFailureHandlerFunc func(context.Context, LegRef, error)
@@ -243,5 +316,21 @@ func (c *errorWriteConn) Write(payload []byte) (int, error) {
 
 func (c *errorWriteConn) Close() error {
 	c.closed = true
+	return nil
+}
+
+func (c *blockingReadConn) Read([]byte) (int, error) {
+	select {
+	case c.readStarted <- struct{}{}:
+	default:
+	}
+	<-c.closed
+	return 0, io.EOF
+}
+
+func (c *blockingReadConn) Close() error {
+	c.closeOnce.Do(func() {
+		close(c.closed)
+	})
 	return nil
 }

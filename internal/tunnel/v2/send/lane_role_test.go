@@ -3,7 +3,6 @@ package send
 import (
 	"context"
 	"testing"
-	"time"
 
 	"github.com/MeteorsLiu/multipath/internal/packetbuf"
 	"github.com/MeteorsLiu/multipath/internal/protocol"
@@ -87,7 +86,7 @@ func TestLaneQoSOverridesSelector(t *testing.T) {
 	l := newLaneRuntime(1, 100)
 	bindBoth(l)
 
-	laneQoSInput{lane: l}.OnQoS(transport.KindUDP, protocol.LinkStatusReasonLimited, 2_000_000, time.Now())
+	laneQoSInput{lane: l}.OnQoSStatus(true, 2_000_000, false, 8_000_000, 1)
 
 	if got := l.primaryTransport(); got.Kind != transport.KindTCP {
 		t.Fatalf("primary kind = %v, want TCP after UDP QoS", got.Kind)
@@ -102,7 +101,7 @@ func TestLaneQoSSelectionWaitsForBandwidthGate(t *testing.T) {
 	bindBoth(l)
 
 	l.leg.setPreferTCP(true)
-	laneQoSInput{lane: l}.OnQoS(transport.KindTCP, protocol.LinkStatusReasonLimited, 2_000_000, time.Now())
+	laneQoSInput{lane: l}.OnQoSStatus(false, 8_000_000, true, 2_000_000, 1)
 
 	if got := l.primaryTransportWithQoS(false); got.Kind != transport.KindTCP {
 		t.Fatalf("primary kind with QoS gated = %v, want TCP from BW PreferTCP", got.Kind)
@@ -116,7 +115,7 @@ func TestLaneQoSSeenDisablesBandwidthPreferTCP(t *testing.T) {
 	gated := newLaneRuntime(1, 100)
 	bindBoth(gated)
 	gated.leg.setPreferTCP(true)
-	laneQoSInput{lane: gated}.OnQoS(transport.KindUDP, protocol.LinkStatusReasonLimited, 2_000_000, time.Now().Add(-301*time.Second))
+	laneQoSInput{lane: gated}.OnQoSStatus(false, 0, false, 0, 1)
 	if got := gated.primaryTransportWithQoS(false); got.Kind != transport.KindTCP {
 		t.Fatalf("primary kind with QoS gated = %v, want TCP from BW PreferTCP", got.Kind)
 	}
@@ -124,9 +123,37 @@ func TestLaneQoSSeenDisablesBandwidthPreferTCP(t *testing.T) {
 	enabled := newLaneRuntime(1, 100)
 	bindBoth(enabled)
 	enabled.leg.setPreferTCP(true)
-	laneQoSInput{lane: enabled}.OnQoS(transport.KindUDP, protocol.LinkStatusReasonLimited, 2_000_000, time.Now().Add(-301*time.Second))
+	laneQoSInput{lane: enabled}.OnQoSStatus(false, 0, false, 0, 1)
 	if got := enabled.primaryTransportWithQoS(true); got.Kind != transport.KindUDP {
 		t.Fatalf("primary kind after QoS evidence = %v, want UDP with BW PreferTCP suppressed", got.Kind)
+	}
+}
+
+func TestLaneQoSInputUpdatesFECRepairCount(t *testing.T) {
+	l := newLaneRuntime(1, 100)
+	if got := l.currentFECRepairCount(); got != 1 {
+		t.Fatalf("initial repair count = %d, want 1", got)
+	}
+
+	laneQoSInput{lane: l}.OnQoSStatus(false, 0, false, 0, 3)
+
+	if got := l.currentFECRepairCount(); got != 3 {
+		t.Fatalf("repair count = %d, want 3", got)
+	}
+}
+
+func TestLaneSetFECRejectsInvalidRepairCount(t *testing.T) {
+	l := newLaneRuntime(1, 100)
+	l.setFEC(4)
+
+	l.setFEC(0)
+	if got := l.currentFECRepairCount(); got != 4 {
+		t.Fatalf("repair count after 0 = %d, want 4", got)
+	}
+
+	l.setFEC(5)
+	if got := l.currentFECRepairCount(); got != 4 {
+		t.Fatalf("repair count after 5 = %d, want 4", got)
 	}
 }
 
@@ -257,4 +284,199 @@ func TestRepairUsesShadowLeg(t *testing.T) {
 	if repairOnTCP != 1 {
 		t.Errorf("REPAIR on TCP(shadow) = %d, want 1", repairOnTCP)
 	}
+}
+
+func TestRepairCountEmitsMultipleRepairFrames(t *testing.T) {
+	s := New()
+	s.EnableFEC()
+
+	const sessionID uint64 = 1001
+	s.sendStatesMu.Lock()
+	s.sendStates[sessionID] = &sendState{}
+	s.sendStatesMu.Unlock()
+
+	lane := newLaneRuntime(1, 100)
+	bindBoth(lane)
+	lane.setFEC(3)
+
+	packets := make([]*packetbuf.Packet, maxFECSourceSpan)
+	for i := range packets {
+		pkt := packetbuf.Acquire(24)
+		for j := range pkt.Payload {
+			pkt.Payload[j] = byte(i + j + 1)
+		}
+		packets[i] = pkt
+	}
+
+	group := txRepairGroup{
+		groupID:    44,
+		sourceSpan: maxFECSourceSpan,
+		packets:    packets,
+	}
+
+	s.sendRepair(context.Background(), sessionID, lane, group)
+
+	seenKeys := make(map[uint16]bool)
+	for i := 0; i < 3; i++ {
+		select {
+		case payload := <-s.Packets():
+			if payload.Leg.Kind != transport.KindTCP {
+				t.Fatalf("repair %d leg kind = %v, want TCP shadow", i, payload.Leg.Kind)
+			}
+			f, err := protocol.Decode(payload.Packet.Payload)
+			payload.Packet.Release()
+			if err != nil {
+				t.Fatalf("decode repair %d: %v", i, err)
+			}
+			if f.Type != protocol.TypeREPAIR {
+				t.Fatalf("frame %d type = %v, want REPAIR", i, f.Type)
+			}
+			body := f.Body.(protocol.RepairBody)
+			if body.GroupID != group.groupID {
+				t.Fatalf("repair %d group_id = %d, want %d", i, body.GroupID, group.groupID)
+			}
+			if body.SourceSpan != group.sourceSpan {
+				t.Fatalf("repair %d source_span = %d, want %d", i, body.SourceSpan, group.sourceSpan)
+			}
+			if body.RepairCount != 3 {
+				t.Fatalf("repair %d repair_count = %d, want 3", i, body.RepairCount)
+			}
+			if seenKeys[body.Key] {
+				t.Fatalf("repair %d repeated key %d", i, body.Key)
+			}
+			seenKeys[body.Key] = true
+		default:
+			t.Fatalf("got %d REPAIR frames, want 3", i)
+		}
+	}
+
+	select {
+	case payload := <-s.Packets():
+		payload.Packet.Release()
+		t.Fatal("got extra REPAIR frame, want exactly 3")
+	default:
+	}
+}
+
+func TestSendRepairDoesNotCallScheduler(t *testing.T) {
+	s := New()
+	s.EnableFEC()
+
+	const sessionID uint64 = 1003
+	s.sendStatesMu.Lock()
+	s.sendStates[sessionID] = &sendState{}
+	s.sendStatesMu.Unlock()
+
+	lane := newLaneRuntime(1, 100)
+	bindBoth(lane)
+	lane.setFEC(3)
+	s.lanesMu.Lock()
+	s.lanes[laneKey{sessionID: sessionID, laneID: lane.id}] = lane
+	s.lanesMu.Unlock()
+
+	strategy := &recordingStrategy{lane: lane}
+	s.strategiesMu.Lock()
+	s.strategies[sessionID] = strategy
+	s.strategiesMu.Unlock()
+
+	packets := make([]*packetbuf.Packet, maxFECSourceSpan)
+	for i := range packets {
+		pkt := packetbuf.Acquire(24)
+		for j := range pkt.Payload {
+			pkt.Payload[j] = byte(i + j + 1)
+		}
+		packets[i] = pkt
+	}
+
+	group := txRepairGroup{
+		groupID:    144,
+		sourceSpan: maxFECSourceSpan,
+		packets:    packets,
+	}
+
+	s.sendRepair(context.Background(), sessionID, lane, group)
+
+	if strategy.picks != 0 {
+		t.Fatalf("repair scheduler picks = %d, want 0", strategy.picks)
+	}
+
+	for {
+		select {
+		case payload := <-s.Packets():
+			payload.Packet.Release()
+		default:
+			return
+		}
+	}
+}
+
+func TestRepairCountScalesForPartialGroup(t *testing.T) {
+	s := New()
+	s.EnableFEC()
+
+	const sessionID uint64 = 1002
+	s.sendStatesMu.Lock()
+	s.sendStates[sessionID] = &sendState{}
+	s.sendStatesMu.Unlock()
+
+	lane := newLaneRuntime(1, 100)
+	bindBoth(lane)
+	lane.setFEC(3)
+
+	packets := make([]*packetbuf.Packet, 2)
+	for i := range packets {
+		pkt := packetbuf.Acquire(24)
+		for j := range pkt.Payload {
+			pkt.Payload[j] = byte(i + j + 1)
+		}
+		packets[i] = pkt
+	}
+
+	group := txRepairGroup{
+		groupID:    88,
+		sourceSpan: 2,
+		packets:    packets,
+	}
+
+	s.sendRepair(context.Background(), sessionID, lane, group)
+
+	for i := 0; i < 2; i++ {
+		select {
+		case payload := <-s.Packets():
+			f, err := protocol.Decode(payload.Packet.Payload)
+			payload.Packet.Release()
+			if err != nil {
+				t.Fatalf("decode repair %d: %v", i, err)
+			}
+			if f.Type != protocol.TypeREPAIR {
+				t.Fatalf("frame %d type = %v, want REPAIR", i, f.Type)
+			}
+			body := f.Body.(protocol.RepairBody)
+			if body.SourceSpan != group.sourceSpan {
+				t.Fatalf("repair %d source_span = %d, want %d", i, body.SourceSpan, group.sourceSpan)
+			}
+			if body.RepairCount != 2 {
+				t.Fatalf("repair %d repair_count = %d, want 2", i, body.RepairCount)
+			}
+		default:
+			t.Fatalf("got %d REPAIR frames, want 2", i)
+		}
+	}
+
+	select {
+	case payload := <-s.Packets():
+		payload.Packet.Release()
+		t.Fatal("got extra REPAIR frame, want exactly 2")
+	default:
+	}
+}
+
+type recordingStrategy struct {
+	lane  *laneRuntime
+	picks int
+}
+
+func (s *recordingStrategy) Pick(_ []*laneRuntime, _ uint32) (*laneRuntime, bool) {
+	s.picks++
+	return s.lane, true
 }

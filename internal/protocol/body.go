@@ -24,10 +24,11 @@ const (
 
 	CloseReasonUnknownSession uint8 = 1
 
-	LinkStatusLegUDP uint8 = 1
-	LinkStatusLegTCP uint8 = 2
+	LinkStatusStateClear   uint8 = 0
+	LinkStatusStateLimited uint8 = 1
 
-	LinkStatusReasonLimited uint8 = 1
+	maxGroupID      uint32 = 1<<30 - 1
+	sourceIndexMask uint32 = 1<<2 - 1
 )
 
 type Body interface {
@@ -59,17 +60,19 @@ type PingBody struct {
 func (PingBody) protocolBody() {}
 
 type DataBody struct {
-	PacketID uint32
-	Packet   []byte
+	GroupID     uint32
+	SourceIndex uint8
+	Packet      []byte
 }
 
 func (DataBody) protocolBody() {}
 
 type RepairBody struct {
-	BasePacketID uint32
-	Key          uint16
-	SourceSpan   uint8
-	Symbol       []byte
+	GroupID     uint32
+	Key         uint16
+	SourceSpan  uint8
+	RepairCount uint8
+	Symbol      []byte
 }
 
 func (RepairBody) protocolBody() {}
@@ -87,7 +90,7 @@ type BandwidthProbeBody struct {
 	Seq                 uint16
 	Count               uint16
 	SendMS              uint64
-	TrainBytesTotal     uint64
+	TargetBps           uint64
 	TrainBytesRemaining uint64
 	Payload             []byte
 }
@@ -106,9 +109,9 @@ type BandwidthProbeAckBody struct {
 func (BandwidthProbeAckBody) protocolBody() {}
 
 type LinkStatusBody struct {
-	LegKind      uint8
-	Reason       uint8
-	DeliveredBps uint32
+	Status          uint8
+	UDPDeliveredBps uint32
+	TCPDeliveredBps uint32
 }
 
 func (LinkStatusBody) protocolBody() {}
@@ -126,7 +129,7 @@ func encodedBodySize(frame Frame) (int, error) {
 		return 16, validBody(ok)
 	case TypeDATA:
 		data, ok := frame.Body.(DataBody)
-		if !ok {
+		if !ok || data.GroupID > maxGroupID || uint32(data.SourceIndex) > sourceIndexMask {
 			return 0, ErrInvalidFrame
 		}
 		return 4 + len(data.Packet), nil
@@ -135,7 +138,7 @@ func encodedBodySize(frame Frame) (int, error) {
 		if !ok {
 			return 0, ErrInvalidFrame
 		}
-		if repair.SourceSpan == 0 || repair.SourceSpan > 4 {
+		if repair.GroupID > maxGroupID || !validRepairSourceSpan(repair.SourceSpan) || !validRepairCount(repair.RepairCount) {
 			return 0, ErrInvalidFrame
 		}
 		return 7 + len(repair.Symbol), nil
@@ -144,8 +147,7 @@ func encodedBodySize(frame Frame) (int, error) {
 		return 2, validBody(ok)
 	case TypeBandwidthProbe:
 		body, ok := frame.Body.(BandwidthProbeBody)
-		if !ok || body.Count == 0 || body.Count > 64 || body.Seq >= body.Count ||
-			body.TrainBytesTotal == 0 || body.TrainBytesRemaining > body.TrainBytesTotal {
+		if !ok || body.Count == 0 || body.Count > 64 || body.Seq >= body.Count {
 			return 0, ErrInvalidFrame
 		}
 		return 44 + len(body.Payload), nil
@@ -157,10 +159,10 @@ func encodedBodySize(frame Frame) (int, error) {
 		return 36, nil
 	case TypeLinkStatus:
 		body, ok := frame.Body.(LinkStatusBody)
-		if !ok || !validLinkStatusLeg(body.LegKind) || !validLinkStatusReason(body.Reason) {
+		if !ok || !validLinkStatusStatus(body.Status) {
 			return 0, ErrInvalidFrame
 		}
-		return 6, nil
+		return 9, nil
 	default:
 		return 0, ErrInvalidFrame
 	}
@@ -192,13 +194,13 @@ func encodeBodyInto(frame Frame, out []byte) error {
 		binary.BigEndian.PutUint64(out[8:16], body.TimeMS)
 	case TypeDATA:
 		data := frame.Body.(DataBody)
-		binary.BigEndian.PutUint32(out[:4], data.PacketID)
+		binary.BigEndian.PutUint32(out[:4], data.GroupID<<2|uint32(data.SourceIndex))
 		copy(out[4:], data.Packet)
 	case TypeREPAIR:
 		repair := frame.Body.(RepairBody)
-		binary.BigEndian.PutUint32(out[:4], repair.BasePacketID)
+		binary.BigEndian.PutUint32(out[:4], repair.GroupID)
 		binary.BigEndian.PutUint16(out[4:6], repair.Key)
-		out[6] = repair.SourceSpan
+		out[6] = encodeRepairSpanCount(repair.SourceSpan, repair.RepairCount)
 		copy(out[7:], repair.Symbol)
 	case TypeCLOSE:
 		body := frame.Body.(CloseBody)
@@ -211,7 +213,7 @@ func encodeBodyInto(frame Frame, out []byte) error {
 		binary.BigEndian.PutUint16(out[16:18], body.Seq)
 		binary.BigEndian.PutUint16(out[18:20], body.Count)
 		binary.BigEndian.PutUint64(out[20:28], body.SendMS)
-		binary.BigEndian.PutUint64(out[28:36], body.TrainBytesTotal)
+		binary.BigEndian.PutUint64(out[28:36], body.TargetBps)
 		binary.BigEndian.PutUint64(out[36:44], body.TrainBytesRemaining)
 		copy(out[44:], body.Payload)
 	case TypeBandwidthProbeAck:
@@ -224,9 +226,9 @@ func encodeBodyInto(frame Frame, out []byte) error {
 		binary.BigEndian.PutUint64(out[28:36], body.LastRXMS)
 	case TypeLinkStatus:
 		body := frame.Body.(LinkStatusBody)
-		out[0] = body.LegKind
-		out[1] = body.Reason
-		binary.BigEndian.PutUint32(out[2:6], body.DeliveredBps)
+		out[0] = body.Status
+		binary.BigEndian.PutUint32(out[1:5], body.UDPDeliveredBps)
+		binary.BigEndian.PutUint32(out[5:9], body.TCPDeliveredBps)
 	default:
 		return ErrInvalidFrame
 	}
@@ -266,22 +268,30 @@ func decodeBody(frame *Frame, body []byte) error {
 		if len(body) < 4 {
 			return ErrBodyTooShort
 		}
+		groupAndSource := binary.BigEndian.Uint32(body[:4])
 		frame.Body = DataBody{
-			PacketID: binary.BigEndian.Uint32(body[:4]),
-			Packet:   body[4:],
+			GroupID:     groupAndSource >> 2,
+			SourceIndex: uint8(groupAndSource & sourceIndexMask),
+			Packet:      body[4:],
 		}
 	case TypeREPAIR:
 		if len(body) < 7 {
 			return ErrBodyTooShort
 		}
-		if body[6] == 0 || body[6] > 4 {
+		sourceSpan, repairCount, ok := decodeRepairSpanCount(body[6])
+		if !ok {
+			return ErrInvalidFrame
+		}
+		groupID := binary.BigEndian.Uint32(body[:4])
+		if groupID > maxGroupID {
 			return ErrInvalidFrame
 		}
 		frame.Body = RepairBody{
-			BasePacketID: binary.BigEndian.Uint32(body[:4]),
-			Key:          binary.BigEndian.Uint16(body[4:6]),
-			SourceSpan:   body[6],
-			Symbol:       body[7:],
+			GroupID:     groupID,
+			Key:         binary.BigEndian.Uint16(body[4:6]),
+			SourceSpan:  sourceSpan,
+			RepairCount: repairCount,
+			Symbol:      body[7:],
 		}
 	case TypeCLOSE:
 		if len(body) != 2 {
@@ -294,9 +304,9 @@ func decodeBody(frame *Frame, body []byte) error {
 		}
 		count := binary.BigEndian.Uint16(body[18:20])
 		seq := binary.BigEndian.Uint16(body[16:18])
-		total := binary.BigEndian.Uint64(body[28:36])
+		targetBps := binary.BigEndian.Uint64(body[28:36])
 		remaining := binary.BigEndian.Uint64(body[36:44])
-		if count == 0 || count > 64 || seq >= count || total == 0 || remaining > total {
+		if count == 0 || count > 64 || seq >= count {
 			return ErrInvalidFrame
 		}
 		frame.Body = BandwidthProbeBody{
@@ -305,7 +315,7 @@ func decodeBody(frame *Frame, body []byte) error {
 			Seq:                 seq,
 			Count:               count,
 			SendMS:              binary.BigEndian.Uint64(body[20:28]),
-			TrainBytesTotal:     total,
+			TargetBps:           targetBps,
 			TrainBytesRemaining: remaining,
 			Payload:             body[44:],
 		}
@@ -327,18 +337,17 @@ func decodeBody(frame *Frame, body []byte) error {
 			LastRXMS:  binary.BigEndian.Uint64(body[28:36]),
 		}
 	case TypeLinkStatus:
-		if len(body) != 6 {
+		if len(body) != 9 {
 			return ErrBodyTooShort
 		}
-		legKind := body[0]
-		reason := body[1]
-		if !validLinkStatusLeg(legKind) || !validLinkStatusReason(reason) {
+		status := body[0]
+		if !validLinkStatusStatus(status) {
 			return ErrInvalidFrame
 		}
 		frame.Body = LinkStatusBody{
-			LegKind:      legKind,
-			Reason:       reason,
-			DeliveredBps: binary.BigEndian.Uint32(body[2:6]),
+			Status:          status,
+			UDPDeliveredBps: binary.BigEndian.Uint32(body[1:5]),
+			TCPDeliveredBps: binary.BigEndian.Uint32(body[5:9]),
 		}
 	default:
 		return ErrInvalidFrame
@@ -346,10 +355,39 @@ func decodeBody(frame *Frame, body []byte) error {
 	return nil
 }
 
-func validLinkStatusLeg(legKind uint8) bool {
-	return legKind == LinkStatusLegUDP || legKind == LinkStatusLegTCP
+func validRepairSourceSpan(sourceSpan uint8) bool {
+	return sourceSpan >= 1 && sourceSpan <= 4
 }
 
-func validLinkStatusReason(reason uint8) bool {
-	return reason == LinkStatusReasonLimited
+func validRepairCount(repairCount uint8) bool {
+	return repairCount <= 4
+}
+
+func encodeRepairSpanCount(sourceSpan, repairCount uint8) uint8 {
+	if repairCount == 0 {
+		repairCount = 1
+	}
+	return sourceSpan | ((repairCount - 1) << 3)
+}
+
+func decodeRepairSpanCount(packed uint8) (uint8, uint8, bool) {
+	if packed&0xe0 != 0 {
+		return 0, 0, false
+	}
+	sourceSpan := packed & 0x07
+	repairCount := ((packed >> 3) & 0x03) + 1
+	if !validRepairSourceSpan(sourceSpan) {
+		return 0, 0, false
+	}
+	return sourceSpan, repairCount, true
+}
+
+func validLinkStatusStatus(status uint8) bool {
+	udp := status >> 4
+	tcp := status & 0x0f
+	return validLinkStatusState(udp) && validLinkStatusState(tcp)
+}
+
+func validLinkStatusState(state uint8) bool {
+	return state <= 7
 }

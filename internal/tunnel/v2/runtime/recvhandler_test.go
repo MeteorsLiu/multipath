@@ -8,6 +8,8 @@ import (
 	"github.com/MeteorsLiu/multipath/internal/protocol"
 	sessionpkg "github.com/MeteorsLiu/multipath/internal/session"
 	"github.com/MeteorsLiu/multipath/internal/transport"
+	"github.com/MeteorsLiu/multipath/internal/tunnel/v2/probe/bw"
+	"github.com/MeteorsLiu/multipath/internal/tunnel/v2/recv"
 	"github.com/MeteorsLiu/multipath/internal/tunnel/v2/send"
 )
 
@@ -25,6 +27,90 @@ func TestNewRecvHandlerWiresSessionAndSend(t *testing.T) {
 	}
 	if handler.sessions != sessions {
 		t.Error("handler sessions not wired correctly")
+	}
+}
+
+func TestRecvHandlerPassiveBWSampleUsesTCPReferenceForPrimaryHint(t *testing.T) {
+	s := send.New()
+	sessions := &sessionpkg.Manager{}
+	handler := NewRecvHandler(s, sessions)
+
+	handler.rememberPassiveBWTrain(10, send.LegKey{SessionID: 99, LaneID: 3, Kind: transport.KindTCP})
+	handler.onPassiveBWSample(10, bw.Sample{BandwidthBps: 1_000_000_000})
+	if observation := handler.takePassiveBWObservation(10); observation != (recv.BandwidthProbeObservation{}) {
+		t.Fatalf("observation after TCP sample = %+v, want empty", observation)
+	}
+
+	handler.rememberPassiveBWTrain(11, send.LegKey{SessionID: 99, LaneID: 3, Kind: transport.KindUDP})
+	handler.onPassiveBWSample(11, bw.Sample{BandwidthBps: 500_000_000})
+
+	observation := handler.takePassiveBWObservation(11)
+	if observation.Primary != transport.KindTCP {
+		t.Fatalf("observation primary = %v, want TCP", observation.Primary)
+	}
+	if !observation.UDPLimited || observation.UDPDeliveredBps != 500_000_000 || observation.TCPDeliveredBps != 1_000_000_000 {
+		t.Fatalf("observation = %+v, want UDP limited with udp=500000000 tcp=1000000000", observation)
+	}
+}
+
+func TestRecvHandlerBandwidthProbeEmitsPassivePrimaryHint(t *testing.T) {
+	s := send.New()
+	sessions := &sessionpkg.Manager{}
+	sessions.GetOrCreate(12345)
+	handler := NewRecvHandler(s, sessions)
+
+	ctx := context.Background()
+	tcpLeg := transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp-1"}
+	udpLeg := transport.LegRef{Kind: transport.KindUDP, EndpointID: "udp-1", RemoteAddr: &testAddr{addr: "127.0.0.1:9000"}}
+
+	sendTrain := func(trainID uint64, leg transport.LegRef, payloadLen int) recv.BandwidthProbeObservation {
+		t.Helper()
+		var observation recv.BandwidthProbeObservation
+		for seq := uint16(0); seq < 2; seq++ {
+			remaining := uint64(payloadLen)
+			if seq == 1 {
+				remaining = 0
+			}
+			if seq == 1 {
+				time.Sleep(2 * time.Millisecond)
+			}
+			var err error
+			observation, err = handler.OnBandwidthProbe(ctx, leg, protocol.Frame{
+				Version:   protocol.Version,
+				Type:      protocol.TypeBandwidthProbe,
+				SessionID: 12345,
+				LaneID:    1,
+				Body: protocol.BandwidthProbeBody{
+					TrainID:             trainID,
+					ProbeID:             trainID*10 + uint64(seq),
+					Seq:                 seq,
+					Count:               2,
+					SendMS:              uint64(1000 + seq),
+					TargetBps:           200_000_000,
+					TrainBytesRemaining: remaining,
+					Payload:             make([]byte, payloadLen),
+				},
+			})
+			if err != nil {
+				t.Fatalf("OnBandwidthProbe train %d seq %d: %v", trainID, seq, err)
+			}
+		}
+		return observation
+	}
+
+	if observation := sendTrain(10, tcpLeg, 32768); observation != (recv.BandwidthProbeObservation{}) {
+		t.Fatalf("observation after TCP reference = %+v, want empty", observation)
+	}
+	observation := sendTrain(11, udpLeg, 1200)
+
+	if observation.Primary != transport.KindTCP {
+		t.Fatalf("observation primary = %v, want TCP", observation.Primary)
+	}
+	if !observation.UDPLimited {
+		t.Fatalf("observation = %+v, want UDP limited", observation)
+	}
+	if observation.CapBps != 200_000_000 {
+		t.Fatalf("observation cap bps = %d, want 200000000", observation.CapBps)
 	}
 }
 
@@ -290,20 +376,58 @@ found:
 	if qos == nil {
 		t.Fatal("missing QoS input")
 	}
+	rec := &recordingQoSInput{}
+	s.LaneManager().RegisterQoS(send.LaneKey{SessionID: sessionID, LaneID: 1}, rec)
 
 	frame := protocol.Frame{
 		Type:      protocol.TypeLinkStatus,
 		SessionID: sessionID,
 		LaneID:    1,
 		Body: protocol.LinkStatusBody{
-			LegKind:      protocol.LinkStatusLegUDP,
-			Reason:       protocol.LinkStatusReasonLimited,
-			DeliveredBps: 2_000_000,
+			Status:          0x54,
+			UDPDeliveredBps: 2_000_000,
+			TCPDeliveredBps: 8_000_000,
 		},
 	}
 	if err := handler.OnQoS(context.Background(), transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp"}, frame); err != nil {
 		t.Fatalf("OnQoS: %v", err)
 	}
+	if !rec.called {
+		t.Fatal("QoS input was not called")
+	}
+	if !rec.udpLimited {
+		t.Fatal("UDP limited = false, want true")
+	}
+	if rec.tcpLimited {
+		t.Fatal("TCP limited = true, want false")
+	}
+	if rec.repairCount != 3 {
+		t.Fatalf("repair count = %d, want 3", rec.repairCount)
+	}
+	if rec.udpDeliveredBps != 2_000_000 {
+		t.Fatalf("UDP delivered bps = %d, want 2000000", rec.udpDeliveredBps)
+	}
+	if rec.tcpDeliveredBps != 8_000_000 {
+		t.Fatalf("TCP delivered bps = %d, want 8000000", rec.tcpDeliveredBps)
+	}
+}
+
+type recordingQoSInput struct {
+	called          bool
+	udpLimited      bool
+	udpDeliveredBps uint32
+	tcpLimited      bool
+	tcpDeliveredBps uint32
+	repairCount     uint8
+}
+
+func (r *recordingQoSInput) OnQoSStatus(udpLimited bool, udpDeliveredBps uint32, tcpLimited bool, tcpDeliveredBps uint32, repairCount uint8) {
+	r.called = true
+	r.udpLimited = udpLimited
+	r.udpDeliveredBps = udpDeliveredBps
+	r.tcpLimited = tcpLimited
+	r.tcpDeliveredBps = tcpDeliveredBps
+	r.repairCount = repairCount
 }
 
 // TestOnPingUnknownSessionRepliesClose verifies the peer-restart self-heal: a

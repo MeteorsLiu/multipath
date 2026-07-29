@@ -14,7 +14,6 @@ import (
 const (
 	deliveryWindowSize = 32
 	deliveryMinSamples = 8
-	qosTTL             = 30 * time.Second
 )
 
 // Observer tracks delivery rate and RTT for UDP and TCP (spec 5.4). It exposes
@@ -40,15 +39,12 @@ type Quality struct {
 	QoSSeen      bool
 
 	QoSActive       bool
-	QoSReason       uint8
 	QoSDeliveredBps uint32
 }
 
 type qosStatus struct {
 	active       bool
-	reason       uint8
 	deliveredBps uint32
-	updatedAt    time.Time
 }
 
 // UDP returns the current UDP quality snapshot.
@@ -97,12 +93,11 @@ func (o *Observer) TCPAt(now time.Time) Quality {
 	return q
 }
 
-func (q *Quality) applyQoS(status qosStatus, now time.Time) {
-	if !status.active || now.Sub(status.updatedAt) > qosTTL {
+func (q *Quality) applyQoS(status qosStatus, _ time.Time) {
+	if !status.active {
 		return
 	}
 	q.QoSActive = true
-	q.QoSReason = status.reason
 	q.QoSDeliveredBps = status.deliveredBps
 }
 
@@ -118,22 +113,12 @@ func (o *Observer) OnDelivery(kind transport.Kind, onTime bool) {
 	}
 }
 
-func (o *Observer) OnQoS(kind transport.Kind, reason uint8, deliveredBps uint32, now time.Time) {
+func (o *Observer) OnQoSStatus(udpLimited bool, udpDeliveredBps uint32, tcpLimited bool, tcpDeliveredBps uint32) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.qosSeen = true
-	status := qosStatus{
-		active:       true,
-		reason:       reason,
-		deliveredBps: deliveredBps,
-		updatedAt:    now,
-	}
-	switch kind {
-	case transport.KindUDP:
-		o.udpQoS = status
-	case transport.KindTCP:
-		o.tcpQoS = status
-	}
+	o.udpQoS = qosStatus{active: udpLimited, deliveredBps: udpDeliveredBps}
+	o.tcpQoS = qosStatus{active: tcpLimited, deliveredBps: tcpDeliveredBps}
 }
 
 // OnRTTSample records an RTT sample in milliseconds.

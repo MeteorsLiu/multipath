@@ -3,6 +3,9 @@ package send
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,6 +19,7 @@ import (
 	"github.com/MeteorsLiu/multipath/internal/schedule/drr"
 	sessionpkg "github.com/MeteorsLiu/multipath/internal/session"
 	"github.com/MeteorsLiu/multipath/internal/transport"
+	"github.com/MeteorsLiu/multipath/internal/transport/selector"
 	"github.com/MeteorsLiu/multipath/internal/tunnel/v2/probe/bw"
 	"github.com/MeteorsLiu/multipath/internal/tunnel/v2/probe/ping"
 )
@@ -28,11 +32,13 @@ var (
 )
 
 const (
-	defaultMTUBytes    = 1500
-	drrBaseQuantum     = 4 * defaultMTUBytes
-	maxFECSourceSpan   = 4
-	defaultFECFlushMin = 5 * time.Millisecond
-	defaultFECFlushMax = 30 * time.Millisecond
+	defaultMTUBytes               = 1500
+	drrBaseQuantum                = 4 * defaultMTUBytes
+	maxFECSourceSpan              = 4
+	maxTxGroupID           uint32 = 1<<30 - 1
+	defaultFECFlushMin            = 5 * time.Millisecond
+	defaultFECFlushMax            = 30 * time.Millisecond
+	debugQueueWaitLogAfter        = time.Millisecond
 )
 
 // Send owns the send-side runtime state per spec section 5.2.
@@ -68,9 +74,8 @@ type Send struct {
 	bwReference uint64
 	bwSched     *bwScheduler
 
-	// FEC codecs (4+1 SLC)
-	fecCodec  *fec.Codec
-	fecCodecs [maxFECSourceSpan + 1]*fec.Codec
+	// FEC codecs indexed by source span and repair count.
+	fecCodecs [maxFECSourceSpan + 1][5]*fec.Codec
 
 	// Atomic state
 	activeSessionID  atomic.Uint64
@@ -116,7 +121,6 @@ type runnableCache struct {
 
 // sendState holds per-session send-side state.
 type sendState struct {
-	nextPacketID  atomic.Uint32
 	nextRepairKey atomic.Uint32
 	fecEnabled    atomic.Bool
 }
@@ -193,11 +197,10 @@ func (s *Send) FECEnabled() bool {
 
 func (s *Send) EnableFEC() {
 	s.fecConfigured.Store(true)
-	// Create 4+1 SLC codec (hardcoded per spec)
-	codec, _ := fec.NewCodec(4, 1)
-	s.fecCodec = codec
 	for i := 1; i <= maxFECSourceSpan; i++ {
-		s.fecCodecs[i], _ = fec.NewCodec(i, 1)
+		for repairs := 1; repairs <= 4; repairs++ {
+			s.fecCodecs[i][repairs], _ = fec.NewCodec(i, repairs)
+		}
 	}
 	if sessionID, ok := s.activeSession(); ok {
 		s.enableSessionFEC(sessionID)
@@ -298,11 +301,10 @@ func (s *Send) bootstrapSession(ctx context.Context) error {
 		s.openLaneHello(sessionCtx, session, sessionID, lane, laneID, legRef)
 
 		// Create and drive the active ping for this lane's UDP leg (spec 5.5, 7.3).
-		// The ping starts dead; its first RecoverSuccess pongs fire OnUp →
-		// leg.markActive, which is how a leg first comes up (initial activation
-		// goes through PONG, not HELLO_ACK). Subsequent MaxLoss timeouts fire
-		// OnDown → leg.markDown. The ping is registered in the shared LaneManager
-		// so the recv glue can route inbound PONG to it without touching send.
+		// The ping starts dead unless the leg has already been activated by a
+		// same-leg HELLO_ACK. Subsequent MaxLoss timeouts fire OnDown →
+		// leg.markDown. The ping is registered in the shared LaneManager so the
+		// recv glue can route inbound PONG to it without touching send.
 		s.startLanePing(sessionCtx, sessionID, lane, legRef)
 
 		// Start the TCP dialer for this lane if a TCP remote is configured and a
@@ -521,6 +523,7 @@ func (s *Send) openLaneHello(ctx context.Context, session *sessionpkg.Session, s
 		lane.markDown(legRef.Kind)
 		s.abortBwTarget(sessionID, laneID, legRef)
 		if legRef.Kind == transport.KindTCP && lane.dialer != nil {
+			lane.markTCPReconnectPending()
 			lane.dialer.redial()
 		}
 	}
@@ -530,9 +533,18 @@ func (s *Send) openLaneHello(ctx context.Context, session *sessionpkg.Session, s
 		TimeoutMS:     30000,
 		OnAck: func() {
 			lane.markActive(legRef.Kind)
+			if legRef.Kind == transport.KindUDP && s.laneManager != nil {
+				if p := s.laneManager.LookupPing(KeyForLeg(sessionID, laneID, legRef)); p != nil {
+					p.MarkAlive()
+				}
+			}
 			s.markRunnableLanesDirty(sessionID)
 			s.syncBwSchedulerAfterLegActive(ctx, sessionID)
 			debuglog.Printf("send", "hello_ack_active session=%d lane=%d kind=%d", sessionID, laneID, legRef.Kind)
+			if legRef.Kind == transport.KindTCP && lane.consumeTCPReconnectPending() {
+				eventlog.Printf("reconnect", "action=tcp_leg_reconnect_done session=%d lane=%d conn=%s",
+					sessionID, laneID, legRef.ConnID)
+			}
 		},
 	}
 	_ = session.Open(ctx, cfg, sender, onExpire)
@@ -614,13 +626,6 @@ func (s *Send) Write(ctx context.Context, packet *packetbuf.Packet) error {
 		return nil
 	}
 
-	// Reserve packet ID
-	state := s.getSendState(sessionID)
-	if state == nil {
-		return nil
-	}
-	packetID := state.nextPacketID.Add(1) - 1
-
 	cost := laneScheduleCost(len(packet.Payload))
 
 	// Pick lane using scheduler
@@ -629,25 +634,23 @@ func (s *Send) Write(ctx context.Context, packet *packetbuf.Packet) error {
 		return nil
 	}
 
-	// Build DATA frame
-	frame := protocol.Frame{
-		Version:   protocol.Version,
-		Type:      protocol.TypeDATA,
-		SessionID: sessionID,
-		LaneID:    lane.id,
-		Body: protocol.DataBody{
-			PacketID: packetID,
-			Packet:   packet.Payload,
-		},
-	}
-
-	return s.sendDataFrame(ctx, lane, frame, packetID, packet.Payload)
+	return s.sendDataFrame(ctx, sessionID, lane, packet.Payload)
 }
 
 // WriteFrame sends a control frame (spec 6.2).
 func (s *Send) WriteFrame(ctx context.Context, frame protocol.Frame, to Ref) error {
 	if to.Kind != 0 {
-		// Explicit transport
+		if (to.Kind == transport.KindUDP && (to.EndpointID == "" || to.RemoteAddr == nil)) ||
+			(to.Kind == transport.KindTCP && to.ConnID == "") {
+			lane := s.getLane(laneKey{sessionID: frame.SessionID, laneID: frame.LaneID})
+			if lane == nil {
+				return ErrUnknownLane
+			}
+			to = lane.leg.refForKind(to.Kind)
+			if to.Kind == 0 {
+				return ErrLaneUnavailable
+			}
+		}
 		if err := s.writeFrameOnLeg(ctx, to, frame); err != nil {
 			return err
 		}
@@ -681,6 +684,11 @@ func (s *Send) admitPassiveHelloAck(ctx context.Context, frame protocol.Frame, l
 	}
 
 	s.rebootstrapMu.Lock()
+	key := laneKey{sessionID: frame.SessionID, laneID: frame.LaneID}
+	if active, ok := s.activeSession(); ok && active != frame.SessionID && s.getLane(key) != nil {
+		s.rebootstrapMu.Unlock()
+		return
+	}
 	sessionCtx, closedTCP := s.ensurePassiveSessionContext(ctx, frame.SessionID)
 
 	s.sendStatesMu.Lock()
@@ -689,7 +697,6 @@ func (s *Send) admitPassiveHelloAck(ctx context.Context, frame protocol.Frame, l
 	}
 	s.sendStatesMu.Unlock()
 
-	key := laneKey{sessionID: frame.SessionID, laneID: frame.LaneID}
 	lane := s.getLane(key)
 	if lane == nil {
 		lane = newLaneRuntime(frame.LaneID, 1)
@@ -710,6 +717,11 @@ func (s *Send) admitPassiveHelloAck(ctx context.Context, frame protocol.Frame, l
 		lane.bindTCP(legRef)
 	}
 	lane.markActive(legRef.Kind)
+	if legRef.Kind == transport.KindUDP && s.laneManager != nil {
+		if p := s.laneManager.LookupPing(KeyForLeg(frame.SessionID, frame.LaneID, legRef)); p != nil {
+			p.MarkAlive()
+		}
+	}
 	if body.Caps&protocol.CapFEC != 0 && body.FECProfile == protocol.FECProfileSLC4Plus1 {
 		s.enableSessionFEC(frame.SessionID)
 	}
@@ -727,7 +739,7 @@ func (s *Send) registerLaneQoS(sessionID uint64, lane *laneRuntime) {
 	if lane == nil {
 		return
 	}
-	s.laneManager.RegisterQoS(LaneKey{SessionID: sessionID, LaneID: lane.id}, laneQoSInput{lane: lane})
+	s.laneManager.RegisterQoS(LaneKey{SessionID: sessionID, LaneID: lane.id}, laneQoSInput{sessionID: sessionID, lane: lane})
 }
 
 func (s *Send) ensurePassiveSessionContext(ctx context.Context, sessionID uint64) (context.Context, []transport.LegRef) {
@@ -757,8 +769,20 @@ func (s *Send) WriteTo(ctx context.Context, leg Ref, packet *packetbuf.Packet) e
 		return nil
 	}
 
+	packetBytes := len(packet.Payload)
+	var start time.Time
+	if debuglog.Enabled() {
+		start = time.Now()
+	}
 	select {
 	case s.packets <- transport.Payload{Leg: leg, Packet: packet}:
+		if !start.IsZero() {
+			wait := time.Since(start)
+			if wait >= debugQueueWaitLogAfter {
+				debuglog.Printf("send", "output_queue_wait leg={%s} wait_us=%d queue_len=%d queue_cap=%d bytes=%d",
+					debugLeg(leg), wait.Microseconds(), len(s.packets), cap(s.packets), packetBytes)
+			}
+		}
 		return nil
 	case <-ctx.Done():
 		packet.Release()
@@ -850,40 +874,81 @@ func (s *Send) markRunnableLanesDirty(sessionID uint64) {
 }
 
 // sendDataFrame sends a DATA frame and adds to FEC window (spec 7.1).
-func (s *Send) sendDataFrame(ctx context.Context, lane *laneRuntime, frame protocol.Frame, packetID uint32, payload []byte) error {
+func (s *Send) sendDataFrame(ctx context.Context, sessionID uint64, lane *laneRuntime, payload []byte) error {
+	qosEnabled := s.qosSelectionEnabled()
+	leg := lane.primaryTransportWithQoS(qosEnabled)
+	if leg.Kind == 0 {
+		return nil
+	}
+
+	fecEnabled := s.sessionFECEnabled(sessionID)
+	groupID, sourceIndex, group, ready, shouldArmFlush := lane.commitPacket(payload, fecEnabled)
+	frame := protocol.Frame{
+		Version:   protocol.Version,
+		Type:      protocol.TypeDATA,
+		SessionID: sessionID,
+		LaneID:    lane.id,
+		Body: protocol.DataBody{
+			GroupID:     groupID,
+			SourceIndex: sourceIndex,
+			Packet:      payload,
+		},
+	}
 	packet, err := s.encodeFrame(frame)
 	if err != nil {
 		return err
 	}
 
-	qosEnabled := s.qosSelectionEnabled()
-	leg := lane.primaryTransportWithQoS(qosEnabled)
-	if leg.Kind == 0 {
-		packet.Release()
-		return nil
-	}
-	s.recordQoSDataLegSelection(frame.SessionID, lane, leg.Kind, qosEnabled)
+	s.recordQoSDataLegSelection(sessionID, lane, leg.Kind, qosEnabled)
 	if debuglog.Enabled() {
 		udpQ, tcpQ := lane.leg.qualitySnapshot()
-		debuglog.Printf("send", "schedule_select session=%d lane=%d leg={%s} frame=type=DATA packet_id=%d payload_len=%d udp_active=%t udp_rate=%.3f udp_qos=%t udp_qos_reason=%d udp_prefer_tcp=%t udp_rttvar_ms=%d tcp_active=%t tcp_rate=%.3f tcp_qos=%t tcp_qos_reason=%d",
-			frame.SessionID, lane.id, debugLeg(leg), packetID, len(payload),
-			udpQ.Active, udpQ.DeliveryRate, udpQ.QoSActive, udpQ.QoSReason, udpQ.PreferTCP, udpQ.RTTVariance.Milliseconds(),
-			tcpQ.Active, tcpQ.DeliveryRate, tcpQ.QoSActive, tcpQ.QoSReason)
+		shadow := lane.shadowTransportWithQoS(qosEnabled)
+		debuglog.Printf("send", "schedule_select session=%d lane=%d primary={%s} shadow={%s} leg={%s} frame=type=DATA group_id=%d source_index=%d payload_len=%d udp_active=%t udp_qos=%t udp_qos_bps=%d udp_prefer_tcp=%t tcp_active=%t tcp_qos=%t tcp_qos_bps=%d",
+			sessionID, lane.id, debugLeg(leg), debugLeg(shadow), debugLeg(leg), groupID, sourceIndex, len(payload),
+			udpQ.Active, udpQ.QoSActive, udpQ.QoSDeliveredBps, udpQ.PreferTCP,
+			tcpQ.Active, tcpQ.QoSActive, tcpQ.QoSDeliveredBps)
 	}
 
-	// Add to FEC window if enabled
-	if s.sessionFECEnabled(frame.SessionID) {
-		group, ready, shouldArmFlush := lane.commitPacket(packetID, payload)
+	if fecEnabled {
 		if ready {
-			// Send REPAIR immediately
-			s.sendRepair(ctx, frame.SessionID, lane, group)
+			s.sendRepair(ctx, sessionID, lane, group)
 		} else if shouldArmFlush {
-			// Arm flush timer
-			s.armFECFlushTimer(frame.SessionID, lane)
+			s.armFECFlushTimer(sessionID, lane)
 		}
 	}
 
 	return s.WriteTo(ctx, leg, packet)
+}
+
+func (s *Send) qosLaneSnapshot(sessionID uint64, qosEnabled bool) string {
+	s.lanesMu.RLock()
+	lanes := make([]*laneRuntime, 0)
+	for key, lane := range s.lanes {
+		if key.sessionID == sessionID && lane != nil {
+			lanes = append(lanes, lane)
+		}
+	}
+	s.lanesMu.RUnlock()
+
+	sort.Slice(lanes, func(i, j int) bool {
+		return lanes[i].id < lanes[j].id
+	})
+
+	parts := make([]string, 0, len(lanes))
+	for _, lane := range lanes {
+		primary := lane.primaryTransportWithQoS(qosEnabled)
+		shadow := lane.shadowTransportWithQoS(qosEnabled)
+		udpQ, tcpQ := lane.leg.qualitySnapshot()
+		reason := selectorEventReason(udpQ, tcpQ, primary.Kind)
+		parts = append(parts, fmt.Sprintf("%d:ready=%t,primary=%s,shadow=%s,reason=%s,repair=%d,udp_active=%t,udp_limited=%t,udp_bps=%d,udp_prefer_tcp=%t,tcp_active=%t,tcp_limited=%t,tcp_bps=%d,tcp_reconnect=%t",
+			lane.id, lane.ready(),
+			kindEventLabel(primary.Kind), kindEventLabel(shadow.Kind), reason,
+			lane.currentFECRepairCount(),
+			udpQ.Active, udpQ.QoSActive, udpQ.QoSDeliveredBps, udpQ.PreferTCP,
+			tcpQ.Active, tcpQ.QoSActive, tcpQ.QoSDeliveredBps,
+			lane.tcpReconnectPending.Load()))
+	}
+	return strings.Join(parts, ";")
 }
 
 func (s *Send) recordQoSDataLegSelection(sessionID uint64, lane *laneRuntime, kind transport.Kind, qosEnabled bool) {
@@ -899,10 +964,42 @@ func (s *Send) recordQoSDataLegSelection(sessionID uint64, lane *laneRuntime, ki
 	if !changed {
 		return
 	}
-	eventlog.Printf("selector", "action=qos_data_leg session=%d lane=%d from=%s to=%s udp_active=%t udp_delivery=%.3f udp_qos=%t udp_qos_bps=%d udp_prefer_tcp=%t tcp_active=%t tcp_delivery=%.3f tcp_qos=%t tcp_qos_bps=%d",
+	eventlog.Printf("qos", "action=selector session=%d lane=%d from=%s to=%s reason=%s qos_enabled=%t lanes=%s",
 		sessionID, lane.id, kindEventLabel(previousKind), kindEventLabel(kind),
-		udpQ.Active, udpQ.DeliveryRate, udpQ.QoSActive, udpQ.QoSDeliveredBps, udpQ.PreferTCP,
-		tcpQ.Active, tcpQ.DeliveryRate, tcpQ.QoSActive, tcpQ.QoSDeliveredBps)
+		selectorEventReason(udpQ, tcpQ, kind), qosEnabled,
+		s.qosLaneSnapshot(sessionID, qosEnabled))
+}
+
+func selectorEventReason(udpQ, tcpQ selector.Quality, selected transport.Kind) string {
+	switch {
+	case udpQ.Active && !tcpQ.Active:
+		return "udp_only_active"
+	case !udpQ.Active && tcpQ.Active:
+		return "tcp_only_active"
+	case udpQ.QoSActive && !tcpQ.QoSActive:
+		if selected == transport.KindTCP {
+			return "qos_avoid_udp"
+		}
+		return "qos_udp_limited_selected"
+	case !udpQ.QoSActive && tcpQ.QoSActive:
+		if selected == transport.KindUDP {
+			return "qos_avoid_tcp"
+		}
+		return "qos_tcp_limited_selected"
+	case udpQ.QoSActive && tcpQ.QoSActive:
+		if selected == transport.KindTCP {
+			return "qos_bps_tcp"
+		}
+		return "qos_bps_udp"
+	case udpQ.PreferTCP && selected == transport.KindTCP:
+		return "prefer_tcp"
+	case selected == transport.KindUDP:
+		return "default_udp"
+	case selected == transport.KindTCP:
+		return "selected_tcp"
+	default:
+		return "unknown"
+	}
 }
 
 func (s *Send) logBandwidthProbeDecision(target bwTarget, sample bw.Sample, preferTCP bool) {
@@ -930,7 +1027,7 @@ func (s *Send) logBandwidthProbeDecision(target bwTarget, sample bw.Sample, pref
 		selected = "tcp"
 	}
 	tcpBetter := referenceBps > sample.BandwidthBps
-	eventlog.Printf("bandwidth_probe_decision", "session=%d lane=%d udp_active=%t tcp_active=%t udp_bps=%d udp_loss=%.3f tcp_bps=%d reference_bps=%d cap_bps=%d udp_qos_limited=%t tcp_better=%t prefer_tcp=%t selected_leg=%s",
+	eventlog.Printf("bandwidth_probe_decision", "side=send session=%d lane=%d udp_active=%t tcp_active=%t udp_bps=%d udp_loss=%.3f tcp_bps=%d reference_bps=%d cap_bps=%d udp_qos_limited=%t tcp_better=%t prefer_tcp=%t selected_leg=%s",
 		target.key.SessionID, target.laneID,
 		udpQ.Active, tcpQ.Active,
 		sample.BandwidthBps, sample.Loss,
@@ -1003,7 +1100,7 @@ func estimateFrameSize(frame protocol.Frame) int {
 	}
 }
 
-// sendRepair sends a REPAIR frame (spec 7.2).
+// sendRepair sends REPAIR frames (spec 7.2).
 func (s *Send) sendRepair(ctx context.Context, sessionID uint64, lane *laneRuntime, group txRepairGroup) {
 	if len(group.packets) == 0 {
 		return
@@ -1017,10 +1114,22 @@ func (s *Send) sendRepair(ctx context.Context, sessionID uint64, lane *laneRunti
 		return
 	}
 
-	repairKey := uint16(state.nextRepairKey.Add(1) - 1)
+	sourceSpan := int(group.sourceSpan)
+	configuredRepairCount := lane.currentFECRepairCount()
+	repairCount := scaledFECRepairCount(configuredRepairCount, sourceSpan)
+	if repairCount == 0 {
+		for _, pkt := range group.packets {
+			pkt.Release()
+		}
+		return
+	}
+	keys := make([]uint16, repairCount)
+	for i := range keys {
+		keys[i] = uint16(state.nextRepairKey.Add(1) - 1)
+	}
 
 	// Encode FEC
-	codec := s.fecCodecForSourceSpan(int(group.sourceSpan))
+	codec := s.fecCodecFor(sourceSpan, repairCount)
 	if codec == nil {
 		for _, pkt := range group.packets {
 			pkt.Release()
@@ -1028,31 +1137,17 @@ func (s *Send) sendRepair(ctx context.Context, sessionID uint64, lane *laneRunti
 		return
 	}
 
-	shards := make([][]byte, int(group.sourceSpan)+1)
+	shards := make([][]byte, sourceSpan+int(repairCount))
 	for i, pkt := range group.packets {
 		shards[i] = pkt.Payload
 	}
 
-	if err := codec.Encode(shards, repairKey); err != nil {
+	if err := codec.Encode(shards, keys); err != nil {
 		debuglog.Printf("send/fec", "encode_err session=%d lane=%d err=%v", sessionID, lane.id, err)
 		for _, pkt := range group.packets {
 			pkt.Release()
 		}
 		return
-	}
-
-	// Build REPAIR frame
-	frame := protocol.Frame{
-		Version:   protocol.Version,
-		Type:      protocol.TypeREPAIR,
-		SessionID: sessionID,
-		LaneID:    lane.id,
-		Body: protocol.RepairBody{
-			BasePacketID: group.basePacketID,
-			Key:          repairKey,
-			SourceSpan:   group.sourceSpan,
-			Symbol:       shards[group.sourceSpan],
-		},
 	}
 
 	// Release DATA packets
@@ -1061,28 +1156,71 @@ func (s *Send) sendRepair(ctx context.Context, sessionID uint64, lane *laneRunti
 	}
 
 	// Send REPAIR on shadow transport
-	packet, err := s.encodeFrame(frame)
-	if err != nil {
-		return
-	}
-
-	leg := lane.shadowTransportWithQoS(s.qosSelectionEnabled())
+	qosEnabled := s.qosSelectionEnabled()
+	leg := lane.shadowTransportWithQoS(qosEnabled)
 	if leg.Kind == 0 {
-		packet.Release()
 		return
 	}
+	debuglog.Printf("send/fec", "repair_group session=%d lane=%d group_id=%d source_span=%d packet_count=%d configured_repair_count=%d scaled_repair_count=%d leg={%s}",
+		sessionID, lane.id, group.groupID, group.sourceSpan, len(group.packets), configuredRepairCount, repairCount, debugLeg(leg))
 
-	_ = s.WriteTo(ctx, leg, packet)
+	for i, key := range keys {
+		symbol := shards[sourceSpan+i]
+		frame := protocol.Frame{
+			Version:   protocol.Version,
+			Type:      protocol.TypeREPAIR,
+			SessionID: sessionID,
+			LaneID:    lane.id,
+			Body: protocol.RepairBody{
+				GroupID:     group.groupID,
+				Key:         key,
+				SourceSpan:  group.sourceSpan,
+				RepairCount: repairCount,
+				Symbol:      symbol,
+			},
+		}
+
+		packet, err := s.encodeFrame(frame)
+		if err != nil {
+			return
+		}
+
+		if debuglog.Enabled() {
+			primary := lane.primaryTransportWithQoS(qosEnabled)
+			debuglog.Printf("send", "schedule_select session=%d lane=%d primary={%s} shadow={%s} leg={%s} frame=type=REPAIR group_id=%d key=%d source_span=%d symbol_len=%d",
+				sessionID, lane.id, debugLeg(primary), debugLeg(leg), debugLeg(leg),
+				group.groupID, key, group.sourceSpan, len(symbol))
+		}
+
+		_ = s.WriteTo(ctx, leg, packet)
+	}
 }
 
-func (s *Send) fecCodecForSourceSpan(sourceSpan int) *fec.Codec {
+func scaledFECRepairCount(repairCount uint8, sourceSpan int) uint8 {
 	if sourceSpan <= 0 || sourceSpan > maxFECSourceSpan {
+		return 0
+	}
+	if repairCount == 0 {
+		repairCount = 1
+	}
+	if repairCount > maxFECSourceSpan {
+		repairCount = maxFECSourceSpan
+	}
+	scaled := (int(repairCount)*sourceSpan + maxFECSourceSpan - 1) / maxFECSourceSpan
+	if scaled < 1 {
+		return 1
+	}
+	if scaled > sourceSpan {
+		return uint8(sourceSpan)
+	}
+	return uint8(scaled)
+}
+
+func (s *Send) fecCodecFor(sourceSpan int, repairCount uint8) *fec.Codec {
+	if sourceSpan <= 0 || sourceSpan > maxFECSourceSpan || repairCount == 0 || repairCount > 4 {
 		return nil
 	}
-	if sourceSpan == maxFECSourceSpan && s.fecCodec != nil {
-		return s.fecCodec
-	}
-	return s.fecCodecs[sourceSpan]
+	return s.fecCodecs[sourceSpan][repairCount]
 }
 
 func (s *Send) armFECFlushTimer(sessionID uint64, lane *laneRuntime) {
@@ -1151,6 +1289,7 @@ func (s *Send) OnLegFailure(ctx context.Context, legRef transport.LegRef, err er
 		affected.lane.markDown(transport.KindTCP)
 		s.abortBwTarget(affected.sessionID, affected.lane.id, legRef)
 		if affected.lane.dialer != nil {
+			affected.lane.markTCPReconnectPending()
 			affected.lane.dialer.redial()
 		}
 		debuglog.Printf("send", "tcp_leg_failure conn=%s err=%v", legRef.ConnID, err)
@@ -1160,11 +1299,10 @@ func (s *Send) OnLegFailure(ctx context.Context, legRef transport.LegRef, err er
 }
 
 // startLanePing creates and drives the active ping for one lane transport path
-// (spec 5.5, 7.3). The ping starts dead (a leg begins inactive): its first
-// RecoverSuccess pongs fire OnUp → leg.markActive, which is how the leg first
-// comes up — initial activation flows through PONG, not HELLO_ACK (per design
-// decision). After it is up, MaxLoss consecutive ping timeouts fire OnDown →
-// leg.markDown.
+// (spec 5.5, 7.3). The ping starts dead when the leg is still inactive; its
+// first RecoverSuccess pongs fire OnUp → leg.markActive. If HELLO_ACK already
+// activated the same leg, the ping starts alive so later MaxLoss timeouts can
+// still fire OnDown → leg.markDown.
 //
 // The closures capture this lane's leg, so liveness lands on leg.markActive /
 // leg.markDown entirely inside send — no transport method is exposed. The ping
@@ -1184,6 +1322,7 @@ func (s *Send) startLanePing(ctx context.Context, sessionID uint64, lane *laneRu
 
 	laneID := lane.id
 	kind := legRef.Kind
+	initDead := !lane.leg.isActive(kind)
 
 	sendMsg := func(m ping.Message) error {
 		frame := protocol.Frame{
@@ -1203,15 +1342,19 @@ func (s *Send) startLanePing(ctx context.Context, sessionID uint64, lane *laneRu
 		Interval: s.probeInterval,
 		Timeout:  s.probeTimeout,
 		SendMsg:  sendMsg,
-		InitDead: true, // leg starts inactive; first pongs bring it up
+		InitDead: initDead,
 		OnUp: func() {
 			lane.markActive(kind)
 			debuglog.Printf("send", "ping_up session=%d lane=%d kind=%d", sessionID, laneID, kind)
+			eventlog.Printf("ping", "action=up session=%d lane=%d leg=%s",
+				sessionID, laneID, kindEventLabel(kind))
 		},
 		OnDown: func() {
 			lane.markDown(kind)
 			s.abortBwTarget(sessionID, laneID, legRef)
 			debuglog.Printf("send", "ping_down session=%d lane=%d kind=%d", sessionID, laneID, kind)
+			eventlog.Printf("ping", "action=down session=%d lane=%d leg=%s",
+				sessionID, laneID, kindEventLabel(kind))
 		},
 		Observer: func(q ping.Quality) {
 			lane.leg.observeRTT(kind, q.SampleMS)
@@ -1333,7 +1476,7 @@ func (s *Send) startBwScheduler(ctx context.Context, sessionID uint64) {
 						Seq:                 p.Seq,
 						Count:               p.Count,
 						SendMS:              p.SendMS,
-						TrainBytesTotal:     p.Total,
+						TargetBps:           p.TargetBps,
 						TrainBytesRemaining: p.Remaining,
 						Payload:             make([]byte, p.Bytes),
 					},

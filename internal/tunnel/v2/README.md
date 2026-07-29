@@ -101,14 +101,14 @@ DATA/REPAIR observations from the receive FEC window. Same-leg DATA/REPAIR
 samples are ignored because they have no cross-leg evidence. Cross-leg samples
 estimate:
 
-- actual DATA delivery rate
-- FEC-derived expected DATA rate
-- REPAIR shadow equivalent rate
+- original DATA delivery rate
+- FEC-recovered expected DATA rate
+- expected REPAIR rate from the group maximum packet size and decoded repair count
 
-The estimator can report either the DATA leg as limited or the REPAIR shadow leg
-as limited. Runtime `QoSWriter` sends LINK_STATUS, and Send applies it as
-time-limited per-lane selector evidence through `LaneManager`; this is not a
-global UDP/TCP fallback.
+The estimator maintains UDP and TCP limited state for the lane. Runtime
+`QoSWriter` sends LINK_STATUS snapshots carrying both leg states and their
+delivered bps estimates, and Send applies each snapshot through `LaneManager`;
+this is not a global UDP/TCP fallback.
 
 ## Bandwidth Probe
 

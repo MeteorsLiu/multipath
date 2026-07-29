@@ -8,6 +8,7 @@ import (
 	"github.com/MeteorsLiu/multipath/internal/protocol"
 	sessionpkg "github.com/MeteorsLiu/multipath/internal/session"
 	"github.com/MeteorsLiu/multipath/internal/transport"
+	"github.com/MeteorsLiu/multipath/internal/transport/selector"
 )
 
 func TestSendWrite(t *testing.T) {
@@ -61,6 +62,51 @@ func TestSendWrite(t *testing.T) {
 		payload.Packet.Release()
 	default:
 		t.Error("expected packet in output queue")
+	}
+}
+
+func TestSelectorEventReason(t *testing.T) {
+	tests := []struct {
+		name     string
+		udp      selector.Quality
+		tcp      selector.Quality
+		selected transport.Kind
+		want     string
+	}{
+		{
+			name:     "qos avoids udp",
+			udp:      selector.Quality{Active: true, QoSActive: true, QoSDeliveredBps: 10},
+			tcp:      selector.Quality{Active: true, QoSDeliveredBps: 100},
+			selected: transport.KindTCP,
+			want:     "qos_avoid_udp",
+		},
+		{
+			name:     "prefer tcp",
+			udp:      selector.Quality{Active: true, PreferTCP: true},
+			tcp:      selector.Quality{Active: true},
+			selected: transport.KindTCP,
+			want:     "prefer_tcp",
+		},
+		{
+			name:     "only tcp active",
+			udp:      selector.Quality{},
+			tcp:      selector.Quality{Active: true},
+			selected: transport.KindTCP,
+			want:     "tcp_only_active",
+		},
+		{
+			name:     "default udp",
+			udp:      selector.Quality{Active: true},
+			tcp:      selector.Quality{Active: true},
+			selected: transport.KindUDP,
+			want:     "default_udp",
+		},
+	}
+
+	for _, tt := range tests {
+		if got := selectorEventReason(tt.udp, tt.tcp, tt.selected); got != tt.want {
+			t.Fatalf("%s: reason = %q, want %q", tt.name, got, tt.want)
+		}
 	}
 }
 
@@ -153,6 +199,42 @@ func TestSendWriteFrameExplicitTransport(t *testing.T) {
 		payload.Packet.Release()
 	default:
 		t.Error("expected packet in output queue")
+	}
+}
+
+func TestSendWriteFrameExplicitTransportKindSelectsBoundLeg(t *testing.T) {
+	s := New()
+	sessionID := uint64(99)
+	lane := newLaneRuntime(1, 100)
+	lane.bindTCP(transport.LegRef{Kind: transport.KindTCP, ConnID: "tcp-lane-1"})
+
+	s.lanesMu.Lock()
+	s.lanes[laneKey{sessionID: sessionID, laneID: 1}] = lane
+	s.lanesMu.Unlock()
+
+	frame := protocol.Frame{
+		Version:   protocol.Version,
+		Type:      protocol.TypePING,
+		SessionID: sessionID,
+		LaneID:    1,
+		Body: protocol.PingBody{
+			PingID: 123,
+			TimeMS: 1000,
+		},
+	}
+
+	if err := s.WriteFrame(context.Background(), frame, transport.LegRef{Kind: transport.KindTCP}); err != nil {
+		t.Fatalf("WriteFrame with kind-only TCP ref failed: %v", err)
+	}
+
+	select {
+	case payload := <-s.Packets():
+		defer payload.Packet.Release()
+		if payload.Leg.Kind != transport.KindTCP || payload.Leg.ConnID != "tcp-lane-1" {
+			t.Fatalf("payload leg = %+v, want tcp-lane-1", payload.Leg)
+		}
+	default:
+		t.Fatal("expected packet in output queue")
 	}
 }
 

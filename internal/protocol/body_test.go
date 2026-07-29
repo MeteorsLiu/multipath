@@ -46,13 +46,13 @@ func TestTypedFramesRoundTrip(t *testing.T) {
 			Type:      TypeDATA,
 			SessionID: 11,
 			LaneID:    1,
-			Body:      DataBody{PacketID: 0x01020304, Packet: []byte("packet")},
+			Body:      DataBody{GroupID: 0x01020304, SourceIndex: 3, Packet: []byte("packet")},
 		},
 		{
 			Type:      TypeREPAIR,
 			SessionID: 11,
 			LaneID:    1,
-			Body:      RepairBody{BasePacketID: 10, Key: 7, SourceSpan: 4, Symbol: []byte("repair")},
+			Body:      RepairBody{GroupID: 10, Key: 7, SourceSpan: 4, RepairCount: 1, Symbol: []byte("repair")},
 		},
 		{
 			Type:      TypeCLOSE,
@@ -70,7 +70,7 @@ func TestTypedFramesRoundTrip(t *testing.T) {
 				Seq:                 2,
 				Count:               4,
 				SendMS:              12347,
-				TrainBytesTotal:     1000,
+				TargetBps:           200_000_000,
 				TrainBytesRemaining: 250,
 				Payload:             []byte("probe"),
 			},
@@ -96,6 +96,88 @@ func TestTypedFramesRoundTrip(t *testing.T) {
 	}
 }
 
+func TestDataBodyPacksGroupIDAndSourceIndex(t *testing.T) {
+	body := DataBody{GroupID: 25, SourceIndex: 3, Packet: []byte("packet")}
+	encoded, err := Encode(Frame{Type: TypeDATA, SessionID: 11, LaneID: 1, Body: body}, nil)
+	if err != nil {
+		t.Fatalf("Encode DATA failed: %v", err)
+	}
+	if got, want := binary.BigEndian.Uint32(encoded[headerSize:headerSize+4]), uint32(103); got != want {
+		t.Fatalf("packed DATA id = %d, want %d", got, want)
+	}
+
+	decoded, err := Decode(encoded)
+	if err != nil {
+		t.Fatalf("Decode DATA failed: %v", err)
+	}
+	got := decoded.Body.(DataBody)
+	if got.GroupID != body.GroupID || got.SourceIndex != body.SourceIndex {
+		t.Fatalf("decoded DATA id = group:%d index:%d, want group:%d index:%d", got.GroupID, got.SourceIndex, body.GroupID, body.SourceIndex)
+	}
+}
+
+func TestGroupIDValidation(t *testing.T) {
+	tests := []Frame{
+		{Type: TypeDATA, Body: DataBody{GroupID: maxGroupID + 1}},
+		{Type: TypeDATA, Body: DataBody{SourceIndex: 4}},
+		{Type: TypeREPAIR, Body: RepairBody{GroupID: maxGroupID + 1, SourceSpan: 4}},
+	}
+	for _, frame := range tests {
+		if _, err := Encode(frame, nil); !errors.Is(err, ErrInvalidFrame) {
+			t.Fatalf("Encode(%+v) err = %v, want ErrInvalidFrame", frame.Body, err)
+		}
+	}
+
+	encoded, err := Encode(Frame{Type: TypeREPAIR, Body: RepairBody{GroupID: 1, SourceSpan: 4}}, nil)
+	if err != nil {
+		t.Fatalf("Encode REPAIR failed: %v", err)
+	}
+	encoded[headerSize] |= 0x40
+	if _, err := Decode(encoded); !errors.Is(err, ErrInvalidFrame) {
+		t.Fatalf("Decode reserved REPAIR group bits err = %v, want ErrInvalidFrame", err)
+	}
+}
+
+func TestRepairBodyPacksSourceSpanAndRepairCount(t *testing.T) {
+	body := RepairBody{GroupID: 10, Key: 7, SourceSpan: 4, Symbol: []byte("repair")}
+	setRepairCountForTest(t, &body, 3)
+	encoded, err := Encode(Frame{Type: TypeREPAIR, SessionID: 11, LaneID: 1, Body: body}, nil)
+	if err != nil {
+		t.Fatalf("Encode REPAIR failed: %v", err)
+	}
+	if got, want := encoded[headerSize+6], uint8(0x14); got != want {
+		t.Fatalf("packed source_span byte = %#x, want %#x", got, want)
+	}
+
+	got, err := Decode(encoded)
+	if err != nil {
+		t.Fatalf("Decode REPAIR failed: %v", err)
+	}
+	repair := got.Body.(RepairBody)
+	if repair.SourceSpan != 4 {
+		t.Fatalf("decoded source span = %d, want 4", repair.SourceSpan)
+	}
+	if got := repairCountForTest(t, repair); got != 3 {
+		t.Fatalf("decoded repair count = %d, want 3", got)
+	}
+}
+
+func TestRepairBodyRejectsReservedSourceSpanBits(t *testing.T) {
+	encoded, err := Encode(Frame{
+		Type:      TypeREPAIR,
+		SessionID: 11,
+		LaneID:    1,
+		Body:      RepairBody{GroupID: 10, Key: 7, SourceSpan: 4, Symbol: []byte("repair")},
+	}, nil)
+	if err != nil {
+		t.Fatalf("Encode REPAIR failed: %v", err)
+	}
+	encoded[headerSize+6] = 0x24
+	if _, err := Decode(encoded); !errors.Is(err, ErrInvalidFrame) {
+		t.Fatalf("Decode reserved repair source_span err = %v, want ErrInvalidFrame", err)
+	}
+}
+
 func TestBodyTooShort(t *testing.T) {
 	for _, frameType := range []FrameType{
 		TypeHELLO,
@@ -116,10 +198,28 @@ func TestBodyTooShort(t *testing.T) {
 	}
 }
 
-func TestBandwidthProbeRejectsInvalidTrainBudget(t *testing.T) {
+func setRepairCountForTest(t *testing.T, body *RepairBody, repairCount uint8) {
+	t.Helper()
+	field := reflect.ValueOf(body).Elem().FieldByName("RepairCount")
+	if !field.IsValid() {
+		t.Fatal("RepairBody missing RepairCount field")
+	}
+	field.SetUint(uint64(repairCount))
+}
+
+func repairCountForTest(t *testing.T, body RepairBody) uint8 {
+	t.Helper()
+	field := reflect.ValueOf(body).FieldByName("RepairCount")
+	if !field.IsValid() {
+		t.Fatal("RepairBody missing RepairCount field")
+	}
+	return uint8(field.Uint())
+}
+
+func TestBandwidthProbeRejectsInvalidRoundShape(t *testing.T) {
 	tests := []BandwidthProbeBody{
-		{TrainID: 1, ProbeID: 1, Seq: 0, Count: 1, SendMS: 1, TrainBytesTotal: 0, TrainBytesRemaining: 0},
-		{TrainID: 1, ProbeID: 1, Seq: 0, Count: 1, SendMS: 1, TrainBytesTotal: 100, TrainBytesRemaining: 101},
+		{TrainID: 1, ProbeID: 1, Seq: 0, Count: 0, SendMS: 1, TargetBps: 200_000_000, TrainBytesRemaining: 0},
+		{TrainID: 1, ProbeID: 1, Seq: 64, Count: 64, SendMS: 1, TargetBps: 200_000_000, TrainBytesRemaining: 0},
 	}
 	for _, body := range tests {
 		_, err := Encode(Frame{Type: TypeBandwidthProbe, SessionID: 1, LaneID: 1, Body: body}, nil)
@@ -129,7 +229,7 @@ func TestBandwidthProbeRejectsInvalidTrainBudget(t *testing.T) {
 	}
 }
 
-func TestBandwidthProbeDecodeRejectsInvalidTrainBudget(t *testing.T) {
+func TestBandwidthProbeTargetBpsUsesFormerTotalField(t *testing.T) {
 	encoded, err := Encode(Frame{
 		Type:      TypeBandwidthProbe,
 		SessionID: 1,
@@ -140,16 +240,23 @@ func TestBandwidthProbeDecodeRejectsInvalidTrainBudget(t *testing.T) {
 			Seq:                 0,
 			Count:               1,
 			SendMS:              1,
-			TrainBytesTotal:     100,
-			TrainBytesRemaining: 100,
+			TargetBps:           123_456_789,
+			TrainBytesRemaining: 987,
 		},
 	}, nil)
 	if err != nil {
 		t.Fatalf("Encode valid probe failed: %v", err)
 	}
-	binary.BigEndian.PutUint64(encoded[10+36:10+44], 101)
-	if _, err := Decode(encoded); !errors.Is(err, ErrInvalidFrame) {
-		t.Fatalf("Decode invalid remaining err = %v, want ErrInvalidFrame", err)
+	if got := binary.BigEndian.Uint64(encoded[10+28 : 10+36]); got != 123_456_789 {
+		t.Fatalf("encoded target_bps = %d, want 123456789", got)
+	}
+	decoded, err := Decode(encoded)
+	if err != nil {
+		t.Fatalf("Decode probe failed: %v", err)
+	}
+	body := decoded.Body.(BandwidthProbeBody)
+	if body.TargetBps != 123_456_789 || body.TrainBytesRemaining != 987 {
+		t.Fatalf("decoded probe = %+v, want target_bps 123456789 remaining 987", body)
 	}
 }
 
@@ -159,9 +266,9 @@ func TestLinkStatusRoundTrip(t *testing.T) {
 		SessionID: 11,
 		LaneID:    1,
 		Body: LinkStatusBody{
-			LegKind:      LinkStatusLegUDP,
-			Reason:       LinkStatusReasonLimited,
-			DeliveredBps: 2_000_000,
+			Status:          0x54,
+			UDPDeliveredBps: 2_000_000,
+			TCPDeliveredBps: 8_000_000,
 		},
 	}
 	encoded, err := Encode(frame, nil)
@@ -177,10 +284,10 @@ func TestLinkStatusRoundTrip(t *testing.T) {
 
 func TestLinkStatusRejectsInvalidBody(t *testing.T) {
 	tests := []LinkStatusBody{
-		{LegKind: 0, Reason: LinkStatusReasonLimited, DeliveredBps: 1},
-		{LegKind: LinkStatusLegUDP, Reason: 0, DeliveredBps: 1},
-		{LegKind: LinkStatusLegTCP + 1, Reason: LinkStatusReasonLimited, DeliveredBps: 1},
-		{LegKind: LinkStatusLegUDP, Reason: LinkStatusReasonLimited + 1, DeliveredBps: 1},
+		{Status: 0x80, UDPDeliveredBps: 1},
+		{Status: 0x08, TCPDeliveredBps: 1},
+		{Status: 0xf0, UDPDeliveredBps: 1},
+		{Status: 0x0f, TCPDeliveredBps: 1},
 	}
 	for _, body := range tests {
 		_, err := Encode(Frame{Type: TypeLinkStatus, SessionID: 1, LaneID: 1, Body: body}, nil)

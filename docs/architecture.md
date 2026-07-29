@@ -255,11 +255,12 @@ type Handler interface {
 }
 
 type QoSStatus struct {
-    SessionID    uint64
-    LaneID       uint8
-    Kind         transport.Kind
-    Reason       uint8
-    DeliveredBps uint32
+    SessionID       uint64
+    LaneID          uint8
+    UDPLimited      bool
+    TCPLimited      bool
+    UDPDeliveredBps uint32
+    TCPDeliveredBps uint32
 }
 
 type QoSCallback func(ctx context.Context, status QoSStatus) error
@@ -289,12 +290,247 @@ Recv passes HELLO, HELLO_ACK, PING, PONG, CLOSE, BW_PROBE, BW_PROBE_ACK, and LIN
 Recv does not pass DATA or REPAIR to Handler.
 Recv only accepts DATA or REPAIR for sessions admitted by the shared Session Manager.
 Unknown-session DATA or REPAIR is dropped.
-Recv owns per-lane receive-side FEC windows and a session-scoped emit dedupe.
-Recv keeps a per-lane QoS estimator beside the receive FEC window. The
-estimator consumes complete or recovered DATA/REPAIR group samples, compares
-DATA-leg delivery with FEC-derived expected delivery, estimates shadow-leg
-equivalent rate from REPAIR bytes, and reports abnormal status through Recv's
-QoS callback.
+Recv owns per-lane receive-side FEC group windows and per-lane emit dedupe.
+Each receive group is keyed by the protocol `group_id` and directly owns its
+retained DATA and REPAIR buffers; Recv does not keep a separate recent-DATA
+window beside the group tree.
+Recv keeps a per-lane QoS estimator beside the receive FEC window. Recv is
+only glue for QoS and FEC-health events: it extracts facts from DATA, REPAIR,
+and FEC-window results, then immediately submits those facts to the estimator.
+Recv must not keep QoS rate counters, FEC-health pending counters, adaptive
+repair-count policy state, QoS decision-filter state, or Recv-side helpers that
+calculate LINK_STATUS state. Do not add a Recv-owned `rxFECPolicy`,
+`fecPolicies`, FEC-health ticker, post-tick hook, or equivalent renamed
+mechanism. The estimator owns all QoS/FEC-health storage and calculation.
+
+The estimator consumes only real receive-side sample classes and keeps them
+separate:
+
+```text
+originalDataBytes = DATA bytes received without REPAIR and without late arrivals
+expectedBytes     = source DATA bytes known from a completed or recovered FEC
+                    group and IP packet header length parsing
+repairBytes       = received REPAIR symbol bytes
+lateDataBytes     = original DATA bytes that arrive after the same packet id
+                    was recovered by FEC
+```
+
+A periodic estimator tick converts these pending byte counters into rate
+observations and clears the pending counters for the next tick. The tick period
+is one second:
+
+```text
+originalDataBps = originalDataBytes / deltaT
+expectedBps     = expectedBytes / deltaT
+repairBps       = repairBytes / deltaT
+lateDataBps     = lateDataBytes / deltaT
+```
+
+DATA-leg QoS is judged from `expectedBytes` versus received DATA bytes.
+`originalDataBytes` is accounted when an original DATA packet is accepted for
+emit. `lateDataBytes` is accounted when a recovered packet's original DATA
+arrives later. DATA-leg rate comparison uses `originalDataBytes +
+lateDataBytes`, while `lateDataBytes` remains a separate late-arrival
+observation for FEC health and logging. The estimator must not add a fifth
+pending byte class for derived repair expectations. The estimator stores each
+tick's `rateGap`, averages three consecutive tick gaps, and compares that
+three-sample average with the QoS thresholds.
+
+Shadow/REPAIR QoS uses the same tick cadence but a REPAIR-specific expected
+rate. When a group completes, the estimator derives a group repair scale from
+the largest source packet in that group and the decoded REPAIR-frame repair
+count:
+
+```text
+groupRepairScale = maxSourceBytes / expectedBytes * repairCount
+```
+
+The estimator updates a direction-local EMA with this scale when the group is
+submitted. The tick does not recompute group ratios; it computes:
+
+```text
+expectedRepairBps = expectedBps * repairScaleEMA
+deliveryGap       = rateGapRatio(expectedRepairBps, repairBps)
+loadGap           = rateGapRatio(expectedBps, repairBps)
+```
+
+The REPAIR-side limited decision uses the three-sample average of
+`deliveryGap`: if REPAIR is not delivering its own expected load, the repair
+transport kind is limited. The REPAIR-side clear decision requires both
+three-sample averages to be below the clear threshold, or the current non-cap
+tick to show full shadow recovery with `repairBps >= expectedBps`:
+
+```text
+deliveryGap <= 0.03
+loadGap     <= 0.10 OR repairBps >= expectedBps
+```
+
+`deliveryGap` proves the REPAIR symbols are being delivered for the repair load
+the peer actually sent. `loadGap` proves that the shadow leg is carrying a load
+close to the current DATA expectation. The clear threshold allows up to 10%
+measurement slack, so the shadow leg must carry at least 90% of the DATA
+expectation. A low-rate REPAIR trickle must not clear a transport kind for DATA:
+with the default 4+1 FEC shape, one REPAIR for four source packets carries
+about 25% of `expectedBps`, so successful delivery of that default repair load
+is not recovery evidence for DATA-primary capacity. When a cap reference is
+active, cap-based clear still uses the cap load threshold rather than the
+`repairBps >= expectedBps` shortcut.
+Inconsistent REPAIR-frame repair counts within one group make that group
+unusable for repair-scale updates.
+
+QoS limited/clear decisions are made only by estimator ticks. DATA and REPAIR
+arrival paths submit raw byte facts to the estimator immediately; group
+lifetime must not decide whether `originalDataBytes`, `repairBytes`, or
+`lateDataBytes` can be accounted. `originalDataBytes` is DATA arrival state,
+`repairBytes` is REPAIR arrival state, and `lateDataBytes` is late DATA arrival
+state. Only `expectedBytes` is a FEC-group result: it is submitted when the
+group completes or recovers and the receiver knows the source DATA byte total.
+None of these paths may submit limited or clear state directly.
+FEC health observations such as incomplete-group `DataArrived/DataExpected`
+do not directly feed the QoS limited/clear detector. They are submitted to the
+same lane-local QoS estimator as FEC-health facts and drive adaptive
+repair count. That adaptive repair count has two purposes:
+
+1. When the current DATA primary is losing heavily, QoS rate detection may lack
+   enough accepted DATA/group evidence. Raising repair count lets the shadow
+   REPAIR leg recover more source packets sooner, restoring tunnel throughput
+   and keeping receive-side group facts flowing.
+2. When the current DATA primary is backpressured and many originals arrive
+   late, raising repair count lets the shadow REPAIR leg recover those packets
+   before the delayed originals arrive, reducing upper-layer wait time.
+
+The higher shadow REPAIR load created by adaptive repair count also supplies
+the only valid shadow-capacity evidence for clearing a previously limited
+transport kind. A clear requires the shadow leg to deliver REPAIR under load
+within 10% of the current DATA expectation; FEC health itself is not a separate
+QoS limited/clear signal.
+
+FEC health has two separate inputs:
+
+- loss health from FEC group completeness
+- late health from original DATA that arrived after the same packet id was
+  recovered by FEC
+
+These inputs must stay separate. Do not merge them into a shared pressure value
+or a shared EMA. The estimator updates the loss-health EMA when each group fact
+is submitted:
+
+```text
+groupLossRatio = (DataExpected - DataArrived) / DataExpected
+lossEMA        = EMA(lossEMA, groupLossRatio, 0.75 when rising, 0.01 when falling)
+lossRepairCount = clamp(ceil(lossEMA * 4), 1, 4)
+```
+
+Loss health must react quickly to rising loss and decay slowly after loss clears,
+so short healthy bursts do not immediately reduce repair traffic and reintroduce
+oscillation.
+
+The estimator updates the late-health EMA only from the estimator tick's own
+pending byte counters:
+
+```text
+lateRatio   = lateDataBytes / expectedBytes
+lateEMA     = EMA(lateEMA, lateRatio, 0.20 when rising, 0.05 when falling)
+
+lateRepairCount = 1 when lateEMA <= 0.50
+lateRepairCount = 2 when lateEMA <= 0.75
+lateRepairCount = 3 when lateEMA <= 1.00
+lateRepairCount = 4 when lateEMA >  1.00
+```
+
+If `expectedBytes` is zero for the tick, late health is not updated because the
+tick has no DATA-load denominator. Late health must be slower and more
+conservative than loss health, so transient late arrivals do not frequently
+raise repair traffic. When late arrivals stop, late health decays through its
+own EMA and may lower its own repair demand.
+
+The shared lane-local estimator tick does not recompute group loss ratios or
+consume a separate FEC-health sample queue. It commits the adaptive
+`repairCount` from the already maintained health state:
+
+```text
+repairCount = max(lossRepairCount, lateRepairCount)
+```
+
+Do not add a separate ticker, loop, timer, goroutine, independently scheduled
+tick, or Recv-owned flush path for FEC health.
+The estimator records the current primary transport direction for the lane. The
+shadow direction is the opposite transport kind and does not need separate
+storage. All estimator runtime state is keyed only by DATA/REPAIR direction and
+role:
+
+```text
+(dataKind, repairKind, role)
+```
+
+where role is primary/DATA or shadow/REPAIR. Rate EMAs, PID correction,
+limited state, delivered-bps estimates, FEC-health EMA state, and
+adaptive repair-count state must not be stored in a map keyed only by transport
+kind such as UDP or TCP. UDP/TCP are transport values inside a direction and are
+allowed only as facts in that direction key or as fields in the final
+LINK_STATUS projection.
+
+Primary/DATA role state is used to judge the current primary DATA leg, and
+shadow/REPAIR role state is used to observe the current shadow leg. Each tick
+evaluates only the state for the current role; non-current role state does not
+consume the tick or emit LINK_STATUS state. The three-sample gap window is the
+QoS smoothing mechanism; do not add a separate minimum group-count gate before
+evaluating QoS.
+Before changing the current primary direction, the estimator resets the target
+primary/DATA state that would otherwise carry stale `actual` or `expected` rate
+history into the new primary leg. It also resets the old primary's
+shadow/REPAIR state that would otherwise carry stale `repair` history into
+shadow observation. The unrelated side of each transport's role state is left
+intact.
+Adaptive `repairCount` is FEC-health state, not a pending sample counter. Tick
+flushes may clear the FEC-health dirty flag after applying the current loss
+EMA, but they must not reset `repairCount` except through the explicit reset
+paths below:
+
+- an actual primary protocol switch between UDP and TCP
+- a direction-local high-repair dwell reset after computed `repairCount=4`
+  persists for 75 seconds
+
+The dwell timer starts when the computed adaptive repair count first reaches
+`4`, clears when the computed count falls below `4`, and is reset by primary
+protocol switches. When the dwell expires, only the direction-local FEC-health
+state is reset to `repairCount=1`; QoS limited/clear state, rate windows, and
+delivered-bps snapshots are preserved. Subsequent loss or late samples may raise
+repair count again and start a new dwell interval. Ordinary estimator ticks,
+empty ticks, clear/limited decisions that do not switch protocol, LINK_STATUS
+send/drop/failure paths, and Recv glue must otherwise preserve the current
+value. When a reset changes `repairCount`, the reset must happen before the
+committed LINK_STATUS snapshot is emitted so the sent repair-count bits and the
+estimator's local committed state are identical.
+The final LINK_STATUS snapshot is a projection computed from committed
+direction-local role state. It may expose UDP and TCP fields because the
+protocol encodes the snapshot that way, but the estimator must not maintain a
+separate transport-indexed state cache just to build that output. An aggregated
+UDP/TCP snapshot must not gate another direction's QoS judgment. LINK_STATUS is
+emitted as state-change feedback, not as continuous bandwidth telemetry.
+`UDPDeliveredBps` and `TCPDeliveredBps` are auxiliary values carried with a
+clear/limited snapshot; a delivered-bps-only change generally does not require
+a new LINK_STATUS frame. The exception is the both-limited case: if updated
+delivered-bps estimates change the QoS-preferred primary leg, the receiver
+sends a fresh LINK_STATUS snapshot so the sender selector is not held to stale
+relative bps.
+Recv must not feed DATA rejected by lane-local emit dedupe into
+`originalDataBytes`, loss health, recovery, emit state, or the receive FEC
+window. Recv forwards the late-DATA fact to the lane-local QoS estimator. The
+estimator may account it once as `lateDataBytes` only when its recovered-packet
+state has seen the packet id; `lateDataBytes` must stay separate from
+`originalDataBytes`. Duplicate original DATA that was already emitted as
+original DATA is not late DATA. QoS must not create synthetic DATA bytes,
+mature rate samples, or bandwidth-estimation inputs from discarded DATA or
+unrecovered DATA. FEC-recovered DATA may
+contribute only to `expectedBytes` after parsing the recovered IP packet header
+length. Unrecoverable or expired groups may only contribute to adaptive FEC
+health observations such as
+`DataArrived/DataExpected`; they must not feed QoS limited/clear rate state.
+Receive-side QoS must not add a `lossRepair` detector or assume that a newly
+sent LINK_STATUS repair count has already affected the peer sender's current
+FEC groups. The current receive group uses the decoded REPAIR-frame repair
+count.
 Recv must not import or call concrete Send.
 ```
 
@@ -330,7 +566,9 @@ RecvHandler routes inbound PONG to the send-registered ping instance through Lan
 RecvHandler routes inbound BW_PROBE_ACK to the send-registered BwLoop through LaneManager.
 RecvHandler routes inbound LINK_STATUS into the lane QoS input registered in LaneManager.
 Runtime QoSWriter converts Recv QoS callbacks into outbound LINK_STATUS frames
-after LINK_STATUS has been negotiated for that session and lane.
+after LINK_STATUS has been negotiated for that session and lane. QoSWriter sends
+those LINK_STATUS frames through `Send.WriteFrame` with a TCP transport ref for
+the target lane, not through the lane's default control-transport policy.
 RecvHandler does not touch lane/leg internals directly.
 RecvHandler does not handle DATA or REPAIR.
 ```
@@ -561,8 +799,11 @@ Protocol does not know Schedule Strategy.
 Protocol behavior is only Encode and Decode.
 Frame carries one concrete Body, and Frame.Type selects which body type is valid.
 Do not add public per-type body helper functions.
+Protocol owns the DATA `group_id`/`source_index` bit packing and the REPAIR
+30-bit `group_id` validation. Send and Recv consume decoded body fields and do
+not duplicate the wire bit layout.
 Current v2 negotiates CapLinkStatus with FEC. LINK_STATUS is a control frame for
-receive-side QoS status; protocol only encodes and decodes it.
+receive-side lane QoS snapshots; protocol only encodes and decodes it.
 ```
 
 ## FEC

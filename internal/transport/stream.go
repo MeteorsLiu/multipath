@@ -30,6 +30,7 @@ type Stream struct {
 
 	mu      sync.RWMutex
 	conns   map[string]net.Conn
+	readers map[string]struct{}
 	writer  PacketWriter
 	failure LegFailureHandler
 	runCtx  context.Context
@@ -40,6 +41,7 @@ func NewStream(listener net.Listener) *Stream {
 	return &Stream{
 		listener: listener,
 		conns:    make(map[string]net.Conn),
+		readers:  make(map[string]struct{}),
 	}
 }
 
@@ -50,14 +52,26 @@ func (s *Stream) SetFailureHandler(handler LegFailureHandler) {
 }
 
 func (s *Stream) Run(ctx context.Context, writer PacketWriter) error {
+	type readStart struct {
+		connID string
+		conn   net.Conn
+	}
+	var starts []readStart
+
 	s.mu.Lock()
 	s.writer = writer
 	s.runCtx = ctx
 	for connID, conn := range s.conns {
-		debuglog.Printf("transport/tcp", "start existing read_loop conn=%s remote=%v", connID, debugRemoteAddr(conn))
-		go s.readLoop(ctx, connID, conn, writer)
+		if s.markReaderLocked(connID, conn) {
+			starts = append(starts, readStart{connID: connID, conn: conn})
+		}
 	}
 	s.mu.Unlock()
+
+	for _, start := range starts {
+		debuglog.Printf("transport/tcp", "start existing read_loop conn=%s remote=%v", start.connID, debugRemoteAddr(start.conn))
+		go s.readLoop(ctx, start.connID, start.conn, writer)
+	}
 	debuglog.Printf("transport/tcp", "run listener=%v", s.listener != nil)
 
 	errCh := make(chan error, 1)
@@ -100,9 +114,7 @@ func (s *Stream) Dial(ctx context.Context, remote string) (LegRef, error) {
 	connID := s.addConn(conn)
 	debuglog.Printf("transport/tcp", "dial ok remote=%s conn=%s local=%v", remote, connID, debugLocalAddr(conn))
 	writer, runCtx := s.currentRuntime()
-	if writer != nil {
-		go s.readLoop(runCtx, connID, conn, writer)
-	}
+	s.startReadLoop(runCtx, connID, conn, writer)
 
 	return LegRef{
 		Kind:   KindTCP,
@@ -128,16 +140,15 @@ func (s *Stream) Write(ctx context.Context, connID string, payload []byte) (int,
 		return 0, ErrUnknownConn
 	}
 
-	var header [2]byte
-	binary.BigEndian.PutUint16(header[:], uint16(len(payload)))
-	buffers := net.Buffers{header[:], payload}
-
 	select {
 	case <-ctx.Done():
 		return 0, ctx.Err()
 	default:
 	}
-	n, err := writeBuffersFull(conn, buffers)
+
+	var header [2]byte
+	binary.BigEndian.PutUint16(header[:], uint16(len(payload)))
+	n, err := writeBuffersFull(conn, net.Buffers{header[:], payload})
 	if err != nil {
 		if isTimeout(err) {
 			select {
@@ -160,23 +171,78 @@ func (s *Stream) Write(ctx context.Context, connID string, payload []byte) (int,
 	if debuglog.Enabled() {
 		debuglog.Printf("transport/tcp", "write conn=%s bytes=%d", connID, written)
 	}
-	metrics.IncCounter(metrics.TransportPacketsTotal,
-		metrics.L("transport", "tcp"),
-		metrics.L("direction", "tx"),
-		metrics.L("endpoint", ""),
-	)
-	metrics.AddCounter(metrics.TransportBytesTotal, uint64(written),
-		metrics.L("transport", "tcp"),
-		metrics.L("direction", "tx"),
-		metrics.L("endpoint", ""),
-	)
+	recordTCPWrite(1, written)
 	return payloadBytesWritten(n), err
+}
+
+func (s *Stream) writePayloadBatch(ctx context.Context, connID string, payloads []Payload) error {
+	if len(payloads) == 0 {
+		return nil
+	}
+	packetCount := len(payloads)
+
+	s.mu.RLock()
+	conn := s.conns[connID]
+	s.mu.RUnlock()
+	if conn == nil {
+		releasePayloads(payloads)
+		debuglog.Printf("transport/tcp", "write unknown conn=%s packets=%d bytes=%d", connID, len(payloads), payloadBatchBytes(payloads))
+		metrics.IncCounter(metrics.TransportErrorsTotal,
+			metrics.L("transport", "tcp"),
+			metrics.L("operation", "write_unknown_conn"),
+		)
+		s.notifyLegFailure(ctx, connID, ErrUnknownConn)
+		return ErrUnknownConn
+	}
+
+	totalBytes, payloadBytes, err := streamPayloadBatchSize(payloads)
+	if err != nil {
+		releasePayloads(payloads)
+		return err
+	}
+
+	select {
+	case <-ctx.Done():
+		releasePayloads(payloads)
+		return ctx.Err()
+	default:
+	}
+
+	n, err := writeStreamPayloadBatch(conn, payloads)
+	releasePayloads(payloads)
+	if err == nil && n != int64(totalBytes) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		if isTimeout(err) {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
+		}
+		debuglog.Printf("transport/tcp", "write batch conn=%s packets=%d bytes=%d err=%v", connID, packetCount, payloadBytes, err)
+		metrics.IncCounter(metrics.TransportErrorsTotal,
+			metrics.L("transport", "tcp"),
+			metrics.L("operation", "write"),
+		)
+		s.deleteConn(connID, conn)
+		_ = conn.Close()
+		s.notifyLegFailure(ctx, connID, err)
+		return err
+	}
+	if debuglog.Enabled() {
+		debuglog.Printf("transport/tcp", "write batch conn=%s packets=%d bytes=%d", connID, packetCount, payloadBytes)
+	}
+	recordTCPWrite(packetCount, payloadBytes)
+	return nil
 }
 
 func (s *Stream) Close(ctx context.Context, connID string) error {
 	s.mu.Lock()
 	conn := s.conns[connID]
 	delete(s.conns, connID)
+	delete(s.readers, connID)
 	s.mu.Unlock()
 	if conn == nil {
 		debuglog.Printf("transport/tcp", "close unknown conn=%s", connID)
@@ -224,7 +290,7 @@ func (s *Stream) acceptLoop(ctx context.Context, writer PacketWriter) error {
 
 		connID := s.addConn(conn)
 		debuglog.Printf("transport/tcp", "accept conn=%s remote=%v local=%v", connID, debugRemoteAddr(conn), debugLocalAddr(conn))
-		go s.readLoop(ctx, connID, conn, writer)
+		s.startReadLoop(ctx, connID, conn, writer)
 	}
 }
 
@@ -324,6 +390,30 @@ func (s *Stream) addConn(conn net.Conn) string {
 	return connID
 }
 
+func (s *Stream) startReadLoop(ctx context.Context, connID string, conn net.Conn, writer PacketWriter) {
+	if writer == nil {
+		return
+	}
+	s.mu.Lock()
+	start := s.markReaderLocked(connID, conn)
+	s.mu.Unlock()
+	if !start {
+		return
+	}
+	go s.readLoop(ctx, connID, conn, writer)
+}
+
+func (s *Stream) markReaderLocked(connID string, conn net.Conn) bool {
+	if connID == "" || conn == nil || s.conns[connID] != conn {
+		return false
+	}
+	if _, ok := s.readers[connID]; ok {
+		return false
+	}
+	s.readers[connID] = struct{}{}
+	return true
+}
+
 func (s *Stream) currentRuntime() (PacketWriter, context.Context) {
 	s.mu.RLock()
 	writer := s.writer
@@ -342,6 +432,7 @@ func (s *Stream) deleteConn(connID string, conn net.Conn) bool {
 		return false
 	}
 	delete(s.conns, connID)
+	delete(s.readers, connID)
 	return true
 }
 
@@ -375,4 +466,65 @@ func payloadBytesWritten(frameBytes int64) int {
 		return 0
 	}
 	return int(frameBytes - 2)
+}
+
+func streamPayloadBatchSize(payloads []Payload) (int, int, error) {
+	totalBytes := 0
+	payloadBytes := 0
+	for _, payload := range payloads {
+		if payload.Packet == nil {
+			continue
+		}
+		n := len(payload.Packet.Payload)
+		if n == 0 || n > maxStreamFrameLen-1 {
+			return 0, 0, ErrFrameTooLarge
+		}
+		totalBytes += n + 2
+		payloadBytes += n
+	}
+	if totalBytes == 0 {
+		return 0, 0, ErrFrameTooLarge
+	}
+	return totalBytes, payloadBytes, nil
+}
+
+func writeStreamPayloadBatch(conn net.Conn, payloads []Payload) (int64, error) {
+	headerLen := len(payloads) * 2
+	var headerStack [tcpPayloadBatchSize * 2]byte
+	headers := headerStack[:]
+	if headerLen > len(headers) {
+		headers = make([]byte, headerLen)
+	}
+
+	var bufferStack [tcpPayloadBatchSize * 2][]byte
+	buffers := net.Buffers(bufferStack[:0])
+	if len(payloads)*2 > cap(buffers) {
+		buffers = make(net.Buffers, 0, len(payloads)*2)
+	}
+
+	headerOffset := 0
+	for _, payload := range payloads {
+		if payload.Packet == nil {
+			continue
+		}
+		n := len(payload.Packet.Payload)
+		header := headers[headerOffset : headerOffset+2]
+		headerOffset += 2
+		binary.BigEndian.PutUint16(header, uint16(n))
+		buffers = append(buffers, header, payload.Packet.Payload)
+	}
+	return writeBuffersFull(conn, buffers)
+}
+
+func recordTCPWrite(packets int, bytes int) {
+	metrics.AddCounter(metrics.TransportPacketsTotal, uint64(packets),
+		metrics.L("transport", "tcp"),
+		metrics.L("direction", "tx"),
+		metrics.L("endpoint", ""),
+	)
+	metrics.AddCounter(metrics.TransportBytesTotal, uint64(bytes),
+		metrics.L("transport", "tcp"),
+		metrics.L("direction", "tx"),
+		metrics.L("endpoint", ""),
+	)
 }

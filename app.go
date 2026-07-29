@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"syscall"
 
 	"github.com/MeteorsLiu/multipath/internal/metrics"
 	"github.com/MeteorsLiu/multipath/internal/session"
@@ -99,7 +100,10 @@ func buildServerRuntime(cfg Config, device *tun.Device) (*appRuntime, []io.Close
 		in.EnableFEC()
 	}
 	qosWriter := tunnelruntime.NewQoSWriter(in)
-	handler := tunnelruntime.NewRecvHandler(in, sessions, tunnelruntime.Config{QoSWriter: qosWriter})
+	handler := tunnelruntime.NewRecvHandler(in, sessions, tunnelruntime.Config{
+		BWCapBps:  cfg.bandwidthProbeCapForSend(),
+		QoSWriter: qosWriter,
+	})
 	out := recv.New(recv.Config{
 		Handler:        handler,
 		SessionManager: sessions,
@@ -187,7 +191,10 @@ func buildClientRuntime(cfg Config, device *tun.Device) (*appRuntime, []io.Close
 		in.EnableFEC()
 	}
 	qosWriter := tunnelruntime.NewQoSWriter(in)
-	handler := tunnelruntime.NewRecvHandler(in, sessions, tunnelruntime.Config{QoSWriter: qosWriter})
+	handler := tunnelruntime.NewRecvHandler(in, sessions, tunnelruntime.Config{
+		BWCapBps:  cfg.bandwidthProbeCapForSend(),
+		QoSWriter: qosWriter,
+	})
 	out := recv.New(recv.Config{
 		Handler:        handler,
 		SessionManager: sessions,
@@ -215,6 +222,9 @@ func newMetricsServer(cfg Config) (*metrics.Server, error) {
 		metrics.L("paths", len(cfg.Client.RemotePaths)),
 	)
 	server, err := metrics.NewServer(cfg.PromListenAddr)
+	if err != nil && cfg.promListenAddrDefaulted && errors.Is(err, syscall.EADDRINUSE) {
+		server, err = metrics.NewServer(defaultPromFallbackListen)
+	}
 	if err != nil {
 		return nil, err
 	}

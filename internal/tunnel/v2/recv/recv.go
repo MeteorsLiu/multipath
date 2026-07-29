@@ -1,6 +1,6 @@
 // Package recv is the v2 receive side. It decodes transport-bound frames,
-// handles DATA and REPAIR locally with per-lane FEC receive windows and a
-// session-scoped emit dedupe, dispatches control frames to a recv.Handler
+// handles DATA and REPAIR locally with per-lane FEC receive windows and
+// per-lane emit dedupe, dispatches control frames to a recv.Handler
 // (spec 5.5/5.6), and runs the receive-side FEC differential QoS detector.
 //
 // recv imports neither send nor the probe packages; the runtime glue that wires
@@ -35,20 +35,30 @@ type Handler interface {
 	OnPing(ctx context.Context, from Ref, frame protocol.Frame) error
 	OnPong(ctx context.Context, from Ref, frame protocol.Frame) error
 	OnClose(ctx context.Context, from Ref, frame protocol.Frame) error
-	OnBandwidthProbe(ctx context.Context, from Ref, frame protocol.Frame) error
+	OnBandwidthProbe(ctx context.Context, from Ref, frame protocol.Frame) (BandwidthProbeObservation, error)
 	OnBandwidthProbeAck(ctx context.Context, from Ref, frame protocol.Frame) error
 	OnQoS(ctx context.Context, from Ref, frame protocol.Frame) error
 }
 
 type QoSStatus struct {
-	SessionID    uint64
-	LaneID       uint8
-	Kind         transport.Kind
-	Reason       uint8
-	DeliveredBps uint32
+	SessionID       uint64
+	LaneID          uint8
+	UDPLimited      bool
+	TCPLimited      bool
+	RepairCount     uint8
+	UDPDeliveredBps uint32
+	TCPDeliveredBps uint32
 }
 
 type QoSCallback func(ctx context.Context, status QoSStatus) error
+
+type BandwidthProbeObservation struct {
+	Primary         transport.Kind
+	UDPLimited      bool
+	UDPDeliveredBps uint32
+	TCPDeliveredBps uint32
+	CapBps          uint32
+}
 
 type Config struct {
 	Handler        Handler
@@ -71,74 +81,178 @@ type Recv struct {
 	handler   Handler
 	manager   *sessionpkg.Manager
 	onQoS     QoSCallback
-	fecCodecs [maxFECSourceSpan + 1]fecCodec
+	fecCodecs [maxFECSourceSpan + 1][5]fecCodec
 	packets   chan *packetbuf.Packet
 	states    map[*sessionpkg.Session]*recvState
 }
 
 type recvState struct {
-	mu         sync.Mutex
-	sessionID  uint64
-	closed     bool
-	pendingQoS []qosStatus
+	mu        sync.Mutex
+	sessionID uint64
+	closed    bool
 
 	// rxWindows holds one FEC receive window per lane id. DATA and REPAIR select
 	// their window by frame.LaneID, so reconstruction never crosses lanes
 	// (spec 9.2).
-	rxWindows map[uint8]*rxSLCWindow
+	rxWindows map[uint8]*rxGroupWindow
 
-	// dedupe is the session-scoped emit dedupe (spec 8.2). It decides whether an
-	// original or FEC-recovered packet id has already been written to TUN.
-	dedupe *emitDedupe
+	// emitDedupe decides whether an original or FEC-recovered lane-local DATA id
+	// has already been written to TUN.
+	emitDedupe map[uint8]*dataIDDedupe
 
-	// qos holds the receive-side FEC differential estimator per lane. It consumes
-	// already-aggregated lane DATA/FEC samples, then emits QoS status through
-	// Recv's callback.
+	// qos holds the receive-side estimator per lane. Recv only forwards facts to
+	// it; QoS/FEC-health state and calculations live inside the estimator.
 	qos map[uint8]*qosEstimator
 
-	// shardScratch is reused by recoverPacket to materialize the shard slice for
+	fecTimers map[rxLaneGroupKey]*time.Timer
+
+	// shardScratch is reused by recoverPackets to materialize the shard slice for
 	// fec.Reconstruct without per-call allocation.
-	shardScratch [8][]byte
+	shardScratch     [8][]byte
+	repairKeyScratch [4]uint16
+}
+
+type rxLaneGroupKey struct {
+	laneID  uint8
+	groupID uint32
 }
 
 // windowFor returns the per-lane FEC receive window for laneID, creating it on
 // first use. Caller holds s.mu.
-func (s *recvState) windowFor(laneID uint8) *rxSLCWindow {
+func (s *recvState) windowFor(laneID uint8) *rxGroupWindow {
 	w := s.rxWindows[laneID]
 	if w == nil {
-		w = newRxSLCWindow(4)
+		w = newRxGroupWindow()
 		s.rxWindows[laneID] = w
 	}
 	return w
 }
 
-func (s *recvState) qosFor(laneID uint8, emit func(qosStatus)) *qosEstimator {
-	q := s.qos[laneID]
+func (s *recvState) emitDedupeFor(laneID uint8) *dataIDDedupe {
+	d := s.emitDedupe[laneID]
+	if d == nil {
+		d = newDataIDDedupe(0)
+		s.emitDedupe[laneID] = d
+	}
+	return d
+}
+
+func laneDataID(groupID uint32, sourceIndex uint8) uint32 {
+	return groupID*maxFECSourceSpan + uint32(sourceIndex)
+}
+
+func (o *Recv) qosFor(state *recvState, laneID uint8) *qosEstimator {
+	sessionID := state.sessionID
+	q := state.qos[laneID]
 	if q == nil {
-		q = newQoSEstimator(qosConfig{SessionID: s.sessionID, LaneID: laneID}, emit)
-		s.qos[laneID] = q
+		q = newQoSEstimator(qosConfig{
+			SessionID: sessionID,
+			LaneID:    laneID,
+			AutoStart: true,
+		}, func(status qosStatus) {
+			state.mu.Lock()
+			if state.closed {
+				state.mu.Unlock()
+				return
+			}
+			state.mu.Unlock()
+			if err := o.reportQoS(context.Background(), sessionID, laneID, []qosStatus{status}); err != nil {
+				debuglog.Printf("recv", "qos_report_error session=%d lane=%d err=%v", sessionID, laneID, err)
+			}
+		})
+		state.qos[laneID] = q
 	}
 	return q
 }
 
-func (s *recvState) observeQoSResult(laneID uint8, result rxWindowResult) {
-	if result.hasSample {
-		s.qosFor(laneID, s.emitQoS).Observe(result.sample)
+func (o *Recv) observeBandwidthProbe(ctx context.Context, sessionID uint64, laneID uint8, observation BandwidthProbeObservation) {
+	if !knownQoSTransport(observation.Primary) {
+		return
+	}
+	state := o.recvState(sessionID)
+	if state == nil {
+		return
+	}
+	state.mu.Lock()
+	if state.closed {
+		state.mu.Unlock()
+		return
+	}
+	q := o.qosFor(state, laneID)
+	state.mu.Unlock()
+	statuses := q.observePrimaryHint(qosPrimaryHint{
+		primary:         observation.Primary,
+		udpLimited:      observation.UDPLimited,
+		udpDeliveredBps: observation.UDPDeliveredBps,
+		tcpDeliveredBps: observation.TCPDeliveredBps,
+		capBps:          observation.CapBps,
+	})
+	if err := o.reportQoS(ctx, sessionID, laneID, statuses); err != nil {
+		debuglog.Printf("recv", "qos_report_error session=%d lane=%d err=%v", sessionID, laneID, err)
 	}
 }
 
-func (s *recvState) emitQoS(status qosStatus) {
-	s.pendingQoS = append(s.pendingQoS, status)
+func (o *Recv) trackFECGroup(state *recvState, laneID uint8, groupID uint32) {
+	key := rxLaneGroupKey{laneID: laneID, groupID: groupID}
+	if timer := state.fecTimers[key]; timer != nil {
+		if timer.Reset(defaultQoSGroupMature) {
+			return
+		}
+	}
+	var timer *time.Timer
+	timer = time.AfterFunc(defaultQoSGroupMature, func() {
+		o.expireFECGroup(state, laneID, groupID, timer)
+	})
+	state.fecTimers[key] = timer
 }
 
-func (s *recvState) takeQoSStatuses() []qosStatus {
-	statuses := append([]qosStatus(nil), s.pendingQoS...)
-	s.pendingQoS = s.pendingQoS[:0]
-	return statuses
+func (o *Recv) observeGroupResult(state *recvState, laneID uint8, result rxGroupWindowResult, at time.Time) {
+	q := o.qosFor(state, laneID)
+	for _, done := range result.done {
+		key := rxLaneGroupKey{laneID: laneID, groupID: done.group.groupID}
+		o.cancelFECGroupTimer(state, key)
+		q.observeGroupDone(done, at)
+	}
+}
+
+func (o *Recv) expireFECGroup(state *recvState, laneID uint8, groupID uint32, timer *time.Timer) {
+	state.mu.Lock()
+	if state.closed {
+		state.mu.Unlock()
+		return
+	}
+	key := rxLaneGroupKey{laneID: laneID, groupID: groupID}
+	if timer != nil && state.fecTimers[key] != timer {
+		state.mu.Unlock()
+		return
+	}
+	delete(state.fecTimers, key)
+	window := state.rxWindows[laneID]
+	if window == nil {
+		state.mu.Unlock()
+		return
+	}
+	result := window.expireGroup(groupID)
+	o.observeGroupResult(state, laneID, result, time.Now())
+	sessionID := state.sessionID
+	state.mu.Unlock()
+	if len(result.recoverable) > 0 {
+		if err := o.maybeRecover(context.Background(), sessionID, laneID, state, result.recoverable[0]); err != nil {
+			debuglog.Printf("recv", "expire_recover_error session=%d lane=%d group_id=%d err=%v",
+				sessionID, laneID, result.recoverable[0].group.groupID, err)
+		}
+	}
+}
+
+func (o *Recv) cancelFECGroupTimer(state *recvState, key rxLaneGroupKey) {
+	if timer := state.fecTimers[key]; timer != nil {
+		timer.Stop()
+	}
+	delete(state.fecTimers, key)
 }
 
 type fecCodec interface {
-	Reconstruct(shards [][]byte, key uint16) error
+	Reconstruct(shards [][]byte, keys []uint16) error
 }
 
 func New(configs ...Config) *Recv {
@@ -148,7 +262,9 @@ func New(configs ...Config) *Recv {
 		manager: &sessionpkg.Manager{},
 	}
 	for sourceSpan := 1; sourceSpan <= maxFECSourceSpan; sourceSpan++ {
-		out.fecCodecs[sourceSpan], _ = fecpkg.NewCodec(sourceSpan, 1)
+		for repairs := 1; repairs <= 4; repairs++ {
+			out.fecCodecs[sourceSpan][repairs], _ = fecpkg.NewCodec(sourceSpan, repairs)
+		}
 	}
 	for _, cfg := range configs {
 		if cfg.Handler != nil {
@@ -257,7 +373,12 @@ func (o *Recv) handleControl(ctx context.Context, leg Ref, frame protocol.Frame)
 	case protocol.TypePONG:
 		return o.handler.OnPong(ctx, leg, frame)
 	case protocol.TypeBandwidthProbe:
-		return o.handler.OnBandwidthProbe(ctx, leg, frame)
+		observation, err := o.handler.OnBandwidthProbe(ctx, leg, frame)
+		if err != nil {
+			return err
+		}
+		o.observeBandwidthProbe(ctx, frame.SessionID, frame.LaneID, observation)
+		return nil
 	case protocol.TypeBandwidthProbeAck:
 		return o.handler.OnBandwidthProbeAck(ctx, leg, frame)
 	case protocol.TypeLinkStatus:
@@ -300,7 +421,6 @@ func (o *Recv) handleDATA(ctx context.Context, leg Ref, frame protocol.Frame, pa
 	if !ok {
 		return false, protocol.ErrInvalidFrame
 	}
-
 	state := o.recvState(frame.SessionID)
 	if state == nil {
 		return false, nil
@@ -311,33 +431,32 @@ func (o *Recv) handleDATA(ctx context.Context, leg Ref, frame protocol.Frame, pa
 		state.mu.Unlock()
 		return false, nil
 	}
-	if !state.dedupe.mark(body.PacketID) {
-		result := state.windowFor(frame.LaneID).observeLateData(leg.Kind, body.PacketID, body.Packet, time.Now())
-		state.observeQoSResult(frame.LaneID, result)
-		statuses := state.takeQoSStatuses()
+	now := time.Now()
+	window := state.windowFor(frame.LaneID)
+	var result rxGroupWindowResult
+	dataID := laneDataID(body.GroupID, body.SourceIndex)
+	if !state.emitDedupeFor(frame.LaneID).mark(dataID) {
+		o.qosFor(state, frame.LaneID).observeLateData(dataID, leg.Kind, len(body.Packet), now)
 		state.mu.Unlock()
 		if debuglog.Enabled() {
-			debuglog.Printf("recv", "data_drop_duplicate session=%d packet_id=%d", frame.SessionID, body.PacketID)
-		}
-		if err := o.reportQoS(ctx, frame.SessionID, frame.LaneID, statuses); err != nil {
-			return false, err
+			debuglog.Printf("recv", "data_drop_duplicate session=%d lane=%d group_id=%d source_index=%d", frame.SessionID, frame.LaneID, body.GroupID, body.SourceIndex)
 		}
 		return false, nil
 	}
-	result := state.windowFor(frame.LaneID).addData(leg.Kind, body.PacketID, body.Packet, time.Now())
-	state.observeQoSResult(frame.LaneID, result)
-	statuses := state.takeQoSStatuses()
-	state.mu.Unlock()
-	if err := o.reportQoS(ctx, frame.SessionID, frame.LaneID, statuses); err != nil {
-		return false, err
+	result, accepted := window.addData(body.GroupID, body.SourceIndex, body.Packet)
+	if accepted {
+		o.trackFECGroup(state, frame.LaneID, body.GroupID)
 	}
+	o.qosFor(state, frame.LaneID).observeOriginalData(leg.Kind, len(body.Packet), now)
+	o.observeGroupResult(state, frame.LaneID, result, now)
+	state.mu.Unlock()
 
 	consumed, err := o.emitTransportPacket(ctx, packet, body.Packet)
 	if err != nil {
 		return false, err
 	}
-	if result.hasRecoverable {
-		return consumed, o.maybeRecover(ctx, frame.SessionID, frame.LaneID, state, result.recoverable)
+	if len(result.recoverable) > 0 {
+		return consumed, o.maybeRecover(ctx, frame.SessionID, frame.LaneID, state, result.recoverable[0])
 	}
 	return consumed, nil
 }
@@ -367,20 +486,24 @@ func (o *Recv) handleREPAIR(ctx context.Context, leg Ref, frame protocol.Frame) 
 		return nil
 	}
 	window := state.windowFor(frame.LaneID)
-	result := window.addRepair(leg.Kind, body.BasePacketID, body.Key, int(body.SourceSpan), body.Symbol, time.Now())
-	state.observeQoSResult(frame.LaneID, result)
-	statuses := state.takeQoSStatuses()
-	state.mu.Unlock()
-	if err := o.reportQoS(ctx, frame.SessionID, frame.LaneID, statuses); err != nil {
-		return err
+	now := time.Now()
+	group := rxGroupKey{groupID: body.GroupID, sourceSpan: int(body.SourceSpan)}
+	q := o.qosFor(state, frame.LaneID)
+	q.observeRepairBytes(leg.Kind, len(body.Symbol), now)
+	result, accepted := window.addRepair(body.GroupID, body.Key, int(body.SourceSpan), body.Symbol)
+	if accepted {
+		o.trackFECGroup(state, frame.LaneID, body.GroupID)
+		q.observeRepairGroup(group, leg.Kind, body.RepairCount)
 	}
-	if result.hasRecoverable {
+	o.observeGroupResult(state, frame.LaneID, result, now)
+	state.mu.Unlock()
+	if len(result.recoverable) > 0 {
 		metrics.IncCounter(metrics.FECEventsTotal,
 			metrics.L("event", "repair_recoverable"),
 			metrics.L("session", frame.SessionID),
-			metrics.L("source_span", result.recoverable.sourceSpan),
+			metrics.L("source_span", result.recoverable[0].group.sourceSpan),
 		)
-		return o.maybeRecover(ctx, frame.SessionID, frame.LaneID, state, result.recoverable)
+		return o.maybeRecover(ctx, frame.SessionID, frame.LaneID, state, result.recoverable[0])
 	}
 	return nil
 }
@@ -391,11 +514,13 @@ func (o *Recv) reportQoS(ctx context.Context, sessionID uint64, laneID uint8, st
 	}
 	for _, status := range statuses {
 		if err := o.onQoS(ctx, QoSStatus{
-			SessionID:    sessionID,
-			LaneID:       laneID,
-			Kind:         status.Kind,
-			Reason:       status.Reason,
-			DeliveredBps: status.DeliveredBps,
+			SessionID:       sessionID,
+			LaneID:          laneID,
+			UDPLimited:      status.UDPLimited,
+			TCPLimited:      status.TCPLimited,
+			RepairCount:     status.RepairCount,
+			UDPDeliveredBps: status.UDPDeliveredBps,
+			TCPDeliveredBps: status.TCPDeliveredBps,
 		}); err != nil {
 			return err
 		}
@@ -423,90 +548,108 @@ func (o *Recv) handleCLOSE(ctx context.Context, leg Ref, frame protocol.Frame) e
 	return nil
 }
 
-func (o *Recv) maybeRecover(ctx context.Context, sessionID uint64, laneID uint8, state *recvState, recoverable rxRecoverable) error {
-	codec := o.fecCodecForSourceSpan(recoverable.sourceSpan)
+func (o *Recv) maybeRecover(ctx context.Context, sessionID uint64, laneID uint8, state *recvState, recoverable rxGroupRecoverable) error {
+	missing := countMissing(recoverable.missingMask, recoverable.group.sourceSpan)
+	if missing == 0 {
+		return nil
+	}
+	codec := o.fecCodecFor(recoverable.group.sourceSpan, missing)
 	if state == nil || codec == nil {
 		return nil
 	}
-	pkt, statuses, ok := o.recoverPacket(sessionID, laneID, state, recoverable, codec)
-	if err := o.reportQoS(ctx, sessionID, laneID, statuses); err != nil {
-		if pkt != nil {
-			pkt.Release()
-		}
-		return err
-	}
+	packets, ok := o.recoverPackets(sessionID, laneID, state, recoverable, codec)
 	if !ok {
 		return nil
 	}
-	select {
-	case o.packets <- pkt:
-		return nil
-	case <-ctx.Done():
-		pkt.Release()
-		return ctx.Err()
+	for i, packet := range packets {
+		select {
+		case o.packets <- packet:
+		case <-ctx.Done():
+			for _, unsent := range packets[i:] {
+				unsent.Release()
+			}
+			return ctx.Err()
+		}
 	}
+	return nil
 }
 
-func (o *Recv) recoverPacket(sessionID uint64, laneID uint8, state *recvState, recoverable rxRecoverable, codec fecCodec) (*packetbuf.Packet, []qosStatus, bool) {
+func (o *Recv) recoverPackets(sessionID uint64, laneID uint8, state *recvState, recoverable rxGroupRecoverable, codec fecCodec) ([]*packetbuf.Packet, bool) {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	if state.closed {
-		return nil, nil, false
+		return nil, false
 	}
 	window := state.rxWindows[laneID]
 	if window == nil {
-		return nil, nil, false
+		return nil, false
 	}
-	shards, ok := window.buildShardsLocked(recoverable, state.shardScratch[:0])
+	shards, repairKeys, ok := window.buildShardsLocked(recoverable, state.shardScratch[:0], state.repairKeyScratch[:0])
 	if !ok {
-		return nil, nil, false
+		return nil, false
 	}
-	if err := codec.Reconstruct(shards, recoverable.key); err != nil {
-		debuglog.Printf("recv", "recover_err session=%d lane=%d base_packet_id=%d key=%d source_span=%d err=%v",
-			sessionID, laneID, recoverable.basePacketID, recoverable.key, recoverable.sourceSpan, err)
+	if err := codec.Reconstruct(shards, repairKeys); err != nil {
+		debuglog.Printf("recv", "recover_err session=%d lane=%d group_id=%d keys=%v source_span=%d err=%v",
+			sessionID, laneID, recoverable.group.groupID, repairKeys, recoverable.group.sourceSpan, err)
 		metrics.IncCounter(metrics.FECEventsTotal,
 			metrics.L("event", "recover_err"),
 			metrics.L("session", sessionID),
-			metrics.L("source_span", recoverable.sourceSpan),
+			metrics.L("source_span", recoverable.group.sourceSpan),
 		)
-		return nil, nil, false
+		return nil, false
 	}
 	metrics.IncCounter(metrics.FECEventsTotal,
 		metrics.L("event", "reconstruct_done"),
 		metrics.L("session", sessionID),
-		metrics.L("source_span", recoverable.sourceSpan),
+		metrics.L("source_span", recoverable.group.sourceSpan),
 	)
 
-	packetID := recoverable.basePacketID + uint32(recoverable.missingIndex)
-	reconstructed := shards[recoverable.missingIndex]
-	payload, ipOK := recoveredIPv4Packet(reconstructed)
-	if !ipOK {
-		return nil, nil, false
+	var packets []*packetbuf.Packet
+	var recoveredBytes uint64
+	var recoveredMaxBytes uint64
+	for missingIndex := 0; missingIndex < recoverable.group.sourceSpan; missingIndex++ {
+		if recoverable.missingMask&(1<<uint(missingIndex)) == 0 {
+			continue
+		}
+		sourceIndex := uint8(missingIndex)
+		dataID := laneDataID(recoverable.group.groupID, sourceIndex)
+		payload, ipOK := recoveredIPv4Packet(shards[missingIndex])
+		if !ipOK {
+			for _, packet := range packets {
+				packet.Release()
+			}
+			return nil, false
+		}
+		if !state.emitDedupeFor(laneID).mark(dataID) {
+			continue
+		}
+		o.qosFor(state, laneID).observeRecoveredData(dataID)
+		payloadBytes := uint64(len(payload))
+		recoveredBytes += payloadBytes
+		if payloadBytes > recoveredMaxBytes {
+			recoveredMaxBytes = payloadBytes
+		}
+		metrics.IncCounter(metrics.FECEventsTotal,
+			metrics.L("event", "recover_emit"),
+			metrics.L("session", sessionID),
+			metrics.L("source_span", recoverable.group.sourceSpan),
+		)
+		debuglog.Printf("recv", "recover_emit session=%d lane=%d group_id=%d source_index=%d keys=%v source_span=%d bytes=%d",
+			sessionID, laneID, recoverable.group.groupID, sourceIndex, repairKeys, recoverable.group.sourceSpan, len(payload))
+		packet := packetbuf.Acquire(len(payload))
+		copy(packet.Payload, payload)
+		packets = append(packets, packet)
 	}
-	if sample, ok := window.finishRecovery(recoverable, payload, time.Now()); ok {
-		state.qosFor(laneID, state.emitQoS).Observe(sample)
-	}
-	statuses := state.takeQoSStatuses()
-	if !state.dedupe.mark(packetID) {
-		return nil, statuses, false
-	}
-	metrics.IncCounter(metrics.FECEventsTotal,
-		metrics.L("event", "recover_emit"),
-		metrics.L("session", sessionID),
-		metrics.L("source_span", recoverable.sourceSpan),
-	)
-	debuglog.Printf("recv", "recover_emit session=%d lane=%d packet_id=%d base_packet_id=%d key=%d source_span=%d bytes=%d",
-		sessionID, laneID, packetID, recoverable.basePacketID, recoverable.key, recoverable.sourceSpan, len(payload))
-	pkt := packetbuf.Acquire(len(payload))
-	copy(pkt.Payload, payload)
-	return pkt, statuses, true
+	result := window.finishRecovery(recoverable, recoveredBytes, recoveredMaxBytes)
+	o.observeGroupResult(state, laneID, result, time.Now())
+	return packets, len(packets) > 0
 }
 
-func (o *Recv) fecCodecForSourceSpan(sourceSpan int) fecCodec {
-	if sourceSpan <= 0 || sourceSpan > maxFECSourceSpan {
+func (o *Recv) fecCodecFor(sourceSpan int, repairCount int) fecCodec {
+	if sourceSpan <= 0 || sourceSpan > maxFECSourceSpan || repairCount <= 0 || repairCount > 4 {
 		return nil
 	}
-	return o.fecCodecs[sourceSpan]
+	return o.fecCodecs[sourceSpan][repairCount]
 }
 
 func (o *Recv) emitTransportPacket(ctx context.Context, packet *packetbuf.Packet, payload []byte) (bool, error) {
@@ -542,10 +685,11 @@ func (o *Recv) recvState(sessionID uint64) *recvState {
 		return state
 	}
 	state = &recvState{
-		sessionID: sessionID,
-		rxWindows: make(map[uint8]*rxSLCWindow),
-		dedupe:    newEmitDedupe(0),
-		qos:       make(map[uint8]*qosEstimator),
+		sessionID:  sessionID,
+		rxWindows:  make(map[uint8]*rxGroupWindow),
+		emitDedupe: make(map[uint8]*dataIDDedupe),
+		qos:        make(map[uint8]*qosEstimator),
+		fecTimers:  make(map[rxLaneGroupKey]*time.Timer),
 	}
 	o.states[session] = state
 	debuglog.Printf("recv", "session_create session=%d", sessionID)
@@ -570,6 +714,15 @@ func (o *Recv) closeRecvState(sessionID uint64, session *sessionpkg.Session) {
 	}
 	state.mu.Lock()
 	state.closed = true
+	for _, q := range state.qos {
+		q.close()
+	}
+	for key, timer := range state.fecTimers {
+		if timer != nil {
+			timer.Stop()
+		}
+		delete(state.fecTimers, key)
+	}
 	for _, window := range state.rxWindows {
 		window.releaseAll()
 	}

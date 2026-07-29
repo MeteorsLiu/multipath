@@ -13,6 +13,12 @@ is:
 Do not infer architecture from deleted historical packages. If docs and old
 mental models conflict, follow the docs.
 
+When actively modifying protocol or architecture from a new spec document, treat
+that spec as the source of truth for the change being implemented. Do not use
+older implementation docs, existing code shape, or historical behavior to
+preserve conflicting old protocol or architecture semantics unless the user
+explicitly asks for a compatibility path.
+
 ## Critical Multipath Semantics
 
 This project is a TUN-based multipath tunnel. It carries complete IP packets
@@ -26,6 +32,11 @@ delay. FEC should opportunistically repair recoverable packet loss before that
 upper-layer ARQ delay is paid; it must not turn the tunnel into a fully reliable
 transport, add tunnel-level retransmission semantics, or chase unrecoverable loss
 with reliability machinery.
+
+Detailed QoS, FEC-health, adaptive repair-count, LINK_STATUS, bandwidth-probe,
+and receive-side accounting semantics live in `docs/protocol.md` and
+`docs/architecture.md`. Keep this file as guidance for agents, not as a second
+copy of protocol or architecture rules.
 
 Do not reduce this project to a single-path transport with a global UDP/TCP
 fallback. Multiple lanes may be active at the same time, and the scheduler
@@ -103,7 +114,7 @@ Important constraints:
   concrete `Body`, and `Frame.Type` selects which body type is valid. Do not add
   public per-type body helper functions.
 - FEC exposes shard-level `Encode` and `Reconstruct`; it does not know
-  `session_id`, `lane_id`, `packet_id`, or protocol frames.
+  `session_id`, `lane_id`, `group_id`, or protocol frames.
 - FEC core erasure coding should use a maintained library. Local code should
   only adapt project shard/window semantics unless a different design is
   discussed first.
@@ -195,13 +206,29 @@ Typical workflow:
    service tooling, and the user's environment are loaded.
 3. In the remote checkout, fetch the target branch, reset or pull to the exact
    commit being tested, and build the real binary there.
-4. Restart the deployed service on the remote host. The current live setup has
+
+Prebuilt-binary workflow, when explicitly requested or when the remote checkout
+must not be changed:
+
+1. Confirm the remote CPU architecture with `uname -m`.
+2. Cross-build locally for the remote target, for example
+   `GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o /tmp/multipath-linux-amd64 .`.
+3. Upload the binary to a remote temporary directory and mark it executable.
+4. Run namespace E2E with the uploaded binary by setting
+   `MULTIPATH_REAL_E2E_BIN=<remote-bin>` and
+   `MULTIPATH_REAL_E2E_PREBUILT_BIN=1`.
+5. If a case subset is needed for debugging, run it from a temporary copy of
+   `scripts/e2e.sh`; do not edit the repository script just to select cases.
+
+For live deployed-service validation:
+
+1. Restart the deployed service on the remote host. The current live setup has
    used a systemd unit named `mp`; verify the unit name on the host before
    restarting it.
-5. Drive traffic through the real tunnel, not through localhost shortcuts.
+2. Drive traffic through the real tunnel, not through localhost shortcuts.
    For reverse-direction QoS, use reverse iperf over the TUN address, for
    example `iperf3 -c <peer-tun-ip> -R`.
-6. Observe the service logs with `journalctl` while traffic and shaping are
+3. Observe the service logs with `journalctl` while traffic and shaping are
    active. Do not rely only on a single command's exit status.
 
 Useful remote log signals:

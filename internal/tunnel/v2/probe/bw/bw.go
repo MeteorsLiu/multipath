@@ -24,7 +24,7 @@ type Probe struct {
 	Seq       uint16 // sequence number within probe round/window
 	Count     uint16 // total packets in probe round/window
 	SendMS    uint64 // send timestamp
-	Total     uint64 // total bytes in train
+	TargetBps uint64 // target/effective cap bandwidth for this train
 	Remaining uint64 // bytes remaining after this packet
 	Bytes     int    // bytes in this probe packet
 }
@@ -43,6 +43,7 @@ type Sample struct {
 	BandwidthBps uint64  // measured bandwidth in bits per second (best step)
 	Loss         float64 // aggregate loss ratio [0.0, 1.0]
 	ReferenceBps uint64  // reference/target bandwidth
+	TargetBps    uint64  // target/effective cap bandwidth carried by the peer train
 }
 
 // Config holds the fixed parameters for a BW instance. Rate adaptation inputs
@@ -410,6 +411,7 @@ func (l *BwLoop) run(ctx context.Context) {
 	curRate := startRate(l.capBps, l.minRateBps)
 	window := trainWindow
 	trainTotal := trainBudgetBytesFor(trainBudgetRate(l.referenceBps, l.capBps, l.minRateBps), window)
+	targetBps := l.targetBps()
 	remaining := trainTotal
 	deadline := time.Now().Add(window)
 	bestBps := uint64(0)
@@ -426,7 +428,7 @@ func (l *BwLoop) run(ctx context.Context) {
 		if stepDeadline.After(deadline) {
 			stepDeadline = deadline
 		}
-		l.sendStep(ctx, step, trainTotal, &remaining, stepDeadline)
+		l.sendStep(ctx, step, targetBps, &remaining, stepDeadline)
 
 		stepBps := l.scoreStep(step)
 		l.mu.Lock()
@@ -444,9 +446,16 @@ func (l *BwLoop) run(ctx context.Context) {
 	}
 
 	if remaining > 0 {
-		l.sendRemainingZero(ctx, trainTotal)
+		l.sendRemainingZero(ctx, targetBps)
 	}
 	l.emitSample()
+}
+
+func (l *BwLoop) targetBps() uint64 {
+	if l.capBps > 0 {
+		return l.capBps
+	}
+	return l.referenceBps
 }
 
 func capReached(measuredBps, capBps uint64) bool {
@@ -456,7 +465,7 @@ func capReached(measuredBps, capBps uint64) bool {
 	return measuredBps >= capBps*capReachedNum/capReachedDen
 }
 
-func (l *BwLoop) sendRemainingZero(ctx context.Context, trainTotal uint64) {
+func (l *BwLoop) sendRemainingZero(ctx context.Context, targetBps uint64) {
 	if ctx.Err() != nil || l.isDone() || l.bw == nil || l.bw.sendProbe == nil {
 		return
 	}
@@ -483,7 +492,7 @@ func (l *BwLoop) sendRemainingZero(ctx context.Context, trainTotal uint64) {
 			Seq:       0,
 			Count:     1,
 			SendMS:    uint64(sendAt.UnixMilli()),
-			Total:     trainTotal,
+			TargetBps: targetBps,
 			Remaining: 0,
 			Bytes:     0,
 		}); err != nil {
@@ -548,7 +557,7 @@ func (l *BwLoop) beginStep(rateBps uint64, count uint16) *stepState {
 // seqs are retransmitted until the step is fully ACKed or the step deadline
 // expires. Each new seq consumes train Remaining exactly once; retransmits reuse
 // the same Remaining value for that seq.
-func (l *BwLoop) sendStep(ctx context.Context, step *stepState, trainTotal uint64, remaining *uint64, deadline time.Time) uint64 {
+func (l *BwLoop) sendStep(ctx context.Context, step *stepState, targetBps uint64, remaining *uint64, deadline time.Time) uint64 {
 	if remaining == nil || *remaining == 0 {
 		return 0
 	}
@@ -639,7 +648,7 @@ func (l *BwLoop) sendStep(ctx context.Context, step *stepState, trainTotal uint6
 				Seq:       uint16(seq),
 				Count:     step.count,
 				SendMS:    uint64(sendAt.UnixMilli()),
-				Total:     trainTotal,
+				TargetBps: targetBps,
 				Remaining: remainingBySeq[seq],
 				Bytes:     bytes,
 			}
@@ -845,6 +854,7 @@ func (l *BwLoop) emitSample() {
 	}
 	loss := aggregateLoss(l.sentFrames, l.ackedFrames)
 	ref := l.referenceBps
+	targetBps := l.targetBps()
 	l.mu.Unlock()
 
 	if l.bw != nil && l.bw.onSample != nil {
@@ -852,6 +862,7 @@ func (l *BwLoop) emitSample() {
 			BandwidthBps: bestBps,
 			Loss:         loss,
 			ReferenceBps: ref,
+			TargetBps:    targetBps,
 		})
 	}
 }
@@ -892,14 +903,17 @@ func aggregateLoss(sentFrames, ackedFrames uint64) float64 {
 // It does not import send or protocol packages (零身份).
 type Receive struct {
 	ackEvery uint16
+	onSample func(uint64, Sample)
 
 	mu     sync.Mutex
 	rounds map[uint64]*passiveRound
+	trains map[uint64]*passiveTrain
 }
 
 // ReceiveConfig tunes the passive side.
 type ReceiveConfig struct {
 	AckEvery uint16 // send an ack every N received frames (default 16)
+	OnSample func(trainID uint64, sample Sample)
 }
 
 const defaultAckEvery = 16
@@ -912,7 +926,9 @@ func NewReceive(cfg ReceiveConfig) *Receive {
 	}
 	return &Receive{
 		ackEvery: ackEvery,
+		onSample: cfg.OnSample,
 		rounds:   make(map[uint64]*passiveRound),
+		trains:   make(map[uint64]*passiveTrain),
 	}
 }
 
@@ -933,10 +949,16 @@ func (r *Receive) Probe(p Probe) (Ack, bool) {
 	r.pruneLocked(now)
 	round := r.rounds[p.ID]
 	if round == nil || round.count != p.Count {
-		round = &passiveRound{count: p.Count, received: bitset.New(uint(p.Count)), firstRXMS: nowMS}
+		round = &passiveRound{
+			count:     p.Count,
+			received:  bitset.New(uint(p.Count)),
+			firstRXMS: nowMS,
+			bytes:     make([]int, p.Count),
+		}
 		r.rounds[p.ID] = round
 	}
 	round.received.Set(uint(p.Seq))
+	round.bytes[p.Seq] = p.Bytes
 	if round.firstRXMS == 0 || nowMS < round.firstRXMS {
 		round.firstRXMS = nowMS
 	}
@@ -958,8 +980,31 @@ func (r *Receive) Probe(p Probe) (Ack, bool) {
 		FirstRXMS: round.firstRXMS,
 		LastRXMS:  round.lastRXMS,
 	}
+	var sample Sample
+	var emitSample bool
+	if p.TrainID != 0 {
+		train := r.trains[p.TrainID]
+		if train == nil {
+			train = &passiveTrain{rounds: make(map[uint64]*passiveRound)}
+			r.trains[p.TrainID] = train
+		}
+		if train.targetBps == 0 {
+			train.targetBps = p.TargetBps
+		}
+		train.rounds[p.ID] = round
+		if p.Remaining == 0 && !train.complete {
+			train.complete = true
+			train.completedAt = now
+			sample = train.sample()
+			emitSample = true
+		}
+	}
+	onSample := r.onSample
 	r.mu.Unlock()
 
+	if emitSample && onSample != nil {
+		onSample(p.TrainID, sample)
+	}
 	return ack, shouldAck
 }
 
@@ -969,6 +1014,11 @@ func (r *Receive) pruneLocked(now time.Time) {
 			delete(r.rounds, id)
 		}
 	}
+	for id, train := range r.trains {
+		if train != nil && train.complete && now.Sub(train.completedAt) > receiveRoundKeepalive {
+			delete(r.trains, id)
+		}
+	}
 }
 
 type passiveRound struct {
@@ -976,8 +1026,46 @@ type passiveRound struct {
 	received    *bitset.BitSet
 	firstRXMS   uint64
 	lastRXMS    uint64
+	bytes       []int
 	complete    bool
 	completedAt time.Time
+}
+
+type passiveTrain struct {
+	rounds      map[uint64]*passiveRound
+	targetBps   uint64
+	complete    bool
+	completedAt time.Time
+}
+
+func (t *passiveTrain) sample() Sample {
+	var bestBps uint64
+	var expectedFrames uint64
+	var receivedFrames uint64
+	for _, round := range t.rounds {
+		if round == nil || round.count == 0 {
+			continue
+		}
+		expectedFrames += uint64(round.count)
+		if round.received != nil {
+			receivedFrames += uint64(round.received.Count())
+		}
+		var receivedBytes uint64
+		for seq, bytes := range round.bytes {
+			if bytes <= 0 || round.received == nil || !round.received.Test(uint(seq)) {
+				continue
+			}
+			receivedBytes += uint64(bytes)
+		}
+		if bps := bandwidthBps(receivedBytes, round.firstRXMS, round.lastRXMS); bps > bestBps {
+			bestBps = bps
+		}
+	}
+	return Sample{
+		BandwidthBps: bestBps,
+		Loss:         aggregateLoss(expectedFrames, receivedFrames),
+		TargetBps:    t.targetBps,
+	}
 }
 
 func bitsetMask(set *bitset.BitSet) uint64 {

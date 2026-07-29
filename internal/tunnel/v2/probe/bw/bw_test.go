@@ -71,7 +71,56 @@ func TestBWStartActiveSendsProbes(t *testing.T) {
 	}
 }
 
-func TestBwLoopUsesTrainBudgetForRemaining(t *testing.T) {
+func TestReceiveEmitsSampleWhenTrainCompletes(t *testing.T) {
+	var gotTrainID uint64
+	var gotSample Sample
+	samples := 0
+	r := NewReceive(ReceiveConfig{
+		OnSample: func(trainID uint64, sample Sample) {
+			gotTrainID = trainID
+			gotSample = sample
+			samples++
+		},
+	})
+
+	r.Probe(Probe{
+		TrainID:   10,
+		ID:        100,
+		Seq:       0,
+		Count:     2,
+		TargetBps: 200_000_000,
+		Remaining: 1200,
+		Bytes:     1200,
+	})
+	time.Sleep(2 * time.Millisecond)
+	r.Probe(Probe{
+		TrainID:   10,
+		ID:        100,
+		Seq:       1,
+		Count:     2,
+		TargetBps: 200_000_000,
+		Remaining: 0,
+		Bytes:     1200,
+	})
+
+	if samples != 1 {
+		t.Fatalf("samples = %d, want 1", samples)
+	}
+	if gotTrainID != 10 {
+		t.Fatalf("trainID = %d, want 10", gotTrainID)
+	}
+	if gotSample.BandwidthBps == 0 {
+		t.Fatalf("sample bandwidth = %d, want non-zero", gotSample.BandwidthBps)
+	}
+	if gotSample.Loss != 0 {
+		t.Fatalf("sample loss = %f, want 0", gotSample.Loss)
+	}
+	if gotSample.TargetBps != 200_000_000 {
+		t.Fatalf("sample target bps = %d, want 200000000", gotSample.TargetBps)
+	}
+}
+
+func TestBwLoopSendsTargetBpsAndRemaining(t *testing.T) {
 	const referenceBps = uint64(200_000_000)
 	withTrainWindow(t, 50*time.Millisecond)
 
@@ -117,8 +166,8 @@ func TestBwLoopUsesTrainBudgetForRemaining(t *testing.T) {
 
 	trainTotal := trainBudgetBytes(referenceBps)
 	first := sentProbes[0]
-	if first.Total != trainTotal {
-		t.Fatalf("first probe total = %d, want train budget %d", first.Total, trainTotal)
+	if first.TargetBps != referenceBps {
+		t.Fatalf("first probe target bps = %d, want %d", first.TargetBps, referenceBps)
 	}
 	if first.Remaining != trainTotal-uint64(first.Bytes) {
 		t.Fatalf("first probe remaining = %d, want %d", first.Remaining, trainTotal-uint64(first.Bytes))
@@ -138,16 +187,16 @@ func TestBwLoopUsesTrainBudgetForRemaining(t *testing.T) {
 		if p.Bytes == 0 {
 			t.Fatalf("probe %d before zero signal has zero bytes: %+v", i, p)
 		}
-		if p.Total != trainTotal {
-			t.Fatalf("probe %d total = %d, want %d", i, p.Total, trainTotal)
+		if p.TargetBps != referenceBps {
+			t.Fatalf("probe %d target bps = %d, want %d", i, p.TargetBps, referenceBps)
 		}
 		if p.Remaining == 0 {
 			t.Fatalf("probe %d reported train complete before zero signal", i)
 		}
 	}
 	for i, p := range sentProbes[zeroAt:] {
-		if p.Remaining != 0 || p.Bytes != 0 || p.Count != 1 {
-			t.Fatalf("probe %d after zero signal start = %+v, want Remaining=0 zero signal", zeroAt+i, p)
+		if p.Remaining != 0 || p.Bytes != 0 || p.Count != 1 || p.TargetBps != referenceBps {
+			t.Fatalf("probe %d after zero signal start = %+v, want Remaining=0 target-carrying zero signal", zeroAt+i, p)
 		}
 	}
 }
@@ -218,9 +267,12 @@ func TestBwLoopRemainingDecreasesAcrossSteps(t *testing.T) {
 		if uniqueData[i].Remaining >= uniqueData[i-1].Remaining {
 			t.Fatalf("remaining did not decrease at unique probe %d: prev=%d cur=%d", i, uniqueData[i-1].Remaining, uniqueData[i].Remaining)
 		}
-		if uniqueData[i].Total != uniqueData[0].Total {
-			t.Fatalf("total changed at unique probe %d: first=%d cur=%d", i, uniqueData[0].Total, uniqueData[i].Total)
+		if uniqueData[i].TargetBps != uniqueData[0].TargetBps {
+			t.Fatalf("target bps changed at unique probe %d: first=%d cur=%d", i, uniqueData[0].TargetBps, uniqueData[i].TargetBps)
 		}
+	}
+	if uniqueData[0].TargetBps != 32_000_000 {
+		t.Fatalf("target bps = %d, want cap 32000000", uniqueData[0].TargetBps)
 	}
 }
 
@@ -568,11 +620,12 @@ func TestReceiveProbeSendsAck(t *testing.T) {
 	acked := false
 	for seq := uint16(0); seq < count; seq++ {
 		ack, send := r.Probe(Probe{
+			TrainID:   trainID,
 			ID:        trainID,
 			Seq:       seq,
 			Count:     count,
 			SendMS:    uint64(time.Now().UnixMilli()),
-			Total:     12000,
+			TargetBps: 200_000_000,
 			Remaining: 12000 - uint64(seq+1)*1200,
 			Bytes:     1200,
 		})
@@ -605,10 +658,10 @@ func TestReceiveProbeKeepsCompletedRoundForLostAckRetransmit(t *testing.T) {
 	const count = 4
 
 	for seq := uint16(0); seq < count; seq++ {
-		r.Probe(Probe{ID: probeID, Seq: seq, Count: count, Total: 4800, Remaining: 4800 - uint64(seq+1)*1200, Bytes: 1200})
+		r.Probe(Probe{ID: probeID, Seq: seq, Count: count, TargetBps: 200_000_000, Remaining: 4800 - uint64(seq+1)*1200, Bytes: 1200})
 	}
 
-	ack, send := r.Probe(Probe{ID: probeID, Seq: 1, Count: count, Total: 4800, Remaining: 2400, Bytes: 1200})
+	ack, send := r.Probe(Probe{ID: probeID, Seq: 1, Count: count, TargetBps: 200_000_000, Remaining: 2400, Bytes: 1200})
 	if !send {
 		t.Fatal("expected retransmitted seq for completed round to trigger ACK")
 	}
