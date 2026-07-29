@@ -203,23 +203,23 @@ func (i laneQoSInput) OnQoSStatus(udpLimited bool, udpDeliveredBps uint32, tcpLi
 	}
 }
 
-// commitPacket adds a DATA packet to this lane's FEC transmit window (spec 9.1).
-// It returns the completed repair group when the window fills, otherwise reports
-// whether the flush timer should be armed.
-func (l *laneRuntime) commitPacket(packetID uint32, payload []byte) (txRepairGroup, bool, bool) {
+// commitPacket allocates this lane's DATA group/index and optionally retains the
+// payload in the FEC transmit window. It returns a completed repair group when
+// the window fills, otherwise reports whether the flush timer should be armed.
+func (l *laneRuntime) commitPacket(payload []byte, retain bool) (uint32, uint8, txRepairGroup, bool, bool) {
 	l.fecMu.Lock()
 	defer l.fecMu.Unlock()
 	if l.txWindow == nil {
-		return txRepairGroup{}, false, false
+		return 0, 0, txRepairGroup{}, false, false
 	}
 	wasEmpty := len(l.txWindow.pending) == 0
-	group, ready := l.txWindow.add(packetID, payload)
+	groupID, sourceIndex, group, ready := l.txWindow.add(payload, retain)
 	if ready {
 		l.cancelFECFlushTimerLocked()
-		return group, true, false
+		return groupID, sourceIndex, group, true, false
 	}
-	shouldArmFlush := wasEmpty && len(l.txWindow.pending) > 0
-	return txRepairGroup{}, false, shouldArmFlush
+	shouldArmFlush := retain && wasEmpty && len(l.txWindow.pending) > 0
+	return groupID, sourceIndex, txRepairGroup{}, false, shouldArmFlush
 }
 
 // cancelFECFlushTimerLocked stops the flush timer. Caller must hold fecMu.
@@ -241,80 +241,91 @@ func (l *laneRuntime) releaseFEC() {
 
 // txSLCWindow is the per-lane FEC transmit window (spec 9.1).
 type txSLCWindow struct {
-	sourceCount int
-	pending     []txSymbol
+	sourceCount   int
+	nextGroupID   uint32
+	activeGroupID uint32
+	nextIndex     uint8
+	pending       []txSymbol
 }
 
 type txSymbol struct {
-	packetID uint32
-	packet   *packetbuf.Packet
+	packet *packetbuf.Packet
 }
 
 // txRepairGroup carries the data shards for one FEC group.
 type txRepairGroup struct {
-	basePacketID uint32
-	sourceSpan   uint8
-	packets      []*packetbuf.Packet
+	groupID    uint32
+	sourceSpan uint8
+	packets    []*packetbuf.Packet
 }
 
 func newTxSLCWindow(sourceCount int) *txSLCWindow {
 	return &txSLCWindow{sourceCount: sourceCount}
 }
 
-func (w *txSLCWindow) add(packetID uint32, packet []byte) (txRepairGroup, bool) {
+func (w *txSLCWindow) add(packet []byte, retain bool) (uint32, uint8, txRepairGroup, bool) {
 	if w.sourceCount <= 0 {
-		return txRepairGroup{}, false
+		return 0, 0, txRepairGroup{}, false
+	}
+	// FEC may become active after this lane has already emitted part of a group.
+	// Those earlier DATA symbols were not retained, so the first protected DATA
+	// starts a fresh group.
+	if retain && len(w.pending) == 0 && w.nextIndex != 0 {
+		w.nextIndex = 0
+	}
+	if w.nextIndex == 0 {
+		w.activeGroupID = w.nextGroupID
+		w.nextGroupID = (w.nextGroupID + 1) & maxTxGroupID
+	}
+	groupID := w.activeGroupID
+	sourceIndex := w.nextIndex
+	w.nextIndex++
+
+	if retain {
+		pkt := packetbuf.Acquire(len(packet))
+		copy(pkt.Payload, packet)
+		pkt.SetLen(len(packet))
+		w.pending = append(w.pending, txSymbol{packet: pkt})
 	}
 
-	pkt := packetbuf.Acquire(len(packet))
-	copy(pkt.Payload, packet)
-	pkt.SetLen(len(packet))
-	w.pending = append(w.pending, txSymbol{packetID: packetID, packet: pkt})
-
-	for len(w.pending) >= w.sourceCount && !w.firstGroupContiguous() {
-		w.pending[0].packet.Release()
-		copy(w.pending, w.pending[1:])
-		w.pending = w.pending[:len(w.pending)-1]
+	if int(w.nextIndex) < w.sourceCount {
+		return groupID, sourceIndex, txRepairGroup{}, false
 	}
-
-	if len(w.pending) < w.sourceCount {
-		return txRepairGroup{}, false
+	w.nextIndex = 0
+	if !retain {
+		return groupID, sourceIndex, txRepairGroup{}, false
 	}
 
 	group := txRepairGroup{
-		basePacketID: w.pending[0].packetID,
-		sourceSpan:   uint8(w.sourceCount),
-		packets:      make([]*packetbuf.Packet, w.sourceCount),
+		groupID:    groupID,
+		sourceSpan: uint8(w.sourceCount),
+		packets:    make([]*packetbuf.Packet, w.sourceCount),
 	}
 	for i := 0; i < w.sourceCount; i++ {
 		group.packets[i] = w.pending[i].packet
 	}
-	copy(w.pending, w.pending[w.sourceCount:])
-	w.pending = w.pending[:len(w.pending)-w.sourceCount]
-	return group, true
+	w.pending = w.pending[:0]
+	return groupID, sourceIndex, group, true
 }
 
 func (w *txSLCWindow) flush() (txRepairGroup, bool) {
 	if w.sourceCount <= 0 || len(w.pending) == 0 {
 		return txRepairGroup{}, false
 	}
-	if len(w.pending) >= w.sourceCount {
+	if int(w.nextIndex) >= w.sourceCount {
 		return txRepairGroup{}, false
 	}
-	count := contiguousPendingPrefix(w.pending, w.sourceCount)
-	if count == 0 {
-		return txRepairGroup{}, false
-	}
+	count := len(w.pending)
 	group := txRepairGroup{
-		basePacketID: w.pending[0].packetID,
-		sourceSpan:   uint8(count),
-		packets:      make([]*packetbuf.Packet, count),
+		groupID:    w.activeGroupID,
+		sourceSpan: uint8(count),
+		packets:    make([]*packetbuf.Packet, count),
 	}
 	for i := 0; i < count; i++ {
 		group.packets[i] = w.pending[i].packet
 	}
-	copy(w.pending, w.pending[count:])
-	w.pending = w.pending[:len(w.pending)-count]
+	w.pending = w.pending[:0]
+	w.nextIndex = 0
 	return group, true
 }
 
@@ -323,33 +334,5 @@ func (w *txSLCWindow) releaseAll() {
 		w.pending[i].packet.Release()
 	}
 	w.pending = w.pending[:0]
-}
-
-func (w *txSLCWindow) firstGroupContiguous() bool {
-	if len(w.pending) < w.sourceCount {
-		return false
-	}
-	base := w.pending[0].packetID
-	for i := 1; i < w.sourceCount; i++ {
-		if w.pending[i].packetID != base+uint32(i) {
-			return false
-		}
-	}
-	return true
-}
-
-func contiguousPendingPrefix(pending []txSymbol, max int) int {
-	if len(pending) == 0 || max <= 0 {
-		return 0
-	}
-	if max > len(pending) {
-		max = len(pending)
-	}
-	base := pending[0].packetID
-	for i := 1; i < max; i++ {
-		if pending[i].packetID != base+uint32(i) {
-			return i
-		}
-	}
-	return max
+	w.nextIndex = 0
 }

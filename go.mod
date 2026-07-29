@@ -4,6 +4,7 @@ go 1.23.4
 
 require (
 	github.com/bits-and-blooms/bitset v1.24.5
+	github.com/emirpasic/gods/v2 v2.0.0-alpha
 	github.com/klauspost/reedsolomon v1.12.6
 	github.com/prometheus/client_golang v1.23.2
 	golang.org/x/net v0.43.0

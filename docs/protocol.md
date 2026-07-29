@@ -23,11 +23,10 @@ The protocol does not own:
 - stream flow control
 - transport-level reliability
 
-With FEC enabled, the receiver keeps bounded per-lane SLC window bookkeeping
-keyed within that lane by `packet_id` and `base_packet_id`. That bookkeeping
-exists only to recover lost tunnel packets and avoid emitting a recovered packet
-twice if the original arrives late. It is not a general reliable-transport
-deduplication layer.
+With FEC enabled, the receiver keeps bounded per-lane SLC group bookkeeping
+keyed within that lane by `group_id`. That bookkeeping exists only to recover
+lost tunnel packets and avoid emitting a recovered packet twice if the original
+arrives late. It is not a general reliable-transport deduplication layer.
 
 ## Terminology
 
@@ -42,10 +41,9 @@ deduplication layer.
   linear coding over GF(2^8) with DATA shards and one REPAIR shard.
 - DATA symbol: the FEC-protected representation of one tunnel IP packet.
 - REPAIR symbol: one FEC parity symbol generated from DATA symbols.
-- packet_id: a session-scoped DATA identifier used by each lane-local SLC
-  window.
-- base_packet_id: the first DATA identifier protected by one lane-local REPAIR
-  group.
+- group_id: a lane-local 30-bit identifier shared by the DATA and REPAIR frames
+  for one SLC group.
+- source_index: the DATA symbol position `0..3` inside one SLC group.
 - key: the SLC coding key used to derive the linear coefficients for a REPAIR
   symbol.
 
@@ -114,11 +112,11 @@ Protocol overhead:
 
 ```text
 common header = 10 bytes
-DATA body     = 4 bytes packet_id
+DATA body     = 4 bytes group_and_source
 DATA overhead = 14 bytes
 
 REPAIR frame header = 10 bytes common header
-                    + 4 bytes base_packet_id
+                    + 4 bytes group_id
                     + 2 bytes key
                     + 1 byte source_span
                     = 17 bytes
@@ -200,9 +198,9 @@ Frame types:
 `session_id` identifies the tunnel. `lane_id` identifies the lane that carries
 this frame and is used for scheduling, health tracking, and per-lane fallback.
 FEC transmit and receive windows are lane-local: DATA and REPAIR frames
-participate in the same SLC scope only when they have the same `session_id` and
-`lane_id`. `packet_id` remains session-scoped, and `base_packet_id` identifies
-the protected group inside that lane-local SLC window.
+participate in the same SLC group only when they have the same `session_id`,
+`lane_id`, and `group_id`. Both `group_id` allocation and receive deduplication
+are lane-local.
 
 Unknown versions or frame types are dropped. On TCP, repeated invalid frames
 should close the transport leg.
@@ -357,45 +355,53 @@ DATA carries one complete IP packet read from TUN.
 Body:
 
 ```text
-packet_id uint32
-ip_packet bytes
+group_and_source uint32
+ip_packet        bytes
 ```
 
-`packet_id` is a session-wide monotonically increasing DATA identifier. It
-exists for SLC window mapping only. It is not a delivery sequence number, and
-the receiver must not wait for missing `packet_id` values before writing DATA
-to TUN.
+`group_and_source` packs the lane-local group identifier and source position:
 
-`packet_id` maps a DATA frame into the SLC repair window. For the fixed 4+1
-profile, the source-symbol position is `packet_id - base_packet_id` inside a
-REPAIR window, and valid positions are `0..3`. For the variable profile, valid
-positions are `0..source_span-1`.
+```text
+bits 31-2 = group_id
+bits 1-0  = source_index
+```
 
-`packet_id` should not wrap inside one live session once session rotation is
-defined. The exact exhaustion threshold and graceful rotation behavior are an
-open item in this draft. Until that policy exists, implementations must not
-turn packet-id exhaustion into a local fail-closed data-plane stop.
+`group_id` is monotonically allocated within one lane. `source_index` is the
+DATA symbol position inside that group. The packed value exists for SLC window
+mapping and duplicate suppression only. It is not a delivery sequence number,
+and the receiver must not wait for missing groups or source positions before
+writing DATA to TUN.
+
+For a REPAIR with decoded `source_span`, valid DATA source positions are
+`0..source_span-1`. A later DATA position outside that range is emitted normally
+but is not retained as part of that FEC group. A REPAIR whose `source_span`
+excludes DATA already retained in the group is rejected.
+
+`group_id` should not wrap inside one live session once session rotation is
+defined. The exact exhaustion threshold and graceful rotation behavior remain
+an open item. Until that policy exists, allocation wraps modulo `2^30` rather
+than turning group-id exhaustion into a local fail-closed data-plane stop.
 
 Sender behavior:
 
 1. Read one complete IP packet from TUN.
-2. Allocate the next session-wide `packet_id`.
-3. Build DATA with `packet_id` and the IP packet.
-4. Select a healthy lane.
+2. Select a healthy lane.
+3. Allocate that lane's current `group_id` and next `source_index`.
+4. Build DATA with the packed group/source value and the IP packet.
 5. Select that lane's transport leg using the send-side leg policy.
 6. Prefer UDP when it is active and not selected against by quality policy.
 7. Send DATA on the TCP leg when UDP is unavailable or the leg policy selects
    TCP.
 8. Do not select a lane with no usable transport leg.
 9. If the DATA frame is written successfully and FEC is enabled, insert
-   `(packet_id, ip_packet)` into the SLC transmit window.
+   `(group_id, source_index, ip_packet)` into the SLC transmit group.
 
 Receiver behavior:
 
 1. Validate session and lane.
 2. Update the lane and transport leg last-seen time.
-3. Save `(packet_id, ip_packet)` into the bounded SLC receive window if FEC is
-   enabled.
+3. Decode `group_id` and `source_index`, then create or update that lane's
+   receive group.
 4. Write `ip_packet` to TUN immediately.
 
 The receiver does not reorder DATA and does not block waiting for gaps.
@@ -407,11 +413,15 @@ REPAIR carries one SLC repair symbol used to recover lost DATA symbols.
 Body:
 
 ```text
-base_packet_id                uint32
+group_id                      uint32
 key                           uint16
 source_span_and_repair_count  uint8
 repair_symbol                 bytes[repair_symbol_size]
 ```
+
+`group_id` uses the low 30 bits of the field. Bits 30-31 are reserved and must
+be zero. It is the same lane-local identifier encoded in the high 30 bits of
+the protected DATA frames.
 
 `source_span_and_repair_count` is a packed byte:
 
@@ -421,11 +431,11 @@ bits 3-4 = repair_count - 1
 bits 5-7 = reserved, must be zero
 ```
 
-`source_span` is the decoded number of contiguous DATA symbols protected by this
-REPAIR frame. It defines the protected range:
+`source_span` is the decoded number of DATA symbols protected by this REPAIR
+frame. It defines the protected source positions:
 
 ```text
-base_packet_id .. base_packet_id + source_span - 1
+source_index = 0 .. source_span - 1
 ```
 
 Rules:
@@ -452,10 +462,10 @@ decoded `repair_count`.
 The protected source symbols are:
 
 ```text
-base_packet_id
-base_packet_id + 1
+(group_id, source_index=0)
+(group_id, source_index=1)
 ...
-base_packet_id + source_span - 1
+(group_id, source_index=source_span-1)
 ```
 
 The DATA symbol used for FEC is the IP packet itself:
@@ -475,7 +485,7 @@ window:
 repair_symbol_size = max(len(P0), ..., len(P[source_span-1]))
 ```
 
-The `4` bytes are `base_packet_id`, the `2` bytes are `key`, and the `1` byte is
+The `4` bytes are `group_id`, the `2` bytes are `key`, and the `1` byte is
 `source_span_and_repair_count`:
 
 ```text
@@ -503,7 +513,7 @@ Sender behavior for `slc_4_plus_1`:
    lane's SLC transmit window.
 2. After four contiguous successfully written DATA symbols, compute the
    configured number of REPAIR symbols for this group.
-3. Set `base_packet_id` to the first protected DATA symbol.
+3. Set `group_id` to the protected DATA group's identifier.
 4. Increment or otherwise vary `key` for each REPAIR.
 5. Encode `source_span = 4` and the group `repair_count` in
    `source_span_and_repair_count`.
@@ -528,7 +538,7 @@ Sender behavior for `slc_variable_plus_1`:
 4. If the timer fires with one to three contiguous DATA symbols pending, emit
    the scaled number of partial REPAIR symbols with `source_span` set to the
    number of protected symbols.
-5. Set `base_packet_id` to the first protected DATA symbol.
+5. Set `group_id` to the protected DATA group's identifier.
 6. Increment or otherwise vary `key` for each REPAIR.
 7. Encode the decoded `source_span` and group `repair_count` in
    `source_span_and_repair_count`.
@@ -555,7 +565,7 @@ Receiver behavior:
 2. Decode `source_span_and_repair_count`; reject frames with nonzero reserved
    bits, invalid `source_span`, or invalid `repair_count`.
 3. Validate decoded `source_span` for the negotiated `fec_profile`.
-4. Use `lane_id`, `base_packet_id`, and decoded `source_span` to identify the protected
+4. Use `lane_id`, `group_id`, and decoded `source_span` to identify the protected
    DATA symbols in that lane's SLC receive window.
 5. Store the REPAIR symbol and decoded `repair_count` while the protected
    lane-local window is still alive. If REPAIR frames for the same group carry
@@ -571,8 +581,12 @@ Receiver behavior:
    total length, truncate to that length, and write the recovered IP packet to
    TUN if it has not already been emitted.
 
-The receiver keeps bounded DATA and REPAIR bookkeeping. Expired or evicted
-symbols are not retransmitted.
+DATA creates the receive group even when REPAIR has not arrived. The group owns
+all retained DATA and REPAIR buffers. Each accepted DATA or REPAIR resets the
+group's 1.5-second inactivity timer. Completion, recovery, expiration, or
+bounded-window eviction closes the group and releases every retained buffer.
+Late frames for a still-tracked closed group do not recreate retained state.
+Expired or evicted symbols are not retransmitted.
 
 ## Type 0x7: CLOSE
 
@@ -836,12 +850,12 @@ After HELLO_ACK, each lane can carry DATA, REPAIR, PING, and PONG.
 Example with two lanes and FEC enabled:
 
 ```text
-TUN packet -> DATA packet_id=100 -> lane 1 UDP
-TUN packet -> DATA packet_id=101 -> lane 1 UDP
-TUN packet -> DATA packet_id=102 -> lane 1 UDP
-TUN packet -> DATA packet_id=103 -> lane 1 UDP
-             REPAIR base_packet_id=100 key=7 source_span=4 -> lane 1 shadow
-TUN packet -> DATA packet_id=104 -> lane 2 UDP
+TUN packet -> DATA group_id=25 source_index=0 packed=100 -> lane 1 UDP
+TUN packet -> DATA group_id=25 source_index=1 packed=101 -> lane 1 UDP
+TUN packet -> DATA group_id=25 source_index=2 packed=102 -> lane 1 UDP
+TUN packet -> DATA group_id=25 source_index=3 packed=103 -> lane 1 UDP
+             REPAIR group_id=25 key=7 source_span=4 -> lane 1 shadow
+TUN packet -> DATA group_id=0 source_index=0 packed=0 -> lane 2 UDP
 ```
 
 `lane_id` on REPAIR identifies both the lane that carries the REPAIR frame and
@@ -931,7 +945,7 @@ The receiver aggregates committed direction-local role state into the final
 per-transport LINK_STATUS snapshot; the aggregated UDP/TCP status must not be
 used as a gate for another direction's QoS judgment.
 
-Duplicate DATA rejected by the session emit dedupe is dropped before TUN output
+Duplicate DATA rejected by the lane-local emit dedupe is dropped before TUN output
 and must not contribute to `originalDataBytes`, FEC health, recovery, or emit
 state, and it must not be inserted into the receive FEC window. The receiver's
 QoS estimator may account that DATA once as `lateDataBytes` when its
@@ -1193,12 +1207,10 @@ received UDP socket and observed remote address.
 
 ## Open Items Before Implementation
 
-- Decide whether SLC receive-window eviction also needs a time-based timeout in
-  addition to the implementation's bounded memory limit.
 - Decide whether TCP fallback legs are drained or closed immediately after UDP
   recovery.
 - Tune the one-shot bandwidth probe ramp policy and UDP QoS threshold.
-- Decide the packet-id exhaustion threshold that triggers graceful session
-  rotation before `packet_id` wraps.
+- Decide the group-id exhaustion threshold that triggers graceful session
+  rotation before the lane-local 30-bit `group_id` wraps.
 - Decide authentication/encryption separately. This draft only describes
   framing and transport behavior.

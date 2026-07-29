@@ -309,9 +309,9 @@ func TestRepairCountEmitsMultipleRepairFrames(t *testing.T) {
 	}
 
 	group := txRepairGroup{
-		basePacketID: 44,
-		sourceSpan:   maxFECSourceSpan,
-		packets:      packets,
+		groupID:    44,
+		sourceSpan: maxFECSourceSpan,
+		packets:    packets,
 	}
 
 	s.sendRepair(context.Background(), sessionID, lane, group)
@@ -332,8 +332,8 @@ func TestRepairCountEmitsMultipleRepairFrames(t *testing.T) {
 				t.Fatalf("frame %d type = %v, want REPAIR", i, f.Type)
 			}
 			body := f.Body.(protocol.RepairBody)
-			if body.BasePacketID != group.basePacketID {
-				t.Fatalf("repair %d base_packet_id = %d, want %d", i, body.BasePacketID, group.basePacketID)
+			if body.GroupID != group.groupID {
+				t.Fatalf("repair %d group_id = %d, want %d", i, body.GroupID, group.groupID)
 			}
 			if body.SourceSpan != group.sourceSpan {
 				t.Fatalf("repair %d source_span = %d, want %d", i, body.SourceSpan, group.sourceSpan)
@@ -358,7 +358,7 @@ func TestRepairCountEmitsMultipleRepairFrames(t *testing.T) {
 	}
 }
 
-func TestSendRepairChargesScheduler(t *testing.T) {
+func TestSendRepairDoesNotCallScheduler(t *testing.T) {
 	s := New()
 	s.EnableFEC()
 
@@ -370,11 +370,8 @@ func TestSendRepairChargesScheduler(t *testing.T) {
 	lane := newLaneRuntime(1, 100)
 	bindBoth(lane)
 	lane.setFEC(3)
-	otherLane := newLaneRuntime(2, 100)
-	bindBoth(otherLane)
 	s.lanesMu.Lock()
 	s.lanes[laneKey{sessionID: sessionID, laneID: lane.id}] = lane
-	s.lanes[laneKey{sessionID: sessionID, laneID: otherLane.id}] = otherLane
 	s.lanesMu.Unlock()
 
 	strategy := &recordingStrategy{lane: lane}
@@ -392,25 +389,15 @@ func TestSendRepairChargesScheduler(t *testing.T) {
 	}
 
 	group := txRepairGroup{
-		basePacketID: 144,
-		sourceSpan:   maxFECSourceSpan,
-		packets:      packets,
+		groupID:    144,
+		sourceSpan: maxFECSourceSpan,
+		packets:    packets,
 	}
 
 	s.sendRepair(context.Background(), sessionID, lane, group)
 
-	if strategy.picks != 3 {
-		t.Fatalf("repair scheduler picks = %d, want 3", strategy.picks)
-	}
-	for i, cost := range strategy.costs {
-		if cost < defaultMTUBytes {
-			t.Fatalf("repair scheduler cost[%d] = %d, want at least MTU %d", i, cost, defaultMTUBytes)
-		}
-	}
-	for i, lanes := range strategy.candidates {
-		if len(lanes) != 1 || lanes[0] != lane {
-			t.Fatalf("repair scheduler candidates[%d] = %v, want only source lane %p", i, lanes, lane)
-		}
+	if strategy.picks != 0 {
+		t.Fatalf("repair scheduler picks = %d, want 0", strategy.picks)
 	}
 
 	for {
@@ -446,9 +433,9 @@ func TestRepairCountScalesForPartialGroup(t *testing.T) {
 	}
 
 	group := txRepairGroup{
-		basePacketID: 88,
-		sourceSpan:   2,
-		packets:      packets,
+		groupID:    88,
+		sourceSpan: 2,
+		packets:    packets,
 	}
 
 	s.sendRepair(context.Background(), sessionID, lane, group)
@@ -485,15 +472,11 @@ func TestRepairCountScalesForPartialGroup(t *testing.T) {
 }
 
 type recordingStrategy struct {
-	lane       *laneRuntime
-	picks      int
-	costs      []uint32
-	candidates [][]*laneRuntime
+	lane  *laneRuntime
+	picks int
 }
 
-func (s *recordingStrategy) Pick(lanes []*laneRuntime, cost uint32) (*laneRuntime, bool) {
+func (s *recordingStrategy) Pick(_ []*laneRuntime, _ uint32) (*laneRuntime, bool) {
 	s.picks++
-	s.costs = append(s.costs, cost)
-	s.candidates = append(s.candidates, append([]*laneRuntime(nil), lanes...))
 	return s.lane, true
 }

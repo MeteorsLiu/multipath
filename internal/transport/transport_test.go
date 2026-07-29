@@ -80,16 +80,11 @@ func TestRunWriterDropsTransientUDPWriteError(t *testing.T) {
 	}
 }
 
-func TestLegWriterQueueSizesSeparateUDPAndTCP(t *testing.T) {
-	if legWriterQueueSize(KindUDP) >= legWriterQueueSize(KindTCP) {
-		t.Fatalf("UDP queue size = %d, TCP = %d, want UDP smaller than TCP",
-			legWriterQueueSize(KindUDP), legWriterQueueSize(KindTCP))
-	}
-	if legWriterQueueSize(KindUDP) != udpLegWriterQueueSize {
-		t.Fatalf("UDP queue size = %d, want %d", legWriterQueueSize(KindUDP), udpLegWriterQueueSize)
-	}
-	if legWriterQueueSize(KindTCP) != tcpLegWriterQueueSize {
-		t.Fatalf("TCP queue size = %d, want %d", legWriterQueueSize(KindTCP), tcpLegWriterQueueSize)
+func TestLegWriterQueueSizes(t *testing.T) {
+	for _, kind := range []Kind{KindUDP, KindTCP} {
+		if got := legWriterQueueSize(kind); got != 1024 {
+			t.Fatalf("queue size for kind %d = %d, want 1024", kind, got)
+		}
 	}
 }
 
@@ -231,7 +226,7 @@ func TestTCPWriterBatchesQueuedPayloads(t *testing.T) {
 	}
 }
 
-func TestRunWriterBlocksWhenLegQueueIsFull(t *testing.T) {
+func TestRunWriterDropsWhenLegQueueIsFull(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -240,10 +235,11 @@ func TestRunWriterBlocksWhenLegQueueIsFull(t *testing.T) {
 		block:   make(chan struct{}),
 		started: make(chan struct{}),
 	}
+	packet := &runWriterPacket{wrote: make(chan struct{})}
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- RunWriter(ctx, packets, nil, stream)
+		errCh <- RunWriter(ctx, packets, packet, stream)
 	}()
 
 	packets <- Payload{
@@ -274,19 +270,32 @@ func TestRunWriterBlocksWhenLegQueueIsFull(t *testing.T) {
 		}
 	}
 
-	blockedPacket := packetbuf.Acquire(16)
+	droppedPacket := packetbuf.Acquire(16)
 	packets <- Payload{
 		Leg:    LegRef{Kind: KindTCP, ConnID: "blocked"},
-		Packet: blockedPacket,
+		Packet: droppedPacket,
+	}
+	packets <- Payload{
+		Leg: LegRef{
+			Kind:       KindUDP,
+			EndpointID: "udp0",
+			RemoteAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1234},
+		},
+		Packet: packetbuf.Acquire(16),
 	}
 
 	select {
-	case err := <-errCh:
-		t.Fatalf("RunWriter exited while dispatch was blocked: %v", err)
-	case <-time.After(25 * time.Millisecond):
+	case <-packet.wrote:
+	case <-time.After(time.Second):
+		t.Fatal("UDP write blocked behind full TCP queue")
 	}
-	if blockedPacket.Payload == nil {
-		t.Fatal("packet was released while dispatch should be blocked on full leg queue")
+	if droppedPacket.Payload != nil {
+		t.Fatal("packet was not released after full queue drop")
+	}
+	select {
+	case err := <-errCh:
+		t.Fatalf("RunWriter exited after full queue drop: %v", err)
+	case <-time.After(25 * time.Millisecond):
 	}
 
 	cancel()
@@ -295,9 +304,6 @@ func TestRunWriterBlocksWhenLegQueueIsFull(t *testing.T) {
 	case err := <-errCh:
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("RunWriter err = %v, want context canceled", err)
-		}
-		if blockedPacket.Payload != nil {
-			t.Fatal("packet was not released after blocked dispatch was canceled")
 		}
 	case <-time.After(time.Second):
 		t.Fatal("RunWriter did not stop after context cancellation")

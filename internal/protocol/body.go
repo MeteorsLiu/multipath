@@ -26,6 +26,9 @@ const (
 
 	LinkStatusStateClear   uint8 = 0
 	LinkStatusStateLimited uint8 = 1
+
+	maxGroupID      uint32 = 1<<30 - 1
+	sourceIndexMask uint32 = 1<<2 - 1
 )
 
 type Body interface {
@@ -57,18 +60,19 @@ type PingBody struct {
 func (PingBody) protocolBody() {}
 
 type DataBody struct {
-	PacketID uint32
-	Packet   []byte
+	GroupID     uint32
+	SourceIndex uint8
+	Packet      []byte
 }
 
 func (DataBody) protocolBody() {}
 
 type RepairBody struct {
-	BasePacketID uint32
-	Key          uint16
-	SourceSpan   uint8
-	RepairCount  uint8
-	Symbol       []byte
+	GroupID     uint32
+	Key         uint16
+	SourceSpan  uint8
+	RepairCount uint8
+	Symbol      []byte
 }
 
 func (RepairBody) protocolBody() {}
@@ -125,7 +129,7 @@ func encodedBodySize(frame Frame) (int, error) {
 		return 16, validBody(ok)
 	case TypeDATA:
 		data, ok := frame.Body.(DataBody)
-		if !ok {
+		if !ok || data.GroupID > maxGroupID || uint32(data.SourceIndex) > sourceIndexMask {
 			return 0, ErrInvalidFrame
 		}
 		return 4 + len(data.Packet), nil
@@ -134,7 +138,7 @@ func encodedBodySize(frame Frame) (int, error) {
 		if !ok {
 			return 0, ErrInvalidFrame
 		}
-		if !validRepairSourceSpan(repair.SourceSpan) || !validRepairCount(repair.RepairCount) {
+		if repair.GroupID > maxGroupID || !validRepairSourceSpan(repair.SourceSpan) || !validRepairCount(repair.RepairCount) {
 			return 0, ErrInvalidFrame
 		}
 		return 7 + len(repair.Symbol), nil
@@ -190,11 +194,11 @@ func encodeBodyInto(frame Frame, out []byte) error {
 		binary.BigEndian.PutUint64(out[8:16], body.TimeMS)
 	case TypeDATA:
 		data := frame.Body.(DataBody)
-		binary.BigEndian.PutUint32(out[:4], data.PacketID)
+		binary.BigEndian.PutUint32(out[:4], data.GroupID<<2|uint32(data.SourceIndex))
 		copy(out[4:], data.Packet)
 	case TypeREPAIR:
 		repair := frame.Body.(RepairBody)
-		binary.BigEndian.PutUint32(out[:4], repair.BasePacketID)
+		binary.BigEndian.PutUint32(out[:4], repair.GroupID)
 		binary.BigEndian.PutUint16(out[4:6], repair.Key)
 		out[6] = encodeRepairSpanCount(repair.SourceSpan, repair.RepairCount)
 		copy(out[7:], repair.Symbol)
@@ -264,9 +268,11 @@ func decodeBody(frame *Frame, body []byte) error {
 		if len(body) < 4 {
 			return ErrBodyTooShort
 		}
+		groupAndSource := binary.BigEndian.Uint32(body[:4])
 		frame.Body = DataBody{
-			PacketID: binary.BigEndian.Uint32(body[:4]),
-			Packet:   body[4:],
+			GroupID:     groupAndSource >> 2,
+			SourceIndex: uint8(groupAndSource & sourceIndexMask),
+			Packet:      body[4:],
 		}
 	case TypeREPAIR:
 		if len(body) < 7 {
@@ -276,12 +282,16 @@ func decodeBody(frame *Frame, body []byte) error {
 		if !ok {
 			return ErrInvalidFrame
 		}
+		groupID := binary.BigEndian.Uint32(body[:4])
+		if groupID > maxGroupID {
+			return ErrInvalidFrame
+		}
 		frame.Body = RepairBody{
-			BasePacketID: binary.BigEndian.Uint32(body[:4]),
-			Key:          binary.BigEndian.Uint16(body[4:6]),
-			SourceSpan:   sourceSpan,
-			RepairCount:  repairCount,
-			Symbol:       body[7:],
+			GroupID:     groupID,
+			Key:         binary.BigEndian.Uint16(body[4:6]),
+			SourceSpan:  sourceSpan,
+			RepairCount: repairCount,
+			Symbol:      body[7:],
 		}
 	case TypeCLOSE:
 		if len(body) != 2 {

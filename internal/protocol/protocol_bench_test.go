@@ -8,7 +8,7 @@ func BenchmarkEncodeDATA(b *testing.B) {
 		Type:      TypeDATA,
 		SessionID: 1,
 		LaneID:    2,
-		Body:      DataBody{PacketID: 3, Packet: packet},
+		Body:      DataBody{GroupID: 3, SourceIndex: 1, Packet: packet},
 	}
 	dst := make([]byte, 0, headerSize+4+len(packet))
 
@@ -31,10 +31,10 @@ func BenchmarkEncodeREPAIR(b *testing.B) {
 		SessionID: 1,
 		LaneID:    2,
 		Body: RepairBody{
-			BasePacketID: 3,
-			Key:          4,
-			SourceSpan:   4,
-			Symbol:       symbol,
+			GroupID:    3,
+			Key:        4,
+			SourceSpan: 4,
+			Symbol:     symbol,
 		},
 	}
 	dst := make([]byte, 0, headerSize+7+len(symbol))
@@ -57,7 +57,7 @@ func BenchmarkDecodeDATA(b *testing.B) {
 		Type:      TypeDATA,
 		SessionID: 1,
 		LaneID:    2,
-		Body:      DataBody{PacketID: 3, Packet: packet},
+		Body:      DataBody{GroupID: 3, SourceIndex: 1, Packet: packet},
 	}, nil)
 	if err != nil {
 		b.Fatal(err)

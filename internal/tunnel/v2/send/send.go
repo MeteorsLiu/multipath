@@ -32,12 +32,13 @@ var (
 )
 
 const (
-	defaultMTUBytes        = 1500
-	drrBaseQuantum         = 4 * defaultMTUBytes
-	maxFECSourceSpan       = 4
-	defaultFECFlushMin     = 5 * time.Millisecond
-	defaultFECFlushMax     = 30 * time.Millisecond
-	debugQueueWaitLogAfter = time.Millisecond
+	defaultMTUBytes               = 1500
+	drrBaseQuantum                = 4 * defaultMTUBytes
+	maxFECSourceSpan              = 4
+	maxTxGroupID           uint32 = 1<<30 - 1
+	defaultFECFlushMin            = 5 * time.Millisecond
+	defaultFECFlushMax            = 30 * time.Millisecond
+	debugQueueWaitLogAfter        = time.Millisecond
 )
 
 // Send owns the send-side runtime state per spec section 5.2.
@@ -120,7 +121,6 @@ type runnableCache struct {
 
 // sendState holds per-session send-side state.
 type sendState struct {
-	nextPacketID  atomic.Uint32
 	nextRepairKey atomic.Uint32
 	fecEnabled    atomic.Bool
 }
@@ -626,13 +626,6 @@ func (s *Send) Write(ctx context.Context, packet *packetbuf.Packet) error {
 		return nil
 	}
 
-	// Reserve packet ID
-	state := s.getSendState(sessionID)
-	if state == nil {
-		return nil
-	}
-	packetID := state.nextPacketID.Add(1) - 1
-
 	cost := laneScheduleCost(len(packet.Payload))
 
 	// Pick lane using scheduler
@@ -641,19 +634,7 @@ func (s *Send) Write(ctx context.Context, packet *packetbuf.Packet) error {
 		return nil
 	}
 
-	// Build DATA frame
-	frame := protocol.Frame{
-		Version:   protocol.Version,
-		Type:      protocol.TypeDATA,
-		SessionID: sessionID,
-		LaneID:    lane.id,
-		Body: protocol.DataBody{
-			PacketID: packetID,
-			Packet:   packet.Payload,
-		},
-	}
-
-	return s.sendDataFrame(ctx, lane, frame, packetID, packet.Payload)
+	return s.sendDataFrame(ctx, sessionID, lane, packet.Payload)
 }
 
 // WriteFrame sends a control frame (spec 6.2).
@@ -893,37 +874,46 @@ func (s *Send) markRunnableLanesDirty(sessionID uint64) {
 }
 
 // sendDataFrame sends a DATA frame and adds to FEC window (spec 7.1).
-func (s *Send) sendDataFrame(ctx context.Context, lane *laneRuntime, frame protocol.Frame, packetID uint32, payload []byte) error {
+func (s *Send) sendDataFrame(ctx context.Context, sessionID uint64, lane *laneRuntime, payload []byte) error {
+	qosEnabled := s.qosSelectionEnabled()
+	leg := lane.primaryTransportWithQoS(qosEnabled)
+	if leg.Kind == 0 {
+		return nil
+	}
+
+	fecEnabled := s.sessionFECEnabled(sessionID)
+	groupID, sourceIndex, group, ready, shouldArmFlush := lane.commitPacket(payload, fecEnabled)
+	frame := protocol.Frame{
+		Version:   protocol.Version,
+		Type:      protocol.TypeDATA,
+		SessionID: sessionID,
+		LaneID:    lane.id,
+		Body: protocol.DataBody{
+			GroupID:     groupID,
+			SourceIndex: sourceIndex,
+			Packet:      payload,
+		},
+	}
 	packet, err := s.encodeFrame(frame)
 	if err != nil {
 		return err
 	}
 
-	qosEnabled := s.qosSelectionEnabled()
-	leg := lane.primaryTransportWithQoS(qosEnabled)
-	if leg.Kind == 0 {
-		packet.Release()
-		return nil
-	}
-	s.recordQoSDataLegSelection(frame.SessionID, lane, leg.Kind, qosEnabled)
+	s.recordQoSDataLegSelection(sessionID, lane, leg.Kind, qosEnabled)
 	if debuglog.Enabled() {
 		udpQ, tcpQ := lane.leg.qualitySnapshot()
 		shadow := lane.shadowTransportWithQoS(qosEnabled)
-		debuglog.Printf("send", "schedule_select session=%d lane=%d primary={%s} shadow={%s} leg={%s} frame=type=DATA packet_id=%d payload_len=%d udp_active=%t udp_qos=%t udp_qos_bps=%d udp_prefer_tcp=%t tcp_active=%t tcp_qos=%t tcp_qos_bps=%d",
-			frame.SessionID, lane.id, debugLeg(leg), debugLeg(shadow), debugLeg(leg), packetID, len(payload),
+		debuglog.Printf("send", "schedule_select session=%d lane=%d primary={%s} shadow={%s} leg={%s} frame=type=DATA group_id=%d source_index=%d payload_len=%d udp_active=%t udp_qos=%t udp_qos_bps=%d udp_prefer_tcp=%t tcp_active=%t tcp_qos=%t tcp_qos_bps=%d",
+			sessionID, lane.id, debugLeg(leg), debugLeg(shadow), debugLeg(leg), groupID, sourceIndex, len(payload),
 			udpQ.Active, udpQ.QoSActive, udpQ.QoSDeliveredBps, udpQ.PreferTCP,
 			tcpQ.Active, tcpQ.QoSActive, tcpQ.QoSDeliveredBps)
 	}
 
-	// Add to FEC window if enabled
-	if s.sessionFECEnabled(frame.SessionID) {
-		group, ready, shouldArmFlush := lane.commitPacket(packetID, payload)
+	if fecEnabled {
 		if ready {
-			// Send REPAIR immediately
-			s.sendRepair(ctx, frame.SessionID, lane, group)
+			s.sendRepair(ctx, sessionID, lane, group)
 		} else if shouldArmFlush {
-			// Arm flush timer
-			s.armFECFlushTimer(frame.SessionID, lane)
+			s.armFECFlushTimer(sessionID, lane)
 		}
 	}
 
@@ -1171,8 +1161,8 @@ func (s *Send) sendRepair(ctx context.Context, sessionID uint64, lane *laneRunti
 	if leg.Kind == 0 {
 		return
 	}
-	debuglog.Printf("send/fec", "repair_group session=%d lane=%d base_packet_id=%d source_span=%d packet_count=%d configured_repair_count=%d scaled_repair_count=%d leg={%s}",
-		sessionID, lane.id, group.basePacketID, group.sourceSpan, len(group.packets), configuredRepairCount, repairCount, debugLeg(leg))
+	debuglog.Printf("send/fec", "repair_group session=%d lane=%d group_id=%d source_span=%d packet_count=%d configured_repair_count=%d scaled_repair_count=%d leg={%s}",
+		sessionID, lane.id, group.groupID, group.sourceSpan, len(group.packets), configuredRepairCount, repairCount, debugLeg(leg))
 
 	for i, key := range keys {
 		symbol := shards[sourceSpan+i]
@@ -1182,11 +1172,11 @@ func (s *Send) sendRepair(ctx context.Context, sessionID uint64, lane *laneRunti
 			SessionID: sessionID,
 			LaneID:    lane.id,
 			Body: protocol.RepairBody{
-				BasePacketID: group.basePacketID,
-				Key:          key,
-				SourceSpan:   group.sourceSpan,
-				RepairCount:  repairCount,
-				Symbol:       symbol,
+				GroupID:     group.groupID,
+				Key:         key,
+				SourceSpan:  group.sourceSpan,
+				RepairCount: repairCount,
+				Symbol:      symbol,
 			},
 		}
 
@@ -1194,17 +1184,12 @@ func (s *Send) sendRepair(ctx context.Context, sessionID uint64, lane *laneRunti
 		if err != nil {
 			return
 		}
-		cost := uint32(len(packet.Payload))
-		if cost < defaultMTUBytes {
-			cost = defaultMTUBytes
-		}
-		_, _ = s.strategy(sessionID).Pick([]*laneRuntime{lane}, cost)
 
 		if debuglog.Enabled() {
 			primary := lane.primaryTransportWithQoS(qosEnabled)
-			debuglog.Printf("send", "schedule_select session=%d lane=%d primary={%s} shadow={%s} leg={%s} frame=type=REPAIR base_packet_id=%d key=%d source_span=%d symbol_len=%d",
+			debuglog.Printf("send", "schedule_select session=%d lane=%d primary={%s} shadow={%s} leg={%s} frame=type=REPAIR group_id=%d key=%d source_span=%d symbol_len=%d",
 				sessionID, lane.id, debugLeg(primary), debugLeg(leg), debugLeg(leg),
-				group.basePacketID, key, group.sourceSpan, len(symbol))
+				group.groupID, key, group.sourceSpan, len(symbol))
 		}
 
 		_ = s.WriteTo(ctx, leg, packet)
