@@ -12,6 +12,19 @@ func observeQoSRepairFrame(e *qosEstimator, group rxGroupKey, repairKind transpo
 	e.observeRepairGroup(group, repairKind, repairCount)
 }
 
+func observeQoSDirectionGroup(e *qosEstimator, group rxGroupKey, dataKind, repairKind transport.Kind, originalBytes, expectedBytes, maxSourceBytes uint64, repairBytes int, repairCount uint8, at time.Time) []qosStatus {
+	e.observeOriginalData(dataKind, int(originalBytes), at)
+	observeQoSRepairFrame(e, group, repairKind, repairBytes, repairCount, at)
+	e.observeGroupDone(rxGroupDone{
+		group:          group,
+		dataArrived:    1,
+		dataExpected:   1,
+		expectedBytes:  expectedBytes,
+		maxSourceBytes: maxSourceBytes,
+	}, at)
+	return e.tick(at.Add(e.cfg.Tick))
+}
+
 func observeQoSGroup(e *qosEstimator, groupID uint32, at time.Time, originalBytes, expectedBytes uint64) []qosStatus {
 	group := rxGroupKey{groupID: groupID, sourceSpan: 2}
 	e.observeOriginalData(transport.KindUDP, int(originalBytes), at)
@@ -168,6 +181,170 @@ func TestQoSEstimatorDataLegRateGapCountsLateData(t *testing.T) {
 	}
 	if e.currentPrimary != transport.KindUDP {
 		t.Fatalf("primary = %v, want UDP", e.currentPrimary)
+	}
+}
+
+func TestQoSEstimatorTCPDataRoleHealthyWhenUDPLimited(t *testing.T) {
+	now := time.Unix(165, 0)
+	e := newQoSEstimator(qosConfig{Tick: time.Second}, nil)
+	e.udpTCPData.dataLimited = true
+	e.currentPrimary = transport.KindTCP
+	e.currentRole = qosRoleData
+
+	for i := 0; i < qosDecisionSamples; i++ {
+		at := now.Add(time.Duration(i) * time.Second)
+		group := rxGroupKey{groupID: uint32(300 + i), sourceSpan: 2}
+		observeQoSDirectionGroup(e, group, transport.KindTCP, transport.KindUDP, 200, 200, 100, 100, 1, at)
+	}
+
+	status := e.snapshotStatus()
+	if !status.UDPLimited || status.TCPLimited {
+		t.Fatalf("status = %+v, want UDP limited only", status)
+	}
+	if e.tcpUDPData.dataLimited {
+		t.Fatal("TCP data role marked limited despite full DATA delivery")
+	}
+	if e.currentPrimary != transport.KindTCP || e.currentRole != qosRoleData {
+		t.Fatalf("primary=%v role=%s, want TCP data role", e.currentPrimary, qosRoleLabel(e.currentRole))
+	}
+}
+
+func TestQoSEstimatorTCPDataRoleLimitedWithUDPLimited(t *testing.T) {
+	now := time.Unix(170, 0)
+	e := newQoSEstimator(qosConfig{Tick: time.Second}, nil)
+	e.udpTCPData.dataLimited = true
+	e.currentPrimary = transport.KindTCP
+	e.currentRole = qosRoleData
+
+	for i := 0; i < qosDecisionSamples; i++ {
+		at := now.Add(time.Duration(i) * time.Second)
+		group := rxGroupKey{groupID: uint32(320 + i), sourceSpan: 2}
+		observeQoSDirectionGroup(e, group, transport.KindTCP, transport.KindUDP, 100, 200, 100, 1, 1, at)
+	}
+
+	status := e.snapshotStatus()
+	if !status.UDPLimited || !status.TCPLimited {
+		t.Fatalf("status = %+v, want both transports limited", status)
+	}
+	if !e.tcpUDPData.dataLimited {
+		t.Fatal("TCP data role did not become limited")
+	}
+	if e.currentPrimary != transport.KindTCP {
+		t.Fatalf("primary=%v, want TCP selected by delivered bps", e.currentPrimary)
+	}
+}
+
+func TestQoSEstimatorUDPDataTCPRepairDeliveryLimited(t *testing.T) {
+	now := time.Unix(172, 0)
+	e := newQoSEstimator(qosConfig{Tick: time.Second}, nil)
+	e.tcpUDPData.dataLimited = true
+	e.currentPrimary = transport.KindUDP
+	e.currentRole = qosRoleRepair
+
+	for i := 0; i < qosDecisionSamples; i++ {
+		at := now.Add(time.Duration(i) * time.Second)
+		group := rxGroupKey{groupID: uint32(330 + i), sourceSpan: 4}
+		observeQoSDirectionGroup(e, group, transport.KindUDP, transport.KindTCP, 0, 4000, 1000, 100, 1, at)
+	}
+
+	status := e.snapshotStatus()
+	if status.UDPLimited || !status.TCPLimited {
+		t.Fatalf("status = %+v, want TCP limited only", status)
+	}
+	if !e.udpTCPRepair.repairLimited {
+		t.Fatal("TCP repair role did not become limited")
+	}
+	if e.currentPrimary != transport.KindUDP || e.currentRole != qosRoleRepair {
+		t.Fatalf("primary=%v role=%s, want UDP repair role", e.currentPrimary, qosRoleLabel(e.currentRole))
+	}
+}
+
+func TestQoSEstimatorUDPDataTCPRepairKeepsLimitedAtLowLoad(t *testing.T) {
+	now := time.Unix(175, 0)
+	e := newQoSEstimator(qosConfig{Tick: time.Second}, nil)
+	e.tcpUDPData.dataLimited = true
+	e.currentPrimary = transport.KindUDP
+	e.currentRole = qosRoleRepair
+
+	for i := 0; i < qosDecisionSamples; i++ {
+		at := now.Add(time.Duration(i) * time.Second)
+		group := rxGroupKey{groupID: uint32(340 + i), sourceSpan: 4}
+		observeQoSDirectionGroup(e, group, transport.KindUDP, transport.KindTCP, 0, 4000, 1000, 1000, 1, at)
+	}
+
+	status := e.snapshotStatus()
+	if status.UDPLimited || !status.TCPLimited {
+		t.Fatalf("status = %+v, want TCP limited only", status)
+	}
+	if e.udpTCPRepair.repairLimited {
+		t.Fatal("TCP repair role marked limited despite complete repair delivery")
+	}
+	if e.currentPrimary != transport.KindUDP || e.currentRole != qosRoleRepair {
+		t.Fatalf("primary=%v role=%s, want UDP repair role", e.currentPrimary, qosRoleLabel(e.currentRole))
+	}
+}
+
+func TestQoSEstimatorUDPDataTCPRepairFullLoadClearsAndReturnsToDataRole(t *testing.T) {
+	now := time.Unix(180, 0)
+	e := newQoSEstimator(qosConfig{Tick: time.Second}, nil)
+	e.tcpUDPData.dataLimited = true
+	e.currentPrimary = transport.KindUDP
+	e.currentRole = qosRoleRepair
+
+	var statuses []qosStatus
+	for i := 0; i < qosDecisionSamples; i++ {
+		at := now.Add(time.Duration(i) * time.Second)
+		group := rxGroupKey{groupID: uint32(360 + i), sourceSpan: 4}
+		statuses = append(statuses, observeQoSDirectionGroup(e, group, transport.KindUDP, transport.KindTCP, 0, 4000, 1000, 4000, 4, at)...)
+	}
+
+	if len(statuses) == 0 {
+		t.Fatal("missing TCP repair clear status")
+	}
+	last := statuses[len(statuses)-1]
+	if last.UDPLimited || last.TCPLimited {
+		t.Fatalf("statuses = %+v, want both transports clear", statuses)
+	}
+	if e.currentPrimary != transport.KindUDP {
+		t.Fatalf("primary=%v, want UDP after TCP repair clear", e.currentPrimary)
+	}
+	if e.currentRole != qosRoleData {
+		t.Fatalf("role=%s, want DATA role after TCP repair clear", qosRoleLabel(e.currentRole))
+	}
+}
+
+func TestQoSEstimatorBothLimitedChoosesHigherDeliveredBps(t *testing.T) {
+	tests := []struct {
+		name        string
+		repairBytes int
+		wantPrimary transport.Kind
+	}{
+		{name: "tcp delivered higher", repairBytes: 100, wantPrimary: transport.KindTCP},
+		{name: "udp delivered higher", repairBytes: 1, wantPrimary: transport.KindUDP},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			now := time.Unix(185, 0)
+			e := newQoSEstimator(qosConfig{Tick: time.Second}, nil)
+			e.tcpUDPData.dataLimited = true
+			e.currentPrimary = transport.KindUDP
+			e.currentRole = qosRoleData
+
+			for i := 0; i < qosDecisionSamples; i++ {
+				at := now.Add(time.Duration(i) * time.Second)
+				group := rxGroupKey{groupID: uint32(380 + i), sourceSpan: 2}
+				observeQoSDirectionGroup(e, group, transport.KindUDP, transport.KindTCP, 50, 100, 50, tt.repairBytes, 1, at)
+			}
+
+			status := e.snapshotStatus()
+			if !status.UDPLimited || !status.TCPLimited {
+				t.Fatalf("status = %+v, want both transports limited", status)
+			}
+			if e.currentPrimary != tt.wantPrimary {
+				t.Fatalf("primary=%v, want %v with UDP bps=%d TCP bps=%d", e.currentPrimary, tt.wantPrimary, status.UDPDeliveredBps, status.TCPDeliveredBps)
+			}
+		})
 	}
 }
 
