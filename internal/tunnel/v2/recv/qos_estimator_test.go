@@ -781,7 +781,7 @@ func TestQoSEstimatorRepairLegClearAllowsNearDataLoad(t *testing.T) {
 	}
 }
 
-func TestQoSEstimatorMaxRepairLateTCPDataMarksTCPLimited(t *testing.T) {
+func TestQoSEstimatorLateTCPDataDoesNotMarkTCPLimited(t *testing.T) {
 	now := time.Unix(297, 500)
 	e := newQoSEstimator(qosConfig{Tick: time.Second}, nil)
 	e.udpTCPData.dataLimited = true
@@ -814,11 +814,11 @@ func TestQoSEstimatorMaxRepairLateTCPDataMarksTCPLimited(t *testing.T) {
 	}
 
 	if len(statuses) == 0 {
-		t.Fatal("missing TCP limited status")
+		t.Fatal("missing clear status")
 	}
 	last := statuses[len(statuses)-1]
-	if last.UDPLimited || !last.TCPLimited {
-		t.Fatalf("statuses = %+v, want TCP limited only", statuses)
+	if last.UDPLimited || last.TCPLimited {
+		t.Fatalf("statuses = %+v, want clear state", statuses)
 	}
 	if !last.primarySwitched || e.currentPrimary != transport.KindUDP {
 		t.Fatalf("statuses = %+v primary=%v, want switch back to UDP", statuses, e.currentPrimary)

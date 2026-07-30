@@ -389,7 +389,7 @@ None of these paths may submit limited or clear state directly.
 FEC health observations such as incomplete-group `DataArrived/DataExpected`
 do not directly feed the QoS limited/clear detector. They are submitted to the
 same lane-local QoS estimator as FEC-health facts and drive adaptive
-repair count. That adaptive repair count has two purposes:
+repair count. That adaptive repair count has three purposes:
 
 1. When the current DATA primary is losing heavily, QoS rate detection may lack
    enough accepted DATA/group evidence. Raising repair count lets the shadow
@@ -398,6 +398,10 @@ repair count. That adaptive repair count has two purposes:
 2. When the current DATA primary is backpressured and many originals arrive
    late, raising repair count lets the shadow REPAIR leg recover those packets
    before the delayed originals arrive, reducing upper-layer wait time.
+3. The sender multiplies that lane's DATA scheduling cost by repair count. A
+   lane at repair count `4` therefore receives approximately one quarter of the
+   DATA selections of an otherwise equal lane at repair count `1`, while
+   remaining runnable.
 
 The higher shadow REPAIR load created by adaptive repair count also supplies
 the only valid shadow-capacity evidence for clearing a previously limited
@@ -672,6 +676,7 @@ package schedule
 type Lane interface {
     comparable
     Weight() uint32
+    Cost(base uint32) uint32
 }
 
 type Strategy[L Lane] interface {
@@ -684,9 +689,17 @@ Rules:
 ```text
 Schedule Strategy is not a runtime loop or packet queue owner.
 Schedule Strategy does not own packet queues, lane lifecycle, fallback state, transport output, protocol frames, or FEC state.
-Send provides the current runnable lane candidates and packet cost.
+Send provides the current runnable lane candidates and base packet cost. Each
+candidate supplies its effective scheduling cost without exposing the policy
+state that produced it to Schedule Strategy.
+DRR advances at most 100 internal virtual rounds until one runnable
+positive-weight lane has enough deficit. The bound prevents an invalid
+configuration from spinning indefinitely; reaching it still selects a
+positive-weight lane rather than making `Pick` fail and causing Send to drop
+the current TUN packet.
 The default v2 strategy is DRR.
-The Lane interface is a local schedule package abstraction for lane weight only; it is not a public runtime Lane module.
+The Lane interface is a local schedule package abstraction for lane weight and
+effective packet cost; it is not a public runtime Lane module.
 ```
 
 ## Transport

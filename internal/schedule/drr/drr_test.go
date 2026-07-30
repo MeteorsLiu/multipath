@@ -5,12 +5,20 @@ import "testing"
 const testMTU = 1500
 
 type testLane struct {
-	id     uint8
-	weight uint32
+	id             uint8
+	weight         uint32
+	costMultiplier uint32
 }
 
 func (l testLane) Weight() uint32 {
 	return l.weight
+}
+
+func (l testLane) Cost(cost uint32) uint32 {
+	if l.costMultiplier == 0 {
+		return cost
+	}
+	return cost * l.costMultiplier
 }
 
 // TestDRREqualWeightsProduceShortBursts pins the core scheduling shape: with
@@ -56,6 +64,31 @@ func TestDRRWeightsAffectLongRunSelection(t *testing.T) {
 	ratio := float64(counts[1]) / float64(counts[2])
 	if ratio < 1.8 || ratio > 2.2 {
 		t.Fatalf("weight-2:weight-1 selection ratio = %.2f (counts=%v), want ~2.0", ratio, counts)
+	}
+}
+
+func TestDRRLaneCostAffectsSelection(t *testing.T) {
+	s := New[testLane](4 * testMTU)
+	lanes := []testLane{
+		{id: 1, weight: 1, costMultiplier: 1},
+		{id: 2, weight: 1, costMultiplier: 2},
+		{id: 3, weight: 1, costMultiplier: 3},
+		{id: 4, weight: 1, costMultiplier: 4},
+	}
+
+	counts := map[uint8]int{}
+	for i := 0; i < 2500; i++ {
+		lane, ok := s.Pick(lanes, testMTU)
+		if !ok {
+			t.Fatalf("pick %d returned empty", i)
+		}
+		counts[lane.id]++
+	}
+	want := map[uint8]int{1: 1200, 2: 600, 3: 400, 4: 300}
+	for laneID, wantCount := range want {
+		if counts[laneID] != wantCount {
+			t.Fatalf("selection counts = %v, want %v", counts, want)
+		}
 	}
 }
 
@@ -116,16 +149,41 @@ func TestDRRDoesNotSpinOnEmptyOrInvalidInput(t *testing.T) {
 	}
 }
 
-// TestDRRLargeCostReturnsFalse verifies a cost larger than one weighted quantum
-// added to the current deficit returns false (no single Pick selects it).
-func TestDRRLargeCostReturnsFalse(t *testing.T) {
+// TestDRRLargeCostAccumulatesQuantum verifies temporary deficit shortage never
+// escapes Pick as a false no-lane result.
+func TestDRRLargeCostAccumulatesQuantum(t *testing.T) {
 	s := New[testLane](4 * testMTU)
 	lanes := []testLane{{id: 1, weight: 1}}
 
-	// One quantum = 4*1500 = 6000; cost 10000 cannot be covered by a single
-	// quantum add against a zero deficit.
-	if lane, ok := s.Pick(lanes, 10000); ok {
-		t.Fatalf("large-cost pick = (%+v,true), want false", lane)
+	lane, ok := s.Pick(lanes, 10000)
+	if !ok || lane.id != 1 {
+		t.Fatalf("large-cost pick = (%+v,%v), want lane 1", lane, ok)
+	}
+	if deficit := s.items[lanes[0]].deficit; deficit != 2000 {
+		t.Fatalf("deficit after large-cost pick = %d, want 2000", deficit)
+	}
+}
+
+func TestDRRRepairCostAboveQuantumStillSelects(t *testing.T) {
+	s := New[testLane](4 * testMTU)
+	lane := testLane{id: 1, weight: 1, costMultiplier: 4}
+
+	picked, ok := s.Pick([]testLane{lane}, 1514)
+	if !ok || picked.id != lane.id {
+		t.Fatalf("repair-cost pick = (%+v,%v), want lane 1", picked, ok)
+	}
+	if deficit := s.items[lane].deficit; deficit != 5944 {
+		t.Fatalf("deficit after repair-cost pick = %d, want 5944", deficit)
+	}
+}
+
+func TestDRRVirtualRoundLimitStillSelects(t *testing.T) {
+	s := New[testLane](0)
+	lane := testLane{id: 1, weight: 1}
+
+	picked, ok := s.Pick([]testLane{lane}, testMTU)
+	if !ok || picked.id != lane.id {
+		t.Fatalf("bounded pick = (%+v,%v), want lane 1", picked, ok)
 	}
 }
 

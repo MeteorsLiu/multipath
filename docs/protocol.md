@@ -964,7 +964,7 @@ DataArrived / DataExpected
 
 FEC health is not a direct QoS limited/clear detector input. It drives the
 lane-local adaptive repair count carried in LINK_STATUS. That repair count has
-two jobs:
+three jobs:
 
 1. When the current DATA primary is losing heavily, QoS rate detection may lack
    enough accepted DATA/group evidence. Higher repair count lets the shadow
@@ -973,6 +973,10 @@ two jobs:
 2. When the current DATA primary is backpressured and many originals arrive
    late, higher repair count lets the shadow REPAIR leg recover those packets
    before the delayed originals arrive, reducing upper-layer wait time.
+3. The sender multiplies the lane's DATA scheduling cost by repair count. A
+   repair-count-4 lane therefore receives approximately one quarter of the DATA
+   selections of an otherwise equal repair-count-1 lane without being removed
+   from the runnable set.
 
 The increased shadow REPAIR load is also the only valid shadow-capacity evidence
 for clearing a previously limited transport kind. The receiver must not treat

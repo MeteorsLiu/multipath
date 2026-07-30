@@ -68,6 +68,13 @@ func (l *laneRuntime) Weight() uint32 {
 	return l.weight.Load()
 }
 
+// Cost raises this lane's DATA scheduling charge with its receive-driven FEC
+// repair demand. A lane at repair count 4 therefore consumes four times the
+// deficit of a healthy repair-count-1 lane with the same configured weight.
+func (l *laneRuntime) Cost(cost uint32) uint32 {
+	return cost * uint32(l.currentFECRepairCount())
+}
+
 // ready returns true if the lane has at least one active transport. Readiness is
 // driven by leg.active (spec: active默认false, HELLO_ACK/PONG才置true), not by
 // "has a ref".

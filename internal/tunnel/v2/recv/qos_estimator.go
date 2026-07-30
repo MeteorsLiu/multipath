@@ -25,10 +25,6 @@ const (
 	qosRateGapClear       = 0.03
 	qosRepairLoadGapClear = 0.10
 	qosRepairCapGapClear  = 0.20
-
-	qosTCPLateGapLimited        = 0.50
-	qosTCPLateGapMinExpectedBps = 500_000
-	qosTCPLateGapMinRepairRatio = 0.80
 )
 
 type qosConfig struct {
@@ -94,7 +90,6 @@ type qosDirection struct {
 	dataDecision    qosDecisionWindow
 	repairDecision  qosDecisionWindow
 	repairLoad      qosDecisionWindow
-	tcpLateData     qosDecisionWindow
 	fecHealth       qosFECHealth
 
 	repairScale            float64
@@ -454,9 +449,6 @@ func (e *qosEstimator) evaluateRatesLocked(direction *qosDirection, rates qosRat
 		if rates.expectedBps == 0 {
 			return
 		}
-		if e.evaluateTCPHighPressureLocked(direction, rates) {
-			return
-		}
 		if !direction.repairScaleInitialized {
 			return
 		}
@@ -492,33 +484,6 @@ func (e *qosEstimator) evaluateRatesLocked(direction *qosDirection, rates qosRat
 		}
 	}
 }
-
-func (e *qosEstimator) evaluateTCPHighPressureLocked(direction *qosDirection, rates qosRates) bool {
-	if direction.dataKind != transport.KindTCP || direction.repairKind != transport.KindUDP {
-		return false
-	}
-
-	lateGap := 0.0
-	if direction.fecHealth.repairCount >= maxFECSourceSpan &&
-		rates.expectedBps >= qosTCPLateGapMinExpectedBps &&
-		float64(rates.repairBps) >= float64(rates.expectedBps)*qosTCPLateGapMinRepairRatio {
-		lateGap = float64(rates.lateDataBps) / float64(rates.expectedBps)
-	}
-	avgLateGap, ready := direction.tcpLateData.add(lateGap)
-	if !ready || avgLateGap < qosTCPLateGapLimited {
-		return false
-	}
-
-	if !direction.dataLimited {
-		e.recordEvent("limited_active", direction.dataKind, direction)
-	}
-	direction.dataLimited = true
-	if e.clearLimitedLocked(direction.repairKind) {
-		e.recordEvent("limited_clear", direction.repairKind, direction)
-	}
-	return true
-}
-
 func (e *qosEstimator) clearLimitedLocked(kind transport.Kind) bool {
 	if kind == transport.KindUDP {
 		return e.clearUDPLimitedLocked()
@@ -846,7 +811,6 @@ func (d *qosDirection) clearDecisions() {
 	d.dataDecision = qosDecisionWindow{}
 	d.repairDecision = qosDecisionWindow{}
 	d.repairLoad = qosDecisionWindow{}
-	d.tcpLateData = qosDecisionWindow{}
 }
 
 func (w *qosDecisionWindow) add(value float64) (float64, bool) {
