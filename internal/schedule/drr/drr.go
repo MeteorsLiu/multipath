@@ -14,6 +14,8 @@ import (
 	"github.com/MeteorsLiu/multipath/internal/schedule"
 )
 
+const maxVirtualRounds = 100
+
 // Strategy is the DRR schedule strategy. The zero value is not usable; call
 // New. All exported behavior is guarded by mu so concurrent Send data-path
 // callers can share one strategy per session, matching the cfs strategy.
@@ -53,8 +55,10 @@ func New[L schedule.Lane](baseQuantum uint32) *Strategy[L] {
 // deficit covers cost, subtracting cost from that lane's deficit. The cursor
 // stays on the selected lane while its remaining deficit still covers cost and
 // otherwise advances to the next candidate, which produces the desired
-// short-burst-then-rotate behavior. If no candidate can cover cost after a
-// single weighted quantum, Pick returns false without spinning.
+// short-burst-then-rotate behavior. If no candidate can cover cost after one
+// scan, Pick advances another virtual DRR round, up to maxVirtualRounds;
+// temporary deficit shortage never makes a runnable positive-weight lane
+// unavailable.
 func (s *Strategy[L]) Pick(lanes []L, cost uint32) (L, bool) {
 	var zero L
 	n := len(lanes)
@@ -78,29 +82,48 @@ func (s *Strategy[L]) Pick(lanes []L, cost uint32) (L, bool) {
 		}
 	}
 
-	costU := uint64(cost)
+	for round := 0; round < maxVirtualRounds; round++ {
+		candidates := 0
+		for k := 0; k < n; k++ {
+			idx := (start + k) % n
+			lane := lanes[idx]
+			weight := lane.Weight()
+			if weight == 0 {
+				continue
+			}
+			candidates++
+			it := s.item(lane)
+			laneCost := uint64(lane.Cost(cost))
+			if it.deficit < laneCost {
+				it.deficit += uint64(s.baseQuantum) * uint64(weight)
+			}
+			if it.deficit < laneCost {
+				continue
+			}
+			it.deficit -= laneCost
+			if it.deficit >= laneCost {
+				s.cursor, s.cursorSet = lane, true
+			} else {
+				s.advanceCursor(lanes, idx)
+			}
+			return lane, true
+		}
+		if candidates == 0 {
+			return zero, false
+		}
+	}
+
+	// Keep Pick work-conserving at the safety limit. This path only protects
+	// against an invalid zero quantum or a cost outside the DATA packet range;
+	// it must not turn temporary deficit shortage into a Send-side packet drop.
 	for k := 0; k < n; k++ {
 		idx := (start + k) % n
 		lane := lanes[idx]
-		weight := lane.Weight()
-		if weight == 0 {
+		if lane.Weight() == 0 {
 			continue
 		}
-		it := s.item(lane)
-		if it.deficit < costU {
-			it.deficit += uint64(s.baseQuantum) * uint64(weight)
-		}
-		if it.deficit < costU {
-			// Even one weighted quantum cannot cover this cost; try the next
-			// candidate rather than spinning on this one.
-			continue
-		}
-		it.deficit -= costU
-		if it.deficit >= costU {
-			s.cursor, s.cursorSet = lane, true
-		} else {
-			s.advanceCursor(lanes, idx)
-		}
+		s.item(lane).deficit = 0
+		s.advanceCursor(lanes, idx)
 		return lane, true
 	}
 	return zero, false

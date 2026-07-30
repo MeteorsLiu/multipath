@@ -53,7 +53,7 @@ func (s *Strategy[L]) Pick(lanes []L, cost uint32) (L, bool) {
 		return zero, false
 	}
 
-	s.addCost(picked, cost, picked.lane.Weight())
+	s.addCost(picked, picked.lane.Cost(cost), picked.lane.Weight())
 	s.minVR = s.minCandidateVR(lanes)
 	return picked.lane, true
 }

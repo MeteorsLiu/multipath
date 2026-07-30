@@ -14,6 +14,10 @@ func (l testLane) Weight() uint32 {
 	return l.weight
 }
 
+func (l testLane) Cost(cost uint32) uint32 {
+	return cost
+}
+
 func TestStrategyOrdersByVirtualRuntime(t *testing.T) {
 	s := New[testLane]()
 	lanes := []testLane{

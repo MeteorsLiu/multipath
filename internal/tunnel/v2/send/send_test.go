@@ -327,6 +327,18 @@ func TestLaneScheduleCostChargesAtLeastMTU(t *testing.T) {
 	}
 }
 
+func TestLaneRuntimeCostScalesWithRepairCount(t *testing.T) {
+	lane := newLaneRuntime(1, 1)
+	if got := lane.Cost(defaultMTUBytes); got != defaultMTUBytes {
+		t.Fatalf("default repair cost = %d, want %d", got, defaultMTUBytes)
+	}
+
+	lane.setFEC(4)
+	if got := lane.Cost(defaultMTUBytes); got != 4*defaultMTUBytes {
+		t.Fatalf("max repair cost = %d, want %d", got, 4*defaultMTUBytes)
+	}
+}
+
 type testAddr struct {
 	addr string
 }
